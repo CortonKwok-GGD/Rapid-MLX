@@ -215,6 +215,12 @@ class SchedulerConfig:
     enable_mtp: bool = False
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
+    # 0.9.11 PR-3 (Gemma 4 external assistant): path (local dir or HF
+    # id) to an external MTP drafter checkpoint. Read by the engine
+    # boot path in ``vllm_mlx/engine/batched.py::_start_llm`` when
+    # ``spec_decode == "mtp"`` to call ``dispatch_mtp_inject`` after
+    # target load. ``None`` = no sidecar (Qwen3.5/3.6 baked-in path).
+    mtp_sidecar: str | None = None
 
     # R15-P1 #302/#313: --spec-decode {none,mtp,dflash} routing knob.
     # Distinct from ``enable_mtp`` because that flag targets the

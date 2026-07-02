@@ -249,6 +249,75 @@ def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
     return has_media, images, videos
 
 
+def _resolve_model_type(model: Any) -> str:
+    """Best-effort ``config.json::model_type`` extraction from a loaded model.
+
+    ``dispatch_mtp_inject`` in :mod:`vllm_mlx.spec_decode.mtp.dispatch`
+    routes on this string. mlx-lm / rapid-mlx stash it at several
+    places depending on the model class shape:
+
+    * Direct attribute ``model.model_type`` (Gemma 4 wrapper — the
+      ``Gemma4LanguageModelWrapper`` in ``models/gemma4_text.py``
+      sets this in its ``__init__``).
+    * Top-level ``model.args.model_type`` (Qwen3.5, native mlx-lm
+      arch classes).
+    * Nested under ``model.language_model.args.model_type`` for the
+      VLM wrapper shapes. The dispatcher allowlist registers both the
+      outer wrapper types (``gemma4`` / ``gemma4_unified``) and inner
+      text types (``gemma4_text`` / ``gemma4_unified_text``) so
+      either resolution lands.
+    * Some model classes stash it as a raw ``config`` dict — checked
+      last as a fallback.
+
+    Returns the empty string when we can't recover a model_type — the
+    dispatcher then log-and-returns False rather than crashing.
+    """
+    # Direct attribute (Gemma 4 wrapper — sets self.model_type).
+    mt_direct = getattr(model, "model_type", None)
+    if isinstance(mt_direct, str) and mt_direct:
+        return mt_direct
+    # Outer wrapper
+    args = getattr(model, "args", None)
+    if args is not None:
+        mt = getattr(args, "model_type", None)
+        if isinstance(mt, str) and mt:
+            return mt
+    # VLM inner language model
+    inner = getattr(model, "language_model", None)
+    if inner is not None:
+        mt_inner_direct = getattr(inner, "model_type", None)
+        if isinstance(mt_inner_direct, str) and mt_inner_direct:
+            return mt_inner_direct
+        inner_args = getattr(inner, "args", None)
+        if inner_args is not None:
+            mt = getattr(inner_args, "model_type", None)
+            if isinstance(mt, str) and mt:
+                return mt
+        inner_cfg = getattr(inner, "config", None)
+        if isinstance(inner_cfg, dict):
+            mt = inner_cfg.get("model_type")
+            if isinstance(mt, str) and mt:
+                return mt
+        # Some wrappers expose ``config`` as an object with a
+        # model_type attribute rather than a dict (e.g. HF-style
+        # PretrainedConfig).
+        if inner_cfg is not None:
+            mt = getattr(inner_cfg, "model_type", None)
+            if isinstance(mt, str) and mt:
+                return mt
+    # ``config`` dict / object fallback on the outer model.
+    cfg = getattr(model, "config", None)
+    if isinstance(cfg, dict):
+        mt = cfg.get("model_type")
+        if isinstance(mt, str) and mt:
+            return mt
+    if cfg is not None:
+        mt = getattr(cfg, "model_type", None)
+        if isinstance(mt, str) and mt:
+            return mt
+    return ""
+
+
 class MLLMModelWrapper:
     """
     Wrapper for MLLM models to make them compatible with BatchGenerator.
@@ -725,6 +794,47 @@ class BatchedEngine(BaseEngine):
                 logger.warning(
                     "[MTP] MTP validation failed — --enable-mtp will be ignored. "
                     "See warnings above for details."
+                )
+
+        # 0.9.11 PR-3 (Gemma 4 external assistant): route MTP injection
+        # through the family dispatcher when ``--spec-decode mtp`` is
+        # active. For Qwen3.5/3.6 (baked-in MTP) the sidecar arg is
+        # None and dispatch resolves to ``qwen3_5_inject``; for Gemma 4
+        # the sidecar path is required and dispatch resolves to
+        # ``gemma4_inject``. The dispatcher's contract is "never
+        # raises" — a failed inject returns False, so we log-and-warn
+        # instead of aborting the boot (the eligibility gate in
+        # ``serve_command`` already bounced ineligible models).
+        sc = self._scheduler_config
+        if sc is not None and getattr(sc, "spec_decode", "none") == "mtp":
+            from ..spec_decode.mtp import dispatch_mtp_inject
+
+            model_type = _resolve_model_type(self._model)
+            sidecar = getattr(sc, "mtp_sidecar", None)
+            logger.info(
+                "[spec-decode mtp] dispatching inject: model_type=%r sidecar=%r",
+                model_type,
+                sidecar,
+            )
+            ok = self._model_load_executor.submit(
+                dispatch_mtp_inject,
+                self._model,
+                model_type,
+                mtp_sidecar=sidecar,
+            ).result()
+            if ok:
+                logger.info(
+                    "[spec-decode mtp] inject succeeded for model_type=%r",
+                    model_type,
+                )
+            else:
+                logger.warning(
+                    "[spec-decode mtp] inject returned False for "
+                    "model_type=%r (sidecar=%r). --spec-decode mtp will "
+                    "be a no-op — the generator loop will fall back to "
+                    "plain decode.",
+                    model_type,
+                    sidecar,
                 )
 
         # Set Metal memory limits on the SAME mlx-step worker that loaded

@@ -134,7 +134,11 @@ def _safe_int(value: Any, default: int = 0) -> int:
             return default
 
 
-def detect_mtp_eligibility(config: dict[str, Any] | None) -> MTPEligibility:
+def detect_mtp_eligibility(
+    config: dict[str, Any] | None,
+    *,
+    has_external_sidecar: bool = False,
+) -> MTPEligibility:
     """Return the MTP eligibility class for a parsed ``config.json``.
 
     Args:
@@ -142,6 +146,17 @@ def detect_mtp_eligibility(config: dict[str, Any] | None) -> MTPEligibility:
             non-dict) returns ``MTPEligibility.NONE`` — used by the CLI
             so callers can pass ``model_auto_config.get_config(path)``
             output unguarded.
+        has_external_sidecar: When ``True``, the caller has committed
+            to loading MTP weights from an EXTERNAL checkpoint (e.g.
+            ``--mtp-sidecar`` pointing at
+            ``google/gemma-4-*-it-assistant``). In that case the
+            target ``config.json`` is not expected to carry
+            ``mtp_num_hidden_layers`` — Google's Gemma 4 releases
+            don't. Skip the layer-count gate and return ``CHAIN``
+            whenever the ``model_type`` is on the allowlist. The
+            downstream ``dispatch_mtp_inject`` still has to succeed
+            with the sidecar weights for MTP to actually run; this
+            flag only relaxes the pre-boot gate.
 
     Returns:
         :class:`MTPEligibility` value. Detection is conservative — any
@@ -150,12 +165,16 @@ def detect_mtp_eligibility(config: dict[str, Any] | None) -> MTPEligibility:
         ``NONE`` so ``--spec-decode mtp`` on an ineligible model is
         rejected at boot rather than silently emitting wrong tokens.
     """
-    result = _detect_mtp_eligibility_verbose(config)
+    result = _detect_mtp_eligibility_verbose(
+        config, has_external_sidecar=has_external_sidecar
+    )
     return result.eligibility
 
 
 def _detect_mtp_eligibility_verbose(
     config: dict[str, Any] | None,
+    *,
+    has_external_sidecar: bool = False,
 ) -> _DetectionResult:
     """Detection helper that returns the full reason string.
 
@@ -180,6 +199,30 @@ def _detect_mtp_eligibility_verbose(
         )
 
     num_mtp_layers = _safe_int(config.get("mtp_num_hidden_layers"), 0)
+    if has_external_sidecar:
+        # External-sidecar path (Google Gemma 4 assistant). The target
+        # config does not carry ``mtp_num_hidden_layers`` — MTP weights
+        # live in a separate ``*-it-assistant`` checkpoint that
+        # ``dispatch_mtp_inject`` loads at boot. The dispatcher itself
+        # will fail-closed if the sidecar path is invalid or the
+        # weight tree doesn't match, so relaxing the layer-count gate
+        # here is safe — a bogus sidecar surfaces as an inject failure
+        # (log-and-warn), not silent wrong-token emission.
+        #
+        # We still return CHAIN (single draft per verify) — the Google
+        # Gemma 4 assistant is a 4-layer transformer that ships one
+        # draft head, matching the chain topology today. If a future
+        # sidecar ships a real tree, this branch is where the tree
+        # eligibility would branch on the sidecar's config.
+        return _DetectionResult(
+            MTPEligibility.CHAIN,
+            model_type,
+            num_mtp_layers,
+            (
+                "external MTP sidecar (target config has no "
+                "mtp_num_hidden_layers; sidecar carries the MTP head)"
+            ),
+        )
     if num_mtp_layers <= 0:
         # MTP-capable model_type but MTP weights not present on this
         # checkpoint. For Qwen3.5 / Qwen3.6 this is a stripped convert —

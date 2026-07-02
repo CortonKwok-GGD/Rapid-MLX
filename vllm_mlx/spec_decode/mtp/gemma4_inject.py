@@ -121,18 +121,51 @@ _ASSISTANT_MODEL_TYPES: frozenset[str] = frozenset(
 def _resolve_inner_text_model(model: Any) -> Any:
     """Return the ``gemma4_text.Model``-like inner text model.
 
-    Three shapes accepted (mirrors qwen3_5_inject's helper):
+    Four shapes accepted:
 
     * The outer VLM-style ``Model`` (``gemma4`` / ``gemma4_unified``)
-      whose ``.language_model`` field is the inner text model.
-    * The inner ``gemma4_text.Model`` itself (also carries
-      ``.language_model = None`` in some builds — check ``.args`` +
-      ``.model``).
+      whose ``.language_model`` field is the inner text model with
+      ``.args`` + ``.model``.
+    * The inner ``gemma4_text.Model`` itself (test path — has
+      ``.args`` + ``.model`` directly).
     * A fake shell with just ``.args`` + ``.model`` (test path).
+    * A ``rapid-mlx``-wrapped ``LanguageModel`` (from mlx-vlm's
+      Gemma 4 loader — the shape ``models/gemma4_text.py``'s
+      ``Gemma4TextWrapper`` produces at boot): ``.language_model``
+      carries ``.model`` and ``.config`` but NO ``.args``. The
+      ``.config`` object exposes the same fields (``hidden_size``,
+      ``vocab_size``, ``layer_types``, ``head_dim``, …) — attach a
+      ``.args`` alias so the rest of ``inject_mtp_support`` reads
+      through without further branching. Idempotent: repeat calls
+      just re-bind the existing attribute.
     """
     lm = getattr(model, "language_model", None)
-    if lm is not None and hasattr(lm, "args") and hasattr(lm, "model"):
-        return lm
+    if lm is not None:
+        # Straight case — inner already exposes .args + .model.
+        if hasattr(lm, "args") and hasattr(lm, "model"):
+            return lm
+        # rapid-mlx / mlx-vlm shape — carries .config in place of .args.
+        # Alias so downstream code keeps its ``inner.args.<field>``
+        # reads working unmodified. Safe because .args is not already
+        # used by mlx-vlm's LanguageModel for anything else.
+        if hasattr(lm, "config") and hasattr(lm, "model") and not hasattr(lm, "args"):
+            try:
+                lm.args = lm.config
+            except AttributeError:
+                # Immutable subclass — synthesise an SimpleNamespace
+                # view over .config as a last resort.
+                from types import SimpleNamespace
+
+                ns = SimpleNamespace()
+                for k in dir(lm.config):
+                    if k.startswith("_"):
+                        continue
+                    try:
+                        setattr(ns, k, getattr(lm.config, k))
+                    except AttributeError:
+                        pass
+                object.__setattr__(lm, "args", ns)
+            return lm
     if hasattr(model, "model") and hasattr(model, "args"):
         return model
     return None

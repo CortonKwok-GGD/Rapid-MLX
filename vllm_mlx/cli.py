@@ -2348,6 +2348,10 @@ def serve_command(args):
         enable_mtp=args.enable_mtp,
         mtp_num_draft_tokens=args.mtp_num_draft_tokens,
         mtp_optimistic=args.mtp_optimistic,
+        # 0.9.11 PR-3 (Gemma 4 external assistant): sidecar path plumbed
+        # through SchedulerConfig so the engine boot path can pick it
+        # up without pulling the raw argparse Namespace.
+        mtp_sidecar=getattr(args, "mtp_sidecar", None),
         # R15-P1 #302/#313: --spec-decode {none,mtp,dflash}. Plumb the
         # raw choice through; the boot-time eligibility check below
         # validates that ``mtp`` was only passed for a config.json with
@@ -2422,14 +2426,25 @@ def serve_command(args):
             hf_cfg_eligibility, _ = _gather_kv_cache_dtype_inputs(args.model)
         except Exception:  # pragma: no cover — best-effort
             hf_cfg_eligibility = None
-        eligibility = detect_mtp_eligibility(hf_cfg_eligibility)
+        # 0.9.11 PR-3 (Gemma 4 external assistant): when the operator
+        # points ``--mtp-sidecar`` at a separate MTP drafter checkpoint
+        # (Google's ``google/gemma-4-*-it-assistant``), the target
+        # ``config.json`` won't carry ``mtp_num_hidden_layers`` —
+        # relax the pre-boot layer-count gate. The dispatcher-side
+        # inject still enforces sidecar shape at load time.
+        has_sidecar = bool(getattr(args, "mtp_sidecar", None))
+        eligibility = detect_mtp_eligibility(
+            hf_cfg_eligibility, has_external_sidecar=has_sidecar
+        )
         if eligibility is MTPEligibility.NONE:
             print(
-                "error: --spec-decode mtp requires a Qwen3.5 / Qwen3.6 "
-                "checkpoint with mtp_num_hidden_layers >= 1 in "
-                "config.json. The loaded model does not qualify "
-                "(re-convert from HF with mlx-lm PR #990's sanitize() "
-                "path to preserve mtp.* weights).",
+                "error: --spec-decode mtp requires either (a) a Qwen3.5 / "
+                "Qwen3.6 checkpoint with mtp_num_hidden_layers >= 1 in "
+                "config.json (re-convert from HF with mlx-lm PR #990's "
+                "sanitize() path to preserve mtp.* weights), or (b) a "
+                "supported model_type (e.g. gemma4 / gemma4_unified) "
+                "paired with --mtp-sidecar pointing at an external MTP "
+                "assistant checkpoint. The loaded model does not qualify.",
                 file=sys.stderr,
             )
             sys.exit(2)
@@ -6245,6 +6260,26 @@ Examples:
         default=False,
         help="Skip MTP acceptance check for maximum speed. "
         "~5-10%% wrong tokens. Best for chat, not for code.",
+    )
+    # 0.9.11 PR-3 (Gemma 4 external assistant): --mtp-sidecar wires an
+    # external MTP assistant/drafter checkpoint into the boot path.
+    # For Qwen3.5/3.6 (upstream PR #990) MTP lives baked into the base
+    # checkpoint via ``mtp.*`` weights, and this flag is unused. For
+    # Gemma 4, Google ships the MTP drafter in a SEPARATE
+    # ``google/gemma-4-*-it-assistant`` repo — the flag points at that
+    # sidecar (local dir or HF id) so ``dispatch_mtp_inject`` can load
+    # it after the target model is loaded. Ignored for families whose
+    # MTP is baked into the target checkpoint (Qwen3.5/3.6).
+    serve_parser.add_argument(
+        "--mtp-sidecar",
+        type=str,
+        default=None,
+        help=(
+            "Path (local dir or HF id) to an external MTP assistant / "
+            "drafter checkpoint. Required for model families where MTP "
+            "lives in a separate checkpoint (e.g. Gemma 4). Ignored for "
+            "families with baked-in MTP (Qwen3.5/3.6)."
+        ),
     )
     # ------------------------------------------------------------------
     # 0.9.11 PR-1: universal MTP draft-``k`` auto-tune controller.

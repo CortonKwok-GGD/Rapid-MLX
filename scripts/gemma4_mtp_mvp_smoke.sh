@@ -146,10 +146,17 @@ boot_and_prompt() {
 
   local server_log="${WORKDIR}/server_${mode}.log"
   echo "[smoke:${mode}] Starting server on :${PORT}..."
+  # ``rapid-mlx serve`` takes the model as a POSITIONAL argument
+  # (see ``serve_parser.add_argument("model", ...)`` in cli.py) —
+  # ``--model foo`` argparse-errors before the server even boots.
+  #
+  # The ``${extra_args[@]+"${extra_args[@]}"}`` shape safely expands
+  # to nothing when the array is empty under ``set -u`` (baseline
+  # mode has no extra args, which used to trip "unbound variable").
   "${RAPID_MLX_BIN}" serve \
-    --model "${MODEL_ALIAS}" \
+    "${MODEL_ALIAS}" \
     --port "${PORT}" \
-    "${extra_args[@]}" \
+    ${extra_args[@]+"${extra_args[@]}"} \
     > "${server_log}" 2>&1 &
   local pid=$!
   echo "[smoke:${mode}] server pid=${pid}"

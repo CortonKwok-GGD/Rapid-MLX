@@ -359,6 +359,56 @@ def test_detect_eligibility_none_or_non_dict_returns_none():
     assert detect_mtp_eligibility([]) is MTPEligibility.NONE  # type: ignore[arg-type]
 
 
+def test_detect_eligibility_gemma4_external_sidecar_bypasses_layer_count():
+    """0.9.11 PR-3: ``has_external_sidecar=True`` skips the
+    ``mtp_num_hidden_layers`` gate.
+
+    Google's official ``google/gemma-4-*-it-assistant`` releases pair a
+    stock Gemma 4 target (no MTP head baked into config.json) with a
+    separate MTP drafter checkpoint. The CLI's ``--mtp-sidecar`` path
+    tells the detector to bypass the layer-count gate — otherwise the
+    boot would bounce with "mtp_num_hidden_layers <= 0" even though the
+    sidecar is what actually carries the MTP head.
+
+    Contract:
+      * ``model_type`` on allowlist AND external sidecar → CHAIN.
+      * The pre-existing (no-sidecar) call still returns NONE for the
+        same config, so external callers who don't pass the sidecar
+        keep the strict pre-boot gate.
+    """
+    from vllm_mlx.spec_decode.mtp import (
+        MTPEligibility,
+        detect_mtp_eligibility,
+    )
+
+    # Stock Google Gemma 4 config: model_type allowlisted, no MTP layer
+    # field on the target.
+    config = {"model_type": "gemma4_unified"}
+
+    # Without sidecar: strict pre-boot gate rejects.
+    assert detect_mtp_eligibility(config) is MTPEligibility.NONE
+    # With external sidecar: gate relaxes to CHAIN.
+    assert (
+        detect_mtp_eligibility(config, has_external_sidecar=True)
+        is MTPEligibility.CHAIN
+    )
+    # Even when mtp_num_hidden_layers is explicit zero, external sidecar
+    # still returns CHAIN — the sidecar is the source of MTP weights.
+    config_zero = {"model_type": "gemma4_unified", "mtp_num_hidden_layers": 0}
+    assert (
+        detect_mtp_eligibility(config_zero, has_external_sidecar=True)
+        is MTPEligibility.CHAIN
+    )
+    # But external_sidecar does NOT override the model_type allowlist:
+    # a random architecture with a sidecar is still NONE (dispatcher
+    # wouldn't have a family inject to route to).
+    off_allowlist = {"model_type": "llama"}
+    assert (
+        detect_mtp_eligibility(off_allowlist, has_external_sidecar=True)
+        is MTPEligibility.NONE
+    )
+
+
 def test_detect_eligibility_aliases_json_schema_untouched():
     """Detection MUST NOT depend on aliases.json fields like
     ``architecture``, ``family``, ``quantization``, ``notes`` — those
