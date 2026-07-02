@@ -6251,8 +6251,17 @@ Examples:
     serve_parser.add_argument(
         "--mtp-num-draft-tokens",
         type=int,
-        default=1,
-        help="Number of draft tokens per MTP step (default: 1)",
+        default=2,
+        help=(
+            "Number of draft tokens per MTP verify pass (default: 2). "
+            "When --mtp-draft-k-auto-tune is off, this is the static "
+            "chain-of-K value passed through to the generator. When "
+            "auto-tune is ON, this is the k_start seed for the "
+            "controller (which then adjusts K within "
+            "[1, --mtp-draft-k-max] based on rolling accept rate). "
+            "Pass 1 to force the byte-identical chain-of-1 legacy "
+            "path (useful for A/B bench baselines)."
+        ),
     )
     serve_parser.add_argument(
         "--mtp-optimistic",
@@ -6321,30 +6330,32 @@ Examples:
     serve_parser.add_argument(
         "--mtp-draft-k-max",
         type=int,
-        default=4,
+        default=5,
         help=(
             "Upper bound on MTP draft-k when auto-tune is enabled "
-            "(default: 4; range: 1-8). Ignored when "
+            "(default: 5; range: 1-8). Ignored when "
             "--mtp-draft-k-auto-tune is off."
         ),
     )
     serve_parser.add_argument(
         "--mtp-draft-k-window",
         type=int,
-        default=64,
+        default=48,
         help=(
-            "Rolling window size (in attempts) used to compute the "
-            "accept rate that drives auto-tune adjustments "
-            "(default: 64). Ignored when auto-tune is off."
+            "Rolling window size (in draft-position samples) used to "
+            "compute the accept rate that drives auto-tune adjustments "
+            "(default: 48). Chain-of-K records one sample per verified "
+            "draft position, so the window covers ~48/K verify passes. "
+            "Ignored when auto-tune is off."
         ),
     )
     serve_parser.add_argument(
         "--mtp-draft-k-upshift-threshold",
         type=float,
-        default=0.80,
+        default=0.82,
         help=(
             "Accept-rate at or above which draft-k is bumped up "
-            "(default: 0.80). Must be strictly greater than "
+            "(default: 0.82). Must be strictly greater than "
             "--mtp-draft-k-downshift-threshold. NaN / +Inf / -Inf "
             "and values outside (0, 1] are rejected at boot. Ignored "
             "when auto-tune is off."
@@ -6353,10 +6364,10 @@ Examples:
     serve_parser.add_argument(
         "--mtp-draft-k-downshift-threshold",
         type=float,
-        default=0.40,
+        default=0.55,
         help=(
             "Accept-rate at or below which draft-k is cut down "
-            "(default: 0.40). Must be strictly less than "
+            "(default: 0.55). Must be strictly less than "
             "--mtp-draft-k-upshift-threshold. NaN / +Inf / -Inf and "
             "values outside [0, 1) are rejected at boot. Ignored "
             "when auto-tune is off."
@@ -6365,10 +6376,10 @@ Examples:
     serve_parser.add_argument(
         "--mtp-draft-k-cooldown",
         type=int,
-        default=128,
+        default=64,
         help=(
-            "Minimum number of recorded verify attempts between "
-            "auto-tune adjustment decisions (default: 128). Prevents "
+            "Minimum number of recorded draft-position samples between "
+            "auto-tune adjustment decisions (default: 64). Prevents "
             "a lucky streak of accepts right after cold-start from "
             "ratcheting k up before steady-state behaviour kicks in. "
             "Ignored when auto-tune is off."

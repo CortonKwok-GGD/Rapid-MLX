@@ -1067,6 +1067,160 @@ def inject_mtp_support(
             _ = mtp_cache
             return logits
 
+        def mtp_draft_block(self, hidden_last, main_tok, k):
+            """Autoregressive K-step drafting for chain-of-K MTP.
+
+            Mirrors mlx-vlm's
+            ``Gemma4AssistantDraftModel.draft_block`` shape (see
+            ``mlx_vlm/speculative/drafters/gemma4_assistant/
+            gemma4_assistant.py::draft_block``). Runs K drafter
+            forwards autoregressively, chaining the drafter's
+            ``post_projection`` output as the "target-hidden-like"
+            input for the next iteration. Position IDs are held
+            CONSTANT across all K draft steps (single-position
+            multi-token trick).
+
+            Reads shared K/V from target's cache — one last-of-type
+            slot per drafter layer (same mapping as
+            :meth:`mtp_forward`). No writes to target cache; drafter
+            has no own cache. The generator advances the target cache
+            afterwards via the verify backbone pass.
+
+            Args:
+                hidden_last: (B=1, 1, backbone_hidden) or (1,
+                    backbone_hidden) — target's hidden at the position
+                    that predicted ``main_tok``. In backbone_hidden
+                    (target hidden dim) space.
+                main_tok: int OR (1,) uint32 array — the last
+                    confirmed emitted token to seed the drafter chain.
+                k: number of draft tokens to produce. Must be >= 1.
+
+            Returns:
+                ``(1, k)`` int32 array of draft token IDs.
+
+            Contract with the generator: caller MUST have run a
+            target-side forward that populated the KV cache to the
+            desired offset BEFORE calling this — the drafter reads
+            ``target_cache[i].state`` for each of the
+            ``_shared_kv_target_indices`` slots at call time.
+            """
+            import mlx.core as _mx
+
+            if k < 1:
+                raise ValueError(f"k must be >= 1; got {k}")
+
+            target_cache = getattr(self, "_mtp_target_cache", None)
+            if target_cache is None:
+                raise RuntimeError(
+                    "[mtp.inject.gemma4] mtp_draft_block invoked before a "
+                    "target backbone forward — target KV cache is not "
+                    "populated."
+                )
+            n_take = _n_assistant_layers
+            if len(target_cache) < n_take:
+                raise RuntimeError(
+                    f"[mtp.inject.gemma4] target has {len(target_cache)} "
+                    f"cache slots but the assistant requires {n_take}."
+                )
+
+            # Root-cause: last-of-type shared K/V (same as mtp_forward).
+            shared_kv_slots = [
+                target_cache[idx] for idx in _shared_kv_target_indices
+            ]
+            layer_states: list[tuple] = []
+            for tgt_cache in shared_kv_slots:
+                try:
+                    state = tgt_cache.state
+                except AttributeError:
+                    state = None
+                if state is None or (
+                    isinstance(state, tuple) and state[0] is None
+                ):
+                    raise RuntimeError(
+                        "[mtp.inject.gemma4] target cache slot has empty "
+                        "state; cannot draft without any K/V."
+                    )
+                if isinstance(state, tuple):
+                    keys, values = state[0], state[1]
+                else:
+                    keys = state
+                    values = state
+                layer_states.append((keys, values))
+
+            # Constant position across all K draft steps. Mirrors
+            # mlx-vlm's ``position = kv_offset - 1`` where kv_offset
+            # is the shared K/V's write-head (== target's cache
+            # offset). Empirically the shape ``base_offset - 1``
+            # matches the drafter's training convention. Note that
+            # our chain-of-1 ``mtp_forward`` uses ``base_offset``
+            # (not -1) for N=1; the -1 shift here is a deliberate
+            # deviation to match mlx-vlm's reference, which trained
+            # against the assistant weights with that convention.
+            # If chain-of-K accept rate is poor, revisit — a 1-off
+            # in RoPE position can drop accept by 10-30 pp.
+            base_offset = int(shared_kv_slots[-1].offset)
+            row_offset_int = max(base_offset - 1, 0)
+            row_offset = _mx.array(row_offset_int)
+
+            # Prepare seed state.
+            if isinstance(main_tok, int):
+                tok = _mx.array([[main_tok]], dtype=_mx.uint32)
+            elif isinstance(main_tok, _mx.array):
+                tok = main_tok.reshape(1, 1).astype(_mx.uint32)
+            else:
+                tok = _mx.array([[int(main_tok)]], dtype=_mx.uint32)
+
+            if hidden_last.ndim == 2:
+                h_prev = hidden_last[None]  # (1, 1, H)
+            elif hidden_last.ndim == 3:
+                h_prev = hidden_last
+                if h_prev.shape[1] != 1:
+                    h_prev = h_prev[:, -1:, :]
+            else:
+                raise ValueError(
+                    f"hidden_last must be 2D or 3D; got shape "
+                    f"{tuple(hidden_last.shape)}"
+                )
+
+            target_embed = self.model.embed_tokens
+            draft_toks: list = []
+
+            for _step in range(k):
+                # Embed input token (target's tokenizer table, scaled by
+                # target's embed_scale — matches mlx-vlm's
+                # ``self._input_embed(tok) * self._input_embed_scale``).
+                tok_embed = target_embed(tok) * _target_embed_scale
+                # Fuse: [tok_embed, h_prev] in that order (Google's
+                # pre_projection weight expects tok-first — same
+                # convention as our chain-of-1 mtp_forward).
+                fused = _mx.concatenate([tok_embed, h_prev], axis=-1)
+                h_proj = self.mtp.pre_projection(fused)  # (1, 1, drafter_h)
+
+                # Run through drafter layers (shared_kv, constant offset).
+                h_layer = h_proj
+                for layer, (keys, values) in zip(
+                    self.mtp.model.layers, layer_states
+                ):
+                    h_layer, _shared, _off = layer(
+                        h_layer,
+                        mask=None,
+                        cache=None,
+                        per_layer_input=None,
+                        shared_kv=(keys, values),
+                        offset=row_offset,
+                    )
+
+                h_norm = self.mtp.model.norm(h_layer)
+                # Tied lm_head — assistant's own embed table.
+                logits = self.mtp.model.embed_tokens.as_linear(h_norm)
+                tok = _mx.argmax(logits, axis=-1).astype(_mx.uint32)  # (1, 1)
+                draft_toks.append(tok)
+
+                # Chain h_prev via post_projection (drafter_h -> backbone_h).
+                h_prev = self.mtp.post_projection(h_norm)
+
+            return _mx.concatenate(draft_toks, axis=-1)  # (1, k)
+
         def make_mtp_cache(self):
             """Empty KVCache slots — safe no-ops for the generator.
 
@@ -1137,6 +1291,7 @@ test_make_mtp_cache_slots_are_generator_safe`
     try:
         _delegate_forward = None
         _delegate_cache = None
+        _delegate_draft_block = None
         if model is not inner:
 
             def _delegate_forward(_self, hidden_states, next_token_ids, mtp_cache):
@@ -1144,6 +1299,9 @@ test_make_mtp_cache_slots_are_generator_safe`
 
             def _delegate_cache(_self):
                 return inner.make_mtp_cache()
+
+            def _delegate_draft_block(_self, hidden_last, main_tok, k):
+                return inner.mtp_draft_block(hidden_last, main_tok, k)
 
         # Commit: class swap first so the surfaces are visible via the
         # inner's own method resolution, then set attributes on inner
@@ -1154,6 +1312,7 @@ test_make_mtp_cache_slots_are_generator_safe`
             model.mtp = inner.mtp
             model.mtp_forward = _types.MethodType(_delegate_forward, model)
             model.make_mtp_cache = _types.MethodType(_delegate_cache, model)
+            model.mtp_draft_block = _types.MethodType(_delegate_draft_block, model)
             # Codex round-11 blocking fix: mirror the static batch-size
             # gate onto the OUTER wrapper. Schedulers that inspect the
             # caller-visible ``model`` object (not the buried inner
@@ -1187,6 +1346,7 @@ test_make_mtp_cache_slots_are_generator_safe`
                     "mtp",
                     "mtp_forward",
                     "make_mtp_cache",
+                    "mtp_draft_block",
                     "mtp_max_batch_size",
                 ):
                     # Direct __dict__ removal first (fast path), then

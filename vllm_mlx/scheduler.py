@@ -213,7 +213,7 @@ class SchedulerConfig:
     # MTP (Multi-Token Prediction) settings
     # Uses the model's built-in MTP head to predict multiple tokens per step
     enable_mtp: bool = False
-    mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
+    mtp_num_draft_tokens: int = 2  # Number of draft tokens from MTP head (chain-of-K)
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
     # 0.9.11 PR-3 (Gemma 4 external assistant): path (local dir or HF
     # id) to an external MTP drafter checkpoint. Read by the engine
@@ -1327,6 +1327,7 @@ def _install_mtp_vendored(
     model: Any,
     requests: dict[str, Any] | None = None,
     uid_to_request_id: dict[int, str] | None = None,
+    num_draft_tokens: int = 1,
 ) -> bool:
     """Install the vendored PR #990 ``mtp_generate_step`` hot loop into
     ``GenerationBatch._step``.
@@ -1536,6 +1537,7 @@ def _install_mtp_vendored(
                     max_tokens=gen_max,
                     prompt_cache=gb.prompt_cache,
                     temp=0.0,
+                    num_draft_tokens=num_draft_tokens,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
@@ -2762,6 +2764,7 @@ class Scheduler:
                     model=self.model,
                     requests=self.requests,
                     uid_to_request_id=self.uid_to_request_id,
+                    num_draft_tokens=self.config.mtp_num_draft_tokens,
                 )
 
         # Install SuffixDecoding (drafter-free spec-decode). Mutually

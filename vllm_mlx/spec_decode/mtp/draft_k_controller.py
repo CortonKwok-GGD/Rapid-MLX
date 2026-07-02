@@ -121,12 +121,12 @@ class DraftKController:
         self,
         *,
         k_min: int = 1,
-        k_max: int = 4,
+        k_max: int = 5,
         k_start: int | None = None,
-        window: int = 64,
-        upshift_threshold: float = 0.80,
-        downshift_threshold: float = 0.40,
-        cooldown: int = 128,
+        window: int = 48,
+        upshift_threshold: float = 0.82,
+        downshift_threshold: float = 0.55,
+        cooldown: int = 64,
     ) -> None:
         # --- integer bounds ------------------------------------------------
         # ``bool`` is a subclass of ``int`` in Python; reject it explicitly

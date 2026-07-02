@@ -191,6 +191,7 @@ def mtp_generate_step(
     xtc_special_tokens: list[int] | None = None,
     accept_counter=None,
     draft_k_controller: DraftKController | None = None,
+    num_draft_tokens: int = 1,
 ) -> Generator[tuple[int, mx.array, bool], None, None]:
     """Generator that uses the model's native MTP head for spec decode.
 
@@ -439,6 +440,166 @@ def mtp_generate_step(
 
     ntoks = 0
     last_cache_block = 0
+
+    # ------------------------------------------------------------------
+    # Chain-of-K dispatch (0.9.11 follow-up).
+    #
+    # When the target model exposes ``mtp_draft_block`` (Gemma 4
+    # assistant path) AND the effective K is >= 1, take the chain-of-K
+    # verify loop. K is read at loop START each iteration:
+    #
+    #   * ``draft_k_controller.current_k()`` when the auto-tune
+    #     controller is installed. The controller default is k_start=2
+    #     via the CLI; it adjusts K within ``[1, k_max]`` based on
+    #     rolling per-position accept rate.
+    #   * ``num_draft_tokens`` (the static override) otherwise. The CLI
+    #     default is 2; operators can pin K=1 to force the
+    #     byte-identical chain-of-1 legacy path.
+    #
+    # When ``mtp_draft_block`` is missing (Qwen3.5/3.6 baked-in MTP —
+    # no autoregressive drafter API) the loop falls through to the
+    # pre-PR chain-of-1 code path so the byte-identical lossless
+    # contract on that family is unchanged.
+    # ------------------------------------------------------------------
+
+    _supports_chain_of_k = callable(getattr(model, "mtp_draft_block", None))
+
+    def _get_k() -> int:
+        """Read the current K at verify-loop start (see docstring above)."""
+        if draft_k_controller is not None:
+            return int(draft_k_controller.current_k())
+        return int(num_draft_tokens)
+
+    # ============================
+    # Chain-of-K path (Gemma 4)
+    # ============================
+    # Gate: only enter chain-of-K when (a) the model exposes
+    # ``mtp_draft_block``, (b) we're greedy (temp=0), and (c) either
+    # the controller is installed or the static K is >= 1. Non-greedy
+    # falls through to the legacy chain-of-1 path which preserves the
+    # lossless marginal via residual sampling.
+    if _supports_chain_of_k and _is_greedy and _get_k() >= 1:
+        # State machine: ``draft_tok_arr`` is None on the first pass
+        # (cold start — need to emit main_tok first). Subsequent passes
+        # carry a (1, K) draft tensor from the previous iteration's
+        # drafter forward.
+        draft_tok_arr: mx.array | None = None
+
+        while ntoks < max_tokens:
+            if draft_tok_arr is None:
+                # Cold start: backbone forward on y (last prompt tok),
+                # sample main_tok, then draft K.
+                toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
+                    y, prev_tokens, n_predict=1
+                )
+                mx.eval(toks)
+                main_tok, main_lp = toks[0], lps[0]
+                ntoks += 1
+                yield main_tok.item(), main_lp, False
+                if ntoks >= max_tokens:
+                    return
+                K = _get_k()
+                if K < 1:
+                    K = 1  # defensive floor
+                hidden_at_main = hidden[:, -1:, :]
+                draft_tok_arr = model.mtp_draft_block(
+                    hidden_at_main, main_tok, K
+                )
+                mx.eval(draft_tok_arr)
+                y = mx.array([main_tok.item()], mx.uint32)
+            else:
+                K = int(draft_tok_arr.shape[1])
+                # Build the verify input: [y, d_1, ..., d_K].
+                drafts_1d = draft_tok_arr[0].astype(mx.uint32)
+                y_with_drafts = mx.concatenate([y, drafts_1d])
+                toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
+                    y_with_drafts,
+                    prev_tokens,
+                    n_predict=K + 1,
+                    n_confirmed=1,
+                )
+                mx.eval(toks, draft_tok_arr)
+
+                # Sequential accept: find first mismatch position j in
+                # [0, K). Greedy path (temp=0) — the scheduler always
+                # installs greedy today (see
+                # ``vllm_mlx/scheduler.py::_is_greedy_for_uid``). The
+                # probabilistic branch is NOT implemented for chain-of-K:
+                # per-position residual sampling under K>1 requires
+                # correlated draws across drafter/verify pairs that
+                # this PR does not attempt.
+                # target's argmax at each of K+1 positions.
+                j = 0
+                for i in range(K):
+                    if int(toks[i].item()) == int(drafts_1d[i].item()):
+                        j += 1
+                    else:
+                        break
+
+                # Emit j accepted drafts.
+                for i in range(j):
+                    accept_counter.record_attempt()
+                    accept_counter.record_accept(tokens_saved=1)
+                    if draft_k_controller is not None:
+                        draft_k_controller.record_attempt(accepted=True)
+                    ntoks += 1
+                    yield int(drafts_1d[i].item()), lps[i], True
+                    if ntoks >= max_tokens:
+                        return
+                # Emit the target's argmax at position j — this is
+                # either the correction (j < K) or the bonus (j == K).
+                correction_tok = int(toks[j].item())
+                correction_lp = lps[j]
+                if j < K:
+                    # First mismatched draft = one rejected attempt.
+                    accept_counter.record_attempt()
+                    accept_counter.record_reject()
+                    if draft_k_controller is not None:
+                        draft_k_controller.record_attempt(accepted=False)
+                ntoks += 1
+                yield correction_tok, correction_lp, False
+                if ntoks >= max_tokens:
+                    return
+
+                # Cache management: after target forward the cache
+                # advanced by K+1 positions. We keep the first j+1
+                # (positions ``L..L+j``, which correspond to y +
+                # accepted drafts). Trim the remaining ``K - j``.
+                trim_amt = K - j
+                if trim_amt > 0:
+                    for c in model_cache:
+                        if hasattr(c, "rollback_state"):
+                            c.rollback_state = None
+                        if c.is_trimmable():
+                            c.trim(trim_amt)
+                else:
+                    _clear_rollback()
+
+                # Next draft: hidden at position j (predicted the
+                # correction / bonus emitted above). K_next may
+                # differ from K if the controller re-evaluated during
+                # ``record_attempt`` calls above.
+                K_next = _get_k()
+                if K_next < 1:
+                    K_next = 1
+                hidden_at_correction = hidden[:, j : j + 1, :]
+                draft_tok_arr = model.mtp_draft_block(
+                    hidden_at_correction,
+                    mx.array([correction_tok], mx.uint32),
+                    K_next,
+                )
+                mx.eval(draft_tok_arr)
+                y = mx.array([correction_tok], mx.uint32)
+
+            block = ntoks // _CACHE_CLEAR_INTERVAL
+            if block > last_cache_block:
+                mx.clear_cache()
+                last_cache_block = block
+        return
+
+    # ============================
+    # Chain-of-1 legacy path (unchanged — byte-identical to PR #990)
+    # ============================
     draft_tok = draft_lp = draft_accept_lp = draft_xtc_draw = None
 
     while ntoks < max_tokens:
