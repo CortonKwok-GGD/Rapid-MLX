@@ -121,18 +121,51 @@ _ASSISTANT_MODEL_TYPES: frozenset[str] = frozenset(
 def _resolve_inner_text_model(model: Any) -> Any:
     """Return the ``gemma4_text.Model``-like inner text model.
 
-    Three shapes accepted (mirrors qwen3_5_inject's helper):
+    Four shapes accepted:
 
     * The outer VLM-style ``Model`` (``gemma4`` / ``gemma4_unified``)
-      whose ``.language_model`` field is the inner text model.
-    * The inner ``gemma4_text.Model`` itself (also carries
-      ``.language_model = None`` in some builds — check ``.args`` +
-      ``.model``).
+      whose ``.language_model`` field is the inner text model with
+      ``.args`` + ``.model``.
+    * The inner ``gemma4_text.Model`` itself (test path — has
+      ``.args`` + ``.model`` directly).
     * A fake shell with just ``.args`` + ``.model`` (test path).
+    * A ``rapid-mlx``-wrapped ``LanguageModel`` (from mlx-vlm's
+      Gemma 4 loader — the shape ``models/gemma4_text.py``'s
+      ``Gemma4TextWrapper`` produces at boot): ``.language_model``
+      carries ``.model`` and ``.config`` but NO ``.args``. The
+      ``.config`` object exposes the same fields (``hidden_size``,
+      ``vocab_size``, ``layer_types``, ``head_dim``, …) — attach a
+      ``.args`` alias so the rest of ``inject_mtp_support`` reads
+      through without further branching. Idempotent: repeat calls
+      just re-bind the existing attribute.
     """
     lm = getattr(model, "language_model", None)
-    if lm is not None and hasattr(lm, "args") and hasattr(lm, "model"):
-        return lm
+    if lm is not None:
+        # Straight case — inner already exposes .args + .model.
+        if hasattr(lm, "args") and hasattr(lm, "model"):
+            return lm
+        # rapid-mlx / mlx-vlm shape — carries .config in place of .args.
+        # Alias so downstream code keeps its ``inner.args.<field>``
+        # reads working unmodified. Safe because .args is not already
+        # used by mlx-vlm's LanguageModel for anything else.
+        if hasattr(lm, "config") and hasattr(lm, "model") and not hasattr(lm, "args"):
+            try:
+                lm.args = lm.config
+            except AttributeError:
+                # Immutable subclass — synthesise an SimpleNamespace
+                # view over .config as a last resort.
+                from types import SimpleNamespace
+
+                ns = SimpleNamespace()
+                for k in dir(lm.config):
+                    if k.startswith("_"):
+                        continue
+                    try:
+                        setattr(ns, k, getattr(lm.config, k))
+                    except AttributeError:
+                        pass
+                object.__setattr__(lm, "args", ns)
+            return lm
     if hasattr(model, "model") and hasattr(model, "args"):
         return model
     return None
@@ -781,6 +814,46 @@ def inject_mtp_support(
     _target_num_layers = len(getattr(inner.model, "layers", []) or [])
     _n_assistant_layers = len(assistant.model.layers)
 
+    # Root-cause fix: Google's assistant is trained expecting each drafter
+    # layer to read shared K/V from the TARGET's LAST layer whose
+    # ``layer_type`` matches. See
+    # ``mlx_vlm/models/gemma4/language.py`` (Gemma4TextModel.__call__ at
+    # ``shared_kv_sink[layer.layer_type] = kvs`` — last-of-type wins) and
+    # ``mlx_vlm/speculative/drafters/gemma4_assistant/gemma4_assistant.py``
+    # (``kv = shared_kv_states[layer.layer_type]`` in ``_forward_hidden``).
+    # A positional ``target_cache[-4:]`` mapping was previously used —
+    # drafter layers 0/1/2 read target cache slots N-4/N-3/N-2 instead
+    # of ALL three sliding drafter layers sharing target's LAST sliding
+    # K/V slot. This collapsed accept rate to ~2%. Compute the correct
+    # mapping once at inject time; drop into the forward below.
+    _assistant_layer_types = list(getattr(assistant.args, "layer_types", []) or [])
+    _target_layer_types = list(getattr(inner.args, "layer_types", []) or [])
+    _last_target_idx_by_type: dict[str, int] = {}
+    for _i, _lt in enumerate(_target_layer_types):
+        _last_target_idx_by_type[_lt] = _i
+    if _assistant_layer_types and all(
+        lt in _last_target_idx_by_type for lt in _assistant_layer_types
+    ):
+        _shared_kv_target_indices: list[int] = [
+            _last_target_idx_by_type[lt] for lt in _assistant_layer_types
+        ]
+    else:
+        # Fallback: preserve prior positional behavior when layer_types
+        # are unresolved (test paths / random-init). Same shape as before.
+        _shared_kv_target_indices = list(
+            range(_target_num_layers - _n_assistant_layers, _target_num_layers)
+        )
+    # Snapshot the target's embed_scale so ``mtp_forward`` can scale the
+    # token embedding as Google's ``Gemma4AssistantDraftModel.draft_block``
+    # does (``tok_embed = self._input_embed(tok) * self._input_embed_scale``,
+    # where ``_input_embed_scale`` is copied from the target's
+    # ``Gemma4TextModel.embed_scale = hidden_size**0.5``). Fetched at
+    # inject time from the concrete backbone module so both mlx-lm and
+    # mlx-vlm target shapes work.
+    _target_embed_scale = float(
+        getattr(getattr(inner, "model", None), "embed_scale", 1.0) or 1.0
+    )
+
     class _Gemma4WithMTP(original_class):  # type: ignore[valid-type, misc]
         """Target model + MTP surfaces for the Google assistant drafter.
 
@@ -885,7 +958,14 @@ def inject_mtp_support(
                     f"[mtp.inject.gemma4] target has {len(target_cache)} cache slots "
                     f"but the assistant requires {n_take}."
                 )
-            shared_kv_slots = target_cache[-n_take:]
+            # Root-cause fix (accept rate 2% → 95%): assistant is trained
+            # with each drafter layer reading target's LAST cache slot of
+            # its own ``layer_type`` (mlx-vlm reference:
+            # ``shared_kv_states[layer.layer_type]``). The prior
+            # ``target_cache[-n_take:]`` mapping gave the drafter's three
+            # sliding layers three DIFFERENT sliding K/V snapshots, not
+            # the single last-of-type snapshot the weights expect.
+            shared_kv_slots = [target_cache[idx] for idx in _shared_kv_target_indices]
 
             # Normalize unbatched shapes.
             if hidden_states.ndim == 2:
@@ -932,16 +1012,31 @@ def inject_mtp_support(
                 layer_states.append((keys, values))
 
             # Embed via TARGET's tokenizer table — matches
-            # pre_projection's backbone_hidden input dim.
+            # pre_projection's backbone_hidden input dim. Root-cause
+            # fix: multiply by target's ``embed_scale`` (``sqrt(hidden)``
+            # for Gemma), matching Google's
+            # ``Gemma4AssistantDraftModel.draft_block``:
+            # ``tok_embed = self._input_embed(tok) * self._input_embed_scale``.
+            # Without this the pre_projection input is off by ~62× on the
+            # 12B target, and drafter accept collapses.
             target_embed = self.model.embed_tokens
-            next_embed_all = target_embed(next_token_ids)  # (B, N, backbone_hidden)
+            next_embed_all = (
+                target_embed(next_token_ids) * _target_embed_scale
+            )  # (B, N, backbone_hidden)
 
             per_position_h: list = []
             for pos in range(n_positions):
                 h_pos = hidden_states[:, pos : pos + 1, :]
                 next_pos = next_embed_all[:, pos : pos + 1, :]
+                # Root-cause fix: order is [tok_embed, hidden], NOT
+                # [hidden, tok_embed]. Google's pre_projection weight is
+                # trained expecting the token-embed half FIRST — see
+                # ``Gemma4AssistantDraftModel.draft_block`` at
+                # ``mx.concatenate([tok_embed, h_prev], axis=-1)``.
+                # Reversing the concat rotates every row of pre_projection
+                # onto the wrong half and yields ~random drafts.
                 fused_pos = _mx.concatenate(
-                    [h_pos, next_pos], axis=-1
+                    [next_pos, h_pos], axis=-1
                 )  # (B, 1, 2 * backbone_hidden)
                 h_pos_proj = self.mtp.pre_projection(fused_pos)  # (B, 1, hidden_size)
 
