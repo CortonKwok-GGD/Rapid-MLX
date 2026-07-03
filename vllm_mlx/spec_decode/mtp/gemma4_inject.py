@@ -604,11 +604,25 @@ def inject_mtp_support(
         assistant_layer_types = list(getattr(args, "layer_types", []) or [])
         target_layer_types = list(getattr(inner.args, "layer_types", []) or [])
         n_assistant = len(assistant_layer_types)
-        if (
-            assistant_layer_types
-            and target_layer_types
-            and len(target_layer_types) >= n_assistant
-        ):
+        if assistant_layer_types and target_layer_types:
+            # Codex round-16 blocking fix: when the target publishes
+            # ``layer_types`` but the list is shorter than the
+            # assistant's, the earlier revision fell through and
+            # ``_shared_kv_target_indices`` ended up sourced from an
+            # invalid tail mapping (or the positional fallback with
+            # negative indices via Python's wrap-around). That crashes
+            # inside ``mtp_forward`` at ``target_cache[idx]`` or feeds
+            # the drafter K/V from a wrong-type target layer. Refuse
+            # closed here before we ever wire up the drafter.
+            if len(target_layer_types) < n_assistant:
+                logger.warning(
+                    "[mtp.inject.gemma4] target published only %d layer_types "
+                    "but the assistant has %d drafter layers; the tail mapping "
+                    "cannot be resolved. Refusing to inject.",
+                    len(target_layer_types),
+                    n_assistant,
+                )
+                return False
             target_tail = target_layer_types[-n_assistant:]
             if target_tail != assistant_layer_types:
                 logger.warning(
@@ -986,12 +1000,23 @@ def inject_mtp_support(
                 )
 
             n_positions = int(hidden_states.shape[1])
-            base_offset = int(shared_kv_slots[-1].offset)
 
-            # Cache the per-layer shared K/V once (they don't vary
-            # per position — the target's cache is shared across all
-            # drafter queries in this call).
+            # Cache the per-layer shared K/V AND the per-layer target
+            # cache offset once (neither varies per position — the
+            # target's cache is shared across all drafter queries in
+            # this call). Codex round-16 blocking fix: keep a
+            # per-layer offset instead of collapsing to
+            # ``shared_kv_slots[-1].offset``. Under rotating / sliding
+            # cache behavior the sliding target cache slots can carry
+            # a DIFFERENT offset (position within the rotated buffer)
+            # than the full-attention slot at the tail — using the
+            # tail's offset for a sliding layer's RoPE rotates the
+            # drafter's Q with an offset that doesn't match the
+            # sliding K/V it reads. Preserve per-slot offsets so each
+            # drafter layer's Q rotation matches the target-layer
+            # cache it consumes.
             layer_states: list[tuple] = []
+            layer_offsets: list[int] = []
             for tgt_cache in shared_kv_slots:
                 try:
                     state = tgt_cache.state
@@ -1010,6 +1035,7 @@ def inject_mtp_support(
                     keys = state
                     values = state
                 layer_states.append((keys, values))
+                layer_offsets.append(int(tgt_cache.offset))
 
             # Embed via TARGET's tokenizer table — matches
             # pre_projection's backbone_hidden input dim. Root-cause
@@ -1040,14 +1066,21 @@ def inject_mtp_support(
                 )  # (B, 1, 2 * backbone_hidden)
                 h_pos_proj = self.mtp.pre_projection(fused_pos)  # (B, 1, hidden_size)
 
-                # Per-position RoPE offset: base - (N - 1) + pos.
-                row_offset_int = base_offset - n_positions + 1 + pos
-                if row_offset_int < 0:
-                    row_offset_int = 0
-                row_offset = _mx.array(row_offset_int)
-
+                # Per-position, per-layer RoPE offset: for row ``pos`` in
+                # a call with N positions, layer i's Q is rotated with
+                # ``layer_offsets[i] - (N - 1) + pos``. Codex round-16
+                # blocking fix: derive from each shared cache slot's
+                # OWN offset rather than the last slot's, so sliding
+                # layers don't inherit the full-attention layer's
+                # position under rotating cache behavior.
                 h_layer = h_pos_proj
-                for layer, (keys, values) in zip(self.mtp.model.layers, layer_states):
+                for layer, (keys, values), tgt_offset in zip(
+                    self.mtp.model.layers, layer_states, layer_offsets
+                ):
+                    row_offset_int = tgt_offset - n_positions + 1 + pos
+                    if row_offset_int < 0:
+                        row_offset_int = 0
+                    row_offset = _mx.array(row_offset_int)
                     h_layer, _shared, _off = layer(
                         h_layer,
                         mask=None,
