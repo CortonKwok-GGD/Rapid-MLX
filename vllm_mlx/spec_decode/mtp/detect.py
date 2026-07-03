@@ -73,30 +73,32 @@ class MTPEligibility(str, enum.Enum):
 # 2. Community fp16-mtp sidecar for Gemma 4 (source:
 #    ``Mia-AiLab/Gemmable-4-12B-MTP-GGUF`` — ~98 k downloads at time
 #    of writing; NOT part of upstream PR #990):
-#    - ``gemma4``         — multimodal variant (``Gemma4ForConditional
-#                            Generation``). Covers the effective MoE
-#                            (26B-A4B) and the small e2b / e4b vision
-#                            checkpoints. Detection only inspects the
-#                            top-level ``model_type`` string, so a
-#                            vision tower on the wrapper does not
-#                            confuse this check.
 #    - ``gemma4_unified`` — text-only unified variant
 #                            (``Gemma4UnifiedForConditional
 #                            Generation``). The 12B dense checkpoints
 #                            (``gemma-4-12B-it-4bit`` /
 #                            ``gemma-4-12B-it-8bit``) ship as unified.
 #
-# The Mia-AiLab sidecar targets 12B (unified) today; ``gemma4`` is
-# included so that when a community fp16-mtp variant lands for the
-# multimodal 26B-A4B or e2b / e4b lineage the detector accepts it
-# without another allowlist bump.
+# The Mia-AiLab sidecar targets 12B unified only today, and the
+# assistant-drafter path in ``gemma4_inject`` has only been verified
+# against the unified 12B target. The multimodal ``gemma4`` model_type
+# (``Gemma4ForConditionalGeneration`` — 26B-A4B / e2b / e4b lineages)
+# is INTENTIONALLY NOT on this allowlist: even though the dispatcher
+# in ``spec_decode/mtp/dispatch.py`` maps it to ``gemma4_inject``,
+# there is no verified sidecar or drafter for that lineage today and
+# advertising ``--spec-decode mtp`` eligibility for a hand-edited
+# multimodal config would let it slip past pre-boot gating into an
+# inject/generator/cache path that hasn't been exercised for that
+# architecture. Add ``gemma4`` here (and ``gemma4_text``) once a
+# multimodal-verified sidecar or assistant drafter lands.
 _SUPPORTED_MODEL_TYPES: frozenset[str] = frozenset(
     {
         # Qwen3.5 / Qwen3.6 (upstream PR #990)
         "qwen3_5",
         "qwen3_5_moe",
-        # Gemma 4 (community sidecar — Mia-AiLab/Gemmable-4-12B-MTP-GGUF)
-        "gemma4",
+        # Gemma 4 12B unified (community sidecar —
+        # Mia-AiLab/Gemmable-4-12B-MTP-GGUF — and Google's
+        # ``google/gemma-4-12b-it-assistant`` drafter).
         "gemma4_unified",
     }
 )

@@ -191,15 +191,24 @@ def test_detect_eligibility_qwen3_5_stripped_checkpoint():
 #     Generation``. Used by the 12B dense checkpoints
 #     (``gemma-4-12B-it-4bit`` / ``gemma-4-12B-it-8bit``), which is the
 #     target of the Mia-AiLab fp16-mtp sidecar (``Mia-AiLab/Gemmable-4-12B
-#     -MTP-GGUF``).
+#     -MTP-GGUF``) AND Google's ``google/gemma-4-12b-it-assistant``
+#     drafter. This is the ONLY Gemma 4 lineage on the detect allowlist
+#     right now — see the comment on ``_SUPPORTED_MODEL_TYPES`` for
+#     rationale.
 #   * ``gemma4`` — multimodal variant. ``Gemma4ForConditionalGeneration``.
 #     Covers the effective-MoE ``gemma-4-26b-a4b-it-4bit`` and the small
-#     vision-tower e2b / e4b checkpoints.
+#     vision-tower e2b / e4b checkpoints. INTENTIONALLY OFF the
+#     allowlist today — a verified sidecar or assistant drafter for
+#     this lineage has not landed; a hand-edited config that stamps
+#     ``mtp_num_hidden_layers: 1`` on top must still be rejected so it
+#     doesn't slip into an un-exercised inject path.
 #
 # Base checkpoints do NOT carry ``mtp_num_hidden_layers`` in their
 # ``config.json`` (verified for all four cache probes) — the sidecar
-# layers it on. We therefore test both the CHAIN path (sidecar applied,
-# mtp=1) and the NONE path (sidecar absent, mtp missing/0).
+# layers it on. We therefore test both the CHAIN path (unified, sidecar
+# applied, mtp=1) and the NONE path (unified, sidecar absent, mtp
+# missing/0), plus the explicit NONE contract for multimodal ``gemma4``
+# regardless of mtp value.
 
 
 def test_detect_eligibility_gemma4_dense_unified_chain():
@@ -241,14 +250,21 @@ def test_detect_eligibility_gemma4_dense_unified_stripped_none():
     assert detect_mtp_eligibility(config_missing) is MTPEligibility.NONE
 
 
-def test_detect_eligibility_gemma4_moe_chain():
-    """Gemma 4 26B-A4B effective-MoE (``gemma4``) with sidecar → CHAIN.
+def test_detect_eligibility_gemma4_multimodal_not_on_allowlist_none():
+    """Gemma 4 multimodal (``gemma4``) — even with mtp=1 → NONE.
 
-    Verified against
-    ``mlx-community/gemma-4-26b-a4b-it-4bit/config.json``: top-level
-    ``model_type`` is ``gemma4`` (the MoE is served by the same
-    ``Gemma4ForConditionalGeneration`` class as e2b / e4b, with an MoE
-    text sub-config). Same allowlist entry, same CHAIN path.
+    ``mlx-community/gemma-4-26b-a4b-it-4bit/config.json`` and the e2b /
+    e4b checkpoints all report top-level ``model_type: gemma4`` (the
+    ``Gemma4ForConditionalGeneration`` class). Neither the Mia-AiLab
+    fp16-mtp sidecar nor Google's ``google/gemma-4-*-it-assistant``
+    drafter has been verified against this lineage yet, so the detect
+    allowlist INTENTIONALLY excludes ``gemma4`` — a hand-edited config
+    that stamps ``mtp_num_hidden_layers: 1`` on top of a multimodal
+    Gemma 4 must still collapse to NONE, so ``--spec-decode mtp`` is
+    rejected pre-boot rather than routed into an inject/generator/cache
+    path that hasn't been exercised for that architecture. Flip this
+    once a verified sidecar or assistant drafter lands for the
+    multimodal lineage.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -256,20 +272,24 @@ def test_detect_eligibility_gemma4_moe_chain():
     )
 
     config = {"model_type": "gemma4", "mtp_num_hidden_layers": 1}
-    assert detect_mtp_eligibility(config) is MTPEligibility.CHAIN
+    assert detect_mtp_eligibility(config) is MTPEligibility.NONE
 
 
-def test_detect_eligibility_gemma4_vision_tower_does_not_confuse_detection():
-    """Gemma 4 e2b / e4b (``gemma4`` with a vision tower) → still CHAIN.
+def test_detect_eligibility_gemma4_vision_tower_still_none():
+    """Gemma 4 e2b / e4b (``gemma4`` with a vision tower) → still NONE.
 
     ``gemma-4-e2b-it-4bit`` and ``gemma-4-e4b-it-4bit`` ship as
     ``model_type: gemma4`` with a ``vision_config`` block, an
     ``audio_config`` block, and a ``text_config`` sub-config. Detection
-    reads ONLY the top-level ``model_type`` string, so the presence of
-    vision / audio fields must not alter the eligibility verdict. This
-    test locks that contract by stuffing the config with the real
-    fields we observed on those checkpoints (``vision_config``,
-    ``audio_config``, ``image_token_id``, ``architectures``).
+    reads ONLY the top-level ``model_type`` string — presence of vision
+    / audio fields must not alter the verdict either way. Since
+    multimodal ``gemma4`` is not on the allowlist (see the sibling
+    ``_multimodal_not_on_allowlist_none`` test), even a hand-edited
+    ``mtp_num_hidden_layers: 1`` on top of a multimodal shape must land
+    at NONE. This test stuffs the config with the real fields observed
+    on those checkpoints (``vision_config``, ``audio_config``,
+    ``image_token_id``, ``architectures``) to lock the "ignore
+    sub-configs, gate on top-level model_type" contract.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -287,7 +307,7 @@ def test_detect_eligibility_gemma4_vision_tower_does_not_confuse_detection():
         "text_config": {"model_type": "gemma4_text"},
         "image_token_id": 262144,
     }
-    assert detect_mtp_eligibility(config) is MTPEligibility.CHAIN
+    assert detect_mtp_eligibility(config) is MTPEligibility.NONE
 
 
 def test_detect_eligibility_gemma_lookalikes_still_rejected():
