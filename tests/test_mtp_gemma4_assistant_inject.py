@@ -1079,6 +1079,52 @@ def test_inject_refuses_when_target_tail_layer_types_mismatch(tmp_path):
     assert ok is False, "layer_types-tail mismatch must fail closed"
 
 
+def test_inject_refuses_when_target_layer_types_shorter_than_assistant(tmp_path):
+    """Codex round-16 blocking-fix locked in.
+
+    When the target publishes ``layer_types`` but the list is shorter
+    than the assistant's, the previous revision fell through the guard
+    and ``_shared_kv_target_indices`` was later built from an invalid
+    tail mapping (or the positional fallback with negative indices via
+    Python's wrap-around). That crashes inside ``mtp_forward`` at
+    ``target_cache[idx]`` or feeds the drafter K/V from a wrong-type
+    target layer. Inject must refuse closed before wiring the drafter.
+    """
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.gemma4_inject import (
+        _build_assistant_model,
+        _build_assistant_model_args,
+        inject_mtp_support,
+    )
+
+    cfg = _google_shaped_assistant_config(hidden=64, backbone=128, n_layers=4)
+    args = _build_assistant_model_args(cfg, target_backbone_hidden=128)
+    model_template = _build_assistant_model(args, backbone_hidden_size=128)
+    mx.eval(model_template.parameters())
+    flat = dict(tree_flatten(model_template.parameters()))
+
+    sidecar_dir = tmp_path / "short-target-types-assistant"
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    (sidecar_dir / "config.json").write_text(json.dumps(cfg))
+    mx.save_safetensors(str(sidecar_dir / "model.safetensors"), flat)
+
+    try:
+        target = _build_tiny_gemma4_target_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Gemma 4 ModelArgs schema mismatch: {exc}")
+
+    # Publish only 2 layer_types on the target — shorter than the
+    # assistant's 4. Guard must fire before building the shared_kv
+    # mapping.
+    target.args.layer_types = ["sliding_attention", "full_attention"]
+
+    ok = inject_mtp_support(target, mtp_sidecar=str(sidecar_dir))
+    assert ok is False, (
+        "target layer_types shorter than assistant layer count must fail closed"
+    )
+
+
 def test_find_safetensors_refuses_multi_file_even_with_model_safetensors(tmp_path):
     """Codex round-10 nit-fix locked in.
 
