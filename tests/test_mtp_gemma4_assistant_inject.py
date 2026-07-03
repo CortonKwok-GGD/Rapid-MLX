@@ -1079,6 +1079,109 @@ def test_inject_refuses_when_target_tail_layer_types_mismatch(tmp_path):
     assert ok is False, "layer_types-tail mismatch must fail closed"
 
 
+def test_mtp_forward_rejects_populated_mtp_cache():
+    """Codex round-17 blocking-fix locked in.
+
+    Under Google's assistant-drafter design each drafter position
+    reads target's shared K/V, never its own — so ``mtp_cache`` is
+    expected to be empty on entry. A populated ``mtp_cache`` means
+    the caller expects chained multi-token drafts (unsupported) or
+    conflates drafter and target caches. Refuse rather than compute
+    wrong logits.
+    """
+    from mlx_lm.models.cache import KVCache
+
+    from vllm_mlx.spec_decode.mtp.gemma4_inject import inject_mtp_support
+
+    try:
+        target = _build_tiny_gemma4_target_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Gemma 4 ModelArgs schema mismatch: {exc}")
+
+    assert inject_mtp_support(target, allow_random_init=True) is True
+
+    n_layers = len(target.model.layers)
+    target._mtp_target_cache = [KVCache() for _ in range(n_layers)]
+
+    # Prime the target cache slots that shared_kv reads from so the
+    # rejection fires on mtp_cache, not on empty target K/V.
+    hidden_size = target.args.hidden_size
+    n_kv_heads = target.args.num_key_value_heads
+    head_dim = target.args.head_dim
+    for c in target._mtp_target_cache:
+        k = mx.zeros((1, n_kv_heads, 1, head_dim))
+        v = mx.zeros((1, n_kv_heads, 1, head_dim))
+        c.update_and_fetch(k, v)
+
+    hidden_states = mx.zeros((1, 1, hidden_size))
+    next_token_ids = mx.zeros((1, 1), dtype=mx.int32)
+
+    # Build a populated mtp_cache — a single KV entry per slot marks
+    # ``offset != 0`` and should trigger the contract violation.
+    mtp_cache = target.make_mtp_cache()
+    for c in mtp_cache:
+        n_heads_asst = target.mtp.model.layers[0].self_attn.n_kv_heads
+        head_dim_asst = target.mtp.model.layers[0].self_attn.head_dim
+        k = mx.zeros((1, n_heads_asst, 1, head_dim_asst))
+        v = mx.zeros((1, n_heads_asst, 1, head_dim_asst))
+        c.update_and_fetch(k, v)
+
+    with pytest.raises(ValueError, match="mtp_cache slots must be empty"):
+        target.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+
+
+def test_mtp_forward_rejects_negative_row_offset():
+    """Codex round-17 blocking-fix locked in.
+
+    If target cache offset is smaller than ``n_positions - 1`` the
+    row_offset for early drafter positions would go negative, meaning
+    the drafter's Q is asked to rotate at a real position that
+    predates any target-cache history. Previously this was silently
+    clamped to 0 (subtle RoPE misalignment vs the actual K/V slot);
+    now it raises so the caller learns to prefill the target first.
+    """
+    from mlx_lm.models.cache import KVCache
+
+    from vllm_mlx.spec_decode.mtp.gemma4_inject import inject_mtp_support
+
+    try:
+        target = _build_tiny_gemma4_target_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Gemma 4 ModelArgs schema mismatch: {exc}")
+
+    assert inject_mtp_support(target, allow_random_init=True) is True
+
+    # Target cache has ZERO tokens — no prefill. Ask the drafter for
+    # N=2 positions: row 0 wants target-timeline position -1, which
+    # must fail closed.
+    n_layers = len(target.model.layers)
+    target._mtp_target_cache = [KVCache() for _ in range(n_layers)]
+
+    n_kv_heads = target.args.num_key_value_heads
+    head_dim = target.args.head_dim
+    for c in target._mtp_target_cache:
+        # Seed with exactly one token so shared_kv reads have shape,
+        # but the effective per-layer offset stays == 1, which is
+        # still < (n_positions=2) - 1 = 1? Actually offset=1 gives
+        # row_offset = 1 - 2 + 1 + 0 = 0 for pos=0 — that is NOT
+        # negative. To trigger, seed with 0 tokens (empty state) and
+        # rely on the ``state is None`` guard NOT firing because
+        # ``.state`` on empty returns a truthy default — the
+        # guardrail is that row_offset < 0. Prime with 1 token then
+        # ask for N=3 positions: row_offset for pos=0 is 1-3+1+0 = -1.
+        k = mx.zeros((1, n_kv_heads, 1, head_dim))
+        v = mx.zeros((1, n_kv_heads, 1, head_dim))
+        c.update_and_fetch(k, v)
+
+    hidden_size = target.args.hidden_size
+    hidden_states = mx.zeros((1, 3, hidden_size))
+    next_token_ids = mx.zeros((1, 3), dtype=mx.int32)
+    mtp_cache = target.make_mtp_cache()
+
+    with pytest.raises(ValueError, match="smaller than n_positions"):
+        target.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+
+
 def test_inject_refuses_when_target_layer_types_shorter_than_assistant(tmp_path):
     """Codex round-16 blocking-fix locked in.
 

@@ -999,6 +999,33 @@ def inject_mtp_support(
                     f"today; got next_token_ids.shape[0]={next_token_ids.shape[0]}."
                 )
 
+            # Codex round-17 blocking fix: make the "``mtp_cache`` is
+            # unused" invariant a hard contract instead of a silent
+            # ignore. Under Google's assistant-drafter design each
+            # drafter position reads target's SHARED K/V, never its
+            # own — so ``make_mtp_cache`` returns empty ``KVCache``
+            # slots and ``mtp_forward`` never writes into them. If a
+            # caller ever passes populated MTP slots, either they
+            # expect chained multi-token drafts (which this drafter
+            # does NOT support — each position is independent) or
+            # they've conflated the drafter's cache with the target's.
+            # Both are caller bugs; refuse rather than compute wrong
+            # logits. Empty ``KVCache`` reports ``offset == 0``, so
+            # this only fires on slots that were actually populated
+            # by an unexpected caller.
+            if mtp_cache is not None:
+                for _slot in mtp_cache:
+                    if int(getattr(_slot, "offset", 0)) != 0:
+                        raise ValueError(
+                            "[mtp.inject.gemma4] mtp_cache slots must be "
+                            "empty on entry — Gemma 4 assistant drafter "
+                            "reads target's shared K/V and does not "
+                            "maintain its own per-layer cache; a "
+                            "populated ``mtp_cache`` indicates the caller "
+                            "expects chained drafts, which are not "
+                            "supported. See ``make_mtp_cache`` docstring."
+                        )
+
             n_positions = int(hidden_states.shape[1])
 
             # Cache the per-layer shared K/V AND the per-layer target
@@ -1073,13 +1100,34 @@ def inject_mtp_support(
                 # OWN offset rather than the last slot's, so sliding
                 # layers don't inherit the full-attention layer's
                 # position under rotating cache behavior.
+                #
+                # Codex round-17 blocking fix: reject the
+                # ``base_offset < n_positions - 1`` case instead of
+                # silently clamping. Clamping a negative row_offset to
+                # 0 causes multiple early drafter positions to share
+                # RoPE position 0 while their target-cache K/V slots
+                # correspond to different real timeline positions —
+                # the drafter's Q rotates at position 0 but reads K/V
+                # rotated at real positions, so cosine-attention lines
+                # up on the wrong axis. In practice this cannot happen
+                # for any real caller (the target must have prefilled
+                # at least ``N-1`` tokens before drafting N positions),
+                # so the check is defensive: if it fires, the caller
+                # is buggy and should be told rather than getting a
+                # subtly-wrong RoPE alignment.
                 h_layer = h_pos_proj
                 for layer, (keys, values), tgt_offset in zip(
                     self.mtp.model.layers, layer_states, layer_offsets
                 ):
                     row_offset_int = tgt_offset - n_positions + 1 + pos
                     if row_offset_int < 0:
-                        row_offset_int = 0
+                        raise ValueError(
+                            "[mtp.inject.gemma4] target cache offset "
+                            f"({tgt_offset}) is smaller than "
+                            f"n_positions-1 ({n_positions - 1}) at drafter "
+                            f"row {pos}; caller must prefill target before "
+                            "drafting."
+                        )
                     row_offset = _mx.array(row_offset_int)
                     h_layer, _shared, _off = layer(
                         h_layer,
