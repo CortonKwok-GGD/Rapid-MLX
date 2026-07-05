@@ -43,7 +43,18 @@ dependencies = [
     # default — the only path that round-trips cleanly across threads.
     "mlx>=0.31.2",
     "mlx-lm>=0.31.3",  # 0.31.1+ required for presence_penalty/frequency_penalty kwargs on make_logits_processors (#512); 0.31.3 added thread-local generation_stream but cross-thread eval is still broken (see shim sites).
-    # mlx-vlm is opt-in via [vision] extras (saves ~322 MB for text-only users)
+    # mlx-vlm is now a CORE dep (was `[vision]` extra pre-0.10.1). Reason:
+    # 0.10.0 shipped +13 Gemma 4 aliases as a headline feature, but a first-time
+    # `pip install rapid-mlx==0.10.0 && rapid-mlx serve gemma-4-12b-4bit` failed
+    # at import with `ImportError: mlx-vlm dependency missing` — a naive-user
+    # regression the M3 Ultra pre-merge dogfood missed because the local venv
+    # already had mlx-vlm from a prior session. See project_0100_shipped.md.
+    # Transitive cost: ~+110 MB (opencv + datasets + miniaudio + llguidance +
+    # mlx-audio + Pillow); NOT the +322 MB the old `[vision]` comment quoted
+    # (that included torch + torchvision, which are still `[vision]`-only for
+    # the non-mlx-vlm vision preprocessing paths). L-07 contract updated in
+    # `tests/test_vision_extra_install.py` to lock this in.
+    "mlx-vlm>=0.6.3",
     #
     # Upper cap <5.13 (release-blocker): mlx-lm and mlx-vlm both float
     # transformers with no upper bound, but transformers 5.13.0 tightened
@@ -100,16 +111,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Vision/multimodal models (Gemma 4, Qwen-VL, etc.) — adds ~322 MB
-# Required for any model with vision input. Text-only models work without this.
-# 0.5.0+ also unlocks DFlash speculative decoding (see [dflash] extras).
+# Vision-INPUT preprocessing (Qwen-VL image understanding, video, etc.) —
+# adds ~210 MB (torch + torchvision).
+#
+# 0.10.1 note: mlx-vlm was previously listed here; it is now a CORE dep so
+# Gemma 4 and DiffusionGemma work with a plain `pip install rapid-mlx`.
+# mlx-vlm is still listed below (redundant but harmless — pip resolves it as
+# already-satisfied) to keep the L-07 lock-in tests + `[all]` synthesis
+# straightforward. Its transitive pillow/opencv-python satisfy the direct
+# imports below.
 vision = [
-    "mlx-vlm>=0.6.3",  # 0.6.3: DiffusionGemma (Gemma 4 DLM PR #1347 + long-context prefill PR #1348). 0.6.1 floor: gemma4_unified architecture. 0.5.0 baseline: gemma4 multi-image + tool-parser fixes, TurboQuant race-condition fix, continuous-batching guard. Also unlocks DFlash spec-decode hooks (see [dflash] extras).
-    "opencv-python>=4.8.0",
-    "torch>=2.3.0",
+    "mlx-vlm>=0.6.3",  # core dep in 0.10.1+; kept here for backward-compat with the L-07 lock-in test surface (`test_vision_extra_lists_mlx_vlm`).
+    "opencv-python>=4.8.0",  # also in mlx-vlm's transitive; kept explicit for the non-mlx-vlm code paths (mllm.py, benchmark.py image mode).
+    "torch>=2.3.0",  # the actual reason `[vision]` still exists — torch is NOT a mlx-vlm transitive.
     "torchvision>=0.18.0",
     # vllm_mlx imports PIL directly on vision paths (mllm.py, benchmark.py
-    # image mode); mlx-vlm requires it too — listed for explicitness.
+    # image mode); mlx-vlm's transitive would satisfy it, listed explicit
+    # so a future mlx-vlm dep-drop doesn't silently break vision code.
     "pillow>=10.0.0",
 ]
 # DFlash speculative decoding for Qwen3.5/3.6 dense 8-bit models

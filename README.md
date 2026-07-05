@@ -119,7 +119,7 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
-> **Vision/multimodal models** (Gemma 4, Qwen-VL) need extras: `pip install 'rapid-mlx[vision]'`. Text-only install is ~460 MB; vision adds ~322 MB. See [Optional Extras](#optional-extras).
+> **Vision-input models** (Qwen-VL, image understanding) need extras: `pip install 'rapid-mlx[vision]'` (torch + torchvision + opencv). Gemma 4 (including DiffusionGemma) now works out of the box in 0.10.1+ — its runtime (mlx-vlm) is a core dep. Text-only install is ~570 MB; vision adds ~210 MB more. See [Optional Extras](#optional-extras).
 
 > **"No matching distribution" from pip?** Your Python is too old. Run `python3 --version` — if it says 3.9, run `brew install python@3.12` then `python3.12 -m pip install rapid-mlx`.
 
@@ -555,7 +555,7 @@ rapid-mlx serve qwen3-coder-4bit --prefill-step-size 8192 --port 8000
 # Vision — image understanding (needs [vision] extras)
 rapid-mlx serve qwen3-vl-4b-4bit --mllm --port 8000
 
-# Text-diffusion — DiffusionGemma 26B-A4B (block denoising, needs [vision] for mlx-vlm 0.6.3+)
+# Text-diffusion — DiffusionGemma 26B-A4B (block denoising; mlx-vlm is core in 0.10.1+)
 rapid-mlx serve diffusion-gemma-26b-4bit --port 8000
 ```
 
@@ -596,7 +596,7 @@ All 17 parsers include automatic recovery — if a quantized model outputs broke
 DiffusionGemma is a **non-autoregressive** language model — instead of emitting one token at a time, it denoises whole blocks of tokens in parallel via a diffusion process. Rapid-MLX wraps it behind the standard OpenAI Chat Completions API.
 
 ```bash
-pip install 'rapid-mlx[vision]'       # mlx-vlm 0.6.3+ provides the diffusion runtime
+# mlx-vlm (the diffusion runtime) is a core dep in 0.10.1+ — no extras needed.
 rapid-mlx serve diffusion-gemma-26b-4bit --port 8000
 ```
 
@@ -862,11 +862,11 @@ Mutex: DFlash cannot combine with MTP or SuffixDecoding (single-user path). MTP 
 
 ## Optional Extras
 
-The base `pip install rapid-mlx` is ~460 MB and covers all text-only models. Vision, audio, and other features ship as opt-in extras:
+The base `pip install rapid-mlx` is ~570 MB (0.10.1+ bundles the mlx-vlm runtime so Gemma 4 and DiffusionGemma work out of the box). Vision-input, audio, and other features ship as opt-in extras:
 
 | Extra | Install | Adds | What it unlocks |
 |---|---|---|---|
-| `vision` | `pip install 'rapid-mlx[vision]'` | ~322 MB | Gemma 4, Qwen-VL, DiffusionGemma, video understanding (mlx-vlm + opencv + torch) |
+| `vision` | `pip install 'rapid-mlx[vision]'` | ~210 MB | Qwen-VL, video understanding, non-mlx-vlm vision preprocessing (torch + torchvision). Gemma 4 & DiffusionGemma no longer need this — mlx-vlm is core. |
 | `audio` | `pip install 'rapid-mlx[audio]'` | ~600 MB | 26 TTS/STT aliases (Kokoro, Chatterbox, VibeVoice, VoxCPM, Dia, Whisper, Parakeet) via `/v1/audio/speech` and `/v1/audio/transcriptions`; bundles Silero VAD for silence pre-trim (guards Whisper against silence hallucination) |
 | `embeddings` | `pip install 'rapid-mlx[embeddings]'` | ~50 MB | `/v1/embeddings` endpoint (mlx-embeddings) |
 | `chat` | `pip install 'rapid-mlx[chat]'` | ~150 MB | Built-in Gradio chat UI |

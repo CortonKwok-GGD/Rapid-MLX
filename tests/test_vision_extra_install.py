@@ -147,23 +147,39 @@ def test_vision_mlx_vlm_floor_is_recognizable() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Defense in depth: mlx-vlm must NOT be in core deps (would defeat the
-# whole point of the extra — the ~322 MB save for text-only users).
+# 0.10.1 CONTRACT FLIP — mlx-vlm MUST now be in core deps.
+#
+# History: 0.8.0-0.10.0 kept mlx-vlm as an opt-in `[vision]` extra to save
+# text-only users the ~322 MB torch+torchvision+opencv+mlx-vlm bundle.
+# 0.10.0 then shipped +13 Gemma 4 aliases as a headline feature — but Gemma
+# 4's model class lives inside mlx-vlm, so a first-time `pip install
+# rapid-mlx==0.10.0 && rapid-mlx serve gemma-4-12b-4bit` failed with an
+# ImportError at boot. Pre-merge dogfood on M3 Ultra missed it because the
+# local venv already carried mlx-vlm from a prior session; only a fresh-venv
+# naive-user simulation caught it.
+#
+# 0.10.1 promotes `mlx-vlm>=0.6.3` to core. Transitive cost: ~+110 MB
+# (opencv + datasets + miniaudio + llguidance + mlx-audio + Pillow). torch
+# + torchvision remain `[vision]`-only for non-mlx-vlm vision preprocessing
+# (Qwen-VL etc.). The L-07 contract is reversed: this test now enforces
+# `mlx-vlm IS in core`.
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_mlx_vlm_not_in_core_dependencies() -> None:
-    """If ``mlx-vlm`` slips into ``[project].dependencies`` the
-    text-only ``pip install rapid-mlx`` jumps from ~460 MB to ~782 MB.
-    The point of the ``[vision]`` extra is to keep that surface
-    opt-in. This is the second half of L-07's contract."""
+def test_mlx_vlm_is_in_core_dependencies() -> None:
+    """0.10.1 contract flip — mlx-vlm MUST be a core dep so a fresh
+    ``pip install rapid-mlx && rapid-mlx serve gemma-4-*`` works out of
+    the box. If this assertion fails, the fresh-install Gemma 4 regression
+    surfaced 2026-07-04 in project_0100_shipped.md returns."""
     py = _load_pyproject()
     core = py.get("project", {}).get("dependencies", [])
     core_names = {_split_spec(s)[0].lower() for s in core}
-    assert "mlx-vlm" not in core_names, (
-        f"mlx-vlm leaked into core deps={core!r}. Move it back under "
-        f"`[project.optional-dependencies].vision` so the text-only "
-        f"`pip install rapid-mlx` stays slim (L-07)."
+    assert "mlx-vlm" in core_names, (
+        f"mlx-vlm missing from core deps={core!r}. Fresh `pip install "
+        f"rapid-mlx && rapid-mlx serve gemma-4-12b-4bit` now fails with "
+        f"`ImportError: mlx-vlm dependency missing`. Add "
+        f"`\"mlx-vlm>=0.6.3\"` to `[project].dependencies` — that's the "
+        f"post-0.10.1 L-07 contract."
     )
 
 
