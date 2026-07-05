@@ -178,7 +178,7 @@ def test_mlx_vlm_is_in_core_dependencies() -> None:
         f"mlx-vlm missing from core deps={core!r}. Fresh `pip install "
         f"rapid-mlx && rapid-mlx serve gemma-4-12b-4bit` now fails with "
         f"`ImportError: mlx-vlm dependency missing`. Add "
-        f"`\"mlx-vlm>=0.6.3\"` to `[project].dependencies` — that's the "
+        f'`"mlx-vlm>=0.6.3"` to `[project].dependencies` — that\'s the '
         f"post-0.10.1 L-07 contract."
     )
 
