@@ -401,7 +401,7 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
     if not _hf_cache_present(family_alias.hf_path):
         strict_skip_or_fail(
             f"HF cache miss for {family_alias.hf_path!r}. "
-            f"Pre-download with: python3.12 -c \"from huggingface_hub import "
+            f'Pre-download with: python3.12 -c "from huggingface_hub import '
             f"snapshot_download; snapshot_download('{family_alias.hf_path}')\""
         )
         return

@@ -228,9 +228,7 @@ class TestSmolagents:
         try:
             answer = agent.run("What's the weather in Tokyo? Use the get_weather tool.")
         except Exception as exc:  # noqa: BLE001
-            strict_skip_or_fail(
-                f"smolagents/{family_alias.family}: run failed: {exc}"
-            )
+            strict_skip_or_fail(f"smolagents/{family_alias.family}: run failed: {exc}")
             return
         content = str(answer)
         assert_content_nonempty(content, ctx=f"smolagents/{family_alias.family}")
