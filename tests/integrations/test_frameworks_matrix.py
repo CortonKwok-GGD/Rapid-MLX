@@ -46,7 +46,7 @@ class TestLangChain:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
         try:
@@ -57,8 +57,8 @@ class TestLangChain:
             pytest.skip("langchain-openai not installed — cell deferred")
 
         llm = ChatOpenAI(
-            model=rapid_mlx_server["model_id"],
-            base_url=rapid_mlx_server["base_url"],
+            model=rapid_mlx_matrix_server["model_id"],
+            base_url=rapid_mlx_matrix_server["base_url"],
             api_key="not-needed",
             temperature=0.0,
             max_tokens=256,
@@ -131,7 +131,7 @@ class TestPydanticAI:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
         try:
@@ -142,9 +142,9 @@ class TestPydanticAI:
             pytest.skip("pydantic-ai not installed — cell deferred")
 
         model = OpenAIChatModel(
-            model_name=rapid_mlx_server["model_id"],
+            model_name=rapid_mlx_matrix_server["model_id"],
             provider=OpenAIProvider(
-                base_url=rapid_mlx_server["base_url"],
+                base_url=rapid_mlx_matrix_server["base_url"],
                 api_key="not-needed",
             ),
         )
@@ -231,7 +231,7 @@ class TestSmolagents:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
         try:
@@ -260,8 +260,8 @@ class TestSmolagents:
                 return f"sunny in {city}"
 
         model = OpenAIServerModel(
-            model_id=rapid_mlx_server["model_id"],
-            api_base=rapid_mlx_server["base_url"],
+            model_id=rapid_mlx_matrix_server["model_id"],
+            api_base=rapid_mlx_matrix_server["base_url"],
             api_key="not-needed",
         )
         agent = ToolCallingAgent(tools=[GetWeatherTool()], model=model, max_steps=3)

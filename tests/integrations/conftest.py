@@ -34,7 +34,7 @@ Environment overrides
 ---------------------
 
 * ``RAPID_MLX_BASE_URL`` — point at an already-running server instead of
-  auto-booting one. When set, the ``rapid_mlx_server`` fixture skips the
+  auto-booting one. When set, the ``rapid_mlx_matrix_server`` fixture skips the
   boot dance and just probes /v1/models. Handy for local dev when a
   large model is already loaded and re-loading would waste 3-5 min.
 * ``RAPID_MLX_AGENT_MATRIX_FAMILY`` — restrict matrix to one family
@@ -515,10 +515,19 @@ def _infer_family_from_model_id(model_id: str) -> str | None:
 
 
 @pytest.fixture
-def rapid_mlx_server(
+def rapid_mlx_matrix_server(
     family_alias: FamilyAlias, request: pytest.FixtureRequest
 ) -> dict[str, Any]:
     """Return metadata for a rapid-mlx server serving ``family_alias``.
+
+    **Matrix-only fixture.** The name intentionally carries the
+    ``_matrix_`` marker because using it in a test file also drags in
+    ``family_alias`` via the transitive dependency, which triggers the
+    4-family auto-parametrization in ``pytest_generate_tests`` below.
+    Do not use this fixture in non-matrix (legacy / deep) tests — boot
+    a server explicitly in those tests instead. Codex #1033 round-8
+    BLOCKING #1 fold; the earlier ``rapid_mlx_server`` name was too
+    generic and invited accidental use in non-matrix tests.
 
     Two modes:
 
@@ -744,45 +753,74 @@ def _hf_cache_present(hf_path: str) -> bool:
             # "any weight" heuristic, which would falsely report ready.
             continue
         # No safetensors index — walk the snapshot for weight files and
-        # check the shard-name pattern. If any file is named
-        # ``model-XX-of-YY.<ext>``, YY tells us the shard count and we
-        # require all YY shards to be present with non-zero size.
-        weight_files: dict[Path, Path] = {}  # dir → sample weight file
+        # check the shard-name pattern. Codex #1033 round-8 BLOCKING #2
+        # fold: a snapshot can carry MULTIPLE sharded weight groups in
+        # the same directory (e.g. ``model-XX-of-YY.safetensors`` for
+        # the main weights plus ``lm_head-XX-of-ZZ.safetensors`` for a
+        # split head, or main weights plus an adapter shard family).
+        # The previous impl only inspected the FIRST sample per directory
+        # via ``weight_files.setdefault(entry.parent, entry)`` and
+        # returned True if that one group was complete — silently
+        # ignoring incompleteness in the other groups. Fix: enumerate
+        # EVERY sharded group by (dir, stem, ext, total) key and require
+        # every group to be complete; only fall through to the "any
+        # single-file weight" heuristic when no sharded groups are
+        # present at all.
+        shard_groups: dict[tuple[Path, str, str, int], set[int]] = {}
+        singles: list[Path] = []
         for entry in snap.rglob("*"):
             if not entry.is_file() and not entry.is_symlink():
                 continue
             if not entry.name.lower().endswith(_WEIGHT_SUFFIXES):
                 continue
-            weight_files.setdefault(entry.parent, entry)
-
-        for wdir, sample in weight_files.items():
-            m = _SHARD_FILENAME_RE.match(sample.name)
+            m = _SHARD_FILENAME_RE.match(entry.name)
             if m:
-                total = int(m.group("total"))
-                stem = m.group("stem")
-                ext = m.group("ext")
-                complete = True
+                key = (
+                    entry.parent,
+                    m.group("stem"),
+                    m.group("ext"),
+                    int(m.group("total")),
+                )
+                shard_groups.setdefault(key, set()).add(int(m.group("idx")))
+            else:
+                singles.append(entry)
+
+        if shard_groups:
+            # Every sharded group must be complete. If any group is
+            # missing shards or has a zero-size shard, the snapshot is
+            # partial and preflight must return False so the fixture
+            # skips/fails before wasting a boot budget.
+            all_groups_complete = True
+            for (wdir, stem, ext, total), _present_idx in shard_groups.items():
                 for i in range(1, total + 1):
                     shard_name = f"{stem}-{i:05d}-of-{total:05d}{ext}"
                     shard_path = wdir / shard_name
                     try:
                         resolved = shard_path.resolve(strict=True)
                         if resolved.stat().st_size <= 0:
-                            complete = False
+                            all_groups_complete = False
                             break
                     except (FileNotFoundError, OSError):
-                        complete = False
+                        all_groups_complete = False
                         break
-                if complete:
+                if not all_groups_complete:
+                    break
+            if all_groups_complete:
+                return True
+            # Any partial shard group → this snapshot is not usable;
+            # move on to the next snapshot dir (don't fall through to
+            # the singles heuristic which would falsely report ready).
+            continue
+
+        # No sharded groups anywhere — a single-file snapshot is fine.
+        # Require at least one non-empty weight file.
+        for path in singles:
+            try:
+                resolved = path.resolve(strict=True)
+                if resolved.stat().st_size > 0:
                     return True
-            else:
-                # Non-sharded single weight file — check it's non-empty.
-                try:
-                    resolved = sample.resolve(strict=True)
-                    if resolved.stat().st_size > 0:
-                        return True
-                except (FileNotFoundError, OSError):
-                    continue
+            except (FileNotFoundError, OSError):
+                continue
     return False
 
 

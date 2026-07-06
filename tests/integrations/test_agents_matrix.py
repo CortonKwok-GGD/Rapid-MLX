@@ -14,7 +14,7 @@ against the four Tier-1 family strong picks:
 * kilo-code (/v1/chat/completions)
 
 Each cell drives the agent's real wire against a booted rapid-mlx
-server (auto-boot by conftest; see ``rapid_mlx_server`` fixture). No
+server (auto-boot by conftest; see ``rapid_mlx_matrix_server`` fixture). No
 mocks, no synthetic fixtures — the assertion catches the actual bytes
 the server put on the socket.
 
@@ -106,7 +106,7 @@ def _extract_text_from_message(msg) -> str:
 
 
 def _run_openai_tool_smoke(
-    rapid_mlx_server: dict[str, Any],
+    rapid_mlx_matrix_server: dict[str, Any],
     family_alias: FamilyAlias,
     *,
     agent_label: str,
@@ -120,8 +120,8 @@ def _run_openai_tool_smoke(
     tool_call fails so the tool-call plumbing regression the matrix
     exists to catch can't hide.
     """
-    client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
-    model_id = rapid_mlx_server["model_id"]
+    client, wire_errors = _openai_client_and_errors(rapid_mlx_matrix_server["base_url"])
+    model_id = rapid_mlx_matrix_server["model_id"]
 
     try:
         resp = client.chat.completions.create(
@@ -184,13 +184,13 @@ class TestCodexCLI:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
         import httpx
 
-        base_url = rapid_mlx_server["base_url"]
-        model_id = rapid_mlx_server["model_id"]
+        base_url = rapid_mlx_matrix_server["base_url"]
+        model_id = rapid_mlx_matrix_server["model_id"]
 
         payload = {
             "model": model_id,
@@ -251,7 +251,7 @@ class TestClaudeCode:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
         try:
@@ -264,7 +264,7 @@ class TestClaudeCode:
         except ImportError:
             pytest.skip("anthropic SDK not installed — cell deferred")
 
-        base_no_v1 = rapid_mlx_server["base_url"].rstrip("/").removesuffix("/v1")
+        base_no_v1 = rapid_mlx_matrix_server["base_url"].rstrip("/").removesuffix("/v1")
         client = Anthropic(
             base_url=base_no_v1,
             api_key="not-needed",
@@ -273,14 +273,14 @@ class TestClaudeCode:
 
         try:
             resp = client.messages.create(
-                model=rapid_mlx_server["model_id"],
+                model=rapid_mlx_matrix_server["model_id"],
                 max_tokens=128,
                 messages=[{"role": "user", "content": "Reply with just SHIPPED."}],
             )
         except NotFoundError:
             strict_skip_or_fail(
                 f"claude-code/{family_alias.family}: /v1/messages returned 404 "
-                f"on {rapid_mlx_server['base_url']} — Anthropic route not wired."
+                f"on {rapid_mlx_matrix_server['base_url']} — Anthropic route not wired."
             )
             return
         except (BadRequestError, APIStatusError) as exc:
@@ -304,10 +304,12 @@ class TestOpenCode:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="opencode")
+        _run_openai_tool_smoke(
+            rapid_mlx_matrix_server, family_alias, agent_label="opencode"
+        )
 
 
 class TestQwenCode:
@@ -315,10 +317,12 @@ class TestQwenCode:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="qwen-code")
+        _run_openai_tool_smoke(
+            rapid_mlx_matrix_server, family_alias, agent_label="qwen-code"
+        )
 
 
 class TestOpenHands:
@@ -326,13 +330,15 @@ class TestOpenHands:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
+        client, wire_errors = _openai_client_and_errors(
+            rapid_mlx_matrix_server["base_url"]
+        )
         try:
             resp = client.chat.completions.create(
-                model=rapid_mlx_server["model_id"],
+                model=rapid_mlx_matrix_server["model_id"],
                 messages=[{"role": "user", "content": "Reply with just OK."}],
                 temperature=0.0,
                 max_tokens=64,
@@ -353,11 +359,11 @@ class TestHermesAgent:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
         _run_openai_tool_smoke(
-            rapid_mlx_server, family_alias, agent_label="hermes-agent"
+            rapid_mlx_matrix_server, family_alias, agent_label="hermes-agent"
         )
 
 
@@ -366,13 +372,15 @@ class TestAider:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
+        client, wire_errors = _openai_client_and_errors(
+            rapid_mlx_matrix_server["base_url"]
+        )
         try:
             resp = client.chat.completions.create(
-                model=rapid_mlx_server["model_id"],
+                model=rapid_mlx_matrix_server["model_id"],
                 messages=[
                     {"role": "system", "content": "You are a coding assistant."},
                     {"role": "user", "content": "Say hi."},
@@ -396,10 +404,12 @@ class TestKiloCode:
 
     def test_smoke(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        _run_openai_tool_smoke(rapid_mlx_server, family_alias, agent_label="kilo-code")
+        _run_openai_tool_smoke(
+            rapid_mlx_matrix_server, family_alias, agent_label="kilo-code"
+        )
 
 
 class TestStreamingDeltas:
@@ -421,10 +431,12 @@ class TestStreamingDeltas:
 
     def test_stream_deltas(
         self,
-        rapid_mlx_server: dict[str, Any],
+        rapid_mlx_matrix_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
+        client, wire_errors = _openai_client_and_errors(
+            rapid_mlx_matrix_server["base_url"]
+        )
         # Import here so a missing openai SDK skips at the imports helper
         # rather than crashing at the module level below.
         try:
@@ -451,10 +463,19 @@ class TestStreamingDeltas:
         # cut the stream mid-reasoning on the strong-pick gpt-oss 120B.
         max_stream_tokens = 256
         final = None
+        # Track whether the stream ended via ``LengthFinishReasonError``
+        # (max_tokens hit before completion). Codex #1033 round-8
+        # BLOCKING #3: on length-finish, we need the extra guard that
+        # at least ONE typed ContentDeltaEvent fired — otherwise the
+        # cell would pass on reasoning-only streams (chunk_text or
+        # a raw-chunk fallback whose content isn't the assistant
+        # channel). typed_text non-empty is the wire-level proof the
+        # openai SDK saw a real ``choices[0].delta.content`` update.
+        length_finished = False
         try:
             events: list[str] = []
             with client.chat.completions.stream(
-                model=rapid_mlx_server["model_id"],
+                model=rapid_mlx_matrix_server["model_id"],
                 messages=[{"role": "user", "content": "Count to three."}],
                 temperature=0.0,
                 max_tokens=max_stream_tokens,
@@ -494,9 +515,12 @@ class TestStreamingDeltas:
                     # reaching the assistant-channel final — the per-
                     # delta assertions above already covered the leak
                     # gate, so this is not a regression. Fall through
-                    # with final=None; the assembled streamed_text
-                    # assertion below is the only remaining gate.
+                    # with final=None + length_finished=True; the
+                    # typed_text guard below enforces that at least one
+                    # user-visible ContentDeltaEvent fired before the
+                    # cutoff (codex #1033 round-8 BLOCKING #3 fold).
                     final = None
+                    length_finished = True
         except wire_errors as exc:
             strict_skip_or_fail(
                 f"stream/{family_alias.family}: server rejected stream: {exc}"
@@ -507,6 +531,25 @@ class TestStreamingDeltas:
             pytest.skip("openai SDK too old for .stream context manager")
             return
         assert events, "no stream events collected"
+        # Codex #1033 round-8 BLOCKING #3: on LengthFinishReasonError,
+        # require the typed ContentDeltaEvent bucket to be non-empty.
+        # The openai SDK reserves ContentDeltaEvent for the assistant
+        # channel (``choices[0].delta.content``), so an empty typed_text
+        # under length-finish means the model never surfaced visible
+        # content — the stream was all reasoning-channel or empty
+        # deltas. That's a real regression signal (either max_tokens
+        # too low OR reasoning-routing bug OR the model never got to
+        # the assistant channel). Fail/skip explicitly instead of
+        # letting chunk_text (which may carry raw reasoning content
+        # unfiltered on a server bug) satisfy the non-empty gate below.
+        if length_finished and not typed_text.strip():
+            strict_skip_or_fail(
+                f"stream/{family_alias.family}: LengthFinishReason cutoff "
+                f"with no typed content.delta events — model never surfaced "
+                f"assistant-channel content. Likely reasoning-only stream; "
+                f"raise max_tokens or investigate reasoning routing."
+            )
+            return
         # Prefer typed content.delta bucket when non-empty (newer SDK),
         # else fall back to the raw chunk bucket (older SDK / proxies
         # that only emit chunks). Both were leak-scanned per-delta
