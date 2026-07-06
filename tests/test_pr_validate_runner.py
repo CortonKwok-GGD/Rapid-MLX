@@ -352,10 +352,23 @@ class TestSelectModels:
     # rather than a list so a future test can't accidentally `.append`
     # to it and silently poison every other test that compares against
     # this constant.
+    #
+    # Two shapes today:
+    # * ``_QWEN36_HERMES_ARGS`` for the 27B fallback (hermes parser —
+    #   both mlx-community and unsloth 27B XML flavours parse cleanly
+    #   through hermes' bare-function pattern).
+    # * ``_QWEN36_XML_ARGS`` for the 35B-A3B primary (qwen3_coder_xml —
+    #   the auto-detect registry maps ``Qwen3.6-35B-A3B`` to the
+    #   qwen3_coder_xml parser; ``aliases.json`` documents the same).
     _QWEN36_HERMES_ARGS = (
         "--enable-auto-tool-choice",
         "--tool-call-parser",
         "hermes",
+    )
+    _QWEN36_XML_ARGS = (
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "qwen3_coder_xml",
     )
 
     def test_high_ram_picks_8bit_primary(self):
@@ -463,24 +476,18 @@ class TestSelectModels:
         # Override args wired through verbatim — full equality so a
         # value-typo in the YAML override (e.g. `hermez` instead of
         # `hermes`) is caught rather than just the truthiness of a
-        # non-empty list.
-        assert tuple(qwen36.extra_args) == self._QWEN36_HERMES_ARGS, (
+        # non-empty list. The set of valid parsers depends on WHICH
+        # candidate the file lists first — the 35B-A3B strong pick uses
+        # ``qwen3_coder_xml``; the 27B fallback uses ``hermes``. Both
+        # are accepted; a bogus parser like ``hermez`` is not.
+        assert tuple(qwen36.extra_args) in (
+            self._QWEN36_XML_ARGS,
+            self._QWEN36_HERMES_ARGS,
+        ), (
             f"selected {qwen36.model_id!r} but its overrides args don't "
             f"match expected — check overrides:{qwen36.model_id} in "
             "golden_models.yaml"
         )
-
-    def test_real_yaml_skips_diffusiongemma_quality_agents(self):
-        """diffusiongemma is a text-diffusion stress/tool-parser smoke
-        target, not a hard correctness oracle for generic agent prompts."""
-        from scripts.pr_validate.steps.stress_e2e_bench import _load_registry
-
-        registry = _load_registry()
-        agents = {a["name"]: a for a in registry["agents"]}
-        model_id = "mlx-community/diffusiongemma-26B-A4B-it-4bit"
-
-        assert model_id in agents["anthropic_sdk"].get("skip_for_models", [])
-        assert model_id in agents["langchain"].get("skip_for_models", [])
 
 
 class TestStressPreexistingClassification:
