@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -184,7 +185,17 @@ def strict_skip_or_fail(reason: str) -> None:
 
 
 def _matrix_port() -> int:
-    port = int(os.environ.get("RAPID_MLX_MATRIX_PORT", str(DEFAULT_MATRIX_PORT)))
+    raw = os.environ.get("RAPID_MLX_MATRIX_PORT", str(DEFAULT_MATRIX_PORT))
+    # Codex #1033 round-1 NIT #1: catch malformed port so a typo like
+    # ``RAPID_MLX_MATRIX_PORT=eight-thousand`` yields the harness's own
+    # skip/fail message instead of a raw ``ValueError`` traceback.
+    try:
+        port = int(raw)
+    except ValueError:
+        pytest.exit(
+            f"RAPID_MLX_MATRIX_PORT={raw!r} is not an integer. "
+            f"Pick a numeric port (e.g. 8802)."
+        )
     # G1: never overlap operator services.
     if port in FORBIDDEN_PORTS:
         pytest.exit(
@@ -200,10 +211,15 @@ def _serve_command(alias: str, port: int) -> list[str]:
     Defaults to ``python3.12 -m vllm_mlx.cli`` (worktree-safe: editable
     install without wrapper indirection). Override via ``RAPID_MLX_SERVE_BIN``
     when the ``rapid-mlx`` wrapper points at the correct venv.
+
+    Codex #1033 round-1 NIT #2: use ``shlex.split`` so a quoted path like
+    ``RAPID_MLX_SERVE_BIN='/opt/homebrew/opt/python@3.12/bin/python3.12 -m vllm_mlx.cli'``
+    or an argv element containing a space parses correctly. Plain
+    ``str.split`` would tokenise on the space inside a quoted path.
     """
     bin_override = os.environ.get("RAPID_MLX_SERVE_BIN", "").strip()
     if bin_override:
-        argv = bin_override.split()
+        argv = shlex.split(bin_override)
     else:
         argv = [sys.executable, "-m", "vllm_mlx.cli"]
     argv += ["serve", alias, "--port", str(port)]
@@ -253,6 +269,13 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
     Uses a log file under /tmp so operators can tail progress. Skips
     (or fails, in strict mode) on boot failure — the matrix cell is
     the audience, not the pytest harness.
+
+    Codex #1033 round-1 BLOCKING #2: the parent's ``log_f`` file
+    descriptor is only used to hand stdout/stderr to ``Popen``. Once
+    the child has inherited the fd, close the parent-side handle so
+    every successful family boot doesn't leak an fd. The child keeps
+    writing through its own inherited fd until it exits and shutdown
+    cleans up.
     """
     if _port_in_use(port):
         strict_skip_or_fail(
@@ -261,22 +284,24 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
         )
 
     log_path = Path("/tmp") / f"rapid-mlx-matrix-{alias.family}-{port}.log"
-    log_f = open(log_path, "w")  # noqa: SIM115 — closed in shutdown
     cmd = _serve_command(alias.alias, port)
-    try:
-        proc = subprocess.Popen(  # noqa: S603
-            cmd,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-    except FileNotFoundError as exc:
-        log_f.close()
-        strict_skip_or_fail(
-            f"could not exec {cmd!r}: {exc}. Set RAPID_MLX_SERVE_BIN or "
-            f"ensure `{sys.executable} -m vllm_mlx.cli` is importable."
-        )
-        return _ServerHandle(None, port, "", "", None)  # unreachable in strict
+    proc = None
+    with open(log_path, "w") as log_f:
+        try:
+            proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        except FileNotFoundError as exc:
+            strict_skip_or_fail(
+                f"could not exec {cmd!r}: {exc}. Set RAPID_MLX_SERVE_BIN or "
+                f"ensure `{sys.executable} -m vllm_mlx.cli` is importable."
+            )
+            return _ServerHandle(None, port, "", "", None)  # unreachable in strict
+    # ``with`` block closed ``log_f`` — the child now owns its own dup'd
+    # fd on the log file, so parent-side fd is safely released.
 
     if not _wait_for_ready(port, SERVER_BOOT_TIMEOUT_S):
         # Best-effort teardown.
@@ -288,7 +313,6 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
                 proc.kill()
             except Exception:  # noqa: BLE001
                 pass
-        log_f.close()
         strict_skip_or_fail(
             f"{alias.alias} did not become ready on port {port} within "
             f"{SERVER_BOOT_TIMEOUT_S}s — see {log_path}"
@@ -353,6 +377,29 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         )
 
 
+_MODEL_ID_TO_FAMILY_PREFIXES: dict[str, tuple[str, ...]] = {
+    "qwen36": ("qwen3.6",),
+    "gemma4": ("gemma-4", "gemma4"),
+    "deepseek": ("deepseek-v4", "deepseek-r1", "deepseek"),
+    "gptoss": ("gpt-oss", "openai/gpt-oss"),
+}
+
+
+def _infer_family_from_model_id(model_id: str) -> str | None:
+    """Best-effort mapping from the server's reported ``/v1/models`` id
+    to a matrix family key. Returns ``None`` if no prefix matches so a
+    stranger model can't silently satisfy any family cell.
+    """
+    if not model_id:
+        return None
+    lower = model_id.lower()
+    for family, prefixes in _MODEL_ID_TO_FAMILY_PREFIXES.items():
+        for prefix in prefixes:
+            if prefix in lower:
+                return family
+    return None
+
+
 @pytest.fixture(scope="session")
 def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
     """Yield metadata for a rapid-mlx server serving ``family_alias``.
@@ -360,9 +407,12 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
     Two modes:
 
     * **External** (env ``RAPID_MLX_BASE_URL`` set): probe /v1/models,
-      assert the reported model_id matches the family, and yield without
-      touching any subprocess. Local-dev shortcut so a large model
-      already loaded elsewhere doesn't get re-booted.
+      assert the reported model_id maps to ``family_alias.family``, and
+      yield without touching any subprocess. Local-dev shortcut so a
+      large model already loaded elsewhere doesn't get re-booted. If
+      the external server serves a different family, the cell skips
+      (or fails in strict mode) — matching the guard the auto-boot
+      path enforces by definition.
     * **Auto-boot** (default): boot ``rapid-mlx serve <alias>`` on
       ``RAPID_MLX_MATRIX_PORT`` (default 8802), yield, teardown at
       session end.
@@ -389,6 +439,19 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
                 f"external RAPID_MLX_BASE_URL={external} unreachable: {exc!r}"
             )
             return
+        # Codex #1033 round-1 BLOCKING #1: verify the server's model_id
+        # maps to the parametrized family — otherwise a single Qwen server
+        # would silently "cover" every Gemma/DeepSeek/gpt-oss cell.
+        active_family = _infer_family_from_model_id(model_id)
+        if active_family != family_alias.family:
+            strict_skip_or_fail(
+                f"cell {family_alias.family}: external RAPID_MLX_BASE_URL "
+                f"serves {model_id!r} which maps to family "
+                f"{active_family or 'unknown'!r}. Restart with the correct "
+                f"model or set RAPID_MLX_AGENT_MATRIX_FAMILY={active_family or ''} "
+                f"to shard on the family the external server serves."
+            )
+            return
         yield {
             "base_url": external,
             "model_id": model_id,
@@ -400,7 +463,8 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
     # Auto-boot mode.
     if not _hf_cache_present(family_alias.hf_path):
         strict_skip_or_fail(
-            f"HF cache miss for {family_alias.hf_path!r}. "
+            f"HF weight cache miss for {family_alias.hf_path!r} "
+            f"(need at least one .safetensors / .npz / .bin file locally). "
             f'Pre-download with: python3.12 -c "from huggingface_hub import '
             f"snapshot_download; snapshot_download('{family_alias.hf_path}')\""
         )
@@ -419,12 +483,20 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
         _shutdown_server(handle)
 
 
-def _hf_cache_present(hf_path: str) -> bool:
-    """Return True iff the HF snapshot cache holds at least one blob for ``hf_path``.
+# Weight-file suffixes that count as "real weights are on disk". Config
+# / tokenizer files alone don't — codex #1033 round-1 BLOCKING #3.
+_WEIGHT_SUFFIXES = (".safetensors", ".npz", ".bin", ".gguf")
 
-    Cheaper than a real ``snapshot_download`` probe — the matrix needs to
-    know whether an auto-boot will spend 30 seconds or 30 minutes; the
-    latter is not appropriate for a per-PR gate.
+
+def _hf_cache_present(hf_path: str) -> bool:
+    """Return True iff the HF snapshot cache holds at least one weight file.
+
+    Codex #1033 round-1 BLOCKING #3: the earlier "any file counts"
+    heuristic passed on a partial snapshot (config.json + tokenizer.json
+    only) and auto-boot would then trigger a 50-65 GB weight download
+    inside the pytest lifespan — turning a per-PR gate into an hours-
+    long fetch. Require at least one weight-format file (.safetensors,
+    .npz, .bin, .gguf) before declaring cache present.
     """
     home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
     hub = home / "hub"
@@ -433,9 +505,18 @@ def _hf_cache_present(hf_path: str) -> bool:
     if not snapshots.exists():
         return False
     for snap in snapshots.iterdir():
-        # Any file (safetensors symlink to blobs) counts.
-        for _ in snap.iterdir():
-            return True
+        for entry in snap.iterdir():
+            name = entry.name.lower()
+            if name.endswith(_WEIGHT_SUFFIXES):
+                # Symlinks are typical (HF layout); resolve and check
+                # the pointed-to blob really exists and is non-empty
+                # (a broken symlink or a zero-byte blob is not a hit).
+                try:
+                    resolved = entry.resolve(strict=True)
+                    if resolved.stat().st_size > 0:
+                        return True
+                except (FileNotFoundError, OSError):
+                    continue
     return False
 
 
