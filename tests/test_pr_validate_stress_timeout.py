@@ -25,6 +25,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from scripts.pr_validate.steps import stress_e2e_bench
 from scripts.pr_validate.steps.stress_e2e_bench import (
     DEFAULT_STRESS_TIMEOUT_S,
@@ -106,10 +108,18 @@ def test_run_stress_falls_back_to_default_when_unset(tmp_path: Path) -> None:
 
 
 def test_golden_models_yaml_diffusiongemma_has_override() -> None:
-    """Config-drift gate: the diffusiongemma candidate in
-    ``golden_models.yaml`` MUST carry ``stress_timeout_s: 1800``. If
-    someone reverts the YAML without reverting the dataclass plumbing,
-    this test catches it before the next high-blast PR hangs for 15 min."""
+    """Conditional config-drift gate: IF the diffusion-gemma candidate is
+    present in ``golden_models.yaml`` (it's optional now — 0.10.2 PR-2
+    realigned the registry to the 4 Tier-1 families only), it MUST still
+    carry ``stress_timeout_s: 1800``.
+
+    Rationale for keeping the conditional gate: diffusion-gemma has
+    historically been added back for DiffusionEngine coverage after
+    Bug A-class regressions; leaving the invariant enforced (when the
+    family is present) means whoever adds it back doesn't have to
+    re-derive the 1800s budget from issue #664 — the test will catch
+    a plain ``ram_gb_required`` addition without the timeout override.
+    """
     import yaml
 
     registry_path = (
@@ -129,9 +139,12 @@ def test_golden_models_yaml_diffusiongemma_has_override() -> None:
                     break
             break
 
-    assert diffusion_candidate is not None, (
-        "diffusion-gemma family / candidate missing from golden_models.yaml"
-    )
+    if diffusion_candidate is None:
+        pytest.skip(
+            "diffusion-gemma not in the current Tier-1 registry (0.10.2 PR-2 "
+            "realignment); invariant vacuously satisfied."
+        )
+
     assert diffusion_candidate.get("stress_timeout_s") == 1800, (
         "diffusiongemma stress_timeout_s must be 1800s (text-diffusion "
         "denoise per step is ~2x autoregressive per-token wall-clock — "
