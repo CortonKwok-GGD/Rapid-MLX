@@ -72,7 +72,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -370,10 +369,15 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
                 stderr=subprocess.STDOUT,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
-        except FileNotFoundError as exc:
+        # Codex #1033 round-7 BLOCKING #2: catch OSError broadly (covers
+        # ``PermissionError`` from a chmod-blocked ``RAPID_MLX_SERVE_BIN``
+        # as well as ``FileNotFoundError``). Anything else escapes — the
+        # ``finally`` still closes the parent-side fd.
+        except OSError as exc:
             strict_skip_or_fail(
                 f"could not exec {cmd!r}: {exc}. Set RAPID_MLX_SERVE_BIN or "
-                f"ensure `{sys.executable} -m vllm_mlx.cli` is importable."
+                f"ensure `{sys.executable} -m vllm_mlx.cli` is importable. "
+                f"(log path: {log_path})"
             )
             return _ServerHandle(None, port, "", "", None)  # unreachable in strict
     finally:
@@ -458,8 +462,33 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             aliases,
             ids=[a.family for a in aliases],
             indirect=False,
+            # Session scope on the parametrization means each family_alias
+            # gets its own instance across the session; combined with the
+            # module-level ``_ACTIVE_SERVER`` cache below, this gives us
+            # "one boot per family, torn down before the next family
+            # starts" — matches the sequential OOM budget the M3 Ultra
+            # requires with operator services running on 8801 / 8772.
             scope="session",
         )
+
+
+# Module-level cache: (family_key) → _ServerHandle. Codex #1033 round-7
+# BLOCKING #1 fold — a function-scoped fixture around this cache gives
+# each test cell its own fixture call, but a fresh boot only when the
+# family flips. When the family flips, the previous handle is torn down
+# BEFORE the new one boots; that guarantees the "Qwen 3.6 → shutdown →
+# Gemma 4 → shutdown" sequencing the OOM budget requires and can't be
+# violated by pytest's session-scope reuse rules.
+_ACTIVE_SERVER: dict[str, Any] = {"family": None, "handle": None, "meta": None}
+
+
+def _teardown_active_server() -> None:
+    handle = _ACTIVE_SERVER.get("handle")
+    if handle is not None:
+        _shutdown_server(handle)
+    _ACTIVE_SERVER["family"] = None
+    _ACTIVE_SERVER["handle"] = None
+    _ACTIVE_SERVER["meta"] = None
 
 
 _MODEL_ID_TO_FAMILY_PREFIXES: dict[str, tuple[str, ...]] = {
@@ -485,32 +514,38 @@ def _infer_family_from_model_id(model_id: str) -> str | None:
     return None
 
 
-@pytest.fixture(scope="session")
-def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
-    """Yield metadata for a rapid-mlx server serving ``family_alias``.
+@pytest.fixture
+def rapid_mlx_server(
+    family_alias: FamilyAlias, request: pytest.FixtureRequest
+) -> dict[str, Any]:
+    """Return metadata for a rapid-mlx server serving ``family_alias``.
 
     Two modes:
 
     * **External** (env ``RAPID_MLX_BASE_URL`` set): probe /v1/models,
       assert the reported model_id maps to ``family_alias.family``, and
-      yield without touching any subprocess. Local-dev shortcut so a
+      return without touching any subprocess. Local-dev shortcut so a
       large model already loaded elsewhere doesn't get re-booted. If
       the external server serves a different family, the cell skips
       (or fails in strict mode) — matching the guard the auto-boot
       path enforces by definition.
     * **Auto-boot** (default): boot ``rapid-mlx serve <alias>`` on
-      ``RAPID_MLX_MATRIX_PORT`` (default 8802), yield, teardown at
-      session end.
+      ``RAPID_MLX_MATRIX_PORT`` (default 8802), return, teardown when
+      the family flips (or at session end via ``_teardown_active_server``).
 
-    Session-scoped keyed on ``family_alias`` — a new server boots for
-    each parametrized family (Qwen 3.6 → shutdown → Gemma 4 → shutdown
-    → ...). Sequential is intentional: two 30-65 GB models in memory
-    would OOM even the 512 GB M3 Ultra with operator services running.
+    Fixture is **function-scoped** but backed by the module-level
+    ``_ACTIVE_SERVER`` cache — codex #1033 round-7 BLOCKING #1 fold:
+    a session-scoped fixture parametrized across families relies on
+    pytest's finalizer ordering to sequence "boot Qwen → teardown Qwen
+    → boot Gemma → ..." and that ordering is not guaranteed when
+    parametrization is done via ``pytest_generate_tests``. Function
+    scope + explicit cache flip is deterministic: when we see a family
+    different from the currently-active one, we tear down the old
+    handle BEFORE booting the new one, which is exactly the OOM
+    sequencing budget we need.
 
-    Codex #1033 round-3 NIT: resolve ``_matrix_port`` only in the auto-
-    boot branch — external-server mode never boots on it, so a bad
-    ``RAPID_MLX_MATRIX_PORT`` shouldn't crash a local dev run that
-    pointed at an already-running server.
+    Teardown of the *last* family's server is registered as a session
+    finalizer so we don't leak a running process at pytest exit.
     """
     external = os.environ.get("RAPID_MLX_BASE_URL", "").strip().rstrip("/")
     if external:
@@ -532,7 +567,7 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
             strict_skip_or_fail(
                 f"external RAPID_MLX_BASE_URL={external} unreachable: {exc!r}"
             )
-            return
+            return {}
         # Codex #1033 round-1 BLOCKING #1: verify the server's model_id
         # maps to the parametrized family — otherwise a single Qwen server
         # would silently "cover" every Gemma/DeepSeek/gpt-oss cell.
@@ -545,16 +580,34 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
                 f"model or set RAPID_MLX_AGENT_MATRIX_FAMILY={active_family or ''} "
                 f"to shard on the family the external server serves."
             )
-            return
-        yield {
+            return {}
+        return {
             "base_url": external,
             "model_id": model_id,
             "family": family_alias.family,
             "alias": family_alias.alias,
         }
-        return
 
-    # Auto-boot mode — port only needed on this branch.
+    # Auto-boot mode. Check module-level cache first: if the currently-
+    # loaded family matches, reuse the running handle — one boot per
+    # family, N cells share it. When the family flips, tear the current
+    # one down BEFORE booting the new one (OOM budget), then cache.
+    if _ACTIVE_SERVER["family"] == family_alias.family and _ACTIVE_SERVER["handle"]:
+        meta: dict[str, Any] = _ACTIVE_SERVER["meta"]
+        return meta
+
+    # Family flipped (or first cell of the session) — flush any active
+    # server before booting the new one.
+    if _ACTIVE_SERVER["family"] is not None:
+        _teardown_active_server()
+
+    # Register session finalizer once (subsequent registrations are
+    # harmless idempotent adds on the same callable, but we gate on the
+    # cache pointer to avoid stacking N teardowns).
+    if _ACTIVE_SERVER.get("finalizer_registered") is not True:
+        request.session.addfinalizer(_teardown_active_server)
+        _ACTIVE_SERVER["finalizer_registered"] = True
+
     port = _matrix_port()
 
     if not _hf_cache_present(family_alias.hf_path):
@@ -564,19 +617,20 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
             f'Pre-download with: python3.12 -c "from huggingface_hub import '
             f"snapshot_download; snapshot_download('{family_alias.hf_path}')\""
         )
-        return
+        return {}
 
     handle = _boot_server(family_alias, port)
-    try:
-        yield {
-            "base_url": handle.base_url,
-            "model_id": handle.model_id,
-            "family": family_alias.family,
-            "alias": family_alias.alias,
-            "server_log": str(handle.log_path) if handle.log_path else None,
-        }
-    finally:
-        _shutdown_server(handle)
+    meta = {
+        "base_url": handle.base_url,
+        "model_id": handle.model_id,
+        "family": family_alias.family,
+        "alias": family_alias.alias,
+        "server_log": str(handle.log_path) if handle.log_path else None,
+    }
+    _ACTIVE_SERVER["family"] = family_alias.family
+    _ACTIVE_SERVER["handle"] = handle
+    _ACTIVE_SERVER["meta"] = meta
+    return meta
 
 
 # Weight-file suffixes that count as "real weights are on disk". Config
@@ -649,11 +703,10 @@ def _hf_cache_present(hf_path: str) -> bool:
         # Prefer the sharded-index path: if ``model.safetensors.index.json``
         # exists, verify every referenced shard is on disk. This is the
         # only way to distinguish "8 of 33 shards" from "the model was
-        # shipped as a single safetensors file".
-        index_paths = [
-            snap / "model.safetensors.index.json",
-            snap / "model.safetensors.index.json",  # rglob catches sub-dirs below
-        ]
+        # shipped as a single safetensors file". Codex #1033 round-7
+        # NIT #1 fold: seed with the top-level index only (rglob below
+        # already covers it), then extend with any sub-dir instances.
+        index_paths: list[Path] = [snap / "model.safetensors.index.json"]
         # Also scan for indices in sub-dirs (weights/, shards/ layouts).
         for extra in snap.rglob("model.safetensors.index.json"):
             if extra not in index_paths:

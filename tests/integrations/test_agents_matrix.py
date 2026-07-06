@@ -431,7 +431,19 @@ class TestStreamingDeltas:
             from openai import LengthFinishReasonError
         except ImportError:  # very old openai
             LengthFinishReasonError = ()  # type: ignore[misc]
-        streamed_text = ""
+        # Codex #1033 round-7 BLOCKING #3: OpenAI's ``ChatCompletionStream``
+        # emits TWO event shapes for the same content — the typed
+        # ``ContentDeltaEvent`` (``type='content.delta'``, ``.delta`` str)
+        # and the raw ``ChunkEvent`` (``type='chunk'``, ``.chunk.choices``
+        # list carrying ``.delta.content``). The previous impl only
+        # touched ``event.delta``, so an SDK / provider variant that
+        # emits only chunks (older openai releases, some proxies) would
+        # accumulate an empty ``streamed_text`` and never leak-scan the
+        # tokens. Accumulate BOTH shapes into separate buckets, then
+        # prefer the typed bucket at the end so we never double-count
+        # (both events fire per content increment in the current SDK).
+        typed_text = ""
+        chunk_text = ""
         # gpt-oss reasoning models emit long analysis-channel content
         # BEFORE the final content. 256 tokens is enough for a "count
         # to three" prompt to reach the assistant-channel output on
@@ -448,14 +460,33 @@ class TestStreamingDeltas:
                 max_tokens=max_stream_tokens,
             ) as stream:
                 for event in stream:
-                    events.append(getattr(event, "type", "unknown"))
-                    # Accumulate content deltas so per-token leaks
-                    # surface even if the final object was scrubbed.
+                    ev_type = getattr(event, "type", "unknown")
+                    events.append(ev_type)
+                    # Path 1 — typed ContentDeltaEvent.
                     delta = getattr(event, "delta", None)
-                    if isinstance(delta, str):
-                        streamed_text += delta
+                    if ev_type == "content.delta" and isinstance(delta, str):
+                        typed_text += delta
                         assert_no_think_tag_leak(delta)
                         assert_no_analysis_channel_leak(delta)
+                        continue
+                    # Path 2 — raw ChunkEvent. Extract content from
+                    # each choice's delta.content field. Same content
+                    # as Path 1 in the current SDK; we bucket
+                    # separately so the final aggregate picks whichever
+                    # bucket is non-empty (typed wins when both are).
+                    if ev_type == "chunk":
+                        chunk = getattr(event, "chunk", None)
+                        for choice in getattr(chunk, "choices", None) or []:
+                            delta_obj = getattr(choice, "delta", None)
+                            content = (
+                                getattr(delta_obj, "content", None)
+                                if delta_obj is not None
+                                else None
+                            )
+                            if isinstance(content, str) and content:
+                                chunk_text += content
+                                assert_no_think_tag_leak(content)
+                                assert_no_analysis_channel_leak(content)
                 try:
                     final = stream.get_final_completion()
                 except LengthFinishReasonError:
@@ -476,6 +507,22 @@ class TestStreamingDeltas:
             pytest.skip("openai SDK too old for .stream context manager")
             return
         assert events, "no stream events collected"
+        # Prefer typed content.delta bucket when non-empty (newer SDK),
+        # else fall back to the raw chunk bucket (older SDK / proxies
+        # that only emit chunks). Both were leak-scanned per-delta
+        # already; this aggregate is just for the concatenated gates
+        # below.
+        streamed_text = typed_text or chunk_text
+        # Codex #1033 round-7 BLOCKING #3 (cont'd): if BOTH buckets are
+        # empty but we have a final completion, fall back to the final
+        # message content as source of truth so the non-empty gate can
+        # still catch a wire that dropped every content event but
+        # somehow assembled a final. Rare, but the alternative is a
+        # cell that goes green on missing wire signal.
+        if not streamed_text.strip() and final is not None:
+            fallback = _extract_text_from_message(final.choices[0].message)
+            if fallback:
+                streamed_text = fallback
         # Concatenated-delta gate: catches leaks that were split across
         # deltas so no single delta contained the marker literally.
         assert_no_think_tag_leak(streamed_text)

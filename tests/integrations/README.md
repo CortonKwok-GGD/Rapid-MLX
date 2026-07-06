@@ -133,25 +133,25 @@ RAPID_MLX_BASE_URL=http://127.0.0.1:8802/v1 \
 
 | Agent | Qwen 3.6 | Gemma 4 | DeepSeek V4 Flash | gpt-oss 120B |
 |---|---|---|---|---|
-| codex-cli | ✅ | ✅ | (pending) | (pending) |
-| claude-code | ✅ | ✅ | (pending) | (pending) |
-| opencode | ✅ | ✅ | (pending) | (pending) |
-| qwen-code | ✅ | ✅ | (pending) | (pending) |
-| openhands | ✅ | ✅ | (pending) | (pending) |
-| hermes-agent | ✅ | ✅ | (pending) | (pending) |
-| aider | ✅ | ✅ | (pending) | (pending) |
-| kilo-code | ✅ | ✅ | (pending) | (pending) |
-| streaming (bonus) | ✅ | ✅ | (pending) | (pending) |
+| codex-cli | ✅ | ✅ | (pending) | ✅ |
+| claude-code | ✅ | ✅ | (pending) | ✅ |
+| opencode | ✅ | ✅ | (pending) | ✅ |
+| qwen-code | ✅ | ✅ | (pending) | ✅ |
+| openhands | ✅ | ✅ | (pending) | ✅ |
+| hermes-agent | ✅ | ✅ | (pending) | ✅ |
+| aider | ✅ | ✅ | (pending) | ✅ |
+| kilo-code | ✅ | ✅ | (pending) | ✅ |
+| streaming (bonus) | ✅ | ✅ | (pending) | ✅ |
 
 ### Framework × Family matrix (3 × 4 = 12)
 
 | Framework | Qwen 3.6 | Gemma 4 | DeepSeek V4 Flash | gpt-oss 120B |
 |---|---|---|---|---|
-| LangChain (+ LangGraph) | ✅ | ✅ | (pending) | (pending) |
-| PydanticAI | ✅ | ✅ | (pending) | (pending) |
-| smolagents | ✅ | ✅ | (pending) | (pending) |
+| LangChain (+ LangGraph) | ✅ | ✅ | (pending) | ✅ |
+| PydanticAI | ✅ | ✅ | (pending) | ✅ |
+| smolagents | ✅ | ✅ | (pending) | ✅ |
 
-Legend: ✅ passing · ⚠️ skipped (known cause) · 🔲 pending · ❌ failing
+Legend: ✅ passing · ⚠️ skipped (known cause) · (pending) DeepSeek weights still downloading · ❌ failing
 
 ## Historical deep-file coverage (pre-0.10.2)
 
