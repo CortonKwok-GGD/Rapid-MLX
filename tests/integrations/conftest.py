@@ -69,6 +69,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -286,14 +287,27 @@ def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
             return False
 
 
-def _wait_for_ready(port: int, timeout_s: int) -> bool:
-    """Poll /v1/models (200) until ready or timeout."""
+def _wait_for_ready(
+    port: int,
+    timeout_s: int,
+    proc: subprocess.Popen | None = None,
+) -> bool:
+    """Poll /v1/models (200) until ready or timeout.
+
+    Codex #1033 round-5 NIT #1: check ``proc.poll()`` on each iteration
+    so a child that died at import time (e.g. missing dependency,
+    stale editable install) fails fast instead of appearing to hang
+    for the full boot budget. Returns False if the process is gone.
+    """
     import urllib.error
     import urllib.request
 
     deadline = time.monotonic() + timeout_s
     url = f"http://127.0.0.1:{port}/v1/models"
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            # Child exited before /v1/models came up — no point polling.
+            return False
         try:
             with urllib.request.urlopen(url, timeout=3) as resp:  # noqa: S310
                 if resp.status == 200:
@@ -333,10 +347,21 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
             f"(check `lsof -i :{port}`)"
         )
 
-    log_path = Path("/tmp") / f"rapid-mlx-matrix-{alias.family}-{port}.log"
+    # Codex #1033 round-5 NIT #2: use ``NamedTemporaryFile(delete=False)``
+    # so a symlink at ``/tmp/rapid-mlx-matrix-...`` (planted by a shared-
+    # machine attacker) can't be followed to clobber an arbitrary file.
+    # ``delete=False`` keeps the log around after the fixture exits so
+    # operators can post-mortem.
+    log_f = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix=f"rapid-mlx-matrix-{alias.family}-{port}-",
+        suffix=".log",
+        delete=False,
+    )
+    log_path = Path(log_f.name)
     cmd = _serve_command(alias, port)
     proc = None
-    with open(log_path, "w") as log_f:
+    try:
         try:
             proc = subprocess.Popen(  # noqa: S603
                 cmd,
@@ -350,10 +375,12 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
                 f"ensure `{sys.executable} -m vllm_mlx.cli` is importable."
             )
             return _ServerHandle(None, port, "", "", None)  # unreachable in strict
-    # ``with`` block closed ``log_f`` — the child now owns its own dup'd
-    # fd on the log file, so parent-side fd is safely released.
+    finally:
+        # Close the parent-side fd — child has dup'd its own copy for
+        # writing. Codex #1033 round-1 BLOCKING #2 fold.
+        log_f.close()
 
-    if not _wait_for_ready(port, SERVER_BOOT_TIMEOUT_S):
+    if not _wait_for_ready(port, SERVER_BOOT_TIMEOUT_S, proc=proc):
         # Best-effort teardown — codex #1033 round-4 BLOCKING #5: after
         # ``proc.kill()`` reap the child with ``proc.wait()`` so a boot-
         # timeout doesn't leave a zombie process; mirrors the normal
@@ -486,6 +513,12 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
     """
     external = os.environ.get("RAPID_MLX_BASE_URL", "").strip().rstrip("/")
     if external:
+        # Codex #1033 round-5 BLOCKING #1: normalize so the probe hits
+        # /v1/models regardless of whether the operator set the /v1 base
+        # URL (documented) or the host root (natural miss). Downstream
+        # SDK clients receive the /v1 base URL either way.
+        if not external.endswith("/v1"):
+            external = external + "/v1"
         import urllib.request
 
         try:
@@ -550,6 +583,34 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
 _WEIGHT_SUFFIXES = (".safetensors", ".npz", ".bin", ".gguf")
 
 
+def _resolve_hf_hub_cache() -> Path:
+    """Return the HF hub cache root, honoring the standard env vars.
+
+    Prefers ``huggingface_hub.constants.HF_HUB_CACHE`` (which folds in
+    the standard priority order: ``HF_HUB_CACHE`` > ``HUGGINGFACE_HUB_CACHE``
+    > ``HF_HOME`` + ``/hub`` > ``~/.cache/huggingface/hub``). Falls back
+    to the same priority manually if ``huggingface_hub`` isn't
+    importable at fixture-collection time (unlikely — it's a rapid-mlx
+    core dep — but the fallback keeps the conftest importable in
+    weird environments).
+
+    Codex #1033 round-5 BLOCKING #2 fold.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        return Path(HF_HUB_CACHE)
+    except ImportError:
+        for env in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+            val = os.environ.get(env, "").strip()
+            if val:
+                return Path(val)
+        home = os.environ.get("HF_HOME", "").strip()
+        if home:
+            return Path(home) / "hub"
+        return Path.home() / ".cache" / "huggingface" / "hub"
+
+
 def _hf_cache_present(hf_path: str) -> bool:
     """Return True iff the HF snapshot cache holds at least one weight file.
 
@@ -563,9 +624,13 @@ def _hf_cache_present(hf_path: str) -> bool:
     Codex #1033 round-3 BLOCKING #2: use ``rglob`` so a snapshot that
     stores weights in subdirectories (some HF repos use a ``weights/``
     or per-shard subdir layout) isn't falsely reported as missing.
+
+    Codex #1033 round-5 BLOCKING #2: honor the documented HF cache
+    env vars (``HF_HUB_CACHE``, ``HUGGINGFACE_HUB_CACHE``, ``HF_HOME``)
+    via ``huggingface_hub.constants.HF_HUB_CACHE`` — a strict matrix
+    job with a relocated cache no longer skips before boot.
     """
-    home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
-    hub = home / "hub"
+    hub = _resolve_hf_hub_cache()
     safe = "models--" + hf_path.replace("/", "--")
     snapshots = hub / safe / "snapshots"
     if not snapshots.exists():
