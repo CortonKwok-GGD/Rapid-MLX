@@ -411,10 +411,21 @@ def test_d_tool_recur_tools_depth_above_cap_returns_400_canonical_envelope(
 
 
 def test_d_tool_recur_parser_depth_1000_returns_invalid_request_code(monkeypatch):
-    """At extreme depths the JSON parser can reject the body before the
-    per-tool validator sees it. That is still a client 400, and the
-    OpenAI-shaped envelope should carry the canonical invalid_request code
-    instead of a null code.
+    """At extreme depths the request MUST be rejected with the canonical
+    invalid_request code. Either the JSON parser or the per-tool validator
+    can be the gate that fires first — the invariant is that the client
+    sees an OpenAI-shaped 400 without stack-trace leakage, not which of
+    the two defensive layers rejected first.
+
+    Historical note (fold from post-#1030 pr_validate red, 0.10.2 PR-2):
+    the previous assertion pinned ``parsing the body`` in the message,
+    which only holds when the body-depth gate wins the race. As the
+    per-tool ``RAPID_MLX_MAX_TOOL_SCHEMA_DEPTH`` cap tightened (now 64),
+    the tool validator catches the same 1000-deep payload before the
+    body parser can trip its own default cap, and the message flipped
+    to reference the tool-schema cap. Both paths satisfy the security
+    invariant this test guards (400 + no traceback + canonical code);
+    the assertion now accepts either.
     """
     monkeypatch.setenv("RAPID_MLX_MAX_BODY_DEPTH", "0")
     app = _build_minimal_app(with_pydantic_chat=True)
@@ -429,7 +440,13 @@ def test_d_tool_recur_parser_depth_1000_returns_invalid_request_code(monkeypatch
     err = resp.json()["error"]
     assert err["type"] == "invalid_request_error"
     assert err["code"] == "invalid_request"
-    assert "parsing the body" in err["message"]
+    # Either gate must fire — accept the message from whichever won the
+    # race, but require a body-shape reference (not a raw exception dump).
+    assert (
+        "parsing the body" in err["message"]
+        or "RAPID_MLX_MAX_TOOL_SCHEMA_DEPTH" in err["message"]
+        or "nesting depth" in err["message"]
+    ), err["message"]
     assert "Traceback" not in resp.text
 
 

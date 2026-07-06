@@ -60,132 +60,76 @@
 # through to the next candidate. For a quick sanity number: dense
 # weights ≈ params × bytes_per_weight; add ~25% for KV/runtime.
 families:
-  - family: qwen3.5
-    candidates:
-      # 8-bit, 35B A3B MoE — chosen so the model itself ~never errs on
-      # the eval suite. Quant noise on a 4-bit small model makes it hard
-      # to tell "model got confused" from "rapid-mlx broke something",
-      # which is the signal pr_validate exists to catch. 8-bit + a real-
-      # capacity model isolates engine bugs cleanly.
-      - id: mlx-community/Qwen3.5-35B-A3B-8bit
-        ram_gb_required: 36
-        quality_tier: golden
+  # ------------------------------------------------------------------
+  # 0.10.2 PR-2 realignment (2026-07-06): 4 Tier-1 families with strong
+  # picks. Small variants (4B / 12B) fail tool-calling for reasons
+  # unrelated to the wire path (model 降智 — capability ceiling of the
+  # quant/size), which pollutes the correctness signal. Strong picks
+  # isolate engine bugs. Priority order per family: 8-bit first (real
+  # capacity), 4-bit / smaller fallbacks for constrained hosts.
+  # ------------------------------------------------------------------
 
   - family: qwen3.6
     candidates:
-      # PRIMARY: 8-bit, same principle as Qwen3.5-35B-A3B-8bit above —
-      # correctness tests need a precision where the model itself
-      # ~never errs so failures cleanly attribute to rapid-mlx. The
-      # 4-bit variant has a documented multi-tool capability deficit
-      # (proven empirically: Qwen3.6-27B-4bit + thinking + 2-tool
-      # composition → 4000-token natural-language ramble, no
-      # <tool_call> XML emitted; identical task on 8-bit emits both
-      # tool calls in 286 tokens). Performance measurements against
-      # the 4-bit variant belong in `bench_dflash` /
-      # `bench_suffix_decoding_integrated` / harness benchmarks, not
-      # in the correctness gate.
+      # PRIMARY: 35B A3B MoE at 8-bit — the Tier-1 Qwen 3.6 strong pick.
+      # Kept as the very first candidate so on the maintainer's M3 Ultra
+      # (which has ample headroom) this always wins the RAM-fit selection.
+      # 27B fallbacks preserved for constrained hosts and CI runners.
+      - id: mlx-community/Qwen3.6-35B-A3B-8bit
+        # 35 GB weights (MoE — all experts resident) + ~3 GB KV cache for
+        # multi-turn tool-call stress + MLX runtime overhead → 42 GB. Fits
+        # 64 GB+ M-series with room to spare; drops through on lesser hosts.
+        ram_gb_required: 42
+        quality_tier: golden
+      # FALLBACK: 27B 8-bit for hosts that can't fit 42 GB.
       - id: unsloth/Qwen3.6-27B-MLX-8bit
-        # 27B dense weights at 8-bit = ~27 GB; add KV cache for the
-        # multi-turn tool-call stress prompt (~2-4 GB) + MLX runtime
-        # overhead (~3 GB) + OS headroom → 36 GB. Underestimating
-        # here would OOM at boot instead of falling through to the
-        # 4-bit fallback. (For comparison, the qwen3.5-35B-A3B-8bit
-        # entry above carries 35 GB of MoE weights — all experts must
-        # be resident even though only ~3B are active per token — so
-        # 36 GB is also the floor there, not slack.)
         ram_gb_required: 36
         quality_tier: golden
-      # FALLBACK: 4-bit retained so hosts that can't fit the 8-bit
-      # variant (≤32 GB RAM — older M2 Pro / base M3) don't silently
-      # drop the qwen3.6 family from the matrix entirely. Selection
-      # logic walks candidates top-to-bottom and picks the first that
-      # fits. On the maintainer's M3 Ultra and any 64 GB+ M-series the
-      # 8-bit entry wins. On constrained hosts the 4-bit entry runs
-      # and the matrix degrades gracefully. CI runners are 8-bit-small
-      # only (separate workflow), so this fallback never fires there.
-      #
-      # Tagged `quality_tier: smoke` (not `golden`) precisely because
-      # `smoke` is the one tier the runner uses to skip agents marked
-      # `skip_for_smoke: true` — today that's just `pydantic_ai`, which
-      # is the multi-tool composition test that EMPIRICALLY rambles
-      # 4000 tokens without emitting <tool_call> XML on this exact
-      # quant + thinking combo (see top-of-file note). Skipping it on
-      # the constrained-host fallback is the WHOLE POINT of this PR's
-      # policy: don't gate the PR on a test that can't pass at this
-      # precision. anthropic_sdk + langchain still run on the 4-bit
-      # fallback; only the test the model can't pass is suppressed.
+      # FALLBACK: 27B 4-bit for very constrained hosts. Tagged ``smoke``
+      # because the 4-bit + multi-tool combo empirically rambles without
+      # emitting <tool_call> XML (see PR #208 notes).
       - id: mlx-community/Qwen3.6-27B-4bit
         ram_gb_required: 18
         quality_tier: smoke
 
-  - family: diffusion-gemma
+  - family: gemma4
     candidates:
-      # Added 2026-06-16 (v0.7.15) to close the DiffusionEngine coverage
-      # gap. ``modality: text-diffusion`` aliases route via
-      # ``vllm_mlx/runtime/diffusion_lane.py::DiffusionEngine`` →
-      # ``mlx_vlm.generate.diffusion.stream_diffusion_generate`` —
-      # completely independent from BatchedEngine (the AR LLM path the
-      # other families cover). Without an entry here, any PR that
-      # silently breaks ``server.load_model``'s modality dispatch or
-      # any DiffusionEngine internals would slip through pr_validate.
-      # Live v0.7.15 e2e (subagent ``a89586066e0144bf2``): 154 s
-      # download+boot+request, coherent ``"Hello there!"`` response in
-      # 4 tokens, server log clean, mmap released on shutdown.
-      #
-      # Quant choice (deviates from the project's 8-bit-only policy
-      # documented above): we use 4-bit here because the test purpose
-      # is ENGINE-PATH coverage, NOT model correctness — DiffusionGemma
-      # is a Gemma-4 derivative and inherits the instruction-following
-      # weaknesses that got Gemma 4 excluded above. Neither quant would
-      # cleanly pass the full agent battery; the 8-bit would just cost
-      # ~14 GB more disk and ~30-60 s more boot for the same engine-
-      # wiring signal. Tagged ``smoke`` so the multi-tool pydantic_ai
-      # test (which the model class can't pass regardless of quant) is
-      # suppressed; anthropic_sdk + langchain still run as smoke
-      # coverage of the gemma4 tool-call parser × DiffusionEngine seam.
-      #
-      # RAM: ~14 GB 4-bit weights + ~3 GB denoising canvas (256-token
-      # canvas × per-step activation) + MLX runtime overhead → 20 GB.
-      - id: mlx-community/diffusiongemma-26B-A4B-it-4bit
-        ram_gb_required: 20
-        quality_tier: smoke
-        stress_timeout_s: 1800  # text-diffusion: ~2x autoregressive per-token wall-clock
+      # PRIMARY: 31B-IT at 4-bit — the Tier-1 Gemma 4 strong pick. 12B
+      # fails tool-calling for reasons unrelated to the wire (documented
+      # in 0.10-TODO Don't do list); 31B is the smallest text-only SKU
+      # that reliably tool-calls at the router / parser layer.
+      # RAM: ~18 GB weights + ~3 GB KV + MLX overhead → 24 GB.
+      - id: mlx-community/gemma-4-31b-it-4bit
+        ram_gb_required: 24
+        quality_tier: golden
 
-  - family: harmony
+  - family: deepseek
     candidates:
-      # Added 2026-05-21 to close the router-allowlist coverage gap surfaced
-      # by Bug A (v0.6.62 tool-call streaming regression). The two families
-      # routed through OutputRouter — `gemma4` and `harmony`
-      # (vllm_mlx/engine/batched.py:_OUTPUT_ROUTER_ALLOWLIST) — were both
-      # absent from this matrix when Bug A shipped, so no PR could have
-      # caught the regression at the integration layer. Gemma 4 remains
-      # excluded (see note below — model-side instruction-following
-      # weaknesses produce agent-test flake), but gpt-oss-20b-mxfp4-q8
-      # (Harmony format) does NOT have those issues and gives us live
-      # OutputRouter coverage for the second allowlist family.
-      #
-      # Bug A's specific surface (Channel.TOOL_CALL aggregate body override)
-      # is gemma4-only at the router layer — Harmony's TokenMap does NOT
-      # set tool_call_start/tool_call_end, so harmony tool calls are
-      # extracted by HarmonyToolParser scanning commentary channel content,
-      # not via OutputRouter.feed(). What harmony DOES exercise here is the
-      # router's CONTENT/REASONING channel routing + HarmonyToolParser's
-      # streaming path end-to-end, which is the closest integration-level
-      # coverage we can get for the parser+router seam.
-      #
-      # The pure router-level invariant (single-token-flush of
-      # Channel.TOOL_CALL aggregates) is enforced by
-      # tests/test_batched_engine_output_router.py::
-      # test_router_allowlist_tool_call_routing_declared — a structural
-      # check that fails CI if anyone adds a router family without
-      # declaring how its tool calls route. That + this matrix entry are
-      # the two halves of the meta-fix.
-      #
-      # RAM: ~12 GB MXFP4-Q8 weights + ~3-4 GB KV cache for tool-call
-      # stress prompts + MLX runtime overhead → 22 GB target.
+      # PRIMARY: DeepSeek V4 Flash at 8-bit — the Tier-1 DeepSeek strong
+      # pick. Only currently-shipping Tier-1 DeepSeek MLX quant that
+      # exercises the deepseek tool-call parser + deepseek_r1 reasoning
+      # parser end-to-end.
+      # RAM: ~50 GB weights + ~4 GB KV + MLX overhead → 58 GB.
+      - id: mlx-community/DeepSeek-V4-Flash-8bit
+        ram_gb_required: 58
+        quality_tier: golden
+
+  - family: gptoss
+    candidates:
+      # PRIMARY: gpt-oss 120B MXFP4-Q8 — the Tier-1 gpt-oss strong pick.
+      # 20B lacks reasoning-channel emission on the tool-call path (proven
+      # in PR #208 validation), so the 120B strong pick is what actually
+      # exercises the Harmony ``analysis`` → reasoning_content routing +
+      # ``commentary`` tool-call extraction that Continue #8990 caught.
+      # RAM: ~65 GB weights + ~4 GB KV + MLX overhead → 74 GB.
+      - id: mlx-community/gpt-oss-120b-MXFP4-Q8
+        ram_gb_required: 74
+        quality_tier: golden
+      # FALLBACK: 20B for hosts that can't fit 74 GB. Loses reasoning-
+      # channel coverage but keeps Harmony parser + router smoke alive.
       - id: mlx-community/gpt-oss-20b-MXFP4-Q8
         ram_gb_required: 22
-        quality_tier: golden
+        quality_tier: smoke
 
 # Gemma 4 was previously listed here for orthogonal coverage (different
 # chat template + tool-call format) but observed in PR #208 validation
@@ -227,35 +171,28 @@ families:
 # ``--tool-call-parser hermes`` is redundant with the registry today
 # but documents intent at the validation surface.
 overrides:
-  "mlx-community/Qwen3.5-35B-A3B-8bit":
-    args: ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
-  # Both Qwen3.6-27B quants emit the same XML tool-call format
-  # (<tool_call><function=name>...</function></tool_call>) — verified by
-  # diffing chat_template.jinja in mlx-community and unsloth snapshots
-  # against the upstream Qwen3.6 base template. Hermes parser handles
-  # both Hermes-style JSON (<tool_call>{"name":...}</tool_call>) and
-  # the bare-XML fallback (<function=...>) via BARE_FUNCTION_PATTERN
-  # in vllm_mlx/tool_parsers/hermes_tool_parser.py, so the same
-  # override is correct for both candidates and either picked entry
-  # (8-bit primary or 4-bit fallback) parses cleanly.
+  # Qwen 3.6: qwen3_coder_xml parser handles <tool_call>...</tool_call>
+  # XML emitted by both 35B and 27B checkpoints; ``--enable-auto-tool-choice``
+  # toggles the OpenAI-style routing on top.
+  "mlx-community/Qwen3.6-35B-A3B-8bit":
+    args: ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder_xml"]
   "unsloth/Qwen3.6-27B-MLX-8bit":
     args: ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
   "mlx-community/Qwen3.6-27B-4bit":
     args: ["--enable-auto-tool-choice", "--tool-call-parser", "hermes"]
-  # Harmony parser handles both <|channel|>commentary tool-call blocks and
-  # the final-channel content for gpt-oss-20b. The auto-detect registry
-  # picks it via gpt-oss-20b-mxfp4-q8 alias profile, but the explicit override
-  # documents intent at the validation surface (mirrors the qwen3.5/3.6
-  # convention above).
+  # Gemma 4 31B — gemma4 tool-call parser (OutputRouter allowlist family).
+  "mlx-community/gemma-4-31b-it-4bit":
+    args: ["--enable-auto-tool-choice", "--tool-call-parser", "gemma4"]
+  # DeepSeek V4 Flash — deepseek tool-call parser + deepseek_r1 reasoning.
+  "mlx-community/DeepSeek-V4-Flash-8bit":
+    args: ["--enable-auto-tool-choice", "--tool-call-parser", "deepseek"]
+  # gpt-oss — Harmony parser handles both <|channel|>commentary tool-call
+  # blocks and the final-channel content. The 120B strong pick is what
+  # actually exercises the reasoning-channel routing that the 20B lacks.
+  "mlx-community/gpt-oss-120b-MXFP4-Q8":
+    args: ["--enable-auto-tool-choice", "--tool-call-parser", "harmony"]
   "mlx-community/gpt-oss-20b-MXFP4-Q8":
     args: ["--enable-auto-tool-choice", "--tool-call-parser", "harmony"]
-  # DiffusionGemma uses the gemma4 tool-call wire format (alias profile
-  # in ``vllm_mlx/aliases.json`` declares ``tool_call_parser: gemma4``;
-  # auto-detect picks it through the alias). Explicit override mirrors
-  # the qwen / harmony convention above for grep-traceability at the
-  # validation surface.
-  "mlx-community/diffusiongemma-26B-A4B-it-4bit":
-    args: ["--enable-auto-tool-choice", "--tool-call-parser", "gemma4"]
 
 # Agent integrations — each is a tests/integrations/ test_X.py script
 # we exec against the live server. The matrix is models × agents.

@@ -3,43 +3,76 @@
 
 Two matrices share this harness:
 
-* ``test_agents_matrix.py`` — 8 Tier-1 agents × 3 families (Qwen 3.6, Gemma 4,
-  gpt-oss) = 24 cells.
-* ``test_frameworks_matrix.py`` — 3 Tier-1 frameworks × 3 families = 9 cells.
+* ``test_agents_matrix.py`` — 8 Tier-1 agents × 4 families (Qwen 3.6,
+  Gemma 4, DeepSeek V4 Flash, gpt-oss 120B) = 32 cells.
+* ``test_frameworks_matrix.py`` — 3 Tier-1 frameworks × 4 families = 12 cells.
 
-Both matrices reuse the same server fixture, cheap-alias-per-family fixture,
-and assertion helpers. The fixtures never boot the server themselves — the
-operator (or CI) must have a rapid-mlx server already listening on
-``RAPID_MLX_BASE_URL`` (default ``http://localhost:8000/v1``) before running
-these tests. If no server is reachable, every test in the matrix ``skip``s
-so ``pytest tests/integrations`` never produces a false red on a clean box.
+Both matrices reuse the same server fixture (which auto-boots
+``rapid-mlx serve <alias>`` on port 8802 for the family currently under
+test), the same tool schemas, and the same channel-leak assertions.
+
+Strong-pick policy (raullen sign-off 2026-07-06, 0.10.2 PR-2)
+------------------------------------------------------------
+
+Each family's alias is the **strong pick** — the largest available
+public MLX quant that fits a 512 GB M3 Ultra and still leaves headroom
+for operator services on ports 8801 / 8772:
+
+* Qwen 3.6: ``qwen3.6-35b-8bit`` — 35 GB, Qwen3.6-35B-A3B-8bit MoE.
+* Gemma 4: ``gemma-4-31b-4bit`` — 18 GB, gemma-4-31b-it-4bit.
+* DeepSeek V4 Flash: ``deepseek-v4-flash-8bit`` — 50 GB.
+* gpt-oss 120B: ``gpt-oss-120b-mxfp4-q8`` — 65 GB (Harmony wire).
+
+Small variants (4B / 12B) fail tool-calling for reasons unrelated to
+the wire path (model 降智 — capability ceiling of the quant/size, not
+a rapid-mlx bug). Testing against strong picks isolates the integration
+signal from model-capability noise. The trade-off is longer boot time
+and per-cell wall-clock (~2-5 min boot, ~60 s per cell) — acceptable
+because this matrix runs per-integration-PR, not per-commit.
 
 Environment overrides
 ---------------------
 
-* ``RAPID_MLX_BASE_URL`` — where to point clients (default: localhost:8000/v1).
+* ``RAPID_MLX_BASE_URL`` — point at an already-running server instead of
+  auto-booting one. When set, the ``rapid_mlx_server`` fixture skips the
+  boot dance and just probes /v1/models. Handy for local dev when a
+  large model is already loaded and re-loading would waste 3-5 min.
 * ``RAPID_MLX_AGENT_MATRIX_FAMILY`` — restrict matrix to one family
-  (``qwen36`` / ``gemma4`` / ``gptoss``). Handy for CI shards.
-* ``RAPID_MLX_MATRIX_STRICT`` — if ``1``, missing-server / model-mismatch
-  raise instead of skipping. Off by default so a naive ``pytest`` run stays
-  green.
+  (``qwen36`` / ``gemma4`` / ``deepseek`` / ``gptoss``). Handy for CI
+  shards. If ``RAPID_MLX_BASE_URL`` is also set, this must match the
+  family the running server is serving (guard checks /v1/models).
+* ``RAPID_MLX_MATRIX_STRICT`` — if ``1``, missing-server / server-error /
+  degraded-cell → fail instead of skip. Off by default so a naive
+  ``pytest`` run stays green without hardware.
+* ``RAPID_MLX_MATRIX_PORT`` — port to boot on (default 8802). NEVER
+  overlap operator services on 8801 (qwen3-vl) or 8772 (holo3) — G1.
+* ``RAPID_MLX_SERVE_BIN`` — how to invoke rapid-mlx (default:
+  ``python3.12 -m vllm_mlx.cli``). Set to ``rapid-mlx`` to use the
+  installed wrapper when the wrapper points at the intended venv.
 
-Cheap-alias policy (W5 OOM budget + G11 disk)
----------------------------------------------
+Post-#1030 codex-review fold
+----------------------------
 
-The matrix boots against **small aliases only** (≤ 8B). The full 27-35B
-alias sweep is reserved for the weekly Golden Path job — never per-PR.
-This keeps the per-CI-run resident footprint under the ~50 GB-per-process
-ceiling agreed in workflow.md ``## W5`` step 4 (see the operator-services
-baseline note).
+Prior scaffold made every matrix cell skip unless the operator hand-
+booted a server. Codex #1030 flagged that as regression-hiding — a
+green run with 44/44 skipped is indistinguishable from a green run
+with 44/44 passing. The 0.10.2 PR-2 rewrite fixes this by (a) auto-
+booting a server per family and (b) elevating ``RAPID_MLX_MATRIX_STRICT``
+to the CI enforcement lever.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 import pytest
 
@@ -48,43 +81,59 @@ import pytest
 # --------------------------------------------------------------------------- #
 
 
-DEFAULT_BASE_URL = "http://localhost:8000/v1"
+DEFAULT_MATRIX_PORT = 8802
+FORBIDDEN_PORTS = frozenset({8801, 8772})  # G1: operator services
+SERVER_BOOT_TIMEOUT_S = 600  # 65B gpt-oss cold boot fits in ~5 min on M3 Ultra
+SERVER_READY_POLL_S = 3.0
+DEFAULT_TIMEOUT_S = 180  # per-cell HTTP client timeout — 35B/120B decodes are slow
 
 
 @dataclass(frozen=True)
 class FamilyAlias:
-    """A cheap-per-family alias used across the matrices."""
+    """A strong-per-family alias used across the matrices."""
 
-    family: str  # matrix column key: "qwen36" / "gemma4" / "gptoss"
+    family: str  # matrix column key: qwen36 / gemma4 / deepseek / gptoss
     alias: str  # rapid-mlx alias string (positional model arg)
-    reason: str  # why this alias — used in skip messages
+    hf_path: str  # HuggingFace repo id (for cache probing)
+    tool_call_parser: str  # documented parser (for skip-inference)
+    reasoning_parser: str  # documented reasoning parser
+    reason: str  # why this strong pick
 
 
-# Cheap per-family aliases. Kept intentionally small so the server can boot
-# them under the W5 OOM budget without evicting operator services on the
-# M3 Ultra. The 27-35B family flagships live in the Golden Path weekly job.
-#
-# ``qwen35-4b`` stands in for the Qwen 3.6 family in the small-alias matrix
-# because the smallest 3.6 SKU is 27B (a 3.6 "4B" does not exist —
-# see 0.10-TODO "Don't do list"). Qwen 3.5-4B shares tool + reasoning
-# parser families (``hermes`` / ``qwen3``) with 3.6, so it exercises the
-# same wire without loading a 15 GB weight blob per test process.
+# Strong per-family aliases (raullen 2026-07-06 sign-off). Keep in sync
+# with the ``hf_path`` fields declared in ``vllm_mlx/aliases.json``.
 _FAMILY_ALIASES: dict[str, FamilyAlias] = {
     "qwen36": FamilyAlias(
         family="qwen36",
-        # 4B stand-in for the family — see docstring above.
-        alias="qwen3.5-4b-4bit",
-        reason="Qwen 3.6 has no <8B SKU; qwen3.5-4b shares parsers",
+        alias="qwen3.6-35b-8bit",
+        hf_path="mlx-community/Qwen3.6-35B-A3B-8bit",
+        tool_call_parser="qwen3_coder_xml",
+        reasoning_parser="qwen3",
+        reason="Qwen 3.6 35B MoE strong pick (raullen sign-off 2026-07-06)",
     ),
     "gemma4": FamilyAlias(
         family="gemma4",
-        alias="gemma-4-12b-4bit",
-        reason="smallest Gemma 4 text-only alias (12B fits in ~7 GB @ 4-bit)",
+        alias="gemma-4-31b-4bit",
+        hf_path="mlx-community/gemma-4-31b-it-4bit",
+        tool_call_parser="gemma4",
+        reasoning_parser="gemma4",
+        reason="Gemma 4 31B strong pick (12B fails tool-calling — model 降智)",
+    ),
+    "deepseek": FamilyAlias(
+        family="deepseek",
+        alias="deepseek-v4-flash-8bit",
+        hf_path="mlx-community/DeepSeek-V4-Flash-8bit",
+        tool_call_parser="deepseek",
+        reasoning_parser="deepseek_r1",
+        reason="DeepSeek V4 Flash 8bit — only Tier-1 DeepSeek MLX quant on-shelf",
     ),
     "gptoss": FamilyAlias(
         family="gptoss",
-        alias="gpt-oss-20b-mxfp4-q8",
-        reason="smallest gpt-oss (20B MXFP4-Q8 ~11 GB); no <20B in the family",
+        alias="gpt-oss-120b-mxfp4-q8",
+        hf_path="mlx-community/gpt-oss-120b-MXFP4-Q8",
+        tool_call_parser="harmony",
+        reasoning_parser="harmony",
+        reason="gpt-oss 120B Harmony strong pick (20B skips reasoning channel)",
     ),
 }
 
@@ -111,13 +160,7 @@ def _strict() -> bool:
 
 
 def matrix_strict_mode() -> bool:
-    """Public accessor for ``RAPID_MLX_MATRIX_STRICT``.
-
-    Cells use this to decide whether to skip on a server / route / SDK
-    failure (default, non-strict) or fail the CI job (strict). CI shards
-    that want per-cell coverage enforcement set ``RAPID_MLX_MATRIX_STRICT=1``
-    before running the matrix.
-    """
+    """Public accessor for ``RAPID_MLX_MATRIX_STRICT``."""
     return _strict()
 
 
@@ -136,52 +179,163 @@ def strict_skip_or_fail(reason: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Server fixture
+# Server auto-boot
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture(scope="session")
-def rapid_mlx_base_url() -> str:
-    """Return the base URL of the rapid-mlx server under test."""
-    return os.environ.get("RAPID_MLX_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
-
-@pytest.fixture(scope="session")
-def rapid_mlx_server(rapid_mlx_base_url: str) -> dict[str, Any]:
-    """Verify a rapid-mlx server is reachable; return metadata.
-
-    Yields a dict with ``base_url`` and ``model_id`` (the first entry from
-    ``/v1/models``). If no server is reachable, this fixture ``skip``s the
-    dependent test unless ``RAPID_MLX_MATRIX_STRICT=1`` is set — that flag
-    turns the miss into a hard fail so CI can enforce coverage.
-    """
-    try:
-        import httpx
-    except ImportError:
-        pytest.skip("httpx not installed — matrix skipped")
-
-    try:
-        resp = httpx.get(f"{rapid_mlx_base_url}/models", timeout=3.0)
-        resp.raise_for_status()
-        data = resp.json().get("data") or []
-        if not data:
-            raise RuntimeError("empty /v1/models response")
-        model_id = data[0]["id"]
-    except Exception as exc:  # noqa: BLE001 — surface the underlying error
-        message = (
-            f"No rapid-mlx server reachable at {rapid_mlx_base_url}: {exc!r}. "
-            "Start one with `rapid-mlx serve <alias>` before running the "
-            "matrix, or set RAPID_MLX_MATRIX_STRICT=1 to hard-fail instead."
+def _matrix_port() -> int:
+    port = int(os.environ.get("RAPID_MLX_MATRIX_PORT", str(DEFAULT_MATRIX_PORT)))
+    # G1: never overlap operator services.
+    if port in FORBIDDEN_PORTS:
+        pytest.exit(
+            f"RAPID_MLX_MATRIX_PORT={port} collides with operator service "
+            f"(forbidden: {sorted(FORBIDDEN_PORTS)}). Pick another port."
         )
-        if _strict():
-            pytest.fail(message)
-        pytest.skip(message)
+    return port
 
-    return {"base_url": rapid_mlx_base_url, "model_id": model_id}
+
+def _serve_command(alias: str, port: int) -> list[str]:
+    """Return argv for ``rapid-mlx serve <alias> --port <port>``.
+
+    Defaults to ``python3.12 -m vllm_mlx.cli`` (worktree-safe: editable
+    install without wrapper indirection). Override via ``RAPID_MLX_SERVE_BIN``
+    when the ``rapid-mlx`` wrapper points at the correct venv.
+    """
+    bin_override = os.environ.get("RAPID_MLX_SERVE_BIN", "").strip()
+    if bin_override:
+        argv = bin_override.split()
+    else:
+        argv = [sys.executable, "-m", "vllm_mlx.cli"]
+    argv += ["serve", alias, "--port", str(port)]
+    return argv
+
+
+def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _wait_for_ready(port: int, timeout_s: int) -> bool:
+    """Poll /v1/models (200) until ready or timeout."""
+    import urllib.error
+    import urllib.request
+
+    deadline = time.monotonic() + timeout_s
+    url = f"http://127.0.0.1:{port}/v1/models"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:  # noqa: S310
+                if resp.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(SERVER_READY_POLL_S)
+    return False
+
+
+@dataclass
+class _ServerHandle:
+    proc: subprocess.Popen | None
+    port: int
+    base_url: str
+    model_id: str
+    log_path: Path | None
+
+
+def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
+    """Boot ``rapid-mlx serve <alias>`` on ``port`` and return handle.
+
+    Uses a log file under /tmp so operators can tail progress. Skips
+    (or fails, in strict mode) on boot failure — the matrix cell is
+    the audience, not the pytest harness.
+    """
+    if _port_in_use(port):
+        strict_skip_or_fail(
+            f"matrix port {port} already in use — refusing to clobber "
+            f"(check `lsof -i :{port}`)"
+        )
+
+    log_path = Path("/tmp") / f"rapid-mlx-matrix-{alias.family}-{port}.log"
+    log_f = open(log_path, "w")  # noqa: SIM115 — closed in shutdown
+    cmd = _serve_command(alias.alias, port)
+    try:
+        proc = subprocess.Popen(  # noqa: S603
+            cmd,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    except FileNotFoundError as exc:
+        log_f.close()
+        strict_skip_or_fail(
+            f"could not exec {cmd!r}: {exc}. Set RAPID_MLX_SERVE_BIN or "
+            f"ensure `{sys.executable} -m vllm_mlx.cli` is importable."
+        )
+        return _ServerHandle(None, port, "", "", None)  # unreachable in strict
+
+    if not _wait_for_ready(port, SERVER_BOOT_TIMEOUT_S):
+        # Best-effort teardown.
+        try:
+            proc.send_signal(2)
+            proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        log_f.close()
+        strict_skip_or_fail(
+            f"{alias.alias} did not become ready on port {port} within "
+            f"{SERVER_BOOT_TIMEOUT_S}s — see {log_path}"
+        )
+        return _ServerHandle(None, port, "", "", None)  # unreachable in strict
+
+    # Probe once more to grab the model_id the server actually reported.
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(  # noqa: S310
+            f"http://127.0.0.1:{port}/v1/models", timeout=3
+        ) as resp:
+            model_id = (json.loads(resp.read()).get("data") or [{}])[0].get("id", "")
+    except Exception:  # noqa: BLE001
+        model_id = alias.alias
+
+    return _ServerHandle(
+        proc=proc,
+        port=port,
+        base_url=f"http://127.0.0.1:{port}/v1",
+        model_id=model_id,
+        log_path=log_path,
+    )
+
+
+def _shutdown_server(handle: _ServerHandle) -> None:
+    """Best-effort SIGINT → SIGKILL teardown."""
+    proc = handle.proc
+    if proc is None:
+        return
+    try:
+        proc.send_signal(2)  # SIGINT — triggers FastAPI lifespan
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --------------------------------------------------------------------------- #
-# Family parametrization
+# Fixtures — the matrix booter
 # --------------------------------------------------------------------------- #
 
 
@@ -194,77 +348,95 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             "family_alias",
             aliases,
             ids=[a.family for a in aliases],
+            indirect=False,
+            scope="session",
         )
 
 
 @pytest.fixture(scope="session")
-def family_alias_for_active_server(
-    rapid_mlx_server: dict[str, Any],
-) -> FamilyAlias | None:
-    """Best-effort mapping from the running server's model_id → family.
+def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
+    """Yield metadata for a rapid-mlx server serving ``family_alias``.
 
-    Returns ``None`` if the running model doesn't match any known family
-    prefix — matrix tests then skip themselves so we never assert against
-    a wire the operator's booted server isn't actually running.
+    Two modes:
+
+    * **External** (env ``RAPID_MLX_BASE_URL`` set): probe /v1/models,
+      assert the reported model_id matches the family, and yield without
+      touching any subprocess. Local-dev shortcut so a large model
+      already loaded elsewhere doesn't get re-booted.
+    * **Auto-boot** (default): boot ``rapid-mlx serve <alias>`` on
+      ``RAPID_MLX_MATRIX_PORT`` (default 8802), yield, teardown at
+      session end.
+
+    Session-scoped keyed on ``family_alias`` — a new server boots for
+    each parametrized family (Qwen 3.6 → shutdown → Gemma 4 → shutdown
+    → ...). Sequential is intentional: two 30-65 GB models in memory
+    would OOM even the 512 GB M3 Ultra with operator services running.
     """
-    mid = rapid_mlx_server["model_id"].lower()
-    if mid.startswith("qwen3.6") or "qwen3.6" in mid:
-        return _FAMILY_ALIASES["qwen36"]
-    if mid.startswith("gemma-4") or "gemma-4" in mid:
-        return _FAMILY_ALIASES["gemma4"]
-    if mid.startswith("gpt-oss") or "gpt-oss" in mid:
-        return _FAMILY_ALIASES["gptoss"]
-    # Qwen 3.5 stands in for Qwen 3.6 in the small-alias matrix (see
-    # ``_FAMILY_ALIASES['qwen36'].reason``).
-    if mid.startswith("qwen3.5"):
-        return _FAMILY_ALIASES["qwen36"]
-    return None
+    port = _matrix_port()
 
+    external = os.environ.get("RAPID_MLX_BASE_URL", "").strip().rstrip("/")
+    if external:
+        import urllib.request
 
-@pytest.fixture(autouse=True)
-def _guard_family_matches_server(request: pytest.FixtureRequest) -> None:
-    """Autouse guard: skip / fail a family cell when the server model doesn't match.
-
-    Codex #1030 flagged that parametrizing every cell over all three
-    families lets a single-family server (e.g. Qwen 3.6 only) silently
-    "cover" Gemma 4 / gpt-oss cells. This guard fires per cell:
-
-    * cell fixture requests ``family_alias`` — the parametrized target;
-    * ``family_alias_for_active_server`` maps the running model → family;
-    * mismatch → ``strict_skip_or_fail`` (fail in strict, skip otherwise).
-
-    Codex #1030 round-4 finding 1: ``rapid_mlx_server`` and
-    ``family_alias_for_active_server`` are fetched **lazily** — only when
-    a cell has actually opted in by requesting ``family_alias``. Fetching
-    them unconditionally would force every existing deep-flow test in
-    ``tests/integrations/`` through the /v1/models probe, changing their
-    behavior. The lazy fetch keeps this fixture scoped to matrix cells.
-    """
-    if "family_alias" not in request.fixturenames:
+        try:
+            with urllib.request.urlopen(  # noqa: S310
+                f"{external}/models", timeout=3
+            ) as resp:
+                data = json.loads(resp.read()).get("data") or []
+            model_id = data[0]["id"] if data else ""
+        except Exception as exc:  # noqa: BLE001
+            strict_skip_or_fail(
+                f"external RAPID_MLX_BASE_URL={external} unreachable: {exc!r}"
+            )
+            return
+        yield {
+            "base_url": external,
+            "model_id": model_id,
+            "family": family_alias.family,
+            "alias": family_alias.alias,
+        }
         return
+
+    # Auto-boot mode.
+    if not _hf_cache_present(family_alias.hf_path):
+        strict_skip_or_fail(
+            f"HF cache miss for {family_alias.hf_path!r}. "
+            f"Pre-download with: python3.12 -c \"from huggingface_hub import "
+            f"snapshot_download; snapshot_download('{family_alias.hf_path}')\""
+        )
+        return
+
+    handle = _boot_server(family_alias, port)
     try:
-        cell_family: FamilyAlias = request.getfixturevalue("family_alias")
-    except pytest.FixtureLookupError:
-        return
-    # Lazy fetch — only after we know this cell opted into the family matrix.
-    server_info: dict[str, Any] = request.getfixturevalue("rapid_mlx_server")
-    active: FamilyAlias | None = request.getfixturevalue(
-        "family_alias_for_active_server"
-    )
-    if active is None:
-        strict_skip_or_fail(
-            f"cell {cell_family.family}: running model "
-            f"{server_info['model_id']!r} doesn't map to any known family "
-            f"(qwen36 / gemma4 / gptoss)."
-        )
-        return
-    if active.family != cell_family.family:
-        strict_skip_or_fail(
-            f"cell {cell_family.family}: running server is {active.family} "
-            f"({server_info['model_id']!r}) — coverage for {cell_family.family} "
-            f"belongs in a separate matrix run "
-            f"(RAPID_MLX_AGENT_MATRIX_FAMILY={cell_family.family})."
-        )
+        yield {
+            "base_url": handle.base_url,
+            "model_id": handle.model_id,
+            "family": family_alias.family,
+            "alias": family_alias.alias,
+            "server_log": str(handle.log_path) if handle.log_path else None,
+        }
+    finally:
+        _shutdown_server(handle)
+
+
+def _hf_cache_present(hf_path: str) -> bool:
+    """Return True iff the HF snapshot cache holds at least one blob for ``hf_path``.
+
+    Cheaper than a real ``snapshot_download`` probe — the matrix needs to
+    know whether an auto-boot will spend 30 seconds or 30 minutes; the
+    latter is not appropriate for a per-PR gate.
+    """
+    home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    hub = home / "hub"
+    safe = "models--" + hf_path.replace("/", "--")
+    snapshots = hub / safe / "snapshots"
+    if not snapshots.exists():
+        return False
+    for snap in snapshots.iterdir():
+        # Any file (safetensors symlink to blobs) counts.
+        for _ in snap.iterdir():
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -290,7 +462,6 @@ def assert_tool_call_shape(tool_call: dict[str, Any]) -> None:
     assert isinstance(args, str), (
         f"tool_call.function.arguments must be JSON string: {args!r}"
     )
-    # arguments should parse as JSON (may be an empty object for no-arg tools)
     try:
         json.loads(args)
     except json.JSONDecodeError as exc:
@@ -330,11 +501,12 @@ def assert_no_think_tag_leak(text: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Public API — what matrix files import
+# Public API
 # --------------------------------------------------------------------------- #
 
 
 __all__ = [
+    "DEFAULT_TIMEOUT_S",
     "FamilyAlias",
     "assert_content_nonempty",
     "assert_no_analysis_channel_leak",

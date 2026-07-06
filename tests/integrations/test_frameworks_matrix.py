@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier-1 frameworks × 3 families integration matrix (0.10.2).
+"""Tier-1 frameworks × 4 families integration matrix (0.10.2 PR-2).
 
-Three Tier-1 frameworks from ``0.10-TODO.md`` §0.10.2:
+Three Tier-1 frameworks × 4 Tier-1 families = 12 real cells. Each
+framework drives the running rapid-mlx server through its own SDK, so
+a regression in the OpenAI-compat chat completions path — or the
+tool-binding path — surfaces via the framework the operator would
+actually use in prod.
 
-* LangChain (+LangGraph — same profile / same wire)
-* PydanticAI
-* smolagents
+Frameworks:
 
-Each cell is a smoke — plain-invoke + one tool call. Deep flows live in
-the dedicated files (``test_langchain.py``, ``test_pydantic_ai_full.py``,
-``test_smolagents_full.py``); the matrix cell here proves the framework
-plumbs onto the running server's model without requiring the deep file
-to be re-run for every family.
+* LangChain (+ LangGraph — same profile) via ``langchain-openai``.
+* PydanticAI via ``pydantic_ai.models.openai.OpenAIChatModel``.
+* smolagents via ``OpenAIServerModel`` + ``ToolCallingAgent``.
+
+Deep flows live in the dedicated files (``test_langchain.py``,
+``test_pydantic_ai_full.py``, ``test_smolagents_full.py``); the matrix
+cell here proves the framework plumbs onto each Tier-1 family without
+having to re-run the deep file per family.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from typing import Any
 import pytest
 
 from tests.integrations.conftest import (
+    DEFAULT_TIMEOUT_S,
     FamilyAlias,
     assert_content_nonempty,
     assert_no_analysis_channel_leak,
@@ -36,12 +42,7 @@ from tests.integrations.conftest import (
 
 
 class TestLangChain:
-    """LangChain / LangGraph — plain invoke + one tool call.
-
-    LangGraph builds directly on ``langchain-openai``'s ``ChatOpenAI`` — a
-    single profile covers both. LangGraph-specific StateGraph tests would
-    add covered lines but no risk-of-regression signal; skipped here.
-    """
+    """LangChain / LangGraph — plain invoke + bind_tools tool call."""
 
     def test_smoke(
         self,
@@ -61,24 +62,28 @@ class TestLangChain:
             api_key="not-needed",
             temperature=0.0,
             max_tokens=256,
+            timeout=DEFAULT_TIMEOUT_S,
         )
 
         # Plain invoke — confirm the model answers over the wire.
         try:
             r = llm.invoke([HumanMessage(content="Reply with just OK.")])
         except Exception as exc:  # noqa: BLE001
-            # Codex #1030 finding 4: a wired-server failure on the same
-            # /v1/chat/completions path LangChain drives is a regression.
-            # Strict CI fails; local dev skips.
             strict_skip_or_fail(
                 f"langchain/{family_alias.family}: plain invoke failed: {exc}"
             )
-        content = r.content or ""
+            return
+        content = getattr(r, "content", "") or ""
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
         assert_content_nonempty(content, ctx=f"langchain/{family_alias.family}")
         assert_no_think_tag_leak(content)
         assert_no_analysis_channel_leak(content)
 
-        # Tool call — confirm the bind_tools path plumbs onto rapid-mlx.
+        # Tool call — confirm bind_tools path plumbs onto rapid-mlx.
         @tool
         def get_weather(city: str) -> str:
             """Get weather for a city."""
@@ -90,25 +95,18 @@ class TestLangChain:
                 [HumanMessage(content="What's the weather in Tokyo? Use the tool.")]
             )
         except Exception as exc:  # noqa: BLE001
-            # Codex #1030 finding 4: strict CI must fail on a real bind_tools
-            # regression — one of the two most common LangChain agent paths.
             strict_skip_or_fail(
                 f"langchain/{family_alias.family}: tool invoke failed: {exc}"
             )
+            return
         tool_calls = getattr(r, "tool_calls", None) or []
         if not tool_calls:
-            # Codex #1030 round-2 finding 2: strict CI must catch the case
-            # where LangChain's bind_tools path stops surfacing tool_calls —
-            # that's exactly the regression a Tier-1 framework matrix cell
-            # is meant to gate. Local dev on a small model still skips.
             strict_skip_or_fail(
-                f"langchain/{family_alias.family}: model returned no tool_calls "
-                f"on bind_tools path — strict CI treats this as a wire "
-                f"regression on the LangChain tool route."
+                f"langchain/{family_alias.family}: bind_tools returned no "
+                f"tool_calls — wire regression on the LangChain tool route."
             )
-            return  # unreachable in strict; explicit for local runs
+            return
         tc = tool_calls[0]
-        # LangChain returns tool_calls as dicts with name/args/id.
         tc_dict = {
             "id": tc.get("id") or "call_lc_smoke",
             "type": "function",
@@ -120,6 +118,7 @@ class TestLangChain:
         assert_tool_call_shape(tc_dict)
         assert tc["name"] == "get_weather", tc
         assert "city" in tc["args"], tc
+        assert "tokyo" in tc["args"]["city"].lower(), tc
 
 
 # --------------------------------------------------------------------------- #
@@ -128,7 +127,7 @@ class TestLangChain:
 
 
 class TestPydanticAI:
-    """PydanticAI — plain run + structured output smoke."""
+    """PydanticAI — plain run + tool call via ``@agent.tool_plain``."""
 
     def test_smoke(
         self,
@@ -150,18 +149,42 @@ class TestPydanticAI:
             ),
         )
         agent = Agent(model)
+
         try:
             result = agent.run_sync("Reply with just OK.")
         except Exception as exc:  # noqa: BLE001
-            # Codex #1030 finding 4: strict CI must fail on a real regression
-            # in the PydanticAI run_sync path.
             strict_skip_or_fail(
                 f"pydantic-ai/{family_alias.family}: run_sync failed: {exc}"
             )
+            return
         content = (result.output or "").strip()
         assert_content_nonempty(content, ctx=f"pydantic-ai/{family_alias.family}")
         assert_no_think_tag_leak(content)
         assert_no_analysis_channel_leak(content)
+
+        # Tool call — pydantic_ai routes tool calls via @agent.tool.
+        tool_agent = Agent(model)
+
+        @tool_agent.tool_plain
+        def get_weather(city: str) -> str:  # noqa: ARG001 — invoked by agent
+            """Get weather for a city."""
+            return f"sunny in {city}"
+
+        try:
+            result = tool_agent.run_sync(
+                "What's the weather in Tokyo? Use the get_weather tool."
+            )
+        except Exception as exc:  # noqa: BLE001
+            strict_skip_or_fail(
+                f"pydantic-ai/{family_alias.family}: tool run failed: {exc}"
+            )
+            return
+        # PydanticAI folds the tool result into ``.output`` — confirm the
+        # answer references the tool's return.
+        answer = (result.output or "").lower()
+        assert_content_nonempty(answer, ctx=f"pydantic-ai/{family_alias.family}/tool")
+        assert_no_think_tag_leak(answer)
+        assert_no_analysis_channel_leak(answer)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,14 +193,7 @@ class TestPydanticAI:
 
 
 class TestSmolagents:
-    """smolagents — ToolCallingAgent with a real tool.
-
-    Codex #1030 round-3 finding 2: an empty ``tools=[]`` ToolCallingAgent
-    doesn't actually exercise the tool-calling path the docstring claims
-    to smoke. A ``final_answer`` tool + a math helper give the agent a
-    real routing decision — a wire regression on the smolagents tool
-    format now surfaces as a hard red instead of a silent "plain reply".
-    """
+    """smolagents — ToolCallingAgent with a real Tool."""
 
     def test_smoke(
         self,
@@ -210,11 +226,12 @@ class TestSmolagents:
         )
         agent = ToolCallingAgent(tools=[GetWeatherTool()], model=model, max_steps=3)
         try:
-            answer = agent.run("What's the weather in Tokyo? Use the tool.")
+            answer = agent.run("What's the weather in Tokyo? Use the get_weather tool.")
         except Exception as exc:  # noqa: BLE001
-            # Strict CI must fail on a real regression in the smolagents
-            # tool-routing path — this is the whole point of a framework cell.
-            strict_skip_or_fail(f"smolagents/{family_alias.family}: run failed: {exc}")
+            strict_skip_or_fail(
+                f"smolagents/{family_alias.family}: run failed: {exc}"
+            )
+            return
         content = str(answer)
         assert_content_nonempty(content, ctx=f"smolagents/{family_alias.family}")
         assert_no_think_tag_leak(content)
