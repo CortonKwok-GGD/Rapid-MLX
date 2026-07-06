@@ -91,14 +91,28 @@ DEFAULT_TIMEOUT_S = 180  # per-cell HTTP client timeout — 35B/120B decodes are
 
 @dataclass(frozen=True)
 class FamilyAlias:
-    """A strong-per-family alias used across the matrices."""
+    """A strong-per-family alias used across the matrices.
+
+    ``serve_args`` are the extra CLI flags appended to
+    ``rapid-mlx serve <alias>`` at auto-boot time. Even though the
+    alias registry (``vllm_mlx/aliases.json``) auto-detects the parser,
+    passing the flags explicitly is defense-in-depth: if a future PR
+    silently regresses the auto-detect table, the matrix is still
+    booting with the correct parser wired at the CLI layer.
+
+    Codex #1033 round-3 BLOCKING #1 fold: without this, the matrix
+    booted with defaults on the auto-detect path and a table regression
+    would surface as a tool-call cell fail instead of an
+    auto-detect-layer red.
+    """
 
     family: str  # matrix column key: qwen36 / gemma4 / deepseek / gptoss
     alias: str  # rapid-mlx alias string (positional model arg)
     hf_path: str  # HuggingFace repo id (for cache probing)
-    tool_call_parser: str  # documented parser (for skip-inference)
+    tool_call_parser: str  # documented parser (for skip-inference + serve_args)
     reasoning_parser: str  # documented reasoning parser
     reason: str  # why this strong pick
+    serve_args: tuple[str, ...] = ()  # extra CLI flags appended to serve command
 
 
 # Strong per-family aliases (raullen 2026-07-06 sign-off). Keep in sync
@@ -111,6 +125,11 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="qwen3_coder_xml",
         reasoning_parser="qwen3",
         reason="Qwen 3.6 35B MoE strong pick (raullen sign-off 2026-07-06)",
+        serve_args=(
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder_xml",
+        ),
     ),
     "gemma4": FamilyAlias(
         family="gemma4",
@@ -119,6 +138,11 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="gemma4",
         reasoning_parser="gemma4",
         reason="Gemma 4 31B strong pick (12B fails tool-calling — model 降智)",
+        serve_args=(
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "gemma4",
+        ),
     ),
     "deepseek": FamilyAlias(
         family="deepseek",
@@ -127,6 +151,11 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="deepseek",
         reasoning_parser="deepseek_r1",
         reason="DeepSeek V4 Flash 8bit — only Tier-1 DeepSeek MLX quant on-shelf",
+        serve_args=(
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "deepseek",
+        ),
     ),
     "gptoss": FamilyAlias(
         family="gptoss",
@@ -135,6 +164,11 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="harmony",
         reasoning_parser="harmony",
         reason="gpt-oss 120B Harmony strong pick (20B skips reasoning channel)",
+        serve_args=(
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "harmony",
+        ),
     ),
 }
 
@@ -205,8 +239,8 @@ def _matrix_port() -> int:
     return port
 
 
-def _serve_command(alias: str, port: int) -> list[str]:
-    """Return argv for ``rapid-mlx serve <alias> --port <port>``.
+def _serve_command(alias: FamilyAlias, port: int) -> list[str]:
+    """Return argv for ``rapid-mlx serve <alias> --port <port> <extra_args>``.
 
     Defaults to ``python3.12 -m vllm_mlx.cli`` (worktree-safe: editable
     install without wrapper indirection). Override via ``RAPID_MLX_SERVE_BIN``
@@ -216,13 +250,19 @@ def _serve_command(alias: str, port: int) -> list[str]:
     ``RAPID_MLX_SERVE_BIN='/opt/homebrew/opt/python@3.12/bin/python3.12 -m vllm_mlx.cli'``
     or an argv element containing a space parses correctly. Plain
     ``str.split`` would tokenise on the space inside a quoted path.
+
+    Codex #1033 round-3 BLOCKING #1: append ``alias.serve_args`` (the
+    per-family --enable-auto-tool-choice / --tool-call-parser flags)
+    so the matrix boots with the intended parser wired at the CLI
+    layer, not silently relying on the auto-detect table.
     """
     bin_override = os.environ.get("RAPID_MLX_SERVE_BIN", "").strip()
     if bin_override:
         argv = shlex.split(bin_override)
     else:
         argv = [sys.executable, "-m", "vllm_mlx.cli"]
-    argv += ["serve", alias, "--port", str(port)]
+    argv += ["serve", alias.alias, "--port", str(port)]
+    argv += list(alias.serve_args)
     return argv
 
 
@@ -284,7 +324,7 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
         )
 
     log_path = Path("/tmp") / f"rapid-mlx-matrix-{alias.family}-{port}.log"
-    cmd = _serve_command(alias.alias, port)
+    cmd = _serve_command(alias, port)
     proc = None
     with open(log_path, "w") as log_f:
         try:
@@ -421,9 +461,12 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
     each parametrized family (Qwen 3.6 → shutdown → Gemma 4 → shutdown
     → ...). Sequential is intentional: two 30-65 GB models in memory
     would OOM even the 512 GB M3 Ultra with operator services running.
-    """
-    port = _matrix_port()
 
+    Codex #1033 round-3 NIT: resolve ``_matrix_port`` only in the auto-
+    boot branch — external-server mode never boots on it, so a bad
+    ``RAPID_MLX_MATRIX_PORT`` shouldn't crash a local dev run that
+    pointed at an already-running server.
+    """
     external = os.environ.get("RAPID_MLX_BASE_URL", "").strip().rstrip("/")
     if external:
         import urllib.request
@@ -460,7 +503,9 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
         }
         return
 
-    # Auto-boot mode.
+    # Auto-boot mode — port only needed on this branch.
+    port = _matrix_port()
+
     if not _hf_cache_present(family_alias.hf_path):
         strict_skip_or_fail(
             f"HF weight cache miss for {family_alias.hf_path!r} "
@@ -497,6 +542,10 @@ def _hf_cache_present(hf_path: str) -> bool:
     inside the pytest lifespan — turning a per-PR gate into an hours-
     long fetch. Require at least one weight-format file (.safetensors,
     .npz, .bin, .gguf) before declaring cache present.
+
+    Codex #1033 round-3 BLOCKING #2: use ``rglob`` so a snapshot that
+    stores weights in subdirectories (some HF repos use a ``weights/``
+    or per-shard subdir layout) isn't falsely reported as missing.
     """
     home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
     hub = home / "hub"
@@ -505,12 +554,14 @@ def _hf_cache_present(hf_path: str) -> bool:
     if not snapshots.exists():
         return False
     for snap in snapshots.iterdir():
-        for entry in snap.iterdir():
+        # rglob catches weights that a repo lays out under sub-dirs
+        # (e.g. ``model.safetensors.index.json`` pointing at
+        # ``shards/model-00001-of-00N.safetensors``).
+        for entry in snap.rglob("*"):
+            if not entry.is_file() and not entry.is_symlink():
+                continue
             name = entry.name.lower()
             if name.endswith(_WEIGHT_SUFFIXES):
-                # Symlinks are typical (HF layout); resolve and check
-                # the pointed-to blob really exists and is non-empty
-                # (a broken symlink or a zero-byte blob is not a hit).
                 try:
                     resolved = entry.resolve(strict=True)
                     if resolved.stat().st_size > 0:
