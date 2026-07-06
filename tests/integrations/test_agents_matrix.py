@@ -409,6 +409,14 @@ class TestStreamingDeltas:
     without dropping tokens or leaking channel markers into deltas.
     Split off from per-agent cells because streaming validation is
     orthogonal to tool-call routing.
+
+    Codex #1033 round-4 BLOCKING #2: leak assertions run on the
+    per-delta text AND on the final assembled content. A server that
+    leaks ``<think>`` / ``<|channel|>analysis`` mid-stream but strips
+    them from the assembled final object would previously pass — a
+    real regression (mid-stream leaks are visible to a client that
+    renders as tokens arrive). The concatenated ``streamed_text`` gates
+    that.
     """
 
     def test_stream_deltas(
@@ -417,6 +425,7 @@ class TestStreamingDeltas:
         family_alias: FamilyAlias,
     ) -> None:
         client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
+        streamed_text = ""
         try:
             events: list[str] = []
             with client.chat.completions.stream(
@@ -427,6 +436,13 @@ class TestStreamingDeltas:
             ) as stream:
                 for event in stream:
                     events.append(getattr(event, "type", "unknown"))
+                    # Accumulate content deltas so per-token leaks
+                    # surface even if the final object was scrubbed.
+                    delta = getattr(event, "delta", None)
+                    if isinstance(delta, str):
+                        streamed_text += delta
+                        assert_no_think_tag_leak(delta)
+                        assert_no_analysis_channel_leak(delta)
                 final = stream.get_final_completion()
         except wire_errors as exc:
             strict_skip_or_fail(
@@ -438,6 +454,10 @@ class TestStreamingDeltas:
             pytest.skip("openai SDK too old for .stream context manager")
             return
         assert events, "no stream events collected"
+        # Concatenated-delta gate: catches leaks that were split across
+        # deltas so no single delta contained the marker literally.
+        assert_no_think_tag_leak(streamed_text)
+        assert_no_analysis_channel_leak(streamed_text)
         text = _extract_text_from_message(final.choices[0].message)
         assert_content_nonempty(text, ctx=f"stream/{family_alias.family}")
         assert_no_think_tag_leak(text)

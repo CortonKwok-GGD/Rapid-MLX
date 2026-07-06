@@ -94,25 +94,32 @@ class FamilyAlias:
     """A strong-per-family alias used across the matrices.
 
     ``serve_args`` are the extra CLI flags appended to
-    ``rapid-mlx serve <alias>`` at auto-boot time. Even though the
-    alias registry (``vllm_mlx/aliases.json``) auto-detects the parser,
-    passing the flags explicitly is defense-in-depth: if a future PR
-    silently regresses the auto-detect table, the matrix is still
-    booting with the correct parser wired at the CLI layer.
+    ``rapid-mlx serve <alias>`` at auto-boot time. **Empty by default** —
+    the matrix exercises the same ``rapid-mlx serve <alias>`` invocation
+    that PyPI / Homebrew users run, so the alias-auto-detect table in
+    ``vllm_mlx/aliases.json`` is under test. A regression in
+    auto-detect surfaces as a matrix cell red.
 
-    Codex #1033 round-3 BLOCKING #1 fold: without this, the matrix
-    booted with defaults on the auto-detect path and a table regression
-    would surface as a tool-call cell fail instead of an
-    auto-detect-layer red.
+    Populate ``serve_args`` (via ``RAPID_MLX_MATRIX_EXPLICIT_PARSER=1``
+    env override, see ``_serve_command``) to belt-and-braces the flags
+    at the CLI layer — useful for a second matrix shard that isolates
+    engine bugs from auto-detect bugs. Not the default.
+
+    Codex #1033 round-3 → round-4 evolution: round-3 wanted the explicit
+    parser flags (defense-in-depth); round-4 pushed back that the
+    matrix must also cover the naive-user auto-detect path. The
+    resolution is: default = auto-detect (the naive-user path);
+    ``RAPID_MLX_MATRIX_EXPLICIT_PARSER=1`` env flips to belt-and-braces
+    for a separate shard.
     """
 
     family: str  # matrix column key: qwen36 / gemma4 / deepseek / gptoss
     alias: str  # rapid-mlx alias string (positional model arg)
     hf_path: str  # HuggingFace repo id (for cache probing)
-    tool_call_parser: str  # documented parser (for skip-inference + serve_args)
+    tool_call_parser: str  # documented parser (for skip-inference + explicit flags)
     reasoning_parser: str  # documented reasoning parser
     reason: str  # why this strong pick
-    serve_args: tuple[str, ...] = ()  # extra CLI flags appended to serve command
+    explicit_serve_args: tuple[str, ...] = ()  # opt-in override — see _serve_command
 
 
 # Strong per-family aliases (raullen 2026-07-06 sign-off). Keep in sync
@@ -125,7 +132,7 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="qwen3_coder_xml",
         reasoning_parser="qwen3",
         reason="Qwen 3.6 35B MoE strong pick (raullen sign-off 2026-07-06)",
-        serve_args=(
+        explicit_serve_args=(
             "--enable-auto-tool-choice",
             "--tool-call-parser",
             "qwen3_coder_xml",
@@ -138,7 +145,7 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="gemma4",
         reasoning_parser="gemma4",
         reason="Gemma 4 31B strong pick (12B fails tool-calling — model 降智)",
-        serve_args=(
+        explicit_serve_args=(
             "--enable-auto-tool-choice",
             "--tool-call-parser",
             "gemma4",
@@ -151,7 +158,7 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="deepseek",
         reasoning_parser="deepseek_r1",
         reason="DeepSeek V4 Flash 8bit — only Tier-1 DeepSeek MLX quant on-shelf",
-        serve_args=(
+        explicit_serve_args=(
             "--enable-auto-tool-choice",
             "--tool-call-parser",
             "deepseek",
@@ -164,7 +171,7 @@ _FAMILY_ALIASES: dict[str, FamilyAlias] = {
         tool_call_parser="harmony",
         reasoning_parser="harmony",
         reason="gpt-oss 120B Harmony strong pick (20B skips reasoning channel)",
-        serve_args=(
+        explicit_serve_args=(
             "--enable-auto-tool-choice",
             "--tool-call-parser",
             "harmony",
@@ -240,7 +247,7 @@ def _matrix_port() -> int:
 
 
 def _serve_command(alias: FamilyAlias, port: int) -> list[str]:
-    """Return argv for ``rapid-mlx serve <alias> --port <port> <extra_args>``.
+    """Return argv for ``rapid-mlx serve <alias> --port <port> [extra]``.
 
     Defaults to ``python3.12 -m vllm_mlx.cli`` (worktree-safe: editable
     install without wrapper indirection). Override via ``RAPID_MLX_SERVE_BIN``
@@ -248,13 +255,15 @@ def _serve_command(alias: FamilyAlias, port: int) -> list[str]:
 
     Codex #1033 round-1 NIT #2: use ``shlex.split`` so a quoted path like
     ``RAPID_MLX_SERVE_BIN='/opt/homebrew/opt/python@3.12/bin/python3.12 -m vllm_mlx.cli'``
-    or an argv element containing a space parses correctly. Plain
-    ``str.split`` would tokenise on the space inside a quoted path.
+    or an argv element containing a space parses correctly.
 
-    Codex #1033 round-3 BLOCKING #1: append ``alias.serve_args`` (the
-    per-family --enable-auto-tool-choice / --tool-call-parser flags)
-    so the matrix boots with the intended parser wired at the CLI
-    layer, not silently relying on the auto-detect table.
+    Codex #1033 round-3 → round-4 evolution: the default is now the
+    **naive-user command** — plain ``serve <alias> --port <port>``, no
+    extra flags. This exercises the alias auto-detect table that PyPI /
+    Homebrew users hit. Set ``RAPID_MLX_MATRIX_EXPLICIT_PARSER=1`` to
+    append the per-family ``explicit_serve_args`` (``--enable-auto-tool-
+    choice`` + ``--tool-call-parser <parser>``) — useful for a CI shard
+    that isolates engine bugs from auto-detect bugs.
     """
     bin_override = os.environ.get("RAPID_MLX_SERVE_BIN", "").strip()
     if bin_override:
@@ -262,7 +271,8 @@ def _serve_command(alias: FamilyAlias, port: int) -> list[str]:
     else:
         argv = [sys.executable, "-m", "vllm_mlx.cli"]
     argv += ["serve", alias.alias, "--port", str(port)]
-    argv += list(alias.serve_args)
+    if os.environ.get("RAPID_MLX_MATRIX_EXPLICIT_PARSER", "").strip() == "1":
+        argv += list(alias.explicit_serve_args)
     return argv
 
 
@@ -344,13 +354,20 @@ def _boot_server(alias: FamilyAlias, port: int) -> _ServerHandle:
     # fd on the log file, so parent-side fd is safely released.
 
     if not _wait_for_ready(port, SERVER_BOOT_TIMEOUT_S):
-        # Best-effort teardown.
+        # Best-effort teardown — codex #1033 round-4 BLOCKING #5: after
+        # ``proc.kill()`` reap the child with ``proc.wait()`` so a boot-
+        # timeout doesn't leave a zombie process; mirrors the normal
+        # ``_shutdown_server`` path.
         try:
             proc.send_signal(2)
             proc.wait(timeout=10)
         except Exception:  # noqa: BLE001
             try:
                 proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
             except Exception:  # noqa: BLE001
                 pass
         strict_skip_or_fail(

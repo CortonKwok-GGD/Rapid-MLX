@@ -201,13 +201,15 @@ class TestPydanticAI:
                 f"invoked despite the tool prompt. Answer was: {answer[:120]!r}"
             )
             return
-        # If we did loop through the tool, the assembled answer should
-        # reference the tool's return value shape (``sunny`` in ``tokyo``).
-        # A pure-inline answer with an ignored tool result would fail this.
-        assert "sunny" in answer or "tokyo" in answer, (
+        # Codex #1033 round-4 BLOCKING #3: require BOTH the tool-return
+        # marker (``sunny``) AND the requested city (``tokyo``). Using
+        # OR let an answer that merely mentioned Tokyo pass even though
+        # it ignored the tool's ``sunny in <city>`` payload — a broken
+        # tool-loop failure mode this cell is exactly here to catch.
+        assert "sunny" in answer and "tokyo" in answer, (
             f"pydantic-ai/{family_alias.family}: tool was called "
             f"({tool_invocations['count']}x) but answer doesn't reference the "
-            f"tool's return: {answer[:200]!r}"
+            f"tool's return (need both 'sunny' AND 'tokyo'): {answer[:200]!r}"
         )
 
 
@@ -217,7 +219,15 @@ class TestPydanticAI:
 
 
 class TestSmolagents:
-    """smolagents — ToolCallingAgent with a real Tool."""
+    """smolagents — ToolCallingAgent with a real Tool.
+
+    Codex #1033 round-4 BLOCKING #4: assert ``GetWeatherTool.forward``
+    actually ran (invocation counter on the tool instance) and that
+    the final answer references the tool's return (``sunny`` in
+    ``tokyo``). Without both, an inline model reply with broken tool
+    routing would still pass — the whole point of a framework tool
+    cell is the tool-loop regression gate.
+    """
 
     def test_smoke(
         self,
@@ -228,6 +238,11 @@ class TestSmolagents:
             from smolagents import OpenAIServerModel, Tool, ToolCallingAgent
         except ImportError:
             pytest.skip("smolagents not installed — cell deferred")
+
+        # Invocation counter kept on the outer scope so the smolagents
+        # ``Tool`` subclass (which the SDK wraps) can bump it inside
+        # forward() without needing a mutable class attribute.
+        invocations: dict[str, int] = {"count": 0}
 
         class GetWeatherTool(Tool):
             name = "get_weather"
@@ -241,6 +256,7 @@ class TestSmolagents:
             output_type = "string"
 
             def forward(self, city: str) -> str:  # type: ignore[override]
+                invocations["count"] += 1
                 return f"sunny in {city}"
 
         model = OpenAIServerModel(
@@ -254,7 +270,23 @@ class TestSmolagents:
         except Exception as exc:  # noqa: BLE001
             strict_skip_or_fail(f"smolagents/{family_alias.family}: run failed: {exc}")
             return
-        content = str(answer)
+        content = str(answer).lower()
         assert_content_nonempty(content, ctx=f"smolagents/{family_alias.family}")
         assert_no_think_tag_leak(content)
         assert_no_analysis_channel_leak(content)
+        if invocations["count"] == 0:
+            strict_skip_or_fail(
+                f"smolagents/{family_alias.family}: get_weather.forward was "
+                f"never called despite the tool prompt. Answer was: "
+                f"{content[:120]!r}"
+            )
+            return
+        # Answer must reference the tool's return — both markers so an
+        # answer that merely echoes ``tokyo`` without touching the tool
+        # result can't slip through.
+        assert "sunny" in content and "tokyo" in content, (
+            f"smolagents/{family_alias.family}: tool was called "
+            f"({invocations['count']}x) but final answer doesn't reference "
+            f"the tool's return (need both 'sunny' AND 'tokyo'): "
+            f"{content[:200]!r}"
+        )
