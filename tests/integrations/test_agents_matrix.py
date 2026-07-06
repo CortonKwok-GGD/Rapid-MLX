@@ -480,6 +480,21 @@ class TestStreamingDeltas:
         # deltas so no single delta contained the marker literally.
         assert_no_think_tag_leak(streamed_text)
         assert_no_analysis_channel_leak(streamed_text)
+        # Codex #1033 round-6 BLOCKING #1: require non-empty assistant
+        # content. If the model never emitted visible content — e.g. a
+        # reasoning model that spent all max_tokens on the analysis
+        # channel and never surfaced anything for the user — that's a
+        # regression signal (raise max_tokens if the model needs more
+        # reasoning budget; the wire itself should never yield zero
+        # deltas on a "count to three" prompt).
+        if not streamed_text.strip():
+            strict_skip_or_fail(
+                f"stream/{family_alias.family}: stream produced no visible "
+                f"assistant content in {len(events)} events (all deltas were "
+                f"reasoning_content or empty). Model may be stuck in the "
+                f"reasoning channel — raise max_tokens or investigate."
+            )
+            return
         # Assembled-final gate — only when the SDK gave us one. On
         # gpt-oss reasoning-heavy models that hit max_tokens mid-
         # reasoning, the per-delta gates above are the only assertion

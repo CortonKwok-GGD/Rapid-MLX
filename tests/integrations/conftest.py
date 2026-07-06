@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -582,6 +583,15 @@ def rapid_mlx_server(family_alias: FamilyAlias) -> Iterator[dict[str, Any]]:
 # / tokenizer files alone don't — codex #1033 round-1 BLOCKING #3.
 _WEIGHT_SUFFIXES = (".safetensors", ".npz", ".bin", ".gguf")
 
+# HF sharded-weight filename pattern: ``model-00007-of-00033.safetensors``,
+# ``pytorch_model-00007-of-00033.bin``, etc. Any single shard we find
+# tells us there are ``N`` total shards, and we can verify all are present.
+# Codex #1033 round-6 BLOCKING #2 fold.
+_SHARD_FILENAME_RE = re.compile(
+    r"^(?P<stem>[\w.\-]+?)-(?P<idx>\d+)-of-(?P<total>\d+)"
+    r"(?P<ext>\.safetensors|\.npz|\.bin|\.gguf)$"
+)
+
 
 def _resolve_hf_hub_cache() -> Path:
     """Return the HF hub cache root, honoring the standard env vars.
@@ -612,23 +622,21 @@ def _resolve_hf_hub_cache() -> Path:
 
 
 def _hf_cache_present(hf_path: str) -> bool:
-    """Return True iff the HF snapshot cache holds at least one weight file.
+    """Return True iff a COMPLETE snapshot is on disk.
 
-    Codex #1033 round-1 BLOCKING #3: the earlier "any file counts"
-    heuristic passed on a partial snapshot (config.json + tokenizer.json
-    only) and auto-boot would then trigger a 50-65 GB weight download
-    inside the pytest lifespan — turning a per-PR gate into an hours-
-    long fetch. Require at least one weight-format file (.safetensors,
-    .npz, .bin, .gguf) before declaring cache present.
-
-    Codex #1033 round-3 BLOCKING #2: use ``rglob`` so a snapshot that
-    stores weights in subdirectories (some HF repos use a ``weights/``
-    or per-shard subdir layout) isn't falsely reported as missing.
-
-    Codex #1033 round-5 BLOCKING #2: honor the documented HF cache
-    env vars (``HF_HUB_CACHE``, ``HUGGINGFACE_HUB_CACHE``, ``HF_HOME``)
-    via ``huggingface_hub.constants.HF_HUB_CACHE`` — a strict matrix
-    job with a relocated cache no longer skips before boot.
+    Codex #1033 round-1 → round-6 evolution:
+    * round-1 BLOCKING #3: reject snapshots that only carry
+      config/tokenizer files — require at least one weight file.
+    * round-3 BLOCKING #2: use ``rglob`` so subdir weight layouts don't
+      falsely miss.
+    * round-5 BLOCKING #2: honor ``HF_HUB_CACHE`` / ``HUGGINGFACE_HUB_CACHE``.
+    * round-6 BLOCKING #2 (this fold): a *partial* sharded snapshot
+      (say 8 of 33 safetensors complete) previously passed because the
+      loop returned True on the first present weight. Now we read
+      ``model.safetensors.index.json`` when present and require every
+      referenced shard to exist on disk with a non-zero resolved size.
+      Snapshots without an index (single-file models) still pass on
+      the "at least one weight" rule.
     """
     hub = _resolve_hf_hub_cache()
     safe = "models--" + hf_path.replace("/", "--")
@@ -636,16 +644,88 @@ def _hf_cache_present(hf_path: str) -> bool:
     if not snapshots.exists():
         return False
     for snap in snapshots.iterdir():
-        # rglob catches weights that a repo lays out under sub-dirs
-        # (e.g. ``model.safetensors.index.json`` pointing at
-        # ``shards/model-00001-of-00N.safetensors``).
+        if not snap.is_dir():
+            continue
+        # Prefer the sharded-index path: if ``model.safetensors.index.json``
+        # exists, verify every referenced shard is on disk. This is the
+        # only way to distinguish "8 of 33 shards" from "the model was
+        # shipped as a single safetensors file".
+        index_paths = [
+            snap / "model.safetensors.index.json",
+            snap / "model.safetensors.index.json",  # rglob catches sub-dirs below
+        ]
+        # Also scan for indices in sub-dirs (weights/, shards/ layouts).
+        for extra in snap.rglob("model.safetensors.index.json"):
+            if extra not in index_paths:
+                index_paths.append(extra)
+        found_index = False
+        for index_path in index_paths:
+            if not index_path.exists():
+                continue
+            found_index = True
+            try:
+                index = json.loads(index_path.read_text())
+                weight_map: dict[str, str] = index.get("weight_map") or {}
+                shards = set(weight_map.values())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not shards:
+                continue
+            root = index_path.parent
+            complete = True
+            for shard in shards:
+                shard_path = root / shard
+                try:
+                    resolved = shard_path.resolve(strict=True)
+                    if resolved.stat().st_size <= 0:
+                        complete = False
+                        break
+                except (FileNotFoundError, OSError):
+                    complete = False
+                    break
+            if complete:
+                return True
+        if found_index:
+            # A sharded model whose index is present but shards are
+            # missing → partial cache. Don't fall through to the
+            # "any weight" heuristic, which would falsely report ready.
+            continue
+        # No safetensors index — walk the snapshot for weight files and
+        # check the shard-name pattern. If any file is named
+        # ``model-XX-of-YY.<ext>``, YY tells us the shard count and we
+        # require all YY shards to be present with non-zero size.
+        weight_files: dict[Path, Path] = {}  # dir → sample weight file
         for entry in snap.rglob("*"):
             if not entry.is_file() and not entry.is_symlink():
                 continue
-            name = entry.name.lower()
-            if name.endswith(_WEIGHT_SUFFIXES):
+            if not entry.name.lower().endswith(_WEIGHT_SUFFIXES):
+                continue
+            weight_files.setdefault(entry.parent, entry)
+
+        for wdir, sample in weight_files.items():
+            m = _SHARD_FILENAME_RE.match(sample.name)
+            if m:
+                total = int(m.group("total"))
+                stem = m.group("stem")
+                ext = m.group("ext")
+                complete = True
+                for i in range(1, total + 1):
+                    shard_name = f"{stem}-{i:05d}-of-{total:05d}{ext}"
+                    shard_path = wdir / shard_name
+                    try:
+                        resolved = shard_path.resolve(strict=True)
+                        if resolved.stat().st_size <= 0:
+                            complete = False
+                            break
+                    except (FileNotFoundError, OSError):
+                        complete = False
+                        break
+                if complete:
+                    return True
+            else:
+                # Non-sharded single weight file — check it's non-empty.
                 try:
-                    resolved = entry.resolve(strict=True)
+                    resolved = sample.resolve(strict=True)
                     if resolved.stat().st_size > 0:
                         return True
                 except (FileNotFoundError, OSError):
