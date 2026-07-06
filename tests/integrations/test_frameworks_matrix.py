@@ -163,11 +163,20 @@ class TestPydanticAI:
         assert_no_analysis_channel_leak(content)
 
         # Tool call — pydantic_ai routes tool calls via @agent.tool.
+        # Codex #1033 round-2 BLOCKING #1: assert the tool was actually
+        # invoked (not just that the model returned non-empty text). A
+        # flag closure captures whether ``get_weather`` ran; strict mode
+        # fails if the tool never fired even though the prompt asked for
+        # it. Also check the answer references the tool's return
+        # (``sunny`` in ``tokyo``) so a broken tool loop where the model
+        # ignores the tool result but improvises can't slip through.
         tool_agent = Agent(model)
+        tool_invocations: dict[str, int] = {"count": 0}
 
         @tool_agent.tool_plain
-        def get_weather(city: str) -> str:  # noqa: ARG001 — invoked by agent
+        def get_weather(city: str) -> str:
             """Get weather for a city."""
+            tool_invocations["count"] += 1
             return f"sunny in {city}"
 
         try:
@@ -179,12 +188,27 @@ class TestPydanticAI:
                 f"pydantic-ai/{family_alias.family}: tool run failed: {exc}"
             )
             return
-        # PydanticAI folds the tool result into ``.output`` — confirm the
-        # answer references the tool's return.
         answer = (result.output or "").lower()
         assert_content_nonempty(answer, ctx=f"pydantic-ai/{family_alias.family}/tool")
         assert_no_think_tag_leak(answer)
         assert_no_analysis_channel_leak(answer)
+        if tool_invocations["count"] == 0:
+            # The whole point of this cell is the tool-loop regression
+            # gate — a model that answers inline without calling the
+            # tool is a real signal in strict CI.
+            strict_skip_or_fail(
+                f"pydantic-ai/{family_alias.family}: get_weather was never "
+                f"invoked despite the tool prompt. Answer was: {answer[:120]!r}"
+            )
+            return
+        # If we did loop through the tool, the assembled answer should
+        # reference the tool's return value shape (``sunny`` in ``tokyo``).
+        # A pure-inline answer with an ignored tool result would fail this.
+        assert "sunny" in answer or "tokyo" in answer, (
+            f"pydantic-ai/{family_alias.family}: tool was called "
+            f"({tool_invocations['count']}x) but answer doesn't reference the "
+            f"tool's return: {answer[:200]!r}"
+        )
 
 
 # --------------------------------------------------------------------------- #

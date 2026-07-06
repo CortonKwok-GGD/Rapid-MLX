@@ -131,6 +131,46 @@ families:
         ram_gb_required: 22
         quality_tier: smoke
 
+  # ------------------------------------------------------------------
+  # Non-Tier-1 supplementary families — kept in the registry for engine-
+  # path coverage that the four Tier-1 families don't provide. These
+  # entries are NOT the correctness surface (both flagged
+  # ``quality_tier: smoke`` so the multi-tool agent test suppresses on
+  # them per the ``skip_for_smoke`` rule); they exist purely so that a
+  # regression in a *different* engine path (DiffusionEngine, MoE
+  # scheduler edge cases, etc.) can't ship past a stress_e2e_bench
+  # gate that only exercises BatchedEngine autoregressive.
+  #
+  # Codex #1033 round-2 BLOCKING #3 fold: keep diffusiongemma here so
+  # ``tests/test_pr_validate_stress_timeout.py::
+  # test_golden_models_yaml_diffusiongemma_has_override`` fires as a
+  # hard assertion again — deleting the only DiffusionEngine stress
+  # entry from the registry can no longer be a silent green.
+  # ------------------------------------------------------------------
+
+  - family: diffusion-gemma
+    candidates:
+      # DiffusionEngine coverage — routes via ``vllm_mlx/runtime/
+      # diffusion_lane.py::DiffusionEngine`` → ``mlx_vlm.generate.
+      # diffusion.stream_diffusion_generate``, entirely separate from
+      # BatchedEngine (the AR LLM path the Tier-1 four cover). Live
+      # v0.7.15 e2e proof: 154 s download+boot+request, coherent
+      # ``"Hello there!"`` in 4 tokens, mmap released on shutdown.
+      #
+      # ``smoke`` tier so pydantic_ai's multi-tool composition (which
+      # the Gemma-4-derivative model class can't reliably do regardless
+      # of quant — same class of instruction-following weakness that
+      # got Gemma 4 excluded from the pre-Tier-1 registry) is
+      # suppressed on this candidate. anthropic_sdk + langchain still
+      # exercise the gemma4 tool-call parser × DiffusionEngine seam.
+      #
+      # RAM: ~14 GB 4-bit weights + ~3 GB denoising canvas + MLX
+      # runtime overhead → 20 GB.
+      - id: mlx-community/diffusiongemma-26B-A4B-it-4bit
+        ram_gb_required: 20
+        quality_tier: smoke
+        stress_timeout_s: 1800  # text-diffusion: ~2x autoregressive per-token wall-clock
+
 # Gemma 4 was previously listed here for orthogonal coverage (different
 # chat template + tool-call format) but observed in PR #208 validation
 # to fail multiple agent tests due to model-side instruction-following
@@ -193,6 +233,13 @@ overrides:
     args: ["--enable-auto-tool-choice", "--tool-call-parser", "harmony"]
   "mlx-community/gpt-oss-20b-MXFP4-Q8":
     args: ["--enable-auto-tool-choice", "--tool-call-parser", "harmony"]
+  # DiffusionGemma uses the gemma4 tool-call wire format (alias profile
+  # in ``vllm_mlx/aliases.json`` declares ``tool_call_parser: gemma4``;
+  # auto-detect picks it through the alias). Explicit override mirrors
+  # the qwen / harmony convention above for grep-traceability at the
+  # validation surface.
+  "mlx-community/diffusiongemma-26B-A4B-it-4bit":
+    args: ["--enable-auto-tool-choice", "--tool-call-parser", "gemma4"]
 
 # Agent integrations — each is a tests/integrations/ test_X.py script
 # we exec against the live server. The matrix is models × agents.
@@ -220,7 +267,7 @@ agents:
     script: tests/integrations/test_pydantic_ai_full.py
     # The multi-tool composition test reliably regresses on quants
     # that can't reach the model class's normal tool-call quality
-    # ceiling (today: qwen3.6-27b-4bit). Other agents still run on
-    # the smoke-tier fallback; only the test the quant provably
-    # can't pass is suppressed.
+    # ceiling (e.g. 4-bit fallbacks). Other agents still run on the
+    # smoke-tier fallback; only the test the quant provably can't
+    # pass is suppressed.
     skip_for_smoke: true

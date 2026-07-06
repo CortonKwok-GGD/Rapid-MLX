@@ -476,14 +476,22 @@ class TestSelectModels:
         # Override args wired through verbatim — full equality so a
         # value-typo in the YAML override (e.g. `hermez` instead of
         # `hermes`) is caught rather than just the truthiness of a
-        # non-empty list. The set of valid parsers depends on WHICH
-        # candidate the file lists first — the 35B-A3B strong pick uses
-        # ``qwen3_coder_xml``; the 27B fallback uses ``hermes``. Both
-        # are accepted; a bogus parser like ``hermez`` is not.
-        assert tuple(qwen36.extra_args) in (
-            self._QWEN36_XML_ARGS,
-            self._QWEN36_HERMES_ARGS,
-        ), (
+        # non-empty list. Codex #1033 round-2 BLOCKING #2: the parser
+        # required depends on WHICH candidate the file lists first —
+        # if the 35B-A3B is picked (`qwen3_coder_xml`) but the override
+        # was wired to `hermes`, that's the exact regression a Tier-1
+        # PR test is meant to catch. Branch on the selected model_id.
+        expected_args_by_model = {
+            "mlx-community/Qwen3.6-35B-A3B-8bit": self._QWEN36_XML_ARGS,
+            "unsloth/Qwen3.6-27B-MLX-8bit": self._QWEN36_HERMES_ARGS,
+            "mlx-community/Qwen3.6-27B-4bit": self._QWEN36_HERMES_ARGS,
+        }
+        assert qwen36.model_id in expected_args_by_model, (
+            f"golden_models.yaml selected {qwen36.model_id!r} for qwen3.6 "
+            f"which this test doesn't know the expected override for. "
+            f"Add an entry to expected_args_by_model above."
+        )
+        assert tuple(qwen36.extra_args) == expected_args_by_model[qwen36.model_id], (
             f"selected {qwen36.model_id!r} but its overrides args don't "
             f"match expected — check overrides:{qwen36.model_id} in "
             "golden_models.yaml"
