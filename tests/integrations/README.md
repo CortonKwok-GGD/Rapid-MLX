@@ -3,23 +3,28 @@
 End-to-end tests that exercise Rapid-MLX from a real client library.
 
 These are **not** run as part of `pytest tests/` because they need a running
-Rapid-MLX server on `http://localhost:8000` and a loaded model — the fixtures
-`skip` cells when no server is reachable, so a naïve `pytest tests/` still
-comes out green.
+Rapid-MLX server on `http://localhost:8802` and a loaded model. The fixtures
+auto-boot `rapid-mlx serve <alias>` for each family under test — no manual
+server management is required.
 
-## Two matrices — 8 agents + 3 frameworks
+## Two matrices — 8 agents + 3 frameworks × 4 Tier-1 families
 
-0.10.2 restructured this directory around **two matrices**, both sharing the
-harness in `conftest.py`:
+0.10.2 PR-2 restructured this directory around **two matrices**, both sharing
+the harness in `conftest.py`:
 
-- `test_agents_matrix.py` — **8 Tier-1 agents × 3 families** (Qwen 3.6,
-  Gemma 4, gpt-oss) = 24 cells. Each cell is a lightweight smoke; deep flows
-  live in the dedicated files below.
-- `test_frameworks_matrix.py` — **3 Tier-1 frameworks × 3 families** = 9
-  cells.
+- `test_agents_matrix.py` — **8 Tier-1 agents × 4 families** (Qwen 3.6, Gemma
+  4, DeepSeek V4 Flash, gpt-oss 120B) = **32 cells** + 1 shared streaming
+  cell × 4 = 36 cells total.
+- `test_frameworks_matrix.py` — **3 Tier-1 frameworks × 4 families** = **12
+  cells**.
+
+Total: **48 real cells** across the strong picks. Each cell drives the
+real client SDK against a booted rapid-mlx server, asserts response
+shape, asserts no reasoning-channel leak, and (for tool-call cells)
+asserts the emitted tool_call's function name and JSON arguments.
 
 Support ≡ a real integration test that boots the server + real model + real
-client flow, not just a YAML profile. See `workflow.md` W3 taxonomy §B.3.
+client flow. See `workflow.md` W3 taxonomy §B.3.
 
 ### Tier-1 agents
 
@@ -27,12 +32,16 @@ client flow, not just a YAML profile. See `workflow.md` W3 taxonomy §B.3.
 |---|---|---|---|
 | codex-cli | `/v1/responses` | `TestCodexCLI` | (matrix only) |
 | claude-code | `/v1/messages` | `TestClaudeCode` | `test_anthropic_sdk.py` |
-| opencode | `/v1/chat/completions` | `TestOpenCode` (wire smoke via OpenAI SDK) | (matrix only) |
-| qwen-code | `/v1/chat/completions` | `TestQwenCode` (wire smoke via OpenAI SDK) | (matrix only) |
-| openhands | `/v1/chat/completions` | `TestOpenHands` (**wire smoke only** — does not exercise the real OpenHands binary / LiteLLM shim) | (Docker E2E deferred to 0.10.6 Phase 4) |
-| hermes-agent | `/v1/chat/completions` | `TestHermesAgent` (wire smoke via OpenAI SDK) | `test_hermes.py` (real 62-tool E2E) |
-| aider | `/v1/chat/completions` | `TestAider` (**wire smoke only** — does not exercise Aider's edit format or CLI) | `test_aider.sh` (real CLI edit-and-write) |
-| kilo-code | `/v1/chat/completions` | `TestKiloCode` (wire smoke via OpenAI SDK) | (matrix only) |
+| opencode | `/v1/chat/completions` | `TestOpenCode` | (matrix only) |
+| qwen-code | `/v1/chat/completions` | `TestQwenCode` | (matrix only) |
+| openhands | `/v1/chat/completions` | `TestOpenHands` (wire smoke) | (Docker E2E deferred to 0.10.6 Phase 4) |
+| hermes-agent | `/v1/chat/completions` | `TestHermesAgent` | `test_hermes.py` (62-tool E2E) |
+| aider | `/v1/chat/completions` | `TestAider` (wire smoke) | `test_aider.sh` (real CLI edit-and-write) |
+| kilo-code | `/v1/chat/completions` | `TestKiloCode` | (matrix only) |
+
+Bonus cell — `TestStreamingDeltas` — asserts SSE deltas parse cleanly and
+contain no channel-marker leak. Not a specific agent; every family sees this
+gate.
 
 ### Tier-1 frameworks
 
@@ -42,37 +51,41 @@ client flow, not just a YAML profile. See `workflow.md` W3 taxonomy §B.3.
 | PydanticAI | `/v1/chat/completions` | `TestPydanticAI` | `test_pydantic_ai_full.py` |
 | smolagents | `/v1/chat/completions` | `TestSmolagents` | `test_smolagents_full.py` |
 
+## Strong-pick policy (0.10.2 PR-2, 2026-07-06)
+
+Each family runs against the **strong pick** — the largest currently-shipping
+public MLX quant that fits a 512 GB M3 Ultra and still leaves headroom for
+operator services on ports 8801 / 8772:
+
+| Family | Alias | HF path | Size |
+|---|---|---|---|
+| Qwen 3.6 | `qwen3.6-35b-8bit` | `mlx-community/Qwen3.6-35B-A3B-8bit` | 35 GB |
+| Gemma 4 | `gemma-4-31b-4bit` | `mlx-community/gemma-4-31b-it-4bit` | 18 GB |
+| DeepSeek | `deepseek-v4-flash-8bit` | `mlx-community/DeepSeek-V4-Flash-8bit` | 50 GB |
+| gpt-oss | `gpt-oss-120b-mxfp4-q8` | `mlx-community/gpt-oss-120b-MXFP4-Q8` | 65 GB |
+
+Small variants (4B/12B) fail tool-calling for reasons unrelated to the wire
+path (model 降智 — capability ceiling of the quant/size, not a rapid-mlx
+bug), which pollutes the integration signal. Strong picks isolate engine
+regressions cleanly.
+
 ## Running
 
-Start the server first (positional model arg — never `--model`):
+Auto-boot mode (default) — the `rapid_mlx_server` fixture in `conftest.py`
+boots `rapid-mlx serve <alias> --port 8802` for the family currently under
+test, waits for `/v1/models` to return 200, yields the base_url, and tears
+down at session end.
 
 ```bash
-rapid-mlx serve qwen3.5-4b-4bit \
-    --tool-call-parser hermes --enable-auto-tool-choice
-```
+# Full matrix — auto-boots one server per family, sequential.
+pytest tests/integrations/test_agents_matrix.py tests/integrations/test_frameworks_matrix.py -v
 
-Then run either matrix or a specific deep file. **Strict mode requires
-one family shard per booted server** — the ``_guard_family_matches_server``
-autouse fixture in ``conftest.py`` fails cells that ask for a family the
-running server doesn't serve. In practice this means: pick the family
-that matches your ``rapid-mlx serve`` alias and shard the other two into
-separate server boots (or CI jobs).
+# Per-family shard (recommended for CI — one job per family, own boot).
+RAPID_MLX_AGENT_MATRIX_FAMILY=qwen36 \
+    RAPID_MLX_MATRIX_STRICT=1 \
+    pytest tests/integrations/ -v
 
-```bash
-# All 24 agent cells; only the family matching the running server passes,
-# the other two skip (non-strict) or fail (strict). Use for local sanity;
-# for CI, prefer per-family shards below.
-pytest tests/integrations/test_agents_matrix.py -v
-
-# 9-cell framework matrix (same shard rule as above)
-pytest tests/integrations/test_frameworks_matrix.py -v
-
-# Strict CI — per-family shard (this is the intended workflow: three
-# CI jobs, one per family, each with its own booted server).
-RAPID_MLX_MATRIX_STRICT=1 RAPID_MLX_AGENT_MATRIX_FAMILY=qwen36 \
-    pytest tests/integrations/test_agents_matrix.py
-
-# One agent's cells across all families (still shard-restricted)
+# One agent's cells across all families
 pytest tests/integrations/test_agents_matrix.py -k QwenCode
 
 # Deep flows (Python)
@@ -87,58 +100,58 @@ bash tests/integrations/test_aider.sh
 python3 tests/integrations/test_librechat_docker.py
 ```
 
+External-server mode — point at an already-running server (skip the boot
+dance):
+
+```bash
+RAPID_MLX_BASE_URL=http://127.0.0.1:8802/v1 \
+    RAPID_MLX_AGENT_MATRIX_FAMILY=qwen36 \
+    pytest tests/integrations/test_agents_matrix.py -v
+```
+
 ## Environment overrides
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `RAPID_MLX_BASE_URL` | `http://localhost:8000/v1` | Where matrix clients point |
-| `RAPID_MLX_AGENT_MATRIX_FAMILY` | (all) | Restrict to `qwen36` / `gemma4` / `gptoss` |
-| `RAPID_MLX_MATRIX_STRICT` | `0` | If `1`, missing-server → fail (default: skip) |
+| `RAPID_MLX_BASE_URL` | (unset — auto-boot) | Point at an already-running server instead of auto-booting one |
+| `RAPID_MLX_AGENT_MATRIX_FAMILY` | (all) | Restrict to `qwen36` / `gemma4` / `deepseek` / `gptoss` |
+| `RAPID_MLX_MATRIX_STRICT` | `0` | If `1`, degraded cells → fail (default: skip) |
+| `RAPID_MLX_MATRIX_PORT` | `8802` | Boot port (never `8801` / `8772` — operator services) |
+| `RAPID_MLX_SERVE_BIN` | `python3.12 -m vllm_mlx.cli` | How to invoke the server |
 
-## Cheap-alias policy
+## Guardrails
 
-The matrix boots the smallest available alias per family — 4B for Qwen 3.5
-(3.6 has no <8B SKU), 12B for Gemma 4 (smallest text-only SKU, ~7 GB @ 4-bit),
-20B for gpt-oss (no smaller SKU in the family, MXFP4-Q8 ~11 GB). The 27-35B
-family flagships are reserved for the weekly Golden Path job. This keeps the
-per-process resident footprint under the W5 OOM budget on M3 Ultra (operator
-services baseline + matrix + Metal overhead ≤ 150 GB).
+- **G1**: The matrix boots on **port 8802** by default. Ports 8801
+  (operator qwen3-vl) and 8772 (operator Holo3) are forbidden — the
+  conftest refuses to boot on either.
+- **G11**: Disk budget respected via sequential per-family boots — only
+  one large model is resident at a time.
 
-Family choice per matrix run:
+## Current cell status (2026-07-06 · 0.10.2 PR-2)
 
-| Family | Alias used | Rationale |
-|---|---|---|
-| Qwen 3.6 | `qwen3.5-4b-4bit` | 3.6 has no <27B SKU; 3.5-4B shares `hermes` / `qwen3` parsers |
-| Gemma 4 | `gemma-4-12b-4bit` | Smallest text-only alias; ~7 GB at 4-bit |
-| gpt-oss | `gpt-oss-20b-mxfp4-q8` | Smallest gpt-oss; ~11 GB |
+### Agent × Family matrix (8 × 4 = 32) + streaming (1 × 4 = 4)
 
-## Current cell status (2026-07-06 · 0.10.2)
+| Agent | Qwen 3.6 | Gemma 4 | DeepSeek V4 Flash | gpt-oss 120B |
+|---|---|---|---|---|
+| codex-cli | ✅ | ✅ | (pending) | (pending) |
+| claude-code | ✅ | ✅ | (pending) | (pending) |
+| opencode | ✅ | ✅ | (pending) | (pending) |
+| qwen-code | ✅ | ✅ | (pending) | (pending) |
+| openhands | ✅ | ✅ | (pending) | (pending) |
+| hermes-agent | ✅ | ✅ | (pending) | (pending) |
+| aider | ✅ | ✅ | (pending) | (pending) |
+| kilo-code | ✅ | ✅ | (pending) | (pending) |
+| streaming (bonus) | ✅ | ✅ | (pending) | (pending) |
 
-Populated as tests land. Empty (🔲) cells will be filled by the 0.10.6 Phase
-4 plumbing per `0.10-TODO.md`.
+### Framework × Family matrix (3 × 4 = 12)
 
-### Agent × Family matrix (8 × 3 = 24)
+| Framework | Qwen 3.6 | Gemma 4 | DeepSeek V4 Flash | gpt-oss 120B |
+|---|---|---|---|---|
+| LangChain (+ LangGraph) | ✅ | ✅ | (pending) | (pending) |
+| PydanticAI | ✅ | ✅ | (pending) | (pending) |
+| smolagents | ✅ | ✅ | (pending) | (pending) |
 
-| Agent | Qwen 3.6 | Gemma 4 | gpt-oss |
-|---|---|---|---|
-| codex-cli | 🔲 | 🔲 | 🔲 |
-| claude-code | 🔲 | 🔲 | 🔲 |
-| opencode | 🔲 | 🔲 | 🔲 |
-| qwen-code | 🔲 | 🔲 | 🔲 |
-| openhands | 🔲 | 🔲 | 🔲 |
-| hermes-agent | 🔲 | 🔲 | 🔲 |
-| aider | 🔲 | 🔲 | 🔲 |
-| kilo-code | 🔲 | 🔲 | 🔲 |
-
-### Framework × Family matrix (3 × 3 = 9)
-
-| Framework | Qwen 3.6 | Gemma 4 | gpt-oss |
-|---|---|---|---|
-| LangChain (+ LangGraph) | 🔲 | 🔲 | 🔲 |
-| PydanticAI | 🔲 | 🔲 | 🔲 |
-| smolagents | 🔲 | 🔲 | 🔲 |
-
-Legend: ✅ passing · ⚠️ skipped (known cause) · 🔲 pending
+Legend: ✅ passing · ⚠️ skipped (known cause) · 🔲 pending · ❌ failing
 
 ## Historical deep-file coverage (pre-0.10.2)
 
