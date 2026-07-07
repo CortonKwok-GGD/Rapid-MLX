@@ -40,7 +40,7 @@
 curl -fsSL https://rapidmlx.com/install.sh | bash
 ```
 
-Installs Python 3.10+ if missing, drops `rapid-mlx` into `~/.local/bin`, and prints a serve command sized to your Mac (8–23 GB → `qwen3.5-4b-4bit`; 24–47 GB → `gpt-oss-20b-mxfp4-q8`; 48–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `gpt-oss-120b-mxfp4-q8`). Homebrew, `uv`, and `pip` all work too — see [Alternative install methods](#alternative-install-methods).
+Installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–23 GB → `qwen3.5-4b-4bit`; 24–47 GB → `gpt-oss-20b-mxfp4-q8`; 48–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `gpt-oss-120b-mxfp4-q8`). Homebrew, `uv`, and `pip` all work too — see [Alternative install methods](#alternative-install-methods).
 
 **2. Chat with a model right now:**
 
