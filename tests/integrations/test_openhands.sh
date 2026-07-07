@@ -105,39 +105,87 @@ if [ -z "$BASE_URL" ]; then
     BASE_URL="http://127.0.0.1:${PORT}/v1"
 fi
 
+# ``python3`` is a hard prerequisite of both the URL parser below AND the
+# post-run correctness check — check it up-front (fail fast) so a broken
+# system Python doesn't get diagnosed as an OpenHands failure.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found on PATH — required for URL parsing + correctness check" >&2
+    exit 1
+fi
+
 # Extract host + port from --base-url so we can decide whether to rewrite
 # the host for the inside-container view. Codex #1048 round-1 finding #1
 # (BLOCKING): the previous unconditional rewrite to ``host.docker.internal``
 # silently broke a CI shard pointing at a genuine remote-serve node
 # (``--base-url http://remote-host:8802/v1``) — the container would have
-# hit the M3 Ultra host instead of the intended remote server. Now we
-# rewrite ONLY the local-loopback aliases (``localhost``, ``127.0.0.1``,
+# hit the M3 Ultra host instead of the intended remote server. We rewrite
+# ONLY the local-loopback aliases (``localhost``, ``127.0.0.1``,
 # ``0.0.0.0``, ``::1``), and preserve any other host so remote fixtures
 # still work.
-CONTAINER_HOST="$(printf '%s' "$BASE_URL" | sed -E 's#https?://([^:/]+):([0-9]+)/?.*#\1#')"
-CONTAINER_PORT="$(printf '%s' "$BASE_URL" | sed -E 's#https?://([^:/]+):([0-9]+)/?.*#\2#')"
-if ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: could not extract port from --base-url=$BASE_URL" >&2
+#
+# Codex #1048 round-2 finding #1 (BLOCKING): the previous sed regex
+# ``[^:/]+`` for the host class ruled out ``:`` inside the hostname, so
+# a valid bracketed IPv6 URL like ``http://[::1]:8802/v1`` exited as
+# "could not extract port" — despite the case-statement including
+# ``::1``. Fix: parse with Python's ``urllib.parse`` (via ``python3``,
+# which is already a hard prerequisite of the correctness check below),
+# strip IPv6 brackets from the extracted host, and only THEN test
+# against the loopback set. Handles ``http://host:port/path``,
+# ``http://[::1]:port/path``, ``http://[fe80::1%25en0]:port/path``,
+# and any IDN hostname LiteLLM might feed us.
+if ! _URL_PARTS="$(python3 - "$BASE_URL" <<'PYEOF'
+import sys
+from urllib.parse import urlparse
+
+url = sys.argv[1]
+parsed = urlparse(url)
+if parsed.scheme not in ("http", "https"):
+    print(f"ERROR: unsupported scheme {parsed.scheme!r} in {url!r}",
+          file=sys.stderr)
+    sys.exit(1)
+
+host = parsed.hostname or ""
+port = parsed.port
+if not host or port is None:
+    print(f"ERROR: could not extract host/port from {url!r}", file=sys.stderr)
+    sys.exit(1)
+
+# urllib strips the surrounding brackets from IPv6 hosts already
+# (``[::1]:8802`` → ``::1``), so a plain string equality against the
+# loopback set below works for both v4 and v6 aliases.
+print(f"{host}\t{port}")
+PYEOF
+)"; then
+    echo "ERROR: could not parse --base-url=$BASE_URL" >&2
     exit 1
 fi
-if [ -z "$CONTAINER_HOST" ]; then
-    echo "ERROR: could not extract host from --base-url=$BASE_URL" >&2
-    exit 1
-fi
+
+CONTAINER_HOST="${_URL_PARTS%$'\t'*}"
+CONTAINER_PORT="${_URL_PARTS##*$'\t'}"
+
 case "$CONTAINER_HOST" in
     localhost|127.0.0.1|0.0.0.0|::1)
         CONTAINER_HOST="host.docker.internal"
         ;;
+    *)
+        # Preserve any other host as-is (remote-serve node, RFC1918 IP,
+        # DNS name, non-loopback IPv6). LiteLLM handles bracket-wrapped
+        # IPv6 in URLs, so we only re-bracket the host when we're
+        # rebuilding the URL below.
+        ;;
 esac
-CONTAINER_BASE_URL="http://${CONTAINER_HOST}:${CONTAINER_PORT}/v1"
 
-# ``python3`` powers the correctness check below (AST parse + runtime
-# ``add(2, 3) == 5`` assertion). Fail early with a clear message so a
-# broken system Python doesn't get diagnosed as an OpenHands failure.
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "ERROR: python3 not found on PATH — required for correctness check" >&2
-    exit 1
-fi
+# Re-bracket IPv6 hosts for URL assembly. ``host.docker.internal`` and
+# IPv4 literals go through unchanged; only literal IPv6 addresses need
+# the ``[…]`` wrapping per RFC 3986 §3.2.2.
+case "$CONTAINER_HOST" in
+    *:*)
+        CONTAINER_BASE_URL="http://[${CONTAINER_HOST}]:${CONTAINER_PORT}/v1"
+        ;;
+    *)
+        CONTAINER_BASE_URL="http://${CONTAINER_HOST}:${CONTAINER_PORT}/v1"
+        ;;
+esac
 
 # Docker daemon must be reachable BEFORE we spend 5-10 minutes staging
 # the sandbox runtime. ``docker info`` is the canonical "server reachable"
