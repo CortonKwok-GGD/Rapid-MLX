@@ -5503,9 +5503,7 @@ class Scheduler:
                 if self._is_harmony_family:
                     from .reasoning.harmony_stop import find_stop_in_final_channel
 
-                    stop_match = find_stop_in_final_channel(
-                        decoded_so_far, stop_params
-                    )
+                    stop_match = find_stop_in_final_channel(decoded_so_far, stop_params)
                 else:
                     for stop_str in stop_params:
                         if stop_str and stop_str in decoded_so_far:

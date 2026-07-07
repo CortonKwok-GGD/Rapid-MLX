@@ -349,9 +349,7 @@ class MLLMScheduler:
         return so callers don't need to change.
         """
         if not self._is_harmony_family:
-            return _find_stop_match_in_new_window(
-                text, new_text_start_len, stop_params
-            )
+            return _find_stop_match_in_new_window(text, new_text_start_len, stop_params)
         from .reasoning.harmony_stop import find_harmony_final_span
 
         span = find_harmony_final_span(text)
@@ -373,9 +371,7 @@ class MLLMScheduler:
         # Cap the new-start to the body length so the matcher's
         # ``search_from`` computation stays inside ``body_text``.
         body_new_start = min(body_new_start, len(body_text))
-        match = _find_stop_match_in_new_window(
-            body_text, body_new_start, stop_params
-        )
+        match = _find_stop_match_in_new_window(body_text, body_new_start, stop_params)
         if match is None:
             return None
         local_idx, stop_str = match

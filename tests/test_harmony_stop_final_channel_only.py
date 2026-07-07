@@ -46,7 +46,6 @@ from vllm_mlx.reasoning.harmony_stop import (
 from vllm_mlx.request import Request, RequestStatus, SamplingParams
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 
-
 # ---------------------------------------------------------------------------
 # Layer 1: pure string-matching contract
 # ---------------------------------------------------------------------------
@@ -54,10 +53,7 @@ from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 
 def test_final_span_none_before_final_marker():
     """Analysis-only surface has no final channel yet — no span."""
-    text = (
-        "<|channel|>analysis<|message|>reasoning about "
-        "</execute_ipython> markers"
-    )
+    text = "<|channel|>analysis<|message|>reasoning about </execute_ipython> markers"
     assert find_harmony_final_span(text) is None
 
 
@@ -75,9 +71,7 @@ def test_final_span_open_when_final_marker_present():
 
 def test_final_span_closed_at_return_marker():
     """``<|return|>`` terminates the final-channel body."""
-    text = (
-        "<|channel|>final<|message|>answer body<|return|>"
-    )
+    text = "<|channel|>final<|message|>answer body<|return|>"
     span = find_harmony_final_span(text)
     assert span is not None
     body_start, body_end = span
@@ -311,9 +305,7 @@ def test_scheduler_harmony_without_stop_param_unaffected():
     must NOT terminate. Sanity guard against a naive fix that would
     have applied the harmony scoping unconditionally."""
     scheduler = _make_harmony_scheduler()
-    analysis_only_surface = (
-        "<|channel|>analysis<|message|>I'll emit </execute_ipython>"
-    )
+    analysis_only_surface = "<|channel|>analysis<|message|>I'll emit </execute_ipython>"
     req = _make_request_with_decoder(
         "rD",
         stop_strings=[],  # empty stop list
@@ -391,8 +383,7 @@ def test_literal_issue_1049_reproducer_surface():
     # After the final marker emits AND completes — the stop fires,
     # correctly this time.
     full = (
-        analysis_only
-        + "<|end|><|start|>assistant<|channel|>final<|message|>"
+        analysis_only + "<|end|><|start|>assistant<|channel|>final<|message|>"
         "<execute_ipython>\nprint('hello world')\n</execute_ipython>"
     )
     match = find_stop_in_final_channel(full, stops)
@@ -402,5 +393,7 @@ def test_literal_issue_1049_reproducer_surface():
     # The truncated content is the FINAL-channel action body without
     # the trailing stop — this is what OpenAI clients see as
     # ``choice.message.content``.
-    trimmed_final_body = full[full.rfind(HARMONY_FINAL_MARKER) + len(HARMONY_FINAL_MARKER) : global_idx]
+    trimmed_final_body = full[
+        full.rfind(HARMONY_FINAL_MARKER) + len(HARMONY_FINAL_MARKER) : global_idx
+    ]
     assert trimmed_final_body == "<execute_ipython>\nprint('hello world')\n"
