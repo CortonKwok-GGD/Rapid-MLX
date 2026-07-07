@@ -40,7 +40,13 @@
 curl -fsSL https://rapidmlx.com/install.sh | bash
 ```
 
-Installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–23 GB → `qwen3.5-4b-4bit`; 24–47 GB → `gpt-oss-20b-mxfp4-q8`; 48–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `gpt-oss-120b-mxfp4-q8`). The script is served over HTTPS from `rapidmlx.com`; if you want to inspect it before running, `curl -fsSL https://rapidmlx.com/install.sh -o install.sh && less install.sh && bash install.sh`. Prefer Homebrew, `uv`, or `pip`? See [Alternative install methods](#alternative-install-methods).
+Installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–23 GB → `qwen3.5-4b-4bit`; 24–47 GB → `gpt-oss-20b-mxfp4-q8`; 48–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `gpt-oss-120b-mxfp4-q8`).
+
+> **`curl | bash` security.** `install.sh` is served over HTTPS (HSTS-preload) from `rapidmlx.com` and is a byte-identical mirror of [`install.sh`](install.sh) at the current release commit — read it before running if you like. Two verified alternatives:
+> - **Pin to a commit hash** — `curl -fsSL https://raw.githubusercontent.com/raullenchai/Rapid-MLX/<commit>/install.sh -o install.sh && shasum -a 256 install.sh && bash install.sh`
+> - **Skip the shell script entirely** — use Homebrew, `uv`, or `pip` below.
+
+See [Alternative install methods](#alternative-install-methods) for the non-curl paths.
 
 **2. Chat with a model right now:**
 
