@@ -20,9 +20,16 @@
 # assertion, which the wire doesn't emit.
 #
 # This harness is the sibling of ``test_aider.sh``. Same arg parsing,
-# same correctness taxonomy (AST BinOp(op=Add) + runtime add(2,3) == 5),
 # same exit-code taxonomy — with docker-daemon + docker-in-docker
 # sock-passthrough layered on for OpenHands' sandbox-runtime container.
+# The correctness taxonomy diverges: this harness uses an AST-only
+# whitelist (no runtime execution) — it parses ``add.py`` after the
+# agent exits, requires a single top-level ``def add(a, b)`` with no
+# decorators / defaults / annotations and a plain module-level shape,
+# and matches the return expression against a semantic-add whitelist
+# (``a + b`` / ``b + a`` / ``sum([a, b])`` / ``sum((a, b))``). Zero
+# code execution on the host, so a bad / compromised model output can
+# never touch the developer or CI process.
 #
 # Usage:
 #   test_openhands.sh --model <alias> (--base-url <url> | --port <port>) [--timeout <secs>]
@@ -40,7 +47,7 @@
 # works.
 #
 # Exit codes (aligned with ``test_aider.sh``):
-#   0  — OpenHands completed and add(2, 3) == 5 in the rewritten file
+#   0  — OpenHands completed and the AST whitelist matched the rewritten file
 #   1  — arg parse / setup error (also: docker daemon unreachable,
 #        ``timeout`` / ``gtimeout`` missing, rapid-mlx serve unreachable)
 #   2  — OpenHands runtime exited non-zero (agent crashed, LLM refused,
@@ -543,6 +550,42 @@ if len(funcs) > 1:
     sys.exit(1)
 func = funcs[0]
 
+# Codex #1048 round-7 finding #1 (BLOCKING): reject decorators,
+# defaults, arg / return annotations, and type comments on ``def
+# add``. Without this gate the following payloads would satisfy the
+# name / body checks but still run attacker code or rebind ``add``:
+#   * ``@evil()\ndef add(a, b): return a + b`` — decorator runs at
+#     import time
+#   * ``def add(a=evil(), b=0): return a + b`` — default eval'd at
+#     definition time
+#   * ``def add(a: evil(), b) -> evil(): ...`` — 3.10+ evaluates
+#     annotations at def time unless ``from __future__ import
+#     annotations`` is set, which we do not force
+# All three are trivial for a compromised model output to reach; the
+# harness never imports ``add.py``, but a downstream reviewer might
+# copy-run it and get owned. Fail fast at the gate.
+if func.decorator_list:
+    print(
+        "[correctness] AST-ERROR: def add must have no decorators; "
+        f"got {[ast.unparse(d) for d in func.decorator_list]}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if func.returns is not None:
+    print(
+        "[correctness] AST-ERROR: def add must have no return "
+        f"annotation; got -> {ast.unparse(func.returns)}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if getattr(func, "type_comment", None):
+    print(
+        "[correctness] AST-ERROR: def add must have no type comment; "
+        f"got # type: {func.type_comment}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 # Signature must be exactly (a, b) — kwarg-only / *args / **kwargs
 # defences prevent ``def add(*args): return sum(args)`` etc. which
 # would pass the return check but doesn't match the harness's stated
@@ -555,15 +598,34 @@ if (
     or args.kwarg is not None
     or args.kwonlyargs
     or args.posonlyargs
+    or args.defaults
+    or args.kw_defaults
 ):
     print(
-        f"[correctness] AST-ERROR: def add signature must be (a, b), "
-        f"got args={[a.arg for a in args.args]} vararg={args.vararg} "
-        f"kwarg={args.kwarg} kwonly={[a.arg for a in args.kwonlyargs]} "
-        f"posonly={[a.arg for a in args.posonlyargs]}",
+        f"[correctness] AST-ERROR: def add signature must be (a, b) "
+        f"with no defaults, got args={[a.arg for a in args.args]} "
+        f"vararg={args.vararg} kwarg={args.kwarg} "
+        f"kwonly={[a.arg for a in args.kwonlyargs]} "
+        f"posonly={[a.arg for a in args.posonlyargs]} "
+        f"defaults={len(args.defaults)} "
+        f"kw_defaults={len(args.kw_defaults)}",
         file=sys.stderr,
     )
     sys.exit(1)
+# Codex #1048 round-7: reject arg annotations. ``ast.arg.annotation``
+# is None for a bare ``a`` / ``b``, non-None for ``a: evil()``. Even
+# if ``from __future__ import annotations`` were in the module we
+# still disallow annotations here — anything the harness accepts must
+# match "pure Python change '-' to '+' in the return statement" — so
+# an annotation is off-taxonomy regardless of when it evaluates.
+for a in args.args:
+    if a.annotation is not None:
+        print(
+            f"[correctness] AST-ERROR: def add arg {a.arg!r} must have "
+            f"no annotation; got : {ast.unparse(a.annotation)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 # Body: allow a leading docstring (Expr(Constant(str))) but require the
 # next statement to be a Return with a whitelisted expression, and
