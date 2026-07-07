@@ -105,17 +105,31 @@ if [ -z "$BASE_URL" ]; then
     BASE_URL="http://127.0.0.1:${PORT}/v1"
 fi
 
-# Extract the port from --base-url regardless of source. The URL passed
-# INTO the OpenHands container must use ``host.docker.internal`` as the
-# host (from inside the container ``localhost``/``127.0.0.1`` refers to
-# the container itself, not the M3 Ultra host where rapid-mlx is
-# listening). We keep BASE_URL as-is for the host-side /v1/models probe.
-CONTAINER_PORT="$(printf '%s' "$BASE_URL" | sed -E 's#https?://[^:/]+:([0-9]+)/?.*#\1#')"
+# Extract host + port from --base-url so we can decide whether to rewrite
+# the host for the inside-container view. Codex #1048 round-1 finding #1
+# (BLOCKING): the previous unconditional rewrite to ``host.docker.internal``
+# silently broke a CI shard pointing at a genuine remote-serve node
+# (``--base-url http://remote-host:8802/v1``) — the container would have
+# hit the M3 Ultra host instead of the intended remote server. Now we
+# rewrite ONLY the local-loopback aliases (``localhost``, ``127.0.0.1``,
+# ``0.0.0.0``, ``::1``), and preserve any other host so remote fixtures
+# still work.
+CONTAINER_HOST="$(printf '%s' "$BASE_URL" | sed -E 's#https?://([^:/]+):([0-9]+)/?.*#\1#')"
+CONTAINER_PORT="$(printf '%s' "$BASE_URL" | sed -E 's#https?://([^:/]+):([0-9]+)/?.*#\2#')"
 if ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]]; then
     echo "ERROR: could not extract port from --base-url=$BASE_URL" >&2
     exit 1
 fi
-CONTAINER_BASE_URL="http://host.docker.internal:${CONTAINER_PORT}/v1"
+if [ -z "$CONTAINER_HOST" ]; then
+    echo "ERROR: could not extract host from --base-url=$BASE_URL" >&2
+    exit 1
+fi
+case "$CONTAINER_HOST" in
+    localhost|127.0.0.1|0.0.0.0|::1)
+        CONTAINER_HOST="host.docker.internal"
+        ;;
+esac
+CONTAINER_BASE_URL="http://${CONTAINER_HOST}:${CONTAINER_PORT}/v1"
 
 # ``python3`` powers the correctness check below (AST parse + runtime
 # ``add(2, 3) == 5`` assertion). Fail early with a clear message so a
@@ -323,21 +337,23 @@ if [ "$STATUS" -ne 0 ]; then
     exit 2
 fi
 
-# Correctness check — same as ``test_aider.sh`` (round-2 finding #2):
-# import the rewritten module and execute ``add(2, 3) == 5``, then assert
-# the AST contains a semantic-add operation (``BinOp(op=Add)`` OR
-# ``sum([a, b])`` OR ``operator.add(a, b)``) so that a mischievous
-# ``return 5`` cheat doesn't fake a pass.
+# Correctness check — Codex #1048 round-1 findings #2 and #3 (BLOCKING):
+# the previous single-pair ``add(2, 3) == 5`` gate + "any ast.Add anywhere
+# in add()" AST match let ``return a - b + 6`` and ``return (a - b) + 6``
+# fake a pass while preserving the original subtraction bug. Fix: sweep a
+# family of input pairs that no polynomial masquerade can satisfy
+# simultaneously, and drop the weak AST match — no single ``a + b + k``
+# / ``a - b + k`` / hard-coded-return cheat can pass ALL five checks,
+# because they pin the linear combination to slope-1 on both variables
+# with zero intercept. Runtime evaluation is safe because the scratch
+# file was written by us and only mutated in place by OpenHands' sandbox
+# edits — no arbitrary source enters the tree.
 if ! python3 - "$WORKDIR" <<'PYEOF'
-import ast
 import importlib.util
 import sys
 
 workdir = sys.argv[1]
 target = f"{workdir}/add.py"
-
-with open(target) as fh:
-    source = fh.read()
 
 # Load the module.
 spec = importlib.util.spec_from_file_location("_openhands_test_add", target)
@@ -353,48 +369,41 @@ if not hasattr(mod, "add") or not callable(mod.add):
           file=sys.stderr)
     sys.exit(1)
 
-# Runtime check.
-try:
-    got = mod.add(2, 3)
-except Exception as exc:  # noqa: BLE001
-    print(f"[correctness] RUNTIME-ERROR: add(2, 3) raised {exc!r}",
-          file=sys.stderr)
-    sys.exit(1)
+# Five checks that jointly force ``add(a, b) == a + b`` — pin slope on
+# both variables to 1 and intercept to 0, so no ``a + k``, ``a - b + k``,
+# ``a + b + k`` (k ≠ 0), ``return CONST`` cheat can satisfy them all:
+#
+#     (2, 3)      → 5    — the "obvious" case (guards against no-op)
+#     (10, -4)    → 6    — kills ``a - b + 6`` (10 - (-4) + 6 = 20)
+#     (0, 0)      → 0    — kills any non-zero intercept
+#     (-1, 1)     → 0    — kills ``a + k`` (any b-independence)
+#     (100, 200)  → 300  — kills any b-scaling other than 1
+CHECKS = [
+    ((2, 3), 5),
+    ((10, -4), 6),
+    ((0, 0), 0),
+    ((-1, 1), 0),
+    ((100, 200), 300),
+]
 
-if got != 5:
-    print(f"[correctness] VALUE-ERROR: add(2, 3) returned {got!r}, expected 5",
-          file=sys.stderr)
-    sys.exit(1)
+for (a, b), expected in CHECKS:
+    try:
+        got = mod.add(a, b)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[correctness] RUNTIME-ERROR: add({a}, {b}) raised {exc!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if got != expected:
+        print(
+            f"[correctness] VALUE-ERROR: add({a}, {b}) returned {got!r}, "
+            f"expected {expected!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-# Structural check — reject ``return 5`` and other hard-code cheats.
-tree = ast.parse(source)
-funcs = [n for n in ast.walk(tree)
-         if isinstance(n, ast.FunctionDef) and n.name == "add"]
-if not funcs:
-    print("[correctness] AST-ERROR: no def add() in module", file=sys.stderr)
-    sys.exit(1)
-
-has_add_op = False
-for func in funcs:
-    for node in ast.walk(func):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            has_add_op = True
-            break
-        # sum([a, b]) / operator.add(a, b) also qualify as "semantic add".
-        if isinstance(node, ast.Call):
-            name = getattr(node.func, "id", "") or getattr(
-                getattr(node.func, "attr", None), "__str__", lambda: ""
-            )()
-            if name in ("sum", "add"):
-                has_add_op = True
-                break
-
-if not has_add_op:
-    print("[correctness] AST-ERROR: add() body has no + BinOp / sum(...) call",
-          file=sys.stderr)
-    sys.exit(1)
-
-print("[correctness] OK: add(2, 3) == 5, AST contains + BinOp")
+print("[correctness] OK: all five (a, b) → a+b checks passed")
 sys.exit(0)
 PYEOF
 then
@@ -404,5 +413,5 @@ then
     exit 3
 fi
 
-echo "[test_openhands.sh] PASS: add(2, 3) == 5 after openhands rewrite"
+echo "[test_openhands.sh] PASS: five-pair add(a, b) == a+b checks satisfied"
 exit 0
