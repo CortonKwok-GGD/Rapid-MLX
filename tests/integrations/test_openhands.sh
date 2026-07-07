@@ -159,7 +159,17 @@ if parsed.scheme not in ("http", "https"):
     sys.exit(1)
 
 host = parsed.hostname or ""
-port = parsed.port
+# Codex #1048 round-5 nit: ``parsed.port`` raises ``ValueError`` on a
+# non-numeric port (``http://127.0.0.1:abc/v1``) which would leak a
+# Python traceback ahead of the bash wrapper could-not-parse error.
+# Catch it explicitly so the failure mode is a single clean message.
+# NOTE: bash 3.2 scans heredoc content inside ``$(...)`` for quote
+# balance, so keep this block apostrophe-free.
+try:
+    port = parsed.port
+except ValueError:
+    print(f"ERROR: non-numeric port in {url!r}", file=sys.stderr)
+    sys.exit(1)
 if not host or port is None:
     print(f"ERROR: could not extract host/port from {url!r}", file=sys.stderr)
     sys.exit(1)
@@ -455,17 +465,25 @@ except SyntaxError as exc:
     print(f"[correctness] SYNTAX-ERROR: {exc}", file=sys.stderr)
     sys.exit(1)
 
+# Codex #1048 round-5 finding #1 (BLOCKING): ``ast.walk`` walked all
+# nested nodes, so ``def wrapper(): def add(a, b): return a + b`` would
+# find the nested ``add`` and pass — but the module doesn't expose a
+# top-level ``add`` any more, so an actual user of the file gets
+# ``NameError``. Restrict to top-level statements only.
 funcs = [
-    n for n in ast.walk(tree)
+    n for n in tree.body
     if isinstance(n, ast.FunctionDef) and n.name == "add"
 ]
 if not funcs:
-    print("[correctness] AST-ERROR: no def add() in module", file=sys.stderr)
+    print(
+        "[correctness] AST-ERROR: no top-level def add() in module",
+        file=sys.stderr,
+    )
     sys.exit(1)
 if len(funcs) > 1:
     print(
-        "[correctness] AST-ERROR: multiple def add() definitions found "
-        f"({len(funcs)}) — reject as ambiguous",
+        "[correctness] AST-ERROR: multiple top-level def add() "
+        f"definitions found ({len(funcs)}) — reject as ambiguous",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -547,17 +565,14 @@ def _matches_whitelist(node):
         and not node.keywords
     ):
         return "Call(sum([a, b]))"
-    # operator.add(a, b) — Attribute call
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "operator"
-        and node.func.attr == "add"
-        and _is_ab(node.args)
-        and not node.keywords
-    ):
-        return "Call(operator.add(a, b))"
+    # Codex #1048 round-5 finding #2 (BLOCKING): the previous whitelist
+    # also accepted ``operator.add(a, b)`` without requiring ``import
+    # operator`` at module top level, so OpenHands could produce a file
+    # that passed the harness but ``NameError``'d when actually used.
+    # Dropped the ``operator.add`` branch — keeping only the two builtin
+    # forms — rather than layering import-validation logic for a
+    # semantic equivalent that the LLM has no reason to emit when the
+    # prompt is "change '-' to '+' in the return statement".
     return None
 
 
