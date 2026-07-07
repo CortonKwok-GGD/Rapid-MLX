@@ -38,10 +38,22 @@ from typing import Any
 # literal once the model has switched to the final channel.
 HARMONY_FINAL_MARKER = "<|channel|>final<|message|>"
 
-# Any harmony control marker terminates the current channel body. When
-# any of these appear AFTER ``HARMONY_FINAL_MARKER`` in the decoded
-# surface, the final-channel body ends at the earliest occurrence.
-HARMONY_FINAL_TERMINATORS = ("<|end|>", "<|return|>", "<|call|>", "<|channel|>")
+# Harmony protocol control markers that terminate the final-channel
+# body. Per the openai-harmony spec, ``<|end|>`` closes a message,
+# ``<|return|>`` marks end-of-conversation-turn, and ``<|call|>``
+# closes a commentary channel body carrying a tool call. Any of these
+# appearing AFTER ``HARMONY_FINAL_MARKER`` in the decoded surface
+# ends the final-channel body at the earliest occurrence.
+#
+# ``<|channel|>`` is intentionally NOT in this set even though it
+# opens the next channel block: in the (extremely rare) analysis→final
+# →analysis transition the caller's ``rfind`` re-anchors to the LATEST
+# ``<|channel|>final<|message|>`` marker anyway, so treating ``<|channel|>``
+# as a terminator would only add a false-positive risk against final-
+# channel content that legitimately contains the literal string
+# ``<|channel|>`` (e.g. answering a user question about harmony
+# format — codex round-2 NIT).
+HARMONY_FINAL_TERMINATORS = ("<|end|>", "<|return|>", "<|call|>")
 
 # Cheap heuristic gate — any harmony-format output contains at least
 # one of these sentinels early in the raw decoded surface. Used to

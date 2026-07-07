@@ -113,7 +113,12 @@ def test_stop_fires_inside_final_channel():
     # including) the final ``</execute_ipython>``.
     trimmed = text[:global_idx]
     assert trimmed.endswith('print("hello world")\n')
-    assert "</execute_ipython>" not in text[global_idx:global_idx]
+    # Trimmed prefix must NOT itself end with the marker; the marker
+    # must sit AT ``global_idx`` in the raw surface (codex round-2
+    # BLOCKING — the previous ``text[global_idx:global_idx]`` slice
+    # was always empty so this line asserted nothing).
+    assert not trimmed.endswith("</execute_ipython>")
+    assert text.startswith("</execute_ipython>", global_idx)
 
 
 def test_stop_earliest_position_wins_inside_final():
@@ -134,6 +139,30 @@ def test_stop_ignores_empty_and_none_stop_strings():
     """Empty / None stop entries must not spuriously match at offset 0."""
     text = "<|channel|>final<|message|>real content"
     assert find_stop_in_final_channel(text, ["", None]) is None  # type: ignore[list-item]
+
+
+def test_final_content_containing_literal_channel_string_still_matches():
+    """Codex round-2 NIT: a model answering "what does <|channel|> mean?"
+    might emit the literal string ``<|channel|>`` inside the final-
+    channel body. That must NOT prematurely close the final span —
+    only true harmony control markers (``<|end|>``, ``<|return|>``,
+    ``<|call|>``) terminate the body. The stop-string still fires
+    correctly at a later position in the same body.
+    """
+    stop_params = ["STOP"]
+    text = (
+        "<|channel|>final<|message|>"
+        "The <|channel|> token opens a channel block. STOP here."
+    )
+    match = find_stop_in_final_channel(text, stop_params)
+    assert match is not None
+    stop_str, global_idx = match
+    assert stop_str == "STOP"
+    # Trim retains the literal ``<|channel|>`` mention inside the
+    # final body — the fix removed ``<|channel|>`` from the terminator
+    # set precisely so this case doesn't false-close the span.
+    trimmed = text[:global_idx]
+    assert "<|channel|>" in trimmed[len("<|channel|>final<|message|>") :]
 
 
 # ---------------------------------------------------------------------------
