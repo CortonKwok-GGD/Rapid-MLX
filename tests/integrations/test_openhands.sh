@@ -29,11 +29,15 @@
 #
 # ``--base-url`` takes the full ``http[s]://host:port/v1`` URL and is the
 # preferred form — it lets the Python wrapper pass whatever URL the
-# ``rapid_mlx_server`` fixture is actually pointed at. Regardless of the
-# host in ``--base-url``, the URL passed into the OpenHands container is
-# rewritten to ``http://host.docker.internal:PORT/v1`` — from inside the
-# container ``localhost`` refers to the container itself, not the host
-# where rapid-mlx is listening.
+# ``rapid_mlx_server`` fixture is actually pointed at. The URL passed
+# into the OpenHands container has its host rewritten to
+# ``host.docker.internal`` ONLY when the parsed host is a loopback alias
+# (``localhost`` / ``127.0.0.1`` / ``0.0.0.0`` / ``::1``) — from inside
+# the container those addresses would refer to the container itself,
+# not the host where rapid-mlx is listening. Any other host (a
+# remote-serve node, RFC1918 IP, DNS name, non-loopback IPv6) is
+# preserved as-is so a fixture pointed at a genuine remote server still
+# works.
 #
 # Exit codes (aligned with ``test_aider.sh``):
 #   0  — OpenHands completed and add(2, 3) == 5 in the rewritten file
@@ -162,6 +166,20 @@ fi
 
 CONTAINER_HOST="${_URL_PARTS%$'\t'*}"
 CONTAINER_PORT="${_URL_PARTS##*$'\t'}"
+
+# Codex #1048 round-3 finding #1 (BLOCKING): explicitly validate the
+# tab-delimited shape of the Python parser output BEFORE downstream
+# reads. The parser always writes errors to stderr and never emits a
+# tab on the ERROR path — but if a future edit accidentally leaks an
+# error onto stdout, we'd construct a malformed CONTAINER_BASE_URL and
+# hit Docker with garbage. This gate turns that into a fast exit 1.
+if [ -z "$CONTAINER_HOST" ] || [ -z "$CONTAINER_PORT" ] \
+   || [ "$CONTAINER_HOST" = "$_URL_PARTS" ] \
+   || ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: URL parser returned malformed host/port shape " >&2
+    echo "       (raw='$_URL_PARTS' host='$CONTAINER_HOST' port='$CONTAINER_PORT')" >&2
+    exit 1
+fi
 
 case "$CONTAINER_HOST" in
     localhost|127.0.0.1|0.0.0.0|::1)
@@ -357,6 +375,7 @@ docker run \
     "$OPENHANDS_IMAGE" \
     python -m openhands.core.main \
         -i "$MAX_ITERATIONS" \
+        -d /workspace \
         -t "The file add.py in the current workspace has a bug: it returns a - b when it should return a + b. Open add.py, change the '-' operator to '+' in the return statement, and save the file. Do not modify anything else. Once the file is saved, stop." \
     >"$LOG" 2>&1
 STATUS=$?
