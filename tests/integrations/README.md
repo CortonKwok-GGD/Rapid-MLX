@@ -62,7 +62,7 @@ for operator scope call in the PR body).
 | claude-code | `/v1/messages` | `TestClaudeCode` | `test_anthropic_sdk.py` |
 | opencode | `/v1/chat/completions` | `TestOpenCode` (wire smoke via OpenAI SDK) | (matrix only) |
 | qwen-code | `/v1/chat/completions` | `TestQwenCode` (wire smoke via OpenAI SDK) | (matrix only) |
-| openhands | `/v1/chat/completions` | `TestOpenHands` (**wire smoke only** — does not exercise the real OpenHands binary / LiteLLM shim) | (Docker E2E deferred to 0.10.6 Phase 4) |
+| openhands | shell subprocess → Docker → `/v1/chat/completions` | `TestOpenHands` (**real Docker E2E harness** — drives pinned OpenHands 0.9.0 app + runtime images with `python -m openhands.core.main -t`, asserts add.py corrected) | `test_openhands.sh` (same harness, standalone) |
 | hermes-agent | `/v1/chat/completions` | `TestHermesAgent` (wire smoke via OpenAI SDK) | `test_hermes.py` (real 62-tool E2E) |
 | aider | shell subprocess → `/v1/chat/completions` | `TestAider` (**real bash-CLI harness** — drives aider one-shot with `--message`, asserts add.py corrected) | `test_aider.sh` (same harness, standalone) |
 | kilo-code | `/v1/chat/completions` | `TestKiloCode` (wire smoke via OpenAI SDK) | (matrix only) |
@@ -119,7 +119,8 @@ python3 tests/integrations/test_anthropic_sdk.py
 python3 tests/integrations/test_openwebui.py
 
 # Deep flows (CLI / Docker)
-bash tests/integrations/test_aider.sh
+bash tests/integrations/test_aider.sh --model qwen3.5-4b-4bit --port 8802
+bash tests/integrations/test_openhands.sh --model qwen3.5-4b-4bit --port 8802
 python3 tests/integrations/test_librechat_docker.py
 ```
 
@@ -162,17 +163,39 @@ real tool-call routing (function name = `get_weather`, arg parses as
 JSON, `city == "Tokyo"`, no `<think>` leak, no `<|channel|>analysis`
 leak). PydanticAI + smolagents cells assert the tool implementation
 itself was invoked (closure counter check), not just that the model
-produced final text. OpenHands `XFAIL`s structurally because its
-native wire is a text-action format, not OpenAI function calling —
-real coverage lives in a Docker E2E harness. Aider now runs a real
-bash-CLI harness (drop-out of the previous structural XFAIL): the
-matrix cell shells out to `test_aider.sh`, which seeds a scratch
-`add.py` with `return a - b  # BUG`, drives `aider --message "Fix
-the bug ..."` one-shot against `/v1/chat/completions`, and asserts
-the file was rewritten to `return a + b`. Aider's own edit format
+produced final text. Aider now runs a real bash-CLI harness (drop-out
+of the previous structural XFAIL): the matrix cell shells out to
+`test_aider.sh`, which seeds a scratch `add.py` with
+`return a - b  # BUG`, drives `aider --message "Fix the bug ..."`
+one-shot against `/v1/chat/completions`, and asserts the file was
+rewritten to `return a + b`. Aider's own edit format
 (`SEARCH ... REPLACE ...` in plain text) does NOT require OpenAI
 tool_calls, so R1-Distill drives it successfully alongside the
 other three families.
+
+OpenHands 2026-07-07 update — the four `openhands` cells previously
+strict-`XFAIL`'d as a "Docker E2E harness required" placeholder now run
+the real harness `test_openhands.sh` which pulls the pinned OpenHands
+0.9.0 app + runtime images (`ghcr.io/all-hands-ai/openhands:0.9.0` +
+`ghcr.io/all-hands-ai/runtime:od_v0.9.0_image_nikolaik___python-nodejs_tag_python3.11-nodejs22`),
+invokes `docker run ... python -m openhands.core.main -t "Fix the bug
+in add.py — ..." -d /workspace` with the sandbox docker-in-docker
+sock passthrough, then asserts the file was rewritten. Same
+`add(2, 3) == 5` correctness gate as Aider (AST BinOp(op=Add) + runtime
+check) so the two harnesses agree on the pass gate. OpenHands'
+CodeActAgent parses `<execute_ipython>` / `<execute_bash>` text-action
+tags from plain-text LLM output, NOT via OpenAI tool_calls, so
+R1-Distill drives it successfully (same pattern as Aider). ONE family
+still `XFAIL`s: gpt-oss + OpenHands hits a rapid-mlx harmony-parser
+stop-sequence scoping bug — the parser applies user-supplied
+`stop=['</execute_ipython>', ...]` against the raw token stream across
+BOTH channels, so the model's analysis-channel CoT (which mentions
+`</execute_ipython>` while reasoning about the action) triggers a
+premature stop before the final channel emits any visible content.
+Root-caused empirically inside the OpenHands container (G8, see
+`conftest.py::_GPTOSS_OPENHANDS_XFAIL_REASON` block) — fix belongs in
+`vllm_mlx` harmony parser (restrict user-supplied stops to
+final-channel content), tracked as a follow-up server-side issue.
 
 DeepSeek family Tier-1 rep was **swapped** from
 `deepseek-v4-flash-8bit` (~155 GB, single-node-infeasible on M3 Ultra
@@ -186,10 +209,10 @@ Full V4 Flash coverage tracked in follow-up issue **#1041**
 
 | Family | Boot alias | Boot time | Wall time (14 cells) | Result |
 |---|---|---|---|---|
-| Qwen 3.6 | `qwen3.6-35b-8bit` (MoE, 3 B active) | ~15 s | 11.32 s + ~3 s aider | 13 PASS / 1 XFAIL |
-| Gemma 4 | `gemma-4-31b-4bit` (dense) | ~10 s | 17.45 s + ~7 s aider | 13 PASS / 1 XFAIL |
-| DeepSeek | `deepseek-r1-32b-4bit` (R1-distilled Qwen 32B, dense) | ~18 s | 191.29 s + ~22 s aider | 4 PASS / 10 XFAIL (9 arch-XFAIL R1-Distill tool-call gap, 1 pre-existing OpenHands) |
-| gpt-oss | `gpt-oss-120b-mxfp4-q8` (MoE) | ~15 s | 14.61 s + ~3 s aider | 13 PASS / 1 XFAIL |
+| Qwen 3.6 | `qwen3.6-35b-8bit` (MoE, 3 B active) | ~15 s | 11.32 s + ~3 s aider + ~32 s openhands | 14 PASS / 0 XFAIL |
+| Gemma 4 | `gemma-4-31b-4bit` (dense) | ~10 s | 17.45 s + ~7 s aider + ~48 s openhands | 14 PASS / 0 XFAIL |
+| DeepSeek | `deepseek-r1-32b-4bit` (R1-distilled Qwen 32B, dense) | ~18 s | 191.29 s + ~22 s aider + ~72 s openhands | 5 PASS / 9 XFAIL (9 arch-XFAIL R1-Distill tool-call gap; OpenHands passes because it parses text-action tags, not tool_calls) |
+| gpt-oss | `gpt-oss-120b-mxfp4-q8` (MoE) | ~15 s | 14.61 s + ~3 s aider + XFAIL openhands | 13 PASS / 1 XFAIL (OpenHands XFAIL — rapid-mlx harmony stop-sequence scoping bug, root-caused, follow-up server fix) |
 
 > **Aider row added post-pilot 2026-07-07.** The pilot times above are the
 > 12-cell subset (aider was structural XFAIL). Re-running with the real
@@ -202,13 +225,27 @@ Full V4 Flash coverage tracked in follow-up issue **#1041**
 > DeepSeek R1-Distill-32B-4bit 22.26 s, gpt-oss-20B-MXFP4-Q8 3.15 s —
 > all four PASS with add.py rewritten to ``return a + b``.
 
+> **OpenHands row added 2026-07-07.** `test_openhands.sh` runs OpenHands
+> 0.9.0 inside Docker with a docker-in-docker sandbox — cold-cache
+> boot pulls two images (~3.4 GB + ~9 GB uncompressed) and builds a
+> hash-tagged runtime layer (first run ~5 min on a warm apt mirror);
+> subsequent runs reuse the hash-tagged image and take 30-75 s
+> per cell. Family-by-family (2026-07-07, cached-image path, 8802 port,
+> `--tool-call-parser <family>` + `--enable-auto-tool-choice`):
+> Qwen 3.5-4B-4bit (`qwen36` rep) 32.14 s (2 CodeAct steps: read →
+> `edit_file_by_replace` → finish), Gemma-4-31B-4bit 47.87 s, DeepSeek
+> R1-Distill-32B-4bit 72.08 s (long analysis-channel CoT before the
+> edit action but still one-shot), gpt-oss-20B-MXFP4-Q8 **XFAIL** at
+> 615 s (harness timeout — see the paragraph above and
+> `conftest.py::_GPTOSS_OPENHANDS_XFAIL_REASON`).
+
 | Agent | Qwen 3.6 | Gemma 4 | DeepSeek | gpt-oss |
 |---|---|---|---|---|
 | codex-cli | ✅ | ✅ | ✅ | ✅ |
 | claude-code | ✅ | ✅ | ✅ | ✅ |
 | opencode | ✅ | ✅ | XFAIL (arch) | ✅ |
 | qwen-code | ✅ | ✅ | XFAIL (arch) | ✅ |
-| openhands | XFAIL | XFAIL | XFAIL | XFAIL |
+| openhands | ✅ | ✅ | ✅ | XFAIL (server) |
 | hermes-agent | ✅ | ✅ | XFAIL (arch) | ✅ |
 | aider | ✅ | ✅ | ✅ | ✅ |
 | kilo-code | ✅ | ✅ | XFAIL (arch) | ✅ |
@@ -225,15 +262,18 @@ Full V4 Flash coverage tracked in follow-up issue **#1041**
 | smolagents | ✅ | ✅ | ✅ | ✅ |
 
 Legend: ✅ passing (real inference · real tool call · semantic assertion;
-or for aider: real bash-CLI drive · real file rewrite)
-· XFAIL = strict expected-fail with reason (Docker harness required for
-OpenHands; **XFAIL (arch)** = R1-Distill architectural tool-emission gap,
-see next paragraph and issue #1041)
+or for aider / openhands: real bash-CLI drive · real file rewrite)
+· **XFAIL (arch)** = R1-Distill architectural tool-emission gap (see next
+paragraph and issue #1041) · **XFAIL (server)** = rapid-mlx server-side
+harmony stop-sequence scoping bug that surfaces only under OpenHands'
+CodeActAgent `stop=['</execute_ipython>', ...]` argument (root-caused,
+see `conftest.py::_GPTOSS_OPENHANDS_XFAIL_REASON`)
 
-**Totals across all 4 families**: 56 cells run → **43 PASS · 13 XFAIL · 0 FAIL**
+**Totals across all 4 families**: 56 cells run → **46 PASS · 10 XFAIL · 0 FAIL**
 (9 XFAIL are the R1-Distill architectural tool-emission cells listed in
-`conftest.py::_DEEPSEEK_R1_TOOLCALL_XFAIL_NODEIDS`; 4 XFAIL are OpenHands
-across all four families pending the 0.10.6 Phase 4 Docker E2E harness).
+`conftest.py::_DEEPSEEK_R1_TOOLCALL_XFAIL_NODEIDS`; 1 XFAIL is the
+gpt-oss+OpenHands cell — rapid-mlx harmony stop-sequence scoping bug,
+tracked as a follow-up server-side issue).
 
 **DeepSeek family — architectural tool-emission gap.** The 9 DeepSeek
 tool-call cells (7 agents + LangChain + PydanticAI) are marked
@@ -265,6 +305,7 @@ For reference — this is what the deep flows historically covered on the
 | `test_anthropic_sdk.py` | x | x | x | — | — | `/v1/messages` endpoint |
 | `test_openwebui.py` | — | x | — | — | — | Docker: register, login, models, chat |
 | `test_aider.sh` | — | — | — | — | — | CLI edit-and-write workflow |
+| `test_openhands.sh` | — | — | — | — | — | Docker E2E: CodeActAgent edit-and-write against a running server (2026-07-07) |
 | `test_librechat_docker.py` | — | — | — | — | — | Docker: register, login, endpoints, models |
 | `test_hermes.py` | x | x | x | x | — | 62-tool Hermes Agent E2E + API stress test |
 
