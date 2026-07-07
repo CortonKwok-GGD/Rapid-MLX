@@ -181,13 +181,17 @@ the real harness `test_openhands.sh` which pulls the pinned OpenHands
 invokes `docker run ... python -m openhands.core.main -t "Fix the bug
 in add.py — ..." -d /workspace` with the sandbox docker-in-docker
 sock passthrough, then asserts the file was rewritten. The correctness
-gate is a **five-pair `add(a, b) == a + b` runtime sweep** — same
-scratch-file scaffolding as Aider (`return a - b  # BUG` seed) but a
-stronger polynomial-masquerade-proof gate: `(2,3)→5`, `(10,-4)→6`,
-`(0,0)→0`, `(-1,1)→0`, `(100,200)→300` jointly pin the linear combination
-to slope-1 on both variables with zero intercept, so no `a + k`,
-`a - b + k`, `a + b + k` (k ≠ 0), or hard-coded `return CONST` cheat can
-satisfy all five (codex #1048 round-1 findings #2/#3). OpenHands'
+gate is a **strict AST whitelist on `add.py`'s return expression** —
+same scratch-file scaffolding as Aider (`return a - b  # BUG` seed) but
+a stronger, non-executing gate: parse the file, find `def add(a, b): …`,
+and require the returned expression to be one of `{a + b`, `b + a`,
+`sum([a, b])` / `sum((a, b))`, `operator.add(a, b)`}` after an optional
+docstring, with the signature pinned to `(a, b)` (no `*args` /
+`**kwargs` / extra positional). Strictly stronger than a runtime
+pair-sweep (no `a - b + k`, `(a - b) + k`, `return CONST`, or `if …:
+return 5` cheat can satisfy the AST shape) AND safer — zero code
+execution, so the LLM's output never touches the host process (codex
+#1048 rounds 1 / 3 / 4). OpenHands'
 CodeActAgent parses `<execute_ipython>` / `<execute_bash>` text-action
 tags from plain-text LLM output, NOT via OpenAI tool_calls, so
 R1-Distill drives it successfully (same pattern as Aider). ONE family

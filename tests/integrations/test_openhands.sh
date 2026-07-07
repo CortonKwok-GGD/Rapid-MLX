@@ -85,13 +85,23 @@ usage() {
     exit 1
 }
 
+# Codex #1048 round-4 nit: guard value-taking options against missing
+# ``$2`` before assigning, so a stray ``--model`` at EOL degrades to a
+# clear ``usage()`` instead of the ``set -u`` "unbound variable" abort.
+_require_value() {
+    if [ "$#" -lt 2 ]; then
+        echo "ERROR: missing value for $1" >&2
+        usage
+    fi
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --model) MODEL="$2"; shift 2 ;;
-        --port) PORT="$2"; shift 2 ;;
-        --base-url) BASE_URL="$2"; shift 2 ;;
-        --timeout) TIMEOUT="$2"; shift 2 ;;
-        --max-iterations) MAX_ITERATIONS="$2"; shift 2 ;;
+        --model) _require_value "$@"; MODEL="$2"; shift 2 ;;
+        --port) _require_value "$@"; PORT="$2"; shift 2 ;;
+        --base-url) _require_value "$@"; BASE_URL="$2"; shift 2 ;;
+        --timeout) _require_value "$@"; TIMEOUT="$2"; shift 2 ;;
+        --max-iterations) _require_value "$@"; MAX_ITERATIONS="$2"; shift 2 ;;
         -v|--verbose) VERBOSE=1; shift ;;
         -h|--help) usage ;;
         *) echo "unknown arg: $1" >&2; usage ;;
@@ -404,73 +414,169 @@ if [ "$STATUS" -ne 0 ]; then
     exit 2
 fi
 
-# Correctness check — Codex #1048 round-1 findings #2 and #3 (BLOCKING):
-# the previous single-pair ``add(2, 3) == 5`` gate + "any ast.Add anywhere
-# in add()" AST match let ``return a - b + 6`` and ``return (a - b) + 6``
-# fake a pass while preserving the original subtraction bug. Fix: sweep a
-# family of input pairs that no polynomial masquerade can satisfy
-# simultaneously, and drop the weak AST match — no single ``a + b + k``
-# / ``a - b + k`` / hard-coded-return cheat can pass ALL five checks,
-# because they pin the linear combination to slope-1 on both variables
-# with zero intercept. Runtime evaluation is safe because the scratch
-# file was written by us and only mutated in place by OpenHands' sandbox
-# edits — no arbitrary source enters the tree.
+# Correctness check — Codex #1048 round-4 finding #1 (BLOCKING): the
+# previous multi-pair runtime sweep imported and executed ``add.py``
+# on the host to test five (a, b) → a+b pairs. Because ``add.py`` is
+# written by an LLM-driven agent, in-process ``exec_module`` opens a
+# host-side arbitrary-code-execution surface if the model output is
+# ever bad or compromised. Fix: swap to a strict **AST whitelist** —
+# parse the file, find ``def add(a, b): …``, and require the return
+# expression to be one of a small semantic-add whitelist (``a + b``,
+# ``b + a``, ``sum([a, b])`` / ``sum((a, b))``, ``operator.add(a, b)``).
+# Zero code execution, so the host is never exposed to the model's
+# output.
+#
+# The whitelist is intentionally tight — a strict pattern match on
+# argument names (``a``, ``b``, in either order) — which makes the
+# gate strictly stronger than the previous five-pair runtime sweep:
+# no ``return a - b + k``, ``return (a - b) + k``, ``return CONST``,
+# ``return a * b``, or hard-coded-value cheat can satisfy it, because
+# the AST shape itself is what's asserted, not the numeric behavior.
+# Rejects on any of:
+#   * missing ``def add`` or a signature that isn't ``(a, b)``
+#   * a return expression that isn't a bare Name-Name addition, a
+#     ``sum([a, b])``/``sum((a, b))`` call, or ``operator.add(a, b)``
+#   * an extra return / conditional / assignment inside the function
+#     body before the return (defence-in-depth against
+#     ``if <cond>: return 5`` style cheats)
 if ! python3 - "$WORKDIR" <<'PYEOF'
-import importlib.util
+import ast
 import sys
 
 workdir = sys.argv[1]
 target = f"{workdir}/add.py"
 
-# Load the module.
-spec = importlib.util.spec_from_file_location("_openhands_test_add", target)
-mod = importlib.util.module_from_spec(spec)
+with open(target) as fh:
+    source = fh.read()
+
 try:
-    spec.loader.exec_module(mod)
-except Exception as exc:  # noqa: BLE001 — diagnose whatever it was
-    print(f"[correctness] MODULE-LOAD-ERROR: {exc}", file=sys.stderr)
+    tree = ast.parse(source)
+except SyntaxError as exc:
+    print(f"[correctness] SYNTAX-ERROR: {exc}", file=sys.stderr)
     sys.exit(1)
 
-if not hasattr(mod, "add") or not callable(mod.add):
-    print("[correctness] MODULE-SHAPE-ERROR: add() missing or not callable",
-          file=sys.stderr)
-    sys.exit(1)
-
-# Five checks that jointly force ``add(a, b) == a + b`` — pin slope on
-# both variables to 1 and intercept to 0, so no ``a + k``, ``a - b + k``,
-# ``a + b + k`` (k ≠ 0), ``return CONST`` cheat can satisfy them all:
-#
-#     (2, 3)      → 5    — the "obvious" case (guards against no-op)
-#     (10, -4)    → 6    — kills ``a - b + 6`` (10 - (-4) + 6 = 20)
-#     (0, 0)      → 0    — kills any non-zero intercept
-#     (-1, 1)     → 0    — kills ``a + k`` (any b-independence)
-#     (100, 200)  → 300  — kills any b-scaling other than 1
-CHECKS = [
-    ((2, 3), 5),
-    ((10, -4), 6),
-    ((0, 0), 0),
-    ((-1, 1), 0),
-    ((100, 200), 300),
+funcs = [
+    n for n in ast.walk(tree)
+    if isinstance(n, ast.FunctionDef) and n.name == "add"
 ]
+if not funcs:
+    print("[correctness] AST-ERROR: no def add() in module", file=sys.stderr)
+    sys.exit(1)
+if len(funcs) > 1:
+    print(
+        "[correctness] AST-ERROR: multiple def add() definitions found "
+        f"({len(funcs)}) — reject as ambiguous",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+func = funcs[0]
 
-for (a, b), expected in CHECKS:
+# Signature must be exactly (a, b) — kwarg-only / *args / **kwargs
+# defences prevent ``def add(*args): return sum(args)`` etc. which
+# would pass the return check but doesn't match the harness's stated
+# fix ("change '-' to '+' in the return statement").
+args = func.args
+if (
+    len(args.args) != 2
+    or {a.arg for a in args.args} != {"a", "b"}
+    or args.vararg is not None
+    or args.kwarg is not None
+    or args.kwonlyargs
+    or args.posonlyargs
+):
+    print(
+        f"[correctness] AST-ERROR: def add signature must be (a, b), "
+        f"got args={[a.arg for a in args.args]} vararg={args.vararg} "
+        f"kwarg={args.kwarg} kwonly={[a.arg for a in args.kwonlyargs]} "
+        f"posonly={[a.arg for a in args.posonlyargs]}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+# Body: allow a leading docstring (Expr(Constant(str))) but require the
+# next statement to be a Return with a whitelisted expression, and
+# reject any other statement.
+body = list(func.body)
+if body and (
+    isinstance(body[0], ast.Expr)
+    and isinstance(body[0].value, ast.Constant)
+    and isinstance(body[0].value.value, str)
+):
+    body = body[1:]
+
+if len(body) != 1 or not isinstance(body[0], ast.Return):
+    print(
+        "[correctness] AST-ERROR: function body must be a single Return "
+        "(after an optional docstring); got "
+        + ", ".join(type(n).__name__ for n in body),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+expr = body[0].value
+if expr is None:
+    print("[correctness] AST-ERROR: bare return with no value", file=sys.stderr)
+    sys.exit(1)
+
+
+def _is_ab(nodes):
+    """True iff `nodes` are two Names whose ids are exactly {a, b}."""
+    if len(nodes) != 2:
+        return False
+    if not all(isinstance(n, ast.Name) for n in nodes):
+        return False
+    return {n.id for n in nodes} == {"a", "b"}
+
+
+def _matches_whitelist(node):
+    # a + b  or  b + a
+    if (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Add)
+        and _is_ab([node.left, node.right])
+    ):
+        return "BinOp(Add, a, b)"
+    # sum([a, b]) / sum((a, b)) — sum with 1 positional list/tuple arg
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "sum"
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+        and _is_ab(node.args[0].elts)
+        and not node.keywords
+    ):
+        return "Call(sum([a, b]))"
+    # operator.add(a, b) — Attribute call
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "operator"
+        and node.func.attr == "add"
+        and _is_ab(node.args)
+        and not node.keywords
+    ):
+        return "Call(operator.add(a, b))"
+    return None
+
+
+match = _matches_whitelist(expr)
+if match is None:
+    # Best-effort string preview of the offending expression for
+    # diagnostics without evaluating it.
     try:
-        got = mod.add(a, b)
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"[correctness] RUNTIME-ERROR: add({a}, {b}) raised {exc!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    if got != expected:
-        print(
-            f"[correctness] VALUE-ERROR: add({a}, {b}) returned {got!r}, "
-            f"expected {expected!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        preview = ast.unparse(expr)
+    except Exception:  # noqa: BLE001 — very old Python
+        preview = ast.dump(expr, annotate_fields=False)
+    print(
+        f"[correctness] AST-ERROR: return expression not in semantic-add "
+        f"whitelist: {preview}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
-print("[correctness] OK: all five (a, b) → a+b checks passed")
+print(f"[correctness] OK: return expression matches whitelist form: {match}")
 sys.exit(0)
 PYEOF
 then
@@ -480,5 +586,5 @@ then
     exit 3
 fi
 
-echo "[test_openhands.sh] PASS: five-pair add(a, b) == a+b checks satisfied"
+echo "[test_openhands.sh] PASS: add.py return expression is semantic add"
 exit 0

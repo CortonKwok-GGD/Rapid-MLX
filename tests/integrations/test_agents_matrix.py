@@ -61,14 +61,15 @@ OpenHands — previously a strict-xfail placeholder pending "Docker E2E
 harness required for OpenHands' text-action format" — has landed the
 same shape: ``TestOpenHands`` now shells out to ``test_openhands.sh``
 which drives the pinned OpenHands 0.9.0 app + runtime images against
-``rapid-mlx serve`` and asserts add.py corrected. Correctness gate is
-a **five-pair ``add(a, b) == a + b`` runtime sweep**
-(``(2,3)→5``, ``(10,-4)→6``, ``(0,0)→0``, ``(-1,1)→0``,
-``(100,200)→300``) that jointly pins the linear combination to slope-1
-on both variables with zero intercept — proof against ``a - b + k`` and
-``return CONST`` masquerades (codex #1048 round-1 findings #2/#3), and
-strictly stronger than Aider's still-single-pair gate. Docker-daemon
-skip guard so non-Docker CI stays green.
+``rapid-mlx serve`` and asserts add.py corrected. Correctness gate is a **strict AST whitelist on ``add.py``'s return
+expression** (parses the file, requires the return to be one of
+``a + b`` / ``b + a`` / ``sum([a, b])`` / ``sum((a, b))`` /
+``operator.add(a, b)`` after an optional docstring, with the signature
+pinned to ``(a, b)``). Non-executing, so the LLM's output never touches
+the host process; strictly stronger than a runtime pair-sweep (no
+``a - b + k``, ``return CONST``, or ``if …: return 5`` cheat can
+satisfy the AST shape). Docker-daemon skip guard so non-Docker CI
+stays green.
 """
 
 from __future__ import annotations
