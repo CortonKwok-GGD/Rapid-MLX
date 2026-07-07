@@ -40,7 +40,7 @@
 curl -fsSL https://rapidmlx.com/install.sh | bash
 ```
 
-Installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–23 GB → `qwen3.5-4b-4bit`; 24–47 GB → `gpt-oss-20b-mxfp4-q8`; 48–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `gpt-oss-120b-mxfp4-q8`). Homebrew, `uv`, and `pip` all work too — see [Alternative install methods](#alternative-install-methods).
+Installs Python 3.10+ if missing, creates an isolated venv at `~/.rapid-mlx/`, symlinks the `rapid-mlx` CLI into `~/.local/bin/`, and prints a serve command sized to your Mac (8–23 GB → `qwen3.5-4b-4bit`; 24–47 GB → `gpt-oss-20b-mxfp4-q8`; 48–95 GB → `qwen3.6-35b-8bit`; 96 GB+ → `gpt-oss-120b-mxfp4-q8`). The script is served over HTTPS from `rapidmlx.com`; if you want to inspect it before running, `curl -fsSL https://rapidmlx.com/install.sh -o install.sh && less install.sh && bash install.sh`. Prefer Homebrew, `uv`, or `pip`? See [Alternative install methods](#alternative-install-methods).
 
 **2. Chat with a model right now:**
 
@@ -56,7 +56,7 @@ Defaults to `qwen3.5-4b-4bit`. First run downloads the weights (~2.5 GB) with a 
 rapid-mlx serve qwen3.5-4b-4bit
 ```
 
-Starts an OpenAI-compatible HTTP server on `http://localhost:8000`. Anything that speaks the OpenAI SDK — Cursor, Claude Code, Codex CLI, Aider, OpenCode, LangChain, PydanticAI, your own scripts — plugs in unmodified.
+Starts an OpenAI-compatible HTTP server bound to `http://localhost:8000`. Point any OpenAI SDK / client (Cursor, Aider, LangChain, OpenCode, PydanticAI, your own scripts) at **`http://localhost:8000/v1`**; Claude Code / Anthropic SDK uses **`http://localhost:8000`** (the Anthropic messages route lives at `/v1/messages` under the same host).
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -97,7 +97,7 @@ print(client.chat.completions.create(
 |---|---|---|
 | **Chat in the terminal** | `rapid-mlx chat qwen3.5-9b-4bit` | Streaming REPL, `/help` for slash commands, `--think` / `--no-think` to control CoT. |
 | **OpenAI server for your apps** | `rapid-mlx serve qwen3.5-9b-4bit` | Point Cursor, Aider, LibreChat, Open WebUI, LangChain at `http://localhost:8000/v1`. |
-| **Agent backends** | `rapid-mlx agents codex --setup && codex` | 8 Tier-1 agents auto-configure with one command — see [Tier-1 support](#tier-1-support). |
+| **Agent backends** | `rapid-mlx serve qwen3.6-35b-8bit &`<br>`rapid-mlx agents codex --setup && codex` | 8 Tier-1 agents auto-configure once the server is up — see [Tier-1 support](#tier-1-support). |
 | **Benchmark your Mac** | `rapid-mlx bench qwen3.5-9b-4bit --submit` | Standardized B=1 bench, opens a PR to publish your row on [rapidmlx.com](https://rapidmlx.com). |
 
 → [One-shot IDE setup](https://rapidmlx.com/docs/cli.html#launch) with `rapid-mlx launch <cursor|claude-code|cline|continue-dev>`
@@ -183,7 +183,7 @@ rapid-mlx --help                    # top-level command list
 rapid-mlx <subcommand> --help       # per-subcommand flags
 ```
 
-19 subcommands cover chat / serve / share / agents / bench / models / pull / rm / ps / info / doctor / upgrade / telemetry / launch / jlens.
+Covers chat, serve, share, agents (setup / test), bench, models, pull, rm, ps, info, doctor, upgrade, telemetry, launch, and jlens.
 
 → [Full CLI reference with every flag](https://rapidmlx.com/docs/cli.html)
 
