@@ -188,8 +188,17 @@ try:
 except ValueError:
     print(f"ERROR: non-numeric port in {url!r}", file=sys.stderr)
     sys.exit(1)
-if not host or port is None:
-    print(f"ERROR: could not extract host/port from {url!r}", file=sys.stderr)
+# Codex #1048 round-8 side-effect: preserving path exposed a
+# pre-existing gap — a proxied URL like
+# ``https://gateway.example.com/rapid/v1`` has no explicit port, so
+# ``parsed.port`` is None even though the URL is well-formed. Default
+# to the scheme-standard port (80 for http, 443 for https) so those
+# deployments no longer trip the "could not extract" gate. Explicit
+# ports still win.
+if port is None:
+    port = {"http": 80, "https": 443}[parsed.scheme]
+if not host:
+    print(f"ERROR: could not extract host from {url!r}", file=sys.stderr)
     sys.exit(1)
 
 # urllib strips the surrounding brackets from IPv6 hosts already
@@ -199,19 +208,28 @@ if not host or port is None:
 # the URL rebuild below preserves ``https://`` when the caller passed
 # an HTTPS remote-serve node. Previous code hard-wired ``http://`` and
 # would silently connect over the wrong protocol.
-print(f"{parsed.scheme}\t{host}\t{port}")
+# Codex #1048 round-8 finding #1 (BLOCKING): also emit the path so the
+# URL rebuild does not silently drop a base-path prefix on proxied
+# deployments (``https://gateway.example.com/rapid/v1``). We default
+# to ``/v1`` only if the caller passed no path at all — the rapid-mlx
+# server always exposes chat completions under ``/v1``. Escape TAB so
+# ``\t`` does not collide with awk splitting; urllib does not permit
+# raw TAB in the path anyway (would be percent-encoded first).
+path = parsed.path or "/v1"
+print(f"{parsed.scheme}\t{host}\t{port}\t{path}")
 PYEOF
 )"; then
     echo "ERROR: could not parse --base-url=$BASE_URL" >&2
     exit 1
 fi
 
-# Split three tab-separated fields (scheme / host / port) with awk so
-# we do not have to care about IPv6 colons or the bash-3.2 lack of
-# named-array literals.
+# Split four tab-separated fields (scheme / host / port / path) with
+# awk so we do not have to care about IPv6 colons or the bash-3.2
+# lack of named-array literals.
 CONTAINER_SCHEME="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $1}')"
 CONTAINER_HOST="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $2}')"
 CONTAINER_PORT="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $3}')"
+CONTAINER_PATH="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $4}')"
 
 # Codex #1048 round-3 finding #1 (BLOCKING): explicitly validate the
 # tab-delimited shape of the Python parser output BEFORE downstream
@@ -219,11 +237,15 @@ CONTAINER_PORT="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $3}')"
 # tab on the ERROR path — but if a future edit accidentally leaks an
 # error onto stdout, we'd construct a malformed CONTAINER_BASE_URL and
 # hit Docker with garbage. This gate turns that into a fast exit 1.
-if [ -z "$CONTAINER_SCHEME" ] || [ -z "$CONTAINER_HOST" ] || [ -z "$CONTAINER_PORT" ] \
+# The path field is also required to start with ``/`` — urllib's
+# ``parsed.path`` guarantees this for absolute URLs so a missing
+# leading slash means the parser is broken and we should fail loud.
+if [ -z "$CONTAINER_SCHEME" ] || [ -z "$CONTAINER_HOST" ] || [ -z "$CONTAINER_PORT" ] || [ -z "$CONTAINER_PATH" ] \
    || ! [[ "$CONTAINER_SCHEME" =~ ^https?$ ]] \
-   || ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: URL parser returned malformed scheme/host/port shape " >&2
-    echo "       (raw='$_URL_PARTS' scheme='$CONTAINER_SCHEME' host='$CONTAINER_HOST' port='$CONTAINER_PORT')" >&2
+   || ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] \
+   || [ "${CONTAINER_PATH:0:1}" != "/" ]; then
+    echo "ERROR: URL parser returned malformed scheme/host/port/path shape " >&2
+    echo "       (raw='$_URL_PARTS' scheme='$CONTAINER_SCHEME' host='$CONTAINER_HOST' port='$CONTAINER_PORT' path='$CONTAINER_PATH')" >&2
     exit 1
 fi
 
@@ -241,14 +263,15 @@ esac
 
 # Re-bracket IPv6 hosts for URL assembly. ``host.docker.internal`` and
 # IPv4 literals go through unchanged; only literal IPv6 addresses need
-# the ``[…]`` wrapping per RFC 3986 §3.2.2. Scheme comes from the
-# parsed input so ``--base-url https://...`` round-trips correctly.
+# the ``[…]`` wrapping per RFC 3986 §3.2.2. Scheme and path come from
+# the parsed input so ``--base-url https://gateway.example.com/rapid/v1``
+# round-trips correctly.
 case "$CONTAINER_HOST" in
     *:*)
-        CONTAINER_BASE_URL="${CONTAINER_SCHEME}://[${CONTAINER_HOST}]:${CONTAINER_PORT}/v1"
+        CONTAINER_BASE_URL="${CONTAINER_SCHEME}://[${CONTAINER_HOST}]:${CONTAINER_PORT}${CONTAINER_PATH}"
         ;;
     *)
-        CONTAINER_BASE_URL="${CONTAINER_SCHEME}://${CONTAINER_HOST}:${CONTAINER_PORT}/v1"
+        CONTAINER_BASE_URL="${CONTAINER_SCHEME}://${CONTAINER_HOST}:${CONTAINER_PORT}${CONTAINER_PATH}"
         ;;
 esac
 
@@ -422,7 +445,7 @@ docker run \
     "$OPENHANDS_IMAGE" \
     python -m openhands.core.main \
         -i "$MAX_ITERATIONS" \
-        -d /workspace \
+        -d /opt/workspace_base \
         -t "The file add.py in the current workspace has a bug: it returns a - b when it should return a + b. Open add.py, change the '-' operator to '+' in the return statement, and save the file. Do not modify anything else. Once the file is saved, stop." \
     >"$LOG" 2>&1
 STATUS=$?

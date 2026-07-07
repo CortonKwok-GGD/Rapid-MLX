@@ -485,8 +485,13 @@ class TestOpenHands:
             pytest.fail(
                 f"openhands/{family_alias.family}: harness wall-timeout "
                 f"({self._HARNESS_TIMEOUT_SECONDS + 60}s) exceeded. "
-                f"stdout(tail)={(exc.stdout or b'')[-800:]!r} "
-                f"stderr(tail)={(exc.stderr or b'')[-800:]!r}"
+                # Codex #1048 round-8 nit: with ``text=True``,
+                # ``TimeoutExpired.stdout``/``.stderr`` are ``str | None``,
+                # so a bytes-literal ``or`` fallback would mix ``str`` and
+                # ``bytes`` in the tail slice. Use ``""`` and take the
+                # tail off a homogeneous ``str``.
+                f"stdout(tail)={(exc.stdout or '')[-800:]!r} "
+                f"stderr(tail)={(exc.stderr or '')[-800:]!r}"
             )
 
         # Assert exit 0 with the tail of stdout+stderr for diagnostics
@@ -623,8 +628,13 @@ class TestAider:
             pytest.fail(
                 f"aider/{family_alias.family}: harness wall-timeout "
                 f"({self._HARNESS_TIMEOUT_SECONDS + 30}s) exceeded. "
-                f"stdout(tail)={(exc.stdout or b'')[-800:]!r} "
-                f"stderr(tail)={(exc.stderr or b'')[-800:]!r}"
+                # Codex #1048 round-8 nit: with ``text=True``,
+                # ``TimeoutExpired.stdout``/``.stderr`` are ``str | None``,
+                # so a bytes-literal ``or`` fallback would mix ``str`` and
+                # ``bytes`` in the tail slice. Use ``""`` and take the
+                # tail off a homogeneous ``str``.
+                f"stdout(tail)={(exc.stdout or '')[-800:]!r} "
+                f"stderr(tail)={(exc.stderr or '')[-800:]!r}"
             )
 
         # Assert exit 0 with the tail of stdout+stderr for diagnostics
