@@ -183,15 +183,22 @@ in add.py — ..." -d /workspace` with the sandbox docker-in-docker
 sock passthrough, then asserts the file was rewritten. The correctness
 gate is a **strict AST whitelist on `add.py`'s return expression** —
 same scratch-file scaffolding as Aider (`return a - b  # BUG` seed) but
-a stronger, non-executing gate: parse the file, find `def add(a, b): …`,
-and require the returned expression to be one of `{a + b`, `b + a`,
-`sum([a, b])` / `sum((a, b))`, `operator.add(a, b)`}` after an optional
+a stronger, non-executing gate: parse the file, first require the
+module's top level to be **only** a `def add` (optionally preceded by
+a docstring — codex #1048 round 6 finding #3 rejected the previous
+"allow arbitrary other top-level statements" behaviour that would let
+an injected `import os; os.system(...)` slip past a good `def add`),
+find `def add(a, b): …`, and require the returned expression to be one
+of `{a + b`, `b + a`, `sum([a, b])` / `sum((a, b))`}` after an optional
 docstring, with the signature pinned to `(a, b)` (no `*args` /
-`**kwargs` / extra positional). Strictly stronger than a runtime
+`**kwargs` / extra positional). The previous `operator.add(a, b)`
+branch was removed in round 5 because the whitelist did not verify
+`import operator` at module top level, so it would accept a file that
+`NameError`d at import time. Strictly stronger than a runtime
 pair-sweep (no `a - b + k`, `(a - b) + k`, `return CONST`, or `if …:
 return 5` cheat can satisfy the AST shape) AND safer — zero code
 execution, so the LLM's output never touches the host process (codex
-#1048 rounds 1 / 3 / 4). OpenHands'
+#1048 rounds 1 / 3 / 4 / 5 / 6). OpenHands'
 CodeActAgent parses `<execute_ipython>` / `<execute_bash>` text-action
 tags from plain-text LLM output, NOT via OpenAI tool_calls, so
 R1-Distill drives it successfully (same pattern as Aider). ONE family

