@@ -60,6 +60,7 @@ def test_cli_parser_accepts_all_flags() -> None:
             "--public-base",
             "https://elsewhere.example",
             "--dry-run",
+            "--verify-only",
             "--tmp-dir",
             "/mnt/scratch",
         ]
@@ -69,6 +70,9 @@ def test_cli_parser_accepts_all_flags() -> None:
     assert args.profile == "other-profile"
     assert args.public_base == "https://elsewhere.example"
     assert args.dry_run is True
+    # Codex round-1 NIT: --verify-only was not part of the smoke matrix
+    # before. One documented flag must always be assertable.
+    assert args.verify_only is True
     assert args.tmp_dir == "/mnt/scratch"
 
 
@@ -135,6 +139,73 @@ def test_should_skip_false_when_hf_size_unknown() -> None:
     assert mirror_to_r2.should_skip(existing_size=500, expected_size=0) is False
 
 
+# ---- codex round-1 BLOCKING #1: size-only isn't proof of identity for LFS
+
+
+def test_should_skip_true_when_size_and_sha_match() -> None:
+    """Both size AND sha match → skip."""
+    sha = "a" * 64
+    assert (
+        mirror_to_r2.should_skip(
+            existing_size=1000,
+            expected_size=1000,
+            existing_sha256=sha,
+            expected_sha256=sha,
+        )
+        is True
+    )
+
+
+def test_should_skip_false_when_size_matches_but_sha_missing_on_lfs() -> None:
+    """Size match + HF has LFS sha + R2 has no sha metadata → re-upload.
+
+    Guards against stale pre-metadata uploads: an object uploaded before
+    we started tagging ``x-amz-meta-hf-sha256`` still shows the right
+    size but we cannot prove it's the current bytes.
+    """
+    sha = "a" * 64
+    assert (
+        mirror_to_r2.should_skip(
+            existing_size=1000,
+            expected_size=1000,
+            existing_sha256=None,
+            expected_sha256=sha,
+        )
+        is False
+    )
+
+
+def test_should_skip_false_when_sha_mismatch() -> None:
+    """Size match + shas differ → same-length-but-different-bytes: re-upload."""
+    assert (
+        mirror_to_r2.should_skip(
+            existing_size=1000,
+            expected_size=1000,
+            existing_sha256="a" * 64,
+            expected_sha256="b" * 64,
+        )
+        is False
+    )
+
+
+def test_should_skip_true_size_only_for_non_lfs_files() -> None:
+    """Non-LFS files (no HF sha256) fall back to size-only skip.
+
+    Rationale in ``should_skip`` docstring: small text files without
+    LFS hashes shouldn't be forced back through the network on every
+    resume pass.
+    """
+    assert (
+        mirror_to_r2.should_skip(
+            existing_size=100,
+            expected_size=100,
+            existing_sha256="ignored" * 8,  # not 64 chars but that's fine here
+            expected_sha256=None,  # HF didn't give us a sha
+        )
+        is True
+    )
+
+
 def test_r2_head_size_returns_content_length() -> None:
     """A mocked boto3 client returns the size on ``head_object``."""
     client = MagicMock()
@@ -165,3 +236,74 @@ def test_r2_head_size_raises_on_permission_error() -> None:
     )
     with pytest.raises(ClientError):
         mirror_to_r2._r2_head_size(client, "bucket", "key")
+
+
+# ---- codex round-1 BLOCKING #2: percent-encode segments in the public URL
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_url"),
+    [
+        (
+            "mlx-community/simple/config.json",
+            "https://models.rapidmlx.com/mlx-community/simple/config.json",
+        ),
+        (
+            "mlx-community/repo name/model card.md",
+            "https://models.rapidmlx.com/mlx-community/repo%20name/model%20card.md",
+        ),
+        (
+            # ``#`` and ``?`` would otherwise start a fragment / query.
+            "mlx-community/repo#v2/config?.json",
+            "https://models.rapidmlx.com/mlx-community/repo%23v2/config%3F.json",
+        ),
+        (
+            "/leading-slash/repo/file.json",
+            "https://models.rapidmlx.com/leading-slash/repo/file.json",
+        ),
+    ],
+)
+def test_public_url_percent_encodes_segments(key: str, expected_url: str) -> None:
+    assert (
+        mirror_to_r2._public_url("https://models.rapidmlx.com", key) == expected_url
+    )
+
+
+# ---- upload adds hf-sha256 metadata for LFS files, omits for non-LFS
+
+
+def test_upload_one_tags_hf_sha_for_lfs_files(tmp_path) -> None:
+    """LFS weight shards get x-amz-meta-hf-sha256 on upload."""
+    client = MagicMock()
+    f = tmp_path / "model.safetensors"
+    f.write_bytes(b"stub")
+    sha = "c" * 64
+    mirror_to_r2._upload_one(
+        client,
+        f,
+        "bucket",
+        "org/repo/model.safetensors",
+        "application/octet-stream",
+        lfs_sha256=sha,
+    )
+    call = client.upload_file.call_args
+    assert call.kwargs["ExtraArgs"]["ContentType"] == "application/octet-stream"
+    assert call.kwargs["ExtraArgs"]["Metadata"] == {"hf-sha256": sha}
+
+
+def test_upload_one_omits_metadata_when_no_sha(tmp_path) -> None:
+    """Non-LFS files (no HF sha256) upload without a Metadata block."""
+    client = MagicMock()
+    f = tmp_path / "config.json"
+    f.write_bytes(b"{}")
+    mirror_to_r2._upload_one(
+        client,
+        f,
+        "bucket",
+        "org/repo/config.json",
+        "application/json",
+        lfs_sha256=None,
+    )
+    extra = client.upload_file.call_args.kwargs["ExtraArgs"]
+    assert extra["ContentType"] == "application/json"
+    assert "Metadata" not in extra

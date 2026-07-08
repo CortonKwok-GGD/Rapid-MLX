@@ -107,6 +107,7 @@ class FileMeta:
     relpath: str  # HF sibling rfilename
     size: int  # bytes; 0 for empty files, from HF metadata
     key: str  # R2 object key = ``<hf-repo-id>/<relpath>``
+    lfs_sha256: str | None = None  # HF's LFS sha256 for weight shards; None otherwise
 
 
 def _hf_files(repo_id: str) -> list[FileMeta]:
@@ -130,8 +131,18 @@ def _hf_files(repo_id: str) -> list[FileMeta]:
         if rname.startswith("/") or ".." in Path(rname).parts:
             raise ValueError(f"Refusing suspicious HF filename: {rname!r}")
         size = int(getattr(s, "size", 0) or 0)
+        # LFS-tracked files (weight shards) expose a canonical sha256
+        # under ``s.lfs.sha256``. We stash it as R2 object metadata so
+        # ``should_skip`` can require both size AND sha match — a stale/
+        # corrupt R2 object with the same byte length can't sneak past.
+        lfs = getattr(s, "lfs", None)
+        lfs_sha256 = getattr(lfs, "sha256", None) if lfs is not None else None
+        if not (isinstance(lfs_sha256, str) and len(lfs_sha256) == 64):
+            lfs_sha256 = None
         key = f"{repo_id}/{rname}"
-        files.append(FileMeta(relpath=rname, size=size, key=key))
+        files.append(
+            FileMeta(relpath=rname, size=size, key=key, lfs_sha256=lfs_sha256)
+        )
     return files
 
 
@@ -158,12 +169,28 @@ def _r2_head_size(client: Any, bucket: str, key: str) -> int | None:
     Any non-404 error raises (fail-fast — we want the operator to see
     permission / endpoint issues immediately rather than skipping past
     them).
+
+    Kept for the unit tests + external callers that only care about
+    size. Callers that need the full HEAD response (including x-amz-meta
+    fields for sha checking) should use :func:`_r2_head`.
+    """
+    r = _r2_head(client, bucket, key)
+    if r is None:
+        return None
+    return int(r["ContentLength"])
+
+
+def _r2_head(client: Any, bucket: str, key: str) -> dict[str, Any] | None:
+    """Return the raw ``head_object`` response, or ``None`` on 404.
+
+    Any non-404 error raises. The returned dict includes ``ContentLength``
+    and ``Metadata`` (a lowercase-keyed dict of x-amz-meta-* headers) —
+    enough to run both a size AND checksum check on skip.
     """
     from botocore.exceptions import ClientError
 
     try:
-        r = client.head_object(Bucket=bucket, Key=key)
-        return int(r["ContentLength"])
+        return client.head_object(Bucket=bucket, Key=key)
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         # Boto raises "404" (string) for HEAD-missing objects.
@@ -172,19 +199,50 @@ def _r2_head_size(client: Any, bucket: str, key: str) -> int | None:
         raise
 
 
-def should_skip(existing_size: int | None, expected_size: int) -> bool:
-    """Skip decision: same size on R2 = same content, do not re-upload.
+def should_skip(
+    existing_size: int | None,
+    expected_size: int,
+    *,
+    existing_sha256: str | None = None,
+    expected_sha256: str | None = None,
+) -> bool:
+    """Skip decision: same size AND (when known) same sha256 = same content.
 
-    Note we treat "HF metadata size is 0" (some older repos don't expose
-    a size) as "cannot skip safely" — force a re-upload rather than risk
-    accepting a truncated leftover.
+    Codex round-1 BLOCKING #1: matching byte length alone can be fooled
+    by a stale/corrupt R2 object that happens to share the file size
+    (e.g. a previous upload from a different repo revision, or a mid-
+    stream truncation that boto3's post-flight ``ContentLength`` still
+    reports as full). Whenever HF exposes an LFS sha256 (all weight
+    shards) we require BOTH size + sha match on the ``x-amz-meta-hf-sha256``
+    metadata field we set at upload time.
+
+    Behavior matrix:
+
+    * ``existing_size is None`` (R2 HEAD → 404): must upload.
+    * ``expected_size <= 0`` (HF didn't tell us the size): must upload
+      — refuse to trust an R2 short-write.
+    * ``expected_sha256`` present but ``existing_sha256`` missing or
+      mismatched: must upload — the R2 object is either an older upload
+      pre-metadata, or a different bytes-with-same-length case.
+    * ``expected_sha256 is None`` (non-LFS: config.json, README.md,
+      etc.): fall back to size-only. Small text files don't get LFS
+      hashes; the practical risk of a same-size-but-corrupt copy is
+      much lower for a 1 KB config than for a 5 GB shard, and forcing
+      users to re-upload every tiny asset on each pass defeats the
+      resumability contract.
     """
     if existing_size is None:
         return False
     if expected_size <= 0:
-        # HF didn't tell us the size — refuse to trust an R2 short-write.
         return False
-    return existing_size == expected_size
+    if existing_size != expected_size:
+        return False
+    # Size matches. When HF told us an LFS sha, demand parity — an R2
+    # object without our sha metadata is stale (from a pre-metadata
+    # upload) and must be re-uploaded to earn the skip.
+    if expected_sha256 is not None:
+        return existing_sha256 == expected_sha256
+    return True
 
 
 def _upload_one(
@@ -193,6 +251,8 @@ def _upload_one(
     bucket: str,
     key: str,
     content_type: str,
+    *,
+    lfs_sha256: str | None = None,
 ) -> None:
     """Upload one file to R2 with boto3 multipart auto-split.
 
@@ -201,12 +261,20 @@ def _upload_one(
     profile sets both to 64 MB. We do NOT reimplement multipart
     ourselves; the SDK handles ``create_multipart_upload`` /
     ``upload_part`` / ``complete_multipart_upload`` including retries.
+
+    When ``lfs_sha256`` is provided (weight shards), it is stored as
+    ``x-amz-meta-hf-sha256`` object metadata so a subsequent
+    :func:`should_skip` check can require both size AND sha parity
+    (codex round-1 BLOCKING #1).
     """
+    extra: dict[str, Any] = {"ContentType": content_type}
+    if lfs_sha256:
+        extra["Metadata"] = {"hf-sha256": lfs_sha256}
     client.upload_file(
         Filename=str(local_path),
         Bucket=bucket,
         Key=key,
-        ExtraArgs={"ContentType": content_type},
+        ExtraArgs=extra,
     )
 
 
@@ -238,7 +306,20 @@ def _cleanup_local(path: Path) -> None:
 
 
 def _public_url(public_base: str, key: str) -> str:
-    return f"{public_base.rstrip('/')}/{key.lstrip('/')}"
+    """Build the public read URL for an R2 key.
+
+    Codex round-1 BLOCKING #2: percent-encode each path segment before
+    joining. Filenames legitimately containing spaces, ``#``, ``?``,
+    ``%``, or other URL-reserved chars would otherwise turn a valid
+    ``mlx-community/repo/model card.md`` key into an unreachable URL
+    (space breaks the path; ``#`` starts a fragment). Encoding per
+    segment (not whole key) preserves the ``/`` separators. Matches the
+    same discipline in ``vllm_mlx/_mirror.py::_build_r2_url``.
+    """
+    encoded = "/".join(
+        urllib.parse.quote(seg, safe="") for seg in key.lstrip("/").split("/") if seg
+    )
+    return f"{public_base.rstrip('/')}/{encoded}"
 
 
 def _http_head_status(url: str, timeout: float = 30.0) -> int:
@@ -324,11 +405,25 @@ def mirror_repo(
         bytes_uploaded = 0
         try:
             for idx, f in enumerate(files, 1):
-                head_size = _r2_head_size(client, bucket, f.key)
-                if should_skip(head_size, f.size):
+                head = _r2_head(client, bucket, f.key)
+                head_size = int(head["ContentLength"]) if head is not None else None
+                # Boto3 lowercases user metadata keys on read.
+                head_sha = (
+                    (head.get("Metadata") or {}).get("hf-sha256")
+                    if head is not None
+                    else None
+                )
+                if should_skip(
+                    head_size,
+                    f.size,
+                    existing_sha256=head_sha,
+                    expected_sha256=f.lfs_sha256,
+                ):
                     skipped += 1
+                    tag = "sha+size" if f.lfs_sha256 else "size-only"
                     print(
-                        f"[{idx}/{len(files)}] SKIP existing {f.key} ({head_size} B)",
+                        f"[{idx}/{len(files)}] SKIP existing {f.key} "
+                        f"({head_size} B, {tag})",
                         flush=True,
                     )
                     continue
@@ -353,6 +448,7 @@ def mirror_repo(
                         bucket,
                         f.key,
                         content_type_for(f.relpath),
+                        lfs_sha256=f.lfs_sha256,
                     )
                 finally:
                     _cleanup_local(local)
