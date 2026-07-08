@@ -1576,6 +1576,8 @@ def _normalize_speculative_config_or_exit(args):
             "mtp_num_draft_tokens": 1,
             "mtp_optimistic": False,
             "mtp_sidecar": None,
+            # 0.10.6 A3 spike — Gemma 4 experimental sidecar.
+            "mtp_gemma4_sidecar_experimental": None,
             "mtp_max_k": 1,
             "mtp_disable_auto_k": False,
             "suffix_decoding": False,
@@ -1601,6 +1603,8 @@ def _normalize_speculative_config_or_exit(args):
             conflicts.append("enable_mtp")
         if (getattr(args, "mtp_sidecar", None) or "").strip():
             conflicts.append("mtp_sidecar")
+        if (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip():
+            conflicts.append("mtp_gemma4_sidecar_experimental")
         # Idempotency guard: after ``_fill_runtime_defaults(overwrite=True)``
         # a disabled config normalizes to ``mtp_max_k=1``. Only flag the
         # value as a ``--no-spec-decode`` conflict when it diverges from
@@ -1647,6 +1651,8 @@ def _normalize_speculative_config_or_exit(args):
             fields.append("enable_mtp")
         if (getattr(args, "mtp_sidecar", None) or "").strip():
             fields.append("mtp_sidecar")
+        if (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip():
+            fields.append("mtp_gemma4_sidecar_experimental")
         if getattr(args, "mtp_max_k", None) is not None:
             fields.append("mtp_max_k")
         if getattr(args, "mtp_num_draft_tokens", 1) != 1:
@@ -2952,7 +2958,15 @@ def serve_command(args):
         dflash_drafter_path=getattr(args, "dflash_drafter_path", "") or "",
         # Optional external MTP sidecar path. ``None`` is the "no
         # sidecar; native-MTP path only" sentinel.
-        mtp_sidecar=getattr(args, "mtp_sidecar", None),
+        mtp_sidecar=(
+            # Prefer the experimental Gemma 4 sidecar path when set —
+            # it takes over the ``mtp_sidecar`` transport under a
+            # distinct opt-in flag (``mtp_gemma4_experimental`` below).
+            # Falls back to the pre-existing hidden ``--mtp-sidecar``
+            # reserved surface when the new flag is unset.
+            getattr(args, "mtp_gemma4_sidecar_experimental", None)
+            or getattr(args, "mtp_sidecar", None)
+        ),
         # 0.9.13 PR-A codex round-E blocker #2: CLI-resolved
         # ``config.json::model_type`` for the dispatch step. See the
         # ``_cli_mtp_model_type`` block above for why this is
@@ -2961,6 +2975,12 @@ def serve_command(args):
         # 0.9.13 PR-B: EV depth controller knobs.
         mtp_max_k=getattr(args, "mtp_max_k", 3),
         mtp_disable_auto_k=getattr(args, "mtp_disable_auto_k", False),
+        # 0.10.6 A3 spike: Gemma 4 assistant-sidecar MTP experimental
+        # gate. Only propagates when the operator opts in via
+        # ``--mtp-gemma4-sidecar-experimental``.
+        mtp_gemma4_experimental=bool(
+            getattr(args, "mtp_gemma4_sidecar_experimental", None)
+        ),
         # SuffixDecoding
         enable_suffix_decoding=args.suffix_decoding,
         suffix_max_draft=args.suffix_max_draft,
@@ -3030,28 +3050,75 @@ def serve_command(args):
             hf_cfg_eligibility, _ = _gather_kv_cache_dtype_inputs(args.model)
         except Exception:  # pragma: no cover — best-effort
             hf_cfg_eligibility = None
-        has_sidecar = bool(getattr(args, "mtp_sidecar", None))
+        # 0.10.6 A3 spike: Gemma 4 experimental sidecar path. When
+        # ``--mtp-gemma4-sidecar-experimental <path>`` is set, treat
+        # the path as the sidecar transport AND flip the experimental
+        # detect gate. The pre-existing hidden ``--mtp-sidecar`` flag
+        # is preserved for compatibility but does NOT flip the
+        # experimental gate — it stays inert until a future promoted
+        # sidecar path lands.
+        gemma4_experimental_sidecar = getattr(
+            args, "mtp_gemma4_sidecar_experimental", None
+        )
+        has_sidecar = bool(
+            gemma4_experimental_sidecar or getattr(args, "mtp_sidecar", None)
+        )
+        experimental_gemma4 = bool(gemma4_experimental_sidecar)
         eligibility = detect_mtp_eligibility(
-            hf_cfg_eligibility, has_external_sidecar=has_sidecar
+            hf_cfg_eligibility,
+            has_external_sidecar=has_sidecar,
+            experimental_gemma4=experimental_gemma4,
         )
         if eligibility is MTPEligibility.NONE:
-            if has_sidecar:
+            model_type_str = None
+            if isinstance(hf_cfg_eligibility, dict):
+                _mt = hf_cfg_eligibility.get("model_type")
+                if isinstance(_mt, str):
+                    model_type_str = _mt
+            is_gemma4 = (
+                model_type_str is not None
+                and model_type_str.startswith("gemma4")
+            )
+            if is_gemma4 and not experimental_gemma4:
                 print(
-                    "error: MTP speculative-config requires either a Qwen3.5 / "
-                    "Qwen3.6 checkpoint with mtp_num_hidden_layers >= 1 in "
-                    "config.json. Assistant sidecars are reserved for future "
-                    "validated support and do not make this model eligible.",
+                    "error: Gemma 4 MTP is EXPERIMENTAL and requires "
+                    "--mtp-gemma4-sidecar-experimental <path-or-hf-repo-id>. "
+                    "Point it at Google's assistant drafter for this size "
+                    "(e.g. google/gemma-4-31B-it-assistant). Run "
+                    "scripts/validate_gemma4_mtp_lossless.py against the "
+                    "batched-consistent contract before relying on the "
+                    "output.",
+                    file=sys.stderr,
+                )
+            elif has_sidecar:
+                print(
+                    "error: MTP speculative-config requires either a Qwen3.5 "
+                    "/ Qwen3.6 checkpoint with mtp_num_hidden_layers >= 1 in "
+                    "config.json, or a Gemma 4 checkpoint paired with "
+                    "--mtp-gemma4-sidecar-experimental <sidecar>. The "
+                    "loaded model does not qualify.",
                     file=sys.stderr,
                 )
             else:
                 print(
                     "error: MTP speculative-config requires a Qwen3.5 / "
                     "Qwen3.6 checkpoint with mtp_num_hidden_layers >= 1 in "
-                    "config.json. Assistant sidecars are not currently "
-                    "supported. The loaded model does not qualify.",
+                    "config.json, or a Gemma 4 checkpoint paired with "
+                    "--mtp-gemma4-sidecar-experimental <sidecar>. The "
+                    "loaded model does not qualify.",
                     file=sys.stderr,
                 )
             sys.exit(2)
+
+        if experimental_gemma4:
+            print(
+                "\n  WARNING: Gemma 4 MTP is EXPERIMENTAL (0.10.6 A3 spike).\n"
+                "  Lossless contract: batched-consistent (not vs single-token\n"
+                "  plain decode — MLX SDPA numerics diverge at q_len=1 vs\n"
+                "  q_len>=2 under quantized weights). Validate output with\n"
+                "  scripts/validate_gemma4_mtp_lossless.py before shipping.\n",
+                file=sys.stderr,
+            )
 
         # Codex round-I BLOCKING #3 / round-K BLOCKING #2:
         # reconcile the earlier best-effort CLI-thread config read
@@ -3071,8 +3138,14 @@ def serve_command(args):
             logger=logger,
         )
 
+        _effective_sidecar = gemma4_experimental_sidecar or getattr(
+            args, "mtp_sidecar", None
+        )
+        experimental_tag = " EXPERIMENTAL" if experimental_gemma4 else ""
         sidecar_note = (
-            f" +sidecar={getattr(args, 'mtp_sidecar', None)}" if has_sidecar else ""
+            f" +sidecar={_effective_sidecar}{experimental_tag}"
+            if has_sidecar
+            else ""
         )
         print(f"Spec-decode: mtp ({eligibility.value}){sidecar_note}")
 
@@ -6889,6 +6962,28 @@ Examples:
     )
     serve_parser.add_argument(
         "--mtp-sidecar",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    # 0.10.6 A3 spike: distinct flag from ``--mtp-sidecar`` so an
+    # operator opting into the experimental Gemma 4 assistant-sidecar
+    # path is explicit about the un-validated performance/lossless
+    # tradeoff. Setting this flag propagates:
+    #
+    # * ``mtp_sidecar`` on SchedulerConfig — the sidecar transport
+    #   (local safetensors dir OR HF repo id, e.g.
+    #   ``google/gemma-4-31B-it-assistant``).
+    # * ``mtp_gemma4_experimental=True`` on SchedulerConfig — the
+    #   twin gate on
+    #   ``vllm_mlx.spec_decode.mtp.detect.detect_mtp_eligibility``.
+    #
+    # Detection collapses to NONE unless BOTH are set, so a bare
+    # ``--speculative-config '{"method":"mtp"}'`` on a stock Gemma 4
+    # checkpoint bounces at the CLI eligibility check with a targeted
+    # error message pointing here.
+    serve_parser.add_argument(
+        "--mtp-gemma4-sidecar-experimental",
+        dest="mtp_gemma4_sidecar_experimental",
         default=None,
         help=argparse.SUPPRESS,
     )

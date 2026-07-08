@@ -5,8 +5,22 @@ Historically, callers of the vendored MTP path
 (:mod:`vllm_mlx.spec_decode.mtp`) reached directly into
 :mod:`vllm_mlx.spec_decode.mtp.qwen3_5_inject`. This dispatcher keeps
 family implementations behind a small registry so new architectures can
-be added only after they pass end-to-end lossless + performance
-validation.
+be added incrementally.
+
+Registered families:
+
+* Qwen3.5 / Qwen3.6 (``qwen3_5`` / ``qwen3_5_moe``) — production,
+  MTP baked into the target checkpoint.
+* Gemma 4 (``gemma4`` / ``gemma4_unified`` / ``gemma4_text`` /
+  ``gemma4_unified_text``) — EXPERIMENTAL (0.10.6 A3 spike). Routes
+  through :mod:`~vllm_mlx.spec_decode.mtp.gemma4_inject`. Runtime
+  activation is gated at the CLI eligibility check
+  (``--mtp-gemma4-sidecar-experimental`` + ``has_external_sidecar``
+  path in :func:`~vllm_mlx.spec_decode.mtp.detect.detect_mtp_eligibility`),
+  not here — the dispatcher's job is purely to find the family
+  implementation. Direct low-level callers (tests, bench harnesses)
+  can invoke ``dispatch_mtp_inject`` with the Gemma 4 model_type and
+  a sidecar path; the CLI is where the "should this run" policy lives.
 
 This module is intentionally the smallest possible dispatcher — no
 config mutation, no monkey-patching. It resolves the family, forwards
@@ -51,6 +65,31 @@ _MTP_INJECT_DISPATCH: dict[str, tuple[str, str]] = {
         "vllm_mlx.spec_decode.mtp.qwen3_5_inject",
         "inject_mtp_support",
     ),
+    # Gemma 4 (EXPERIMENTAL — 0.10.6 A3 spike). Paired with Google's
+    # ``google/gemma-4-<size>-it-assistant`` drafter checkpoints,
+    # Apache 2.0. Both the outer wrapper model_types (``gemma4`` /
+    # ``gemma4_unified``) and the inner text model_types
+    # (``gemma4_text`` / ``gemma4_unified_text``) route to the same
+    # ``gemma4_inject`` module so callers that resolve model_type on
+    # the inner ``language_model.args`` still land correctly. The CLI
+    # eligibility gate blocks these paths from firing unless the
+    # operator opts in via ``--mtp-gemma4-sidecar-experimental``.
+    "gemma4": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
+        "inject_mtp_support",
+    ),
+    "gemma4_unified": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
+        "inject_mtp_support",
+    ),
+    "gemma4_text": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
+        "inject_mtp_support",
+    ),
+    "gemma4_unified_text": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
+        "inject_mtp_support",
+    ),
 }
 
 
@@ -64,6 +103,22 @@ _MTP_VALIDATE_DISPATCH: dict[str, tuple[str, str]] = {
     ),
     "qwen3_5_moe": (
         "vllm_mlx.spec_decode.mtp.qwen3_5_inject",
+        "validate_mtp_support",
+    ),
+    "gemma4": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
+        "validate_mtp_support",
+    ),
+    "gemma4_unified": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
+        "validate_mtp_support",
+    ),
+    "gemma4_text": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
+        "validate_mtp_support",
+    ),
+    "gemma4_unified_text": (
+        "vllm_mlx.spec_decode.mtp.gemma4_inject",
         "validate_mtp_support",
     ),
 }

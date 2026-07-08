@@ -355,6 +355,18 @@ class SchedulerConfig:
     mtp_max_k: int = 3
     mtp_disable_auto_k: bool = False
 
+    # 0.10.6 A3 spike: Gemma 4 assistant-sidecar MTP experimental gate.
+    # False by default so the detection layer stays fail-closed for the
+    # Gemma 4 family. Set by the CLI when the operator passes
+    # ``--mtp-gemma4-sidecar-experimental``. Twin gate with
+    # ``mtp_sidecar`` — both must be truthy before a Gemma 4 checkpoint
+    # is promoted to CHAIN. Split from ``mtp_sidecar`` so a future
+    # non-experimental sidecar path (once the batched-consistent
+    # lossless contract is validated across all Gemma 4 sizes and the
+    # feature is promoted to default) can be introduced without renaming
+    # this flag.
+    mtp_gemma4_experimental: bool = False
+
     def __post_init__(self) -> None:
         if self.enable_mtp:
             import warnings
@@ -1808,9 +1820,23 @@ def _config_vetted_mtp_supports_spec_decode(model_type: str | None) -> bool:
     eligibility gate's model_type into SchedulerConfig only after
     ``detect_mtp_eligibility`` accepts the config; keep the scheduler override
     narrowly tied to the model families this MTP runtime supports.
+
+    Gemma 4 model_types (``gemma4`` / ``gemma4_unified`` / ``gemma4_text`` /
+    ``gemma4_unified_text``) are included behind the CLI experimental gate —
+    reaching this function already implies detection accepted the config,
+    which for the Gemma 4 family requires both ``experimental_gemma4=True``
+    and ``has_external_sidecar=True`` (see
+    :func:`vllm_mlx.spec_decode.mtp.detect.detect_mtp_eligibility`).
     """
 
-    return model_type in {"qwen3_5", "qwen3_5_moe"}
+    return model_type in {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "gemma4",
+        "gemma4_unified",
+        "gemma4_text",
+        "gemma4_unified_text",
+    }
 
 
 def _install_suffix_decoding(

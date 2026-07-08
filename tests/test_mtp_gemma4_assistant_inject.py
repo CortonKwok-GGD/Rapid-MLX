@@ -561,19 +561,31 @@ def test_make_mtp_cache_slots_are_generator_safe():
 # ---------------------------------------------------------------------------
 
 
-def test_dispatcher_does_not_route_gemma4_families_to_this_module():
-    """Gemma 4 assistant-sidecar MTP stays unregistered until lossless.
+def test_dispatcher_routes_gemma4_families_to_this_module():
+    """``gemma4`` / ``gemma4_unified`` / ``gemma4_text`` / ``gemma4_unified_text``
+    all route to ``gemma4_inject`` (0.10.6 A3 spike — EXPERIMENTAL path).
 
-    The injector module remains unit-tested directly in this file, but
-    dispatcher registration is the supported runtime surface. July 2026
-    server A/B found greedy output divergence, so the dispatcher must not
-    expose Gemma 4 MTP yet.
+    The dispatcher registry itself is unconditional — the CLI eligibility
+    gate at ``vllm_mlx.spec_decode.mtp.detect.detect_mtp_eligibility``
+    (paired with ``--mtp-gemma4-sidecar-experimental`` on the CLI) is
+    where the "should this run" policy lives. Keeping the registry
+    always populated lets low-level callers (bench harnesses, the
+    lossless validation script at
+    ``scripts/validate_gemma4_mtp_lossless.py``) reach the injector
+    without duplicating the experimental gate at every call site.
     """
     from vllm_mlx.spec_decode.mtp import dispatch as _dispatch
 
     for mt in ("gemma4", "gemma4_unified", "gemma4_text", "gemma4_unified_text"):
-        assert mt not in _dispatch._MTP_INJECT_DISPATCH
-        assert mt not in _dispatch._MTP_VALIDATE_DISPATCH
+        assert mt in _dispatch._MTP_INJECT_DISPATCH, (
+            f"{mt!r} missing from inject dispatch"
+        )
+        module_path, _ = _dispatch._MTP_INJECT_DISPATCH[mt]
+        assert module_path == "vllm_mlx.spec_decode.mtp.gemma4_inject"
+
+        assert mt in _dispatch._MTP_VALIDATE_DISPATCH
+        v_path, _ = _dispatch._MTP_VALIDATE_DISPATCH[mt]
+        assert v_path == "vllm_mlx.spec_decode.mtp.gemma4_inject"
 
 
 def test_dispatcher_still_routes_qwen3_5():
@@ -604,16 +616,16 @@ def test_dispatcher_swallows_family_exceptions(monkeypatch):
     Codex round-3 blocker: unwrapped ``fn(...)`` calls could propagate.
     """
     from vllm_mlx.spec_decode.mtp import dispatch as _dispatch
-    from vllm_mlx.spec_decode.mtp import qwen3_5_inject
+    from vllm_mlx.spec_decode.mtp import gemma4_inject
 
     def _raising_inject(model, mtp_sidecar=None, *, allow_random_init=False):
-        raise RuntimeError("simulated loader crash inside qwen3_5_inject")
+        raise RuntimeError("simulated loader crash inside gemma4_inject")
 
-    monkeypatch.setattr(qwen3_5_inject, "inject_mtp_support", _raising_inject)
+    monkeypatch.setattr(gemma4_inject, "inject_mtp_support", _raising_inject)
 
     result = _dispatch.dispatch_mtp_inject(
         object(),
-        model_type="qwen3_5",
+        model_type="gemma4_unified",
         allow_random_init=True,
     )
     assert result is False, "dispatcher must convert family exceptions to False"
@@ -622,14 +634,14 @@ def test_dispatcher_swallows_family_exceptions(monkeypatch):
 def test_dispatcher_validate_swallows_family_exceptions(monkeypatch):
     """Same as above but for ``dispatch_mtp_validate``."""
     from vllm_mlx.spec_decode.mtp import dispatch as _dispatch
-    from vllm_mlx.spec_decode.mtp import qwen3_5_inject
+    from vllm_mlx.spec_decode.mtp import gemma4_inject
 
     def _raising_validate(model):
         raise RuntimeError("simulated validator crash")
 
-    monkeypatch.setattr(qwen3_5_inject, "validate_mtp_support", _raising_validate)
+    monkeypatch.setattr(gemma4_inject, "validate_mtp_support", _raising_validate)
 
-    result = _dispatch.dispatch_mtp_validate(object(), model_type="qwen3_5")
+    result = _dispatch.dispatch_mtp_validate(object(), model_type="gemma4_unified")
     assert result is False
 
 
@@ -681,11 +693,15 @@ def test_gemma4_text_modelargs_carries_fields_this_module_reads():
     )
 
 
-def test_dispatcher_does_not_call_gemma4_inject(monkeypatch):
-    """A Gemma 4 dispatch request fails closed without calling the injector.
+def test_dispatcher_routes_gemma4_unified_to_gemma4_inject(monkeypatch):
+    """The dispatcher forwards ``model`` + kwargs verbatim to gemma4_inject.
 
-    This is the runtime guard that prevents an explicit sidecar flag from
-    reaching the unvalidated assistant path.
+    0.10.6 A3 spike: registration re-enabled. Guards against silent
+    argument drops (e.g. dropping ``mtp_sidecar`` would let a production
+    caller silently random-init a drafter). Runtime activation is gated
+    at the CLI (``--mtp-gemma4-sidecar-experimental``); the dispatcher
+    itself is unconditional so bench / validation harnesses can reach
+    the injector without duplicating the CLI-level gate.
     """
     from vllm_mlx.spec_decode.mtp import dispatch as _dispatch
     from vllm_mlx.spec_decode.mtp import gemma4_inject
@@ -705,7 +721,7 @@ def test_dispatcher_does_not_call_gemma4_inject(monkeypatch):
     monkeypatch.setattr(gemma4_inject, "inject_mtp_support", _fake_inject)
 
     sentinel_model = object()
-    sentinel_sidecar = "google/gemma-4-12B-it-assistant"
+    sentinel_sidecar = "google/gemma-4-31B-it-assistant"
 
     result = _dispatch.dispatch_mtp_inject(
         sentinel_model,
@@ -713,8 +729,11 @@ def test_dispatcher_does_not_call_gemma4_inject(monkeypatch):
         mtp_sidecar=sentinel_sidecar,
         allow_random_init=False,
     )
-    assert result is False
-    assert calls == []
+    assert result is True
+    assert len(calls) == 1
+    assert calls[0]["model"] is sentinel_model
+    assert calls[0]["mtp_sidecar"] == sentinel_sidecar
+    assert calls[0]["allow_random_init"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -34,13 +34,16 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 
 
-def test_detect_sidecar_does_not_promote_gemma4_unified_missing_mtp_layers():
-    """Base Gemma 4 unified checkpoint + sidecar stays NONE.
+def test_detect_experimental_sidecar_promotes_gemma4_unified_missing_mtp_layers():
+    """Base Gemma 4 unified + sidecar + experimental gate → CHAIN.
 
-    Local July 2026 A/B validation of ``mlx-community/gemma-4-12B-it-4bit`` +
-    ``google/gemma-4-12B-it-assistant`` still diverges from the greedy
-    no-spec server output, so sidecar mode must not promote Gemma 4 into
-    MTP eligibility until a lossless implementation lands.
+    0.10.6 A3 spike: re-enable Gemma 4 MTP under an EXPERIMENTAL gate
+    (``experimental_gemma4=True``) paired with a sidecar path. The prior
+    #1038 revert's "greedy output divergence" finding is consistent with
+    the MLX SDPA quantized numerics gotcha (q_len=1 vs q_len>=2 drift),
+    so the correct lossless contract is batched-consistent (see
+    ``scripts/validate_gemma4_mtp_lossless.py``). Without both gates,
+    detection stays NONE.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -48,18 +51,32 @@ def test_detect_sidecar_does_not_promote_gemma4_unified_missing_mtp_layers():
     )
 
     config = {"model_type": "gemma4_unified"}  # no mtp_num_hidden_layers
+    # Baseline: no gates → NONE.
     assert detect_mtp_eligibility(config) is MTPEligibility.NONE
+    # Sidecar without experimental → NONE (still fail-closed).
     assert (
         detect_mtp_eligibility(config, has_external_sidecar=True) is MTPEligibility.NONE
     )
+    # Experimental without sidecar → NONE.
+    assert (
+        detect_mtp_eligibility(config, experimental_gemma4=True) is MTPEligibility.NONE
+    )
+    # Both gates set → CHAIN (experimental promotion).
+    assert (
+        detect_mtp_eligibility(
+            config, has_external_sidecar=True, experimental_gemma4=True
+        )
+        is MTPEligibility.CHAIN
+    )
 
 
-def test_detect_sidecar_does_not_promote_gemma4_unified_zero_mtp_layers():
-    """Explicit ``mtp_num_hidden_layers: 0`` + sidecar stays NONE too.
+def test_detect_experimental_sidecar_promotes_gemma4_unified_zero_mtp_layers():
+    """Explicit ``mtp_num_hidden_layers: 0`` still promotes under both gates.
 
-    Same shape as the base 12B checkpoint after someone hand-edited
-    the config to stamp a zero on it. Sidecar-mode must still fail
-    closed for Gemma 4 until lossless validation passes.
+    Same shape as the base 12B checkpoint after someone hand-edited the
+    config to stamp a zero on it. The sidecar carries the drafter, so
+    the base's zero is expected; the experimental+sidecar combo must
+    still promote to CHAIN.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -70,6 +87,12 @@ def test_detect_sidecar_does_not_promote_gemma4_unified_zero_mtp_layers():
     assert detect_mtp_eligibility(config) is MTPEligibility.NONE
     assert (
         detect_mtp_eligibility(config, has_external_sidecar=True) is MTPEligibility.NONE
+    )
+    assert (
+        detect_mtp_eligibility(
+            config, has_external_sidecar=True, experimental_gemma4=True
+        )
+        is MTPEligibility.CHAIN
     )
 
 
@@ -100,16 +123,16 @@ def test_detect_sidecar_no_effect_on_qwen3_5_missing_mtp():
     )
 
 
-def test_detect_sidecar_no_effect_on_gemma4_multimodal():
-    """Multimodal ``gemma4`` (Gemma4ForConditionalGeneration) — sidecar
-    does NOT promote to CHAIN.
+def test_detect_experimental_sidecar_covers_gemma4_multimodal():
+    """Multimodal ``gemma4`` (Gemma4ForConditionalGeneration) also promotes
+    under both gates.
 
-    ``gemma4_unified`` is the ONLY lineage on the sidecar-allowlist for
-    PR-A because that's the only one with a verified external assistant
-    drafter today (``google/gemma-4-*-it-assistant``). Multimodal
-    ``gemma4`` (26B-A4B / e2b / e4b) stays NONE regardless of the
-    sidecar flag — a future release can add it once the multimodal
-    drafter lineage lands.
+    The multimodal wrapper's inner text model exposes the drafter surface
+    once ``gemma4_inject`` walks ``language_model``; treating the outer
+    wrapper as ``NONE`` here would gate the multimodal 26B-A4B lineage
+    out of the experimental path even when the operator explicitly opts
+    in and supplies a sidecar. The sidecar-registered dispatcher entry
+    for ``gemma4`` already routes to ``gemma4_inject``.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -117,8 +140,16 @@ def test_detect_sidecar_no_effect_on_gemma4_multimodal():
     )
 
     config = {"model_type": "gemma4", "mtp_num_hidden_layers": 0}
+    # Baseline (no gates): NONE.
     assert (
         detect_mtp_eligibility(config, has_external_sidecar=True) is MTPEligibility.NONE
+    )
+    # Both gates: CHAIN.
+    assert (
+        detect_mtp_eligibility(
+            config, has_external_sidecar=True, experimental_gemma4=True
+        )
+        is MTPEligibility.CHAIN
     )
 
 
@@ -274,14 +305,23 @@ def test_scheduler_config_mtp_model_type_round_trip():
     assert cfg.mtp_model_type == "gemma4_unified"
 
 
-def test_config_vetted_mtp_support_allowlist_is_qwen_only():
-    """Alias-profile false is only bypassed for config-vetted Qwen MTP."""
+def test_config_vetted_mtp_support_allowlist_covers_qwen_and_gemma4_experimental():
+    """Alias-profile false is bypassed for both Qwen and Gemma 4 config-vetted MTP.
+
+    Reaching ``_config_vetted_mtp_supports_spec_decode`` implies detection
+    accepted the config; for the Gemma 4 family that already required the
+    experimental gate + sidecar path via
+    ``detect_mtp_eligibility(experimental_gemma4=True, has_external_sidecar=True)``.
+    """
 
     from vllm_mlx.scheduler import _config_vetted_mtp_supports_spec_decode
 
     assert _config_vetted_mtp_supports_spec_decode("qwen3_5") is True
     assert _config_vetted_mtp_supports_spec_decode("qwen3_5_moe") is True
-    assert _config_vetted_mtp_supports_spec_decode("gemma4_unified") is False
+    assert _config_vetted_mtp_supports_spec_decode("gemma4") is True
+    assert _config_vetted_mtp_supports_spec_decode("gemma4_unified") is True
+    assert _config_vetted_mtp_supports_spec_decode("gemma4_text") is True
+    assert _config_vetted_mtp_supports_spec_decode("gemma4_unified_text") is True
     assert _config_vetted_mtp_supports_spec_decode(None) is False
 
 

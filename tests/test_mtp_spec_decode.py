@@ -199,36 +199,39 @@ def test_detect_eligibility_qwen3_5_stripped_checkpoint():
 
 
 # ---------------------------------------------------------------------------
-# 1b. Gemma 4 detection (assistant sidecar path currently disabled)
+# 1b. Gemma 4 detection (0.10.6 A3 spike — EXPERIMENTAL sidecar path)
 # ---------------------------------------------------------------------------
 # Gemma 4 ships in two ``model_type`` flavours (verified against the
 # cached mlx-community configs on 2026-07-01):
 #
 #   * ``gemma4_unified`` — text-only variant. ``Gemma4UnifiedForConditional
-#     Generation``. Used by the 12B dense checkpoints
-#     (``gemma-4-12B-it-4bit`` / ``gemma-4-12B-it-8bit``).
+#     Generation``. Used by the dense checkpoints
+#     (``gemma-4-12B-it-4bit`` / ``gemma-4-31B-it-4bit`` /
+#     ``gemma-4-12B-it-8bit``).
 #   * ``gemma4`` — multimodal variant. ``Gemma4ForConditionalGeneration``.
 #     Covers the effective-MoE ``gemma-4-26b-a4b-it-4bit`` and the small
-#     vision-tower e2b / e4b checkpoints. INTENTIONALLY OFF the
-#     allowlist today — a verified sidecar or assistant drafter for
-#     this lineage has not landed; a hand-edited config that stamps
-#     ``mtp_num_hidden_layers: 1`` on top must still be rejected so it
-#     doesn't slip into an un-exercised inject path.
+#     vision-tower e2b / e4b checkpoints.
 #
 # Base checkpoints do NOT carry ``mtp_num_hidden_layers`` in their
-# ``config.json`` (verified for all four cache probes). July 2026 A/B
-# validation found greedy output divergence for the Google 12B assistant
-# sidecar, so all Gemma 4 model_types must stay NONE regardless of
-# ``mtp_num_hidden_layers`` until a future implementation proves lossless.
+# ``config.json`` (verified for all four cache probes). The sidecar
+# supplies the drafter externally.
+#
+# 0.10.6 A3 spike re-enabled Gemma 4 MTP under a TWO-GATE experimental
+# opt-in on ``detect_mtp_eligibility``:
+#   * ``has_external_sidecar=True`` — operator supplied a sidecar path.
+#   * ``experimental_gemma4=True``  — operator opted in via the CLI
+#     flag ``--mtp-gemma4-sidecar-experimental``.
+# Both must be true or detection stays NONE. The tests below lock the
+# fail-closed defaults AND the both-gates promotion.
 
 
-def test_detect_eligibility_gemma4_dense_unified_stays_none_even_with_mtp_layers():
-    """Gemma 4 12B dense (``gemma4_unified``) stays NONE.
+def test_detect_eligibility_gemma4_dense_unified_stays_none_without_experimental_gate():
+    """Gemma 4 12B dense (``gemma4_unified``) stays NONE without both gates.
 
     A hand-edited config or sidecar-derived config may stamp
     ``mtp_num_hidden_layers=1``, but Gemma 4 MTP is not considered
-    supported until the assistant-sidecar path passes greedy-lossless
-    server A/B validation.
+    supported unless the operator explicitly opts in via BOTH the
+    sidecar path AND the experimental gate.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -236,44 +239,51 @@ def test_detect_eligibility_gemma4_dense_unified_stays_none_even_with_mtp_layers
     )
 
     config = {"model_type": "gemma4_unified", "mtp_num_hidden_layers": 1}
+    # No gates → NONE.
     assert detect_mtp_eligibility(config) is MTPEligibility.NONE
+    # Sidecar alone → NONE.
+    assert (
+        detect_mtp_eligibility(config, has_external_sidecar=True)
+        is MTPEligibility.NONE
+    )
+    # Experimental alone → NONE.
+    assert (
+        detect_mtp_eligibility(config, experimental_gemma4=True)
+        is MTPEligibility.NONE
+    )
 
 
-def test_detect_eligibility_gemma4_dense_unified_stripped_none():
-    """Gemma 4 12B dense with sidecar NOT applied (mtp=0) → NONE.
+def test_detect_eligibility_gemma4_dense_unified_experimental_two_gate_chain():
+    """Gemma 4 12B dense + sidecar + experimental → CHAIN.
 
-    Base ``mlx-community/gemma-4-12b-it-4bit`` ships without an MTP
-    head; ``mtp_num_hidden_layers`` is either absent or 0. Detection
-    must collapse to NONE so ``--spec-decode mtp`` is rejected at boot.
+    0.10.6 A3 spike two-gate promotion contract.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
         detect_mtp_eligibility,
     )
 
-    # Explicit 0 (stripped/no-sidecar): reject.
-    config_zero = {"model_type": "gemma4_unified", "mtp_num_hidden_layers": 0}
-    assert detect_mtp_eligibility(config_zero) is MTPEligibility.NONE
-    # Missing key (stock HF Gemma 4 shape): reject.
-    config_missing = {"model_type": "gemma4_unified"}
-    assert detect_mtp_eligibility(config_missing) is MTPEligibility.NONE
+    for cfg in (
+        {"model_type": "gemma4_unified"},  # missing key
+        {"model_type": "gemma4_unified", "mtp_num_hidden_layers": 0},
+        {"model_type": "gemma4_unified", "mtp_num_hidden_layers": 1},
+    ):
+        assert (
+            detect_mtp_eligibility(
+                cfg, has_external_sidecar=True, experimental_gemma4=True
+            )
+            is MTPEligibility.CHAIN
+        )
 
 
-def test_detect_eligibility_gemma4_multimodal_not_on_allowlist_none():
-    """Gemma 4 multimodal (``gemma4``) — even with mtp=1 → NONE.
+def test_detect_eligibility_gemma4_multimodal_two_gate_chain():
+    """Gemma 4 multimodal (``gemma4``) — under both gates → CHAIN.
 
     ``mlx-community/gemma-4-26b-a4b-it-4bit/config.json`` and the e2b /
-    e4b checkpoints all report top-level ``model_type: gemma4`` (the
-    ``Gemma4ForConditionalGeneration`` class). Neither the Mia-AiLab
-    fp16-mtp sidecar nor Google's ``google/gemma-4-*-it-assistant``
-    drafter has been verified against this lineage yet, so the detect
-    allowlist INTENTIONALLY excludes ``gemma4`` — a hand-edited config
-    that stamps ``mtp_num_hidden_layers: 1`` on top of a multimodal
-    Gemma 4 must still collapse to NONE, so ``--spec-decode mtp`` is
-    rejected pre-boot rather than routed into an inject/generator/cache
-    path that hasn't been exercised for that architecture. Flip this
-    once a verified sidecar or assistant drafter lands for the
-    multimodal lineage.
+    e4b checkpoints all report top-level ``model_type: gemma4``. The
+    multimodal wrapper's inner text model exposes the drafter surface
+    once ``gemma4_inject`` walks ``language_model``; the two-gate
+    promotion covers this lineage too.
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -281,24 +291,25 @@ def test_detect_eligibility_gemma4_multimodal_not_on_allowlist_none():
     )
 
     config = {"model_type": "gemma4", "mtp_num_hidden_layers": 1}
+    # Baseline fail-closed.
     assert detect_mtp_eligibility(config) is MTPEligibility.NONE
+    # Two-gate promotion.
+    assert (
+        detect_mtp_eligibility(
+            config, has_external_sidecar=True, experimental_gemma4=True
+        )
+        is MTPEligibility.CHAIN
+    )
 
 
-def test_detect_eligibility_gemma4_vision_tower_still_none():
-    """Gemma 4 e2b / e4b (``gemma4`` with a vision tower) → still NONE.
+def test_detect_eligibility_gemma4_vision_tower_two_gate_chain():
+    """Gemma 4 e2b / e4b (``gemma4`` with a vision tower) — two-gate → CHAIN.
 
-    ``gemma-4-e2b-it-4bit`` and ``gemma-4-e4b-it-4bit`` ship as
-    ``model_type: gemma4`` with a ``vision_config`` block, an
-    ``audio_config`` block, and a ``text_config`` sub-config. Detection
-    reads ONLY the top-level ``model_type`` string — presence of vision
-    / audio fields must not alter the verdict either way. Since
-    multimodal ``gemma4`` is not on the allowlist (see the sibling
-    ``_multimodal_not_on_allowlist_none`` test), even a hand-edited
-    ``mtp_num_hidden_layers: 1`` on top of a multimodal shape must land
-    at NONE. This test stuffs the config with the real fields observed
-    on those checkpoints (``vision_config``, ``audio_config``,
-    ``image_token_id``, ``architectures``) to lock the "ignore
-    sub-configs, gate on top-level model_type" contract.
+    Detection reads ONLY the top-level ``model_type`` string — presence
+    of vision / audio fields must not alter the verdict either way.
+    Under both experimental gates the multimodal ``gemma4`` promotes
+    just like the plain multimodal shape (dispatcher routes both to
+    ``gemma4_inject``).
     """
     from vllm_mlx.spec_decode.mtp import (
         MTPEligibility,
@@ -316,7 +327,15 @@ def test_detect_eligibility_gemma4_vision_tower_still_none():
         "text_config": {"model_type": "gemma4_text"},
         "image_token_id": 262144,
     }
+    # No gates: NONE (fail-closed baseline).
     assert detect_mtp_eligibility(config) is MTPEligibility.NONE
+    # Two-gate: CHAIN.
+    assert (
+        detect_mtp_eligibility(
+            config, has_external_sidecar=True, experimental_gemma4=True
+        )
+        is MTPEligibility.CHAIN
+    )
 
 
 def test_detect_eligibility_gemma_lookalikes_still_rejected():
