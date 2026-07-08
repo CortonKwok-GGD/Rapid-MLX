@@ -152,9 +152,7 @@ def _hf_files(repo_id: str) -> list[FileMeta]:
         if not (isinstance(lfs_sha256, str) and len(lfs_sha256) == 64):
             lfs_sha256 = None
         key = f"{repo_id}/{rname}"
-        files.append(
-            FileMeta(relpath=rname, size=size, key=key, lfs_sha256=lfs_sha256)
-        )
+        files.append(FileMeta(relpath=rname, size=size, key=key, lfs_sha256=lfs_sha256))
     return files
 
 
@@ -351,7 +349,9 @@ def _http_head_status(url: str, timeout: float = 30.0) -> int:
     edge sometimes rejects HEAD; fall through to a byte-range GET on any
     non-2xx status to distinguish "HEAD blocked" from "object missing".
     """
-    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": _USER_AGENT})
+    req = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": _USER_AGENT}
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return int(resp.status)
@@ -537,9 +537,7 @@ def mirror_repo(
             print(f"   FAIL {f.key}: not on R2", flush=True)
             continue
         if f.size is not None and head_size != f.size:
-            verify_failed.append(
-                (f.key, f"r2-size:{head_size}!={f.size}")
-            )
+            verify_failed.append((f.key, f"r2-size:{head_size}!={f.size}"))
             print(
                 f"   FAIL {f.key}: R2 size {head_size} != HF size {f.size}",
                 flush=True,

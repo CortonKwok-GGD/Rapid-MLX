@@ -153,9 +153,7 @@ def test_should_skip_false_when_hf_size_unknown() -> None:
     Codex round-2 BLOCKING #2: this must NOT collapse with the
     "expected_size == 0 (real empty file)" branch below.
     """
-    assert (
-        mirror_to_r2.should_skip(existing_size=500, expected_size=None) is False
-    )
+    assert mirror_to_r2.should_skip(existing_size=500, expected_size=None) is False
 
 
 def test_should_skip_true_for_legitimate_empty_file() -> None:
@@ -164,16 +162,12 @@ def test_should_skip_true_for_legitimate_empty_file() -> None:
     Codex round-2 BLOCKING #2: without distinguishing ``None`` (unknown)
     from ``0`` (empty), every empty file gets re-uploaded on every run.
     """
-    assert (
-        mirror_to_r2.should_skip(existing_size=0, expected_size=0) is True
-    )
+    assert mirror_to_r2.should_skip(existing_size=0, expected_size=0) is True
 
 
 def test_should_skip_false_when_r2_has_content_but_expected_empty() -> None:
     """R2 has non-empty bytes but HF says empty → re-upload (size mismatch)."""
-    assert (
-        mirror_to_r2.should_skip(existing_size=42, expected_size=0) is False
-    )
+    assert mirror_to_r2.should_skip(existing_size=42, expected_size=0) is False
 
 
 # ---- codex round-1 BLOCKING #1: size-only isn't proof of identity for LFS
@@ -301,9 +295,7 @@ def test_r2_head_size_raises_on_permission_error() -> None:
     ],
 )
 def test_public_url_percent_encodes_segments(key: str, expected_url: str) -> None:
-    assert (
-        mirror_to_r2._public_url("https://models.rapidmlx.com", key) == expected_url
-    )
+    assert mirror_to_r2._public_url("https://models.rapidmlx.com", key) == expected_url
 
 
 # ---- upload adds hf-sha256 metadata for LFS files, omits for non-LFS
