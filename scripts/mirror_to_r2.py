@@ -102,10 +102,17 @@ def content_type_for(filename: str) -> str:
 
 @dataclass
 class FileMeta:
-    """One expected file in the HF repo → R2 mapping."""
+    """One expected file in the HF repo → R2 mapping.
+
+    ``size`` is ``None`` when HF's siblings metadata didn't expose one
+    (some older repos, older HF API versions) — distinct from ``0``,
+    which is a legitimate empty file. The distinction matters for the
+    skip decision and for the verification path (codex round-2 BLOCKING
+    #2 and #3).
+    """
 
     relpath: str  # HF sibling rfilename
-    size: int  # bytes; 0 for empty files, from HF metadata
+    size: int | None  # bytes; None if HF didn't expose it; 0 = real empty
     key: str  # R2 object key = ``<hf-repo-id>/<relpath>``
     lfs_sha256: str | None = None  # HF's LFS sha256 for weight shards; None otherwise
 
@@ -130,7 +137,12 @@ def _hf_files(repo_id: str) -> list[FileMeta]:
         # a compromised repo could still ship one.
         if rname.startswith("/") or ".." in Path(rname).parts:
             raise ValueError(f"Refusing suspicious HF filename: {rname!r}")
-        size = int(getattr(s, "size", 0) or 0)
+        # Codex round-2 BLOCKING #2: preserve the distinction between
+        # "HF didn't expose a size" (None) and "the file is legitimately
+        # 0 bytes" (0). Passing `or 0` collapses both to 0 and forces a
+        # perpetual re-upload of every empty file.
+        raw_size = getattr(s, "size", None)
+        size = int(raw_size) if isinstance(raw_size, int) else None
         # LFS-tracked files (weight shards) expose a canonical sha256
         # under ``s.lfs.sha256``. We stash it as R2 object metadata so
         # ``should_skip`` can require both size AND sha match — a stale/
@@ -201,7 +213,7 @@ def _r2_head(client: Any, bucket: str, key: str) -> dict[str, Any] | None:
 
 def should_skip(
     existing_size: int | None,
-    expected_size: int,
+    expected_size: int | None,
     *,
     existing_sha256: str | None = None,
     expected_sha256: str | None = None,
@@ -216,24 +228,30 @@ def should_skip(
     shards) we require BOTH size + sha match on the ``x-amz-meta-hf-sha256``
     metadata field we set at upload time.
 
+    Codex round-2 BLOCKING #2: ``expected_size`` is ``None`` when HF
+    didn't expose a size, distinct from ``0`` (a legitimate empty
+    file). Previously both collapsed to a "must upload" branch; empty
+    files were re-uploaded every run despite matching R2 state.
+
     Behavior matrix:
 
     * ``existing_size is None`` (R2 HEAD → 404): must upload.
-    * ``expected_size <= 0`` (HF didn't tell us the size): must upload
-      — refuse to trust an R2 short-write.
+    * ``expected_size is None`` (HF didn't tell us): must upload —
+      refuse to trust an R2 short-write when we can't validate length.
+    * ``existing_size != expected_size``: must upload.
     * ``expected_sha256`` present but ``existing_sha256`` missing or
       mismatched: must upload — the R2 object is either an older upload
       pre-metadata, or a different bytes-with-same-length case.
     * ``expected_sha256 is None`` (non-LFS: config.json, README.md,
-      etc.): fall back to size-only. Small text files don't get LFS
-      hashes; the practical risk of a same-size-but-corrupt copy is
-      much lower for a 1 KB config than for a 5 GB shard, and forcing
-      users to re-upload every tiny asset on each pass defeats the
-      resumability contract.
+      empty files, etc.): fall back to size-only. Small text files
+      don't get LFS hashes; the practical risk of a same-size-but-
+      corrupt copy is much lower for a 1 KB config than for a 5 GB
+      shard, and forcing users to re-upload every tiny asset on each
+      pass defeats the resumability contract.
     """
     if existing_size is None:
         return False
-    if expected_size <= 0:
+    if expected_size is None:
         return False
     if existing_size != expected_size:
         return False
@@ -387,7 +405,10 @@ def mirror_repo(
         print("   MODE:     verify-only (no uploads)", flush=True)
 
     files = _hf_files(repo_id)
-    total_bytes = sum(f.size for f in files)
+    # HF sometimes doesn't expose sizes for a subset of siblings; treat
+    # those as 0 for the aggregate banner (the actual bytes-uploaded
+    # counter tracks the ground truth below).
+    total_bytes = sum((f.size or 0) for f in files)
     print(
         f"   files:    {len(files)} ({total_bytes / 1e9:.3f} GB total)",
         flush=True,
@@ -397,9 +418,18 @@ def mirror_repo(
 
     # ---- upload / skip loop
     if not verify_only:
-        if tmp_dir is None:
-            tmp_dir = Path(f"/tmp/mirror-{os.getpid()}")
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+        # Codex round-2 BLOCKING #1: NEVER ``rmtree`` a user-supplied
+        # ``--tmp-dir`` — the operator may have pointed us at a shared
+        # scratch root (e.g. ``/mnt/scratch``) that holds unrelated data.
+        # Always work inside a per-run subdirectory we exclusively
+        # created; only that subdirectory gets deleted on exit.
+        base_tmp = tmp_dir if tmp_dir is not None else Path("/tmp")
+        base_tmp.mkdir(parents=True, exist_ok=True)
+        run_tmp = base_tmp / f"mirror-{os.getpid()}"
+        run_tmp.mkdir(parents=True, exist_ok=True)
+        # Expose the concrete per-run dir under the same variable name
+        # the rest of the function (and _download_one_hf) references.
+        tmp_dir = run_tmp
         uploaded = 0
         skipped = 0
         bytes_uploaded = 0
@@ -428,15 +458,17 @@ def mirror_repo(
                     )
                     continue
                 if dry_run:
+                    size_label = f.size if f.size is not None else "?"
                     print(
                         f"[{idx}/{len(files)}] DRY-RUN would upload {f.key} "
-                        f"({f.size} B, type={content_type_for(f.relpath)})",
+                        f"({size_label} B, type={content_type_for(f.relpath)})",
                         flush=True,
                     )
                     continue
                 # Download → upload → delete, one at a time.
+                size_label = f.size if f.size is not None else "?"
                 print(
-                    f"[{idx}/{len(files)}] UPLOAD started {f.key} ({f.size} B)",
+                    f"[{idx}/{len(files)}] UPLOAD started {f.key} ({size_label} B)",
                     flush=True,
                 )
                 t0 = time.monotonic()
@@ -453,11 +485,20 @@ def mirror_repo(
                 finally:
                     _cleanup_local(local)
                 wall = time.monotonic() - t0
+                # If HF didn't tell us the size, count the actual bytes we
+                # wrote out (fall back to 0 when the local file is gone
+                # after an interrupted download).
+                actual_size = f.size
+                if actual_size is None:
+                    try:
+                        actual_size = local.stat().st_size
+                    except OSError:
+                        actual_size = 0
                 uploaded += 1
-                bytes_uploaded += f.size
+                bytes_uploaded += actual_size
                 print(
-                    f"[{idx}/{len(files)}] OK {f.size} B {wall:.1f}s "
-                    f"({(f.size / max(wall, 0.001)) / 1e6:.1f} MB/s) {f.key}",
+                    f"[{idx}/{len(files)}] OK {actual_size} B {wall:.1f}s "
+                    f"({(actual_size / max(wall, 0.001)) / 1e6:.1f} MB/s) {f.key}",
                     flush=True,
                 )
         except Exception as e:
@@ -489,7 +530,7 @@ def mirror_repo(
             verify_failed.append((f.key, "r2-missing"))
             print(f"   FAIL {f.key}: not on R2", flush=True)
             continue
-        if f.size > 0 and head_size != f.size:
+        if f.size is not None and head_size != f.size:
             verify_failed.append(
                 (f.key, f"r2-size:{head_size}!={f.size}")
             )
@@ -498,9 +539,19 @@ def mirror_repo(
                 flush=True,
             )
             continue
-        # Public read — Range-GET the first byte to prove the CDN serves it.
+        # Public read.
+        # Codex round-2 BLOCKING #3: a 0-byte object cannot satisfy
+        # ``Range: bytes=0-0`` — the server correctly returns HTTP 416
+        # (Range Not Satisfiable), which would falsely fail verify.
+        # Route empty files through HEAD (which returns 200 on any
+        # publicly-readable object regardless of size). Non-empty files
+        # keep the byte-range GET path — it's cheaper than a full body
+        # download and works when the edge rejects HEAD.
         url = _public_url(public_base, f.key)
-        status = _http_range_get_status(url)
+        if head_size == 0:
+            status = _http_head_status(url)
+        else:
+            status = _http_range_get_status(url)
         if status != 200:
             verify_failed.append((f.key, f"public-http:{status}"))
             print(

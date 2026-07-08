@@ -8,6 +8,12 @@ Three cases, all offline (no network, no boto3 calls):
 3. Skip-if-exists head-check logic — with a mocked boto3-shaped client,
    an R2 object whose size matches HF is SKIPPED (no ``upload_file``
    call); a size mismatch or 404 forces an upload.
+
+Codex round-2 BLOCKING #4: ``boto3`` / ``botocore`` are only pulled by
+the ``[mirror]`` optional extra. Default ``pip install rapid-mlx[dev]``
+does not include them, and CI that runs ``pytest tests/`` without the
+mirror extra should collect + skip cleanly rather than fail at import.
+``pytest.importorskip("botocore")`` at module load enforces that.
 """
 
 from __future__ import annotations
@@ -18,6 +24,13 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+# Codex round-2 BLOCKING #4: skip the whole module if botocore isn't
+# installed (default dev env without the [mirror] extra). Load-time
+# check so the mirror_to_r2 module import below — which does not
+# eagerly import boto3 itself, but many of the tests DO — doesn't
+# collect into a false failure.
+pytest.importorskip("botocore")
 
 # Load the CLI module from ``scripts/`` — it isn't a package member.
 _SCRIPT = Path(__file__).parent.parent / "scripts" / "mirror_to_r2.py"
@@ -131,12 +144,36 @@ def test_should_skip_false_on_size_mismatch() -> None:
 
 
 def test_should_skip_false_when_hf_size_unknown() -> None:
-    """If HF metadata didn't expose a size, refuse to skip.
+    """If HF metadata didn't expose a size (``expected_size is None``),
+    refuse to skip.
 
     Prevents accepting a truncated leftover R2 object from a previous
     run where we couldn't validate the true length.
+
+    Codex round-2 BLOCKING #2: this must NOT collapse with the
+    "expected_size == 0 (real empty file)" branch below.
     """
-    assert mirror_to_r2.should_skip(existing_size=500, expected_size=0) is False
+    assert (
+        mirror_to_r2.should_skip(existing_size=500, expected_size=None) is False
+    )
+
+
+def test_should_skip_true_for_legitimate_empty_file() -> None:
+    """A real 0-byte HF file already at 0 bytes on R2 → skip.
+
+    Codex round-2 BLOCKING #2: without distinguishing ``None`` (unknown)
+    from ``0`` (empty), every empty file gets re-uploaded on every run.
+    """
+    assert (
+        mirror_to_r2.should_skip(existing_size=0, expected_size=0) is True
+    )
+
+
+def test_should_skip_false_when_r2_has_content_but_expected_empty() -> None:
+    """R2 has non-empty bytes but HF says empty → re-upload (size mismatch)."""
+    assert (
+        mirror_to_r2.should_skip(existing_size=42, expected_size=0) is False
+    )
 
 
 # ---- codex round-1 BLOCKING #1: size-only isn't proof of identity for LFS
