@@ -299,9 +299,13 @@ def _upload_one(
 def _download_one_hf(repo_id: str, relpath: str, tmp_dir: Path) -> Path:
     """Download a single HF file into ``tmp_dir`` (flat, no snapshot layout).
 
-    ``local_dir=tmp_dir`` + ``local_dir_use_symlinks=False`` gives us a
-    real file (not a symlink into the HF cache) that we can delete after
-    upload without touching the operator's shared HF cache — G1 respect.
+    Passing ``local_dir=tmp_dir`` puts the file directly under ``tmp_dir``
+    as a real file — modern ``huggingface_hub`` (>=0.23) writes directly
+    to ``local_dir`` without the legacy symlink-through-cache behavior,
+    so we can delete the file after upload without touching the
+    operator's shared HF cache — G1 respect. Codex round-3 NIT: earlier
+    revisions of this docstring named a ``local_dir_use_symlinks=False``
+    kwarg that was removed upstream; the behavior is now the default.
     """
     from huggingface_hub import hf_hub_download
 
@@ -473,6 +477,17 @@ def mirror_repo(
                 )
                 t0 = time.monotonic()
                 local = _download_one_hf(repo_id, f.relpath, tmp_dir)
+                # Codex round-3 BLOCKING: stat BEFORE cleanup — the
+                # ``finally`` below deletes ``local``, so a later
+                # ``local.stat()`` in the summary path would race and
+                # always find zero. Capture the on-disk size now.
+                if f.size is not None:
+                    actual_size = f.size
+                else:
+                    try:
+                        actual_size = local.stat().st_size
+                    except OSError:
+                        actual_size = 0
                 try:
                     _upload_one(
                         client,
@@ -485,15 +500,6 @@ def mirror_repo(
                 finally:
                     _cleanup_local(local)
                 wall = time.monotonic() - t0
-                # If HF didn't tell us the size, count the actual bytes we
-                # wrote out (fall back to 0 when the local file is gone
-                # after an interrupted download).
-                actual_size = f.size
-                if actual_size is None:
-                    try:
-                        actual_size = local.stat().st_size
-                    except OSError:
-                        actual_size = 0
                 uploaded += 1
                 bytes_uploaded += actual_size
                 print(
