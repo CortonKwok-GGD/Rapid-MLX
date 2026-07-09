@@ -45,6 +45,29 @@ def _log_level_choice(value: str) -> str:
     return value.upper()
 
 
+def _norm_sidecar_arg(value: object | None) -> str | None:
+    """Normalize a sidecar-path arg to ``str | None``.
+
+    argparse strings pass through ``.strip() or None``. Non-string
+    values (Path, int, or other test-supplied types that don't
+    implement ``.strip()``) get coerced through ``str(value).strip()``
+    instead of raising AttributeError — codex round-B BLOCKING #1/#2
+    called out that non-CLI callers/tests populating this arg as a
+    non-string would crash the conflict scan before validation.
+
+    Module-level (not nested inside ``serve_command``) so the
+    SchedulerConfig construction and eligibility gate (both outside
+    the nested-helper scope where this lived in the first patch) can
+    share the same normalization semantics.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    return str(value).strip() or None
+
+
 def _auth_feature_str(argv_api_key: str | None) -> str | None:
     """Banner-side renderer for the ``auth: on`` feature line.
 
@@ -1601,9 +1624,9 @@ def _normalize_speculative_config_or_exit(args):
             conflicts.append("dflash_drafter_path")
         if getattr(args, "enable_mtp", False):
             conflicts.append("enable_mtp")
-        if (getattr(args, "mtp_sidecar", None) or "").strip():
+        if _norm_sidecar_arg(getattr(args, "mtp_sidecar", None)):
             conflicts.append("mtp_sidecar")
-        if (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip():
+        if _norm_sidecar_arg(getattr(args, "mtp_gemma4_sidecar_experimental", None)):
             conflicts.append("mtp_gemma4_sidecar_experimental")
         # Idempotency guard: after ``_fill_runtime_defaults(overwrite=True)``
         # a disabled config normalizes to ``mtp_max_k=1``. Only flag the
@@ -1649,9 +1672,9 @@ def _normalize_speculative_config_or_exit(args):
             fields.append("dflash_drafter_path")
         if getattr(args, "enable_mtp", False):
             fields.append("enable_mtp")
-        if (getattr(args, "mtp_sidecar", None) or "").strip():
+        if _norm_sidecar_arg(getattr(args, "mtp_sidecar", None)):
             fields.append("mtp_sidecar")
-        if (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip():
+        if _norm_sidecar_arg(getattr(args, "mtp_gemma4_sidecar_experimental", None)):
             fields.append("mtp_gemma4_sidecar_experimental")
         if getattr(args, "mtp_max_k", None) is not None:
             fields.append("mtp_max_k")
@@ -2969,11 +2992,8 @@ def serve_command(args):
             # distinct opt-in flag (``mtp_gemma4_experimental`` below).
             # Falls back to the pre-existing hidden ``--mtp-sidecar``
             # reserved surface when the new flag is unset.
-            (
-                (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip()
-                or (getattr(args, "mtp_sidecar", None) or "").strip()
-            )
-            or None
+            _norm_sidecar_arg(getattr(args, "mtp_gemma4_sidecar_experimental", None))
+            or _norm_sidecar_arg(getattr(args, "mtp_sidecar", None))
         ),
         # 0.9.13 PR-A codex round-E blocker #2: CLI-resolved
         # ``config.json::model_type`` for the dispatch step. See the
@@ -2985,10 +3005,11 @@ def serve_command(args):
         mtp_disable_auto_k=getattr(args, "mtp_disable_auto_k", False),
         # 0.10.6 A3 spike: Gemma 4 assistant-sidecar MTP experimental
         # gate. Only propagates when the operator opts in via
-        # ``--mtp-gemma4-sidecar-experimental``. Strip first — a
-        # whitespace-only value must not flip the gate.
+        # ``--mtp-gemma4-sidecar-experimental``. Normalize via the
+        # shared helper — a whitespace-only or non-string value must
+        # not flip the gate.
         mtp_gemma4_experimental=bool(
-            (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip()
+            _norm_sidecar_arg(getattr(args, "mtp_gemma4_sidecar_experimental", None))
         ),
         # SuffixDecoding
         enable_suffix_decoding=args.suffix_decoding,
@@ -3066,22 +3087,15 @@ def serve_command(args):
         # is preserved for compatibility but does NOT flip the
         # experimental gate — it stays inert until a future promoted
         # sidecar path lands.
-        # Strip once so " " isn't treated as a truthy sidecar path — the
-        # earlier conflict scan at lines 1606 / 1654 already calls
-        # ``.strip()`` on this arg; the eligibility gate must match to
-        # avoid a whitespace-only value silently flipping
+        # Normalize once via ``_norm_sidecar_arg`` — same helper the
+        # conflict scan at lines 1606 / 1654 uses, so a whitespace-only
+        # or non-string value cannot silently flip
         # ``experimental_gemma4=True`` while ``has_sidecar`` measures the
-        # unstripped value from ``args.mtp_sidecar``.
-        _gemma4_raw = getattr(args, "mtp_gemma4_sidecar_experimental", None)
-        gemma4_experimental_sidecar = (
-            _gemma4_raw.strip() if isinstance(_gemma4_raw, str) else _gemma4_raw
-        ) or None
-        _mtp_sidecar_raw = getattr(args, "mtp_sidecar", None)
-        _mtp_sidecar_normalized = (
-            _mtp_sidecar_raw.strip()
-            if isinstance(_mtp_sidecar_raw, str)
-            else _mtp_sidecar_raw
-        ) or None
+        # raw ``args.mtp_sidecar``.
+        gemma4_experimental_sidecar = _norm_sidecar_arg(
+            getattr(args, "mtp_gemma4_sidecar_experimental", None)
+        )
+        _mtp_sidecar_normalized = _norm_sidecar_arg(getattr(args, "mtp_sidecar", None))
         has_sidecar = bool(gemma4_experimental_sidecar or _mtp_sidecar_normalized)
         experimental_gemma4 = bool(gemma4_experimental_sidecar)
         eligibility = detect_mtp_eligibility(

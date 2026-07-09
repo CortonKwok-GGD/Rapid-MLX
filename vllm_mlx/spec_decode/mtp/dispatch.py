@@ -133,6 +133,26 @@ def dispatch_mtp_inject(
 ) -> bool:
     """Route an inject call to the family-specific implementation.
 
+    .. warning::
+
+        **INTERNAL LOW-LEVEL PRIMITIVE — NOT A PRODUCTION ACTIVATION
+        SURFACE.** For the Gemma 4 family, this dispatcher will invoke
+        the family inject on any registered ``model_type`` regardless
+        of whether the "should this run" experimental policy has been
+        satisfied. The policy gate lives in the CLI eligibility layer
+        (``detect_mtp_eligibility(experimental_gemma4=True,
+        has_external_sidecar=True)``) and in the scheduler's
+        :func:`vllm_mlx.scheduler._config_vetted_mtp_supports_spec_decode`
+        twin gate, NOT here. If you are wiring a new in-process
+        integration path (embedders, test harnesses, non-CLI servers),
+        replicate BOTH gates upstream of your ``dispatch_mtp_inject``
+        call — otherwise you can attach the drafter to a Gemma 4 target
+        without the operator having opted in. Codex round-B NIT #5
+        called this out; the fix here is docstring + tests, because
+        threading the CLI policy into the dispatcher itself would
+        conflate a low-level router with a high-level activation
+        decision.
+
     Args:
         model: Loaded model instance (from ``mlx_lm.load()``).
         model_type: The ``config.json::model_type`` string.

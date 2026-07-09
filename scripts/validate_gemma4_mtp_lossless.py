@@ -445,6 +445,89 @@ def _find_first_divergence(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_target_config(target_model: str) -> dict | None:
+    """Best-effort resolve of the target's ``config.json`` to a dict.
+
+    Handles both local dir paths and HF repo ids. Returns ``None`` on
+    any resolve error — callers must treat that as "cannot verify" and
+    fail loud rather than silently accepting the requested precision.
+    """
+    try:
+        p = Path(target_model)
+        if p.is_dir() and (p / "config.json").exists():
+            with open(p / "config.json") as f:
+                return json.load(f)
+        # HF repo id → resolve via mlx_lm's cache.
+        from mlx_lm.utils import _download
+
+        model_dir = _download(target_model)
+        with open(Path(model_dir) / "config.json") as f:
+            return json.load(f)
+    except Exception as exc:
+        logger.warning("could not resolve config.json for %s: %s", target_model, exc)
+        return None
+
+
+def _check_target_precision(target_model: str, requested: str) -> None:
+    """Fail loud when ``--target-precision`` disagrees with the mirror.
+
+    Codex round-B BLOCKING #3: the flag was documentation-only, so a
+    user could pass ``--target-precision bf16`` on a quantized target
+    and get the all-pass correctness gate (no drift ceiling) applied
+    to a run that was actually subject to quant SDPA drift. Here we
+    read the resolved ``config.json``, look for a top-level
+    ``quantization`` block (mlx-community's convention — 4/5/6/8bit
+    mirrors carry ``{"group_size": ..., "bits": N}``), and:
+
+      * refuse ``bf16``/``fp16`` if the config advertises quantization;
+      * refuse ``quant`` if the config does NOT.
+
+    If the config cannot be resolved (offline / missing file), the
+    error path prints a hint and exits 2 — silent acceptance would
+    reintroduce the bug.
+    """
+    if requested not in ("quant", "bf16", "fp16"):
+        return  # defensive: unreachable under argparse choices
+    cfg = _resolve_target_config(target_model)
+    if cfg is None:
+        print(
+            "!! ERROR: could not read config.json for "
+            f"target-model={target_model!r} — cannot verify "
+            f"--target-precision {requested}. Refusing to run: an "
+            "unverified precision flag would let the all-pass bf16 "
+            "gate apply to a quantized run (codex round-B BLOCKING #3).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    quant_block = cfg.get("quantization")
+    if not quant_block and isinstance(cfg.get("text_config"), dict):
+        # mlx-community 12B carries the ``quantization`` block at the
+        # outer level; other mirrors nest it under ``text_config``.
+        quant_block = cfg["text_config"].get("quantization")
+    is_quant = bool(quant_block)
+    if requested in ("bf16", "fp16") and is_quant:
+        print(
+            f"!! ERROR: --target-precision {requested} was requested "
+            f"but target-model={target_model!r} config.json carries a "
+            f"quantization block ({quant_block!r}). The bf16/fp16 "
+            f"correctness-proof gate (all prompts must be byte-exact) "
+            f"would apply to a run subject to the MLX quant SDPA "
+            f"q_len drift, hiding real divergences behind the gate.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if requested == "quant" and not is_quant:
+        print(
+            f"!! ERROR: --target-precision quant was requested but "
+            f"target-model={target_model!r} config.json has NO "
+            f"quantization block. The quant drift-ceiling gate "
+            f"(default len(prompts)-6) would apply to an unquantized "
+            f"run where any divergence is a real injector bug.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def _load_baseline(target_model: str) -> tuple[Any, Any]:
     """Load ``target_model`` without MTP for plain greedy decode."""
     from mlx_lm import load
@@ -780,6 +863,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} (explicit)")
     print()
 
+    # Codex round-B BLOCKING #3: verify the resolved model config
+    # actually matches the requested --target-precision. Refuses bf16/
+    # fp16 on a quant mirror (would apply the all-pass gate to a run
+    # subject to quant SDPA drift) and refuses quant on a bf16 mirror
+    # (would apply the drift-ceiling gate to a run where any divergence
+    # is a real injector bug). Runs BEFORE any model load — a fast fail
+    # on config.json misalignment beats waiting 30s for weight I/O.
+    _check_target_precision(args.target_model, args.target_precision)
+
     if args.baseline_mode == "plain-decode":
         print("=== Loading baseline (no MTP) ===")
         baseline_model, baseline_tokenizer = _load_baseline(args.target_model)
@@ -812,6 +904,15 @@ def main(argv: list[str] | None = None) -> int:
         mtp_tok_s_runs: list[float] = []
         base_tokens_ref: list[int] | None = None
         mtp_tokens_ref: list[int] | None = None
+        # Codex round-B NIT #4: check baseline-vs-MTP divergence EVERY
+        # run, not just run 0. A per-run divergence that only shows up
+        # on run 2 (say, because of a KV-cache residual from run 1)
+        # would previously be hidden by "same across runs, same base
+        # tokens" — but the base tokens can be identical while an MTP
+        # cache-carryover bug flips a byte on a later run.
+        per_run_diverged = False
+        first_bad_run: int | None = None
+        first_bad_div: int | None = None
 
         for run_idx in range(args.runs):
             if args.baseline_mode == "batched-consistent":
@@ -828,6 +929,19 @@ def main(argv: list[str] | None = None) -> int:
 
             base_tok_s_runs.append(len(base_tokens) / base_t if base_t > 0 else 0.0)
             mtp_tok_s_runs.append(len(mtp_tokens) / mtp_t if mtp_t > 0 else 0.0)
+
+            # Per-run byte-exact check (NIT #4): compute divergence for
+            # THIS run's baseline vs THIS run's MTP tokens, independent
+            # of run 0. Under quant precision this may naturally
+            # diverge (SDPA drift ceiling); under bf16 any per-run
+            # divergence is a real bug and the min-pass gate below
+            # sees the AND across runs.
+            _this_div = _find_first_divergence(list(base_tokens), list(mtp_tokens))
+            if _this_div is not None:
+                per_run_diverged = True
+                if first_bad_run is None:
+                    first_bad_run = run_idx
+                    first_bad_div = _this_div
 
             if run_idx == 0:
                 base_tokens_ref = list(base_tokens)
@@ -859,8 +973,11 @@ def main(argv: list[str] | None = None) -> int:
         speedup = mtp_tok_s / plain_tok_s if plain_tok_s > 0 else 0.0
 
         assert base_tokens_ref is not None and mtp_tokens_ref is not None
+        # Byte-exact is true only when EVERY run's baseline == MTP for
+        # this prompt (per NIT #4). run-0 divergence position is
+        # reported for continuity with the pre-NIT-4 log format.
         div = _find_first_divergence(base_tokens_ref, mtp_tokens_ref)
-        byte_exact = div is None
+        byte_exact = (not per_run_diverged) and (div is None)
 
         row = {
             "id": pid,
@@ -877,11 +994,21 @@ def main(argv: list[str] | None = None) -> int:
 
         if not byte_exact:
             any_divergence = True
-            print(
-                f"\n!! DIVERGENCE at position {div}: "
-                f"baseline={base_tokens_ref[div] if div < len(base_tokens_ref) else '<eos>'} "
-                f"mtp={mtp_tokens_ref[div] if div < len(mtp_tokens_ref) else '<eos>'}"
-            )
+            if div is not None:
+                print(
+                    f"\n!! DIVERGENCE (run 0) at position {div}: "
+                    f"baseline={base_tokens_ref[div] if div < len(base_tokens_ref) else '<eos>'} "
+                    f"mtp={mtp_tokens_ref[div] if div < len(mtp_tokens_ref) else '<eos>'}"
+                )
+            elif per_run_diverged:
+                # run 0 was byte-exact but a later run diverged — surface
+                # the run + position so the operator can reproduce.
+                print(
+                    f"\n!! DIVERGENCE (run {first_bad_run}) at position "
+                    f"{first_bad_div}: baseline-vs-MTP mismatch appeared "
+                    f"only after run 0 (per-run NIT #4 gate). Likely a "
+                    "KV-cache or drafter-state carryover between runs."
+                )
 
     # Aggregates
     plain_med = statistics.median(r["plain_tok_s"] for r in rows)
