@@ -92,6 +92,18 @@ _TOOL_CALL_MALFORMED = re.compile(
 
 # Standalone open-tag detector for suffix-tolerant streaming trigger.
 _TOOL_CALL_OPEN = re.compile(rf"<tool_call{_SUFFIX}>")
+# Canonical close only — the streaming pending-check MUST use this
+# stricter form, not the malformed-tolerant ``_TOOL_CALL_CLOSE_ANY``,
+# because the XML-pair body legitimately contains ``</arg_value>`` for
+# every argument value. Treating those as closes would emit the call
+# prematurely on the first ``</arg_value>`` (codex round-2 BLOCKING #1).
+# The malformed-close fallback (``</arg_value>`` without a matching
+# ``<end_of_tool_call>``) is handled by the non-streaming extractor
+# which sees the whole body at once and can distinguish the "no
+# ``<tool_sep>`` in the body" malformed case from the XML-pair case.
+_TOOL_CALL_CANONICAL_CLOSE = re.compile(rf"<end_of_tool_call{_SUFFIX}>")
+# Malformed OR canonical — used only by ``extract_tool_calls`` (non-
+# streaming) where we can safely distinguish which shape applies.
 _TOOL_CALL_CLOSE_ANY = re.compile(rf"<end_of_tool_call{_SUFFIX}>|</arg_value{_SUFFIX}>")
 
 # Body-level tags.
@@ -329,23 +341,38 @@ class HyV3ToolParser(ToolParser):
 
     def _last_unclosed_tool_call_position(self, text: str) -> int:
         """Return the offset of the LAST ``<tool_call>`` opener that has
-        no matching close tag AFTER it (i.e. an unclosed call still in
-        flight), or ``-1`` when every opener already closed.
+        no matching close tag after it, or ``-1`` when every opener
+        already closed.
 
-        Codex round-1 BLOCKING fix (PR #1070): the earlier streaming
-        gate ``if _TOOL_CALL_OPEN.search(current_text)`` treated a
-        stream as inside-a-tool-call for the ENTIRE rest of the
-        response once ANY completed ``<tool_call>...<end_of_tool_call>``
-        had appeared, so plain-content deltas that followed a completed
-        call were silently dropped. Scoping the check to an UNCLOSED
-        opener restores the passthrough for post-call content.
+        The close-tag definition is MODE-DEPENDENT (codex round-2
+        BLOCKING #1, PR #1070):
+
+        * **XML-pair body** — when a ``<tool_sep>`` appears between the
+          opener and cursor, the body is the ``<arg_key>K</arg_key>
+          <arg_value>V</arg_value>`` variant. Each argument value
+          legitimately ends with ``</arg_value>``, so ONLY the canonical
+          ``<end_of_tool_call>`` marker closes the call. Treating
+          ``</arg_value>`` as a close here would flush the call after
+          the FIRST argument, emitting truncated ``arguments={}``.
+        * **Malformed / no-sep body** — when no ``<tool_sep>`` is in
+          flight, the call shape is either canonical-close (still
+          waiting for ``<end_of_tool_call>``) or the salvage case
+          ``<tool_call>NAME</arg_value>`` where the sep + args never
+          arrived. In the salvage case, ``</arg_value>`` acts as the
+          effective close — recognising it lets the streaming path
+          emit rather than hanging until the request timeout.
         """
-        # Walk every opener from last to first; the last one whose
-        # matching close hasn't arrived yet is the pending call.
         openers = [m.start() for m in _TOOL_CALL_OPEN.finditer(text)]
         for opener_pos in reversed(openers):
             after_opener = text[opener_pos:]
-            if not _TOOL_CALL_CLOSE_ANY.search(after_opener):
+            # Mode split: canonical-only when a tool_sep is already in
+            # flight (XML-pair body); canonical-or-malformed otherwise
+            # (defensive salvage for the sep-less shape).
+            if _TOOL_SEP.search(after_opener):
+                close_re = _TOOL_CALL_CANONICAL_CLOSE
+            else:
+                close_re = _TOOL_CALL_CLOSE_ANY
+            if not close_re.search(after_opener):
                 return opener_pos
         return -1
 
@@ -361,25 +388,20 @@ class HyV3ToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         """Extract Hy3 tool calls from streaming model output.
 
-        Streaming rules:
+        Streaming rules (mirrors ``Glm47ToolParser`` policy):
 
-        * While an UNCLOSED ``<tool_call>`` opener is in flight,
-          suppress content (matches glm47's policy).
-        * The FIRST delta on which the accumulated text transitions
-          from "has unclosed opener" to "no unclosed opener" is the
-          delta that carries the closer bytes. Parse ``current_text``
-          and emit the tool_calls array.
-        * Otherwise, pass content through.
-
-        Codex round-1 BLOCKING fixes (PR #1070):
-
-        1. Post-call content isn't dropped anymore — the pending-opener
-           check is scoped to the LAST opener without a matching close,
-           not "any opener anywhere". (finding #1)
-        2. SSE-boundary-split close tags trigger parsing — the
-           transition detection compares ``previous_text`` state to
-           ``current_text`` state, not "did the whole close token
-           appear in this delta". (finding #3)
+        * Once ANY ``<tool_call>`` opener has entered ``current_text``,
+          the assistant turn is a TOOL-CALL turn. Suppress every content
+          delta after that — OpenAI-compatible clients treat
+          ``tool_calls`` and ``content`` as mutually exclusive for a
+          single assistant turn (codex round-2 BLOCKING #2).
+        * The FIRST delta on which ``current_text`` transitions from
+          "has an unclosed canonical opener" to "canonical close seen"
+          is the delta on which we emit the tool_calls array. Compare
+          ``previous_text`` state to ``current_text`` state (not "did
+          the close token appear entirely in this delta") so a close
+          split across SSE chunks still fires (codex round-1 #3).
+        * Before any opener appears, pass content deltas through.
         """
         # Skip while inside a suffix-tolerant thinking span. Recompute
         # think-state on ``current_text`` (source of truth).
@@ -390,10 +412,11 @@ class HyV3ToolParser(ToolParser):
 
         prev_pending = self._last_unclosed_tool_call_position(previous_text)
         curr_pending = self._last_unclosed_tool_call_position(current_text)
+        seen_opener = _TOOL_CALL_OPEN.search(current_text) is not None
 
         if prev_pending >= 0 and curr_pending < 0:
-            # Transition: previous had an unclosed call, current does
-            # not. The close tag arrived (possibly split across chunks).
+            # Transition: canonical close arrived (possibly split across
+            # chunks). Parse and emit the tool_calls array.
             result = self.extract_tool_calls(current_text, request)
             if result.tools_called:
                 return {
@@ -414,14 +437,17 @@ class HyV3ToolParser(ToolParser):
             # residue rather than leak <tool_call> literals to content.
             return None
 
-        if curr_pending >= 0:
-            # Still inside an unclosed tool_call — suppress content.
+        if seen_opener:
+            # Any opener anywhere in the accumulated text — this turn is
+            # a tool-call turn (codex round-2 BLOCKING #2). Suppress
+            # further content deltas until the closer arrives (the
+            # transition branch above handles that).
             return None
 
-        # No unclosed opener — this is either pre-call plain content or
-        # post-call plain content. Trim any inline think tags that
-        # slipped through (only when the closer is actually in this
-        # delta, so mid-stream deltas don't lose inter-word spacing).
+        # No opener seen yet — pass plain content through. Trim any
+        # inline think tags that slipped through (only when the closer
+        # is actually in this delta, so mid-stream deltas don't lose
+        # inter-word spacing).
         if re.search(rf"</think{_SUFFIX}>", delta_text):
             clean = re.sub(
                 rf"<think{_SUFFIX}>.*?</think{_SUFFIX}>",

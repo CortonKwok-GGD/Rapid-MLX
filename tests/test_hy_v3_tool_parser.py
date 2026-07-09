@@ -242,13 +242,19 @@ def test_streaming_passthrough_content_when_no_tool_call():
     assert msg["content"] == "Hello "
 
 
-def test_streaming_content_after_completed_tool_call_is_not_dropped():
-    """Codex round-1 BLOCKING #1 regression test. After a completed
-    ``<tool_call>...<end_of_tool_call>`` has streamed through, subsequent
-    plain-content deltas MUST pass through — the earlier gate
-    (``_TOOL_CALL_OPEN.search(current_text)`` alone) suppressed EVERY
-    later delta because the completed opener was still visible in the
-    accumulated text."""
+def test_streaming_content_after_completed_tool_call_is_suppressed():
+    """Codex round-2 BLOCKING #2 regression test. Once an assistant turn
+    is a TOOL-CALL turn (any ``<tool_call>`` opener has appeared in the
+    accumulated text), post-close plain-content deltas MUST be
+    suppressed. OpenAI-compatible clients treat ``tool_calls`` and
+    ``content`` as mutually exclusive for a single assistant turn — a
+    later ``delta.content`` after ``delta.tool_calls`` breaks parsers
+    that dispatch the response as a tool call. This mirrors the
+    ``Glm47ToolParser`` policy.
+
+    (Round-1 codex asked us to KEEP post-call content; round-2 codex
+    overturned that as wrong per the OpenAI spec — the round-2 fix wins.
+    See PR #1070 for the full arc.)"""
     parser = HyV3ToolParser()
     parser.reset()
     prev = ""
@@ -267,13 +273,53 @@ def test_streaming_content_after_completed_tool_call_is_not_dropped():
     final = step("<end_of_tool_call:opensource>")
     assert final is not None and "tool_calls" in final
 
-    # Post-call plain content MUST pass through as content deltas.
+    # Post-call plain content deltas MUST be suppressed — the assistant
+    # turn is already committed to being a tool-call turn.
     m1 = step(" now ")
-    assert m1 is not None
-    assert m1["content"] == " now "
+    assert m1 is None
     m2 = step("what?")
-    assert m2 is not None
-    assert m2["content"] == "what?"
+    assert m2 is None
+
+
+def test_streaming_xml_pair_first_arg_close_does_not_emit_early():
+    """Codex round-2 BLOCKING #1 regression test. When the body uses the
+    XML-pair variant (``<arg_key>K</arg_key><arg_value>V</arg_value>``),
+    the FIRST argument's ``</arg_value>`` closer MUST NOT be treated as
+    a tool-call close — otherwise the parser flushes the call after the
+    first argument with ``arguments={}`` or a truncated dict. Only the
+    canonical ``<end_of_tool_call>`` closes an XML-pair body, and this
+    test locks that contract in."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    assert step("<tool_call:opensource>") is None
+    assert step("multi_arg_fn") is None
+    assert step("<tool_sep:opensource>") is None
+    assert step("<arg_key:opensource>city</arg_key:opensource>") is None
+    assert step("<arg_value:opensource>Paris") is None
+    # The FIRST </arg_value> — mid-body, MUST NOT flush.
+    early = step("</arg_value:opensource>")
+    assert early is None, (
+        "First-arg </arg_value> was treated as call-close — regressing "
+        "codex round-2 BLOCKING #1."
+    )
+    assert step("<arg_key:opensource>units</arg_key:opensource>") is None
+    assert step("<arg_value:opensource>metric</arg_value:opensource>") is None
+    # Canonical close is the ONLY trigger.
+    final = step("<end_of_tool_call:opensource>")
+    assert final is not None
+    tc = final["tool_calls"][0]
+    assert tc["function"]["name"] == "multi_arg_fn"
+    args = json.loads(tc["function"]["arguments"])
+    assert args == {"city": "Paris", "units": "metric"}
 
 
 def test_streaming_close_split_across_sse_boundary_still_emits():
