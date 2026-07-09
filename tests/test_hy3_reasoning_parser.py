@@ -68,9 +68,7 @@ def test_extract_reasoning_implicit_close_only():
     the close tag appears in the output. Suffixed variant must route the
     same way."""
     parser = Hy3ReasoningParser()
-    r, c = parser.extract_reasoning(
-        "reasoning here</think:opensource>final answer"
-    )
+    r, c = parser.extract_reasoning("reasoning here</think:opensource>final answer")
     assert r == "reasoning here"
     assert c == "final answer"
 
@@ -117,6 +115,50 @@ def test_streaming_tag_atomic_deltas():
     m5 = step(prev, "Paris")
     assert m5 is not None
     assert m5.content == "Paris"
+
+
+def test_streaming_suffix_tag_split_across_boundary_preserves_invariant():
+    """Codex round-1 BLOCKING #2 regression test. When
+    ``<think:opensource>`` straddles the SSE chunk boundary (e.g. delta
+    1 ends with ``<think:opens``, delta 2 opens with ``ource>``), the
+    partial-tag suffix MUST be withheld so the base qwen3 state machine
+    sees consistent ``previous_norm``/``current_norm``/``delta_norm``.
+    Without this fix, ``current_norm`` collapses the completed tag to
+    ``<think>`` on delta 2 while ``previous_norm`` still ends with
+    ``<think:opens``, breaking the base parser's invariant and leaking
+    tag fragments into the wrong channel."""
+    parser = Hy3ReasoningParser()
+    parser.reset_state()
+
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_reasoning_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    # Half the opener arrives.
+    m1 = step("<think:opens")
+    # Must not emit tag fragments — either None or reasoning-only up to
+    # the withhold point (empty here since the whole delta is inside
+    # the partial-tag suffix).
+    assert m1 is None or (m1.content is None)
+    # Second half completes the tag.
+    m2 = step("ource>Hello")
+    # After completion the reasoning body ``Hello`` should reach
+    # ``reasoning`` (not ``content``).
+    assert m2 is not None
+    assert m2.reasoning == "Hello"
+    assert m2.content is None
+    # Close tag, also split — first half.
+    m3 = step("</think:opens")
+    assert m3 is None or (m3.content is None and m3.reasoning is None)
+    # Second half of close + trailing content.
+    m4 = step("ource>Paris")
+    assert m4 is not None
+    assert m4.content == "Paris"
 
 
 def test_finalize_streaming_delegates_to_qwen3():

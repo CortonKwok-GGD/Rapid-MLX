@@ -981,17 +981,29 @@ def apply_chat_template(
     try:
         return template_applicator.apply_chat_template(messages, **template_kwargs)
     except TypeError as e:
-        # Step 1: retry without enable_thinking (many templates don't support it)
+        # Step 1: retry without enable_thinking (many templates don't support it).
+        # Codex round-1 NIT fix (PR #1070 finding #4): keep
+        # ``reasoning_effort`` on this first retry so a Hy3 checkpoint
+        # that supports ``reasoning_effort`` but rejects
+        # ``enable_thinking`` still gets the ``low`` override. Only drop
+        # ``reasoning_effort`` on the SECOND TypeError below, when we
+        # know the retry itself failed.
         logger.debug("Chat template TypeError, retrying without enable_thinking: %s", e)
         template_kwargs.pop("enable_thinking", None)
-        # If the failure was actually caused by ``reasoning_effort`` (older
-        # Hy3 checkpoints without the kwarg, or a homonym HF path), drop
-        # it too so the retry can succeed. Cheap belt-and-braces defence.
-        template_kwargs.pop("reasoning_effort", None)
         try:
             return template_applicator.apply_chat_template(messages, **template_kwargs)
-        except TypeError:
-            pass
+        except TypeError as e2:
+            # Second failure — the residual unknown kwarg is most likely
+            # ``reasoning_effort`` on a non-Hy3 template that regex-matched
+            # the Hy3 pattern by mistake, or an older Hy3 checkpoint that
+            # never wired the kwarg. Drop it and let the tools-fallback
+            # branch below run without it.
+            logger.debug(
+                "Chat template TypeError persisted after dropping "
+                "enable_thinking, retrying without reasoning_effort: %s",
+                e2,
+            )
+            template_kwargs.pop("reasoning_effort", None)
 
         # Step 2: template also rejects tools — fall back to prompt injection.
         # Restore enable_thinking: the step-1 pop removed it because we

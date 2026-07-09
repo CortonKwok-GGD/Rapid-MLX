@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from vllm_mlx.tool_parsers import HyV3ToolParser, ToolParserManager
 
 
@@ -242,6 +240,71 @@ def test_streaming_passthrough_content_when_no_tool_call():
     msg = parser.extract_tool_calls_streaming("", "Hello ", "Hello ")
     assert msg is not None
     assert msg["content"] == "Hello "
+
+
+def test_streaming_content_after_completed_tool_call_is_not_dropped():
+    """Codex round-1 BLOCKING #1 regression test. After a completed
+    ``<tool_call>...<end_of_tool_call>`` has streamed through, subsequent
+    plain-content deltas MUST pass through — the earlier gate
+    (``_TOOL_CALL_OPEN.search(current_text)`` alone) suppressed EVERY
+    later delta because the completed opener was still visible in the
+    accumulated text."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    step("<tool_call:opensource>")
+    step("do_it")
+    step("<tool_sep:opensource>")
+    step("{}")
+    final = step("<end_of_tool_call:opensource>")
+    assert final is not None and "tool_calls" in final
+
+    # Post-call plain content MUST pass through as content deltas.
+    m1 = step(" now ")
+    assert m1 is not None
+    assert m1["content"] == " now "
+    m2 = step("what?")
+    assert m2 is not None
+    assert m2["content"] == "what?"
+
+
+def test_streaming_close_split_across_sse_boundary_still_emits():
+    """Codex round-1 BLOCKING #3 regression test. The close tag arrives
+    split across two SSE chunks (e.g. ``<end_of_tool_c`` then
+    ``all:opensource>``). The parser MUST detect the transition to
+    "no pending unclosed call" and emit the tool_calls array — the
+    earlier gate (which only searched ``delta_text``) would never fire
+    on the second chunk because the close token only fully appears in
+    ``current_text``, not the second delta alone."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    step("<tool_call>")
+    step("my_fn")
+    step("<tool_sep>")
+    step("{}")
+    # Split the closer across two chunks.
+    m_partial = step("<end_of_tool_c")
+    assert m_partial is None
+    m_close = step("all>")
+    assert m_close is not None
+    assert m_close["tool_calls"][0]["function"]["name"] == "my_fn"
 
 
 def test_has_pending_tool_call_recognises_suffix_variant():

@@ -25,16 +25,14 @@ The normalized text has identical structure to what a plain-tag stream
 would produce, so all of Qwen3's Case 1/2/3/4 + streaming multi-block +
 SSE-boundary withhold logic applies verbatim.
 
-Streaming caveat: a delta boundary that lands INSIDE a ``<think:xxx>``
-suffix (e.g. delta ends with ``<think:`` and the next delta opens with
-``opensource>``) will let ``<think:`` slip into ``reasoning_content``
-briefly — the base parser recognises ``<think>`` as complete but treats
-``<think:`` as an in-progress prefix of the plain tag it doesn't know
-about. The bytes normalise correctly on the FOLLOWING delta because
-``current_text`` sees the whole suffix. For the preview HY3 checkpoint
-(released 2026-07-06) mlx-lm's SSE chunker emits tag-atomic deltas in
-practice, so this is a theoretical concern only — pinned in tests but
-not gate-blocking for the launch.
+SSE-boundary partial-tag withhold. The ``:opensource`` suffix creates
+partial-tag prefixes qwen3's own ``_held_partial_tag_len`` doesn't know
+about (its withhold logic recognises ``<`` through ``<think>``, not
+``<think:`` through ``<think:opensource>``). ``_hy3_straddle_suffix_len``
+adds withhold coverage for the ``:[label]`` region so
+``previous_norm + delta_norm == current_norm`` holds by construction on
+every tick — including the one where the suffixed tag spans the SSE
+chunk boundary. See PR #1070 codex round-1 finding #2.
 """
 
 from __future__ import annotations
@@ -48,6 +46,14 @@ from .qwen3_parser import Qwen3ReasoningParser
 # future model revisions keep parsing without a code change.
 _HY3_OPEN_TAG_RE = re.compile(r"<think(?::[\w-]+)?>")
 _HY3_CLOSE_TAG_RE = re.compile(r"</think(?::[\w-]+)?>")
+
+# Straddle-boundary detector: strict prefix of a suffixed close/open tag
+# that MAY complete on the next delta. Anchored on the exact `<think:`
+# opener (or `</think:`) followed by 0+ label chars but with no closing
+# `>`. Matching this suffix means we must withhold those bytes so the
+# next tick sees the whole tag and normalisation stays consistent.
+_HY3_OPEN_STRADDLE_RE = re.compile(r"<think:[\w-]*$")
+_HY3_CLOSE_STRADDLE_RE = re.compile(r"</think:[\w-]*$")
 
 
 def _normalize_hy3_tags(text: str) -> str:
@@ -63,6 +69,30 @@ def _normalize_hy3_tags(text: str) -> str:
     text = _HY3_OPEN_TAG_RE.sub("<think>", text)
     text = _HY3_CLOSE_TAG_RE.sub("</think>", text)
     return text
+
+
+def _hy3_straddle_suffix_len(text: str) -> int:
+    """Length of the trailing suffix that is an in-progress Hy3 tag.
+
+    Returns 0 when ``text`` doesn't end mid-tag. The base qwen3 state
+    machine handles the plain ``<think>`` / ``</think>`` partial-tag
+    withhold itself (via ``_held_partial_tag_len``); this helper covers
+    ONLY the additional ``:[label]`` region that qwen3 has no knowledge
+    of. Withholding those bytes on the current tick preserves the
+    invariant ``previous_norm + delta_norm == current_norm`` for the
+    NEXT tick when the tag completes.
+
+    Codex round-1 BLOCKING fix (PR #1070 finding #2).
+    """
+    if not text:
+        return 0
+    m = _HY3_CLOSE_STRADDLE_RE.search(text)
+    if m is not None:
+        return len(text) - m.start()
+    m = _HY3_OPEN_STRADDLE_RE.search(text)
+    if m is not None:
+        return len(text) - m.start()
+    return 0
 
 
 class Hy3ReasoningParser(Qwen3ReasoningParser):
@@ -98,20 +128,38 @@ class Hy3ReasoningParser(Qwen3ReasoningParser):
         current_text: str,
         delta_text: str,
     ) -> DeltaMessage | None:
-        # Normalize current + previous. Recompute delta from the
-        # normalized strings so ``previous_norm + delta_norm ==
-        # current_norm`` (the invariant the base multi-block router
-        # relies on). When ``current_text`` doesn't cleanly extend
-        # ``previous_text`` under normalization — the tag boundary
-        # straddled the SSE chunk boundary — fall back to normalizing
-        # the delta directly. The base's partial-tag withhold handles
-        # the residue on the next tick.
-        current_norm = _normalize_hy3_tags(current_text)
-        previous_norm = _normalize_hy3_tags(previous_text)
+        # Codex round-1 BLOCKING fix (PR #1070 finding #2): withhold
+        # trailing bytes that could be an in-progress Hy3 suffixed tag
+        # (``<think:opensou`` waiting on ``rce>``) BEFORE normalisation.
+        # Without this, ``current_norm`` collapses ``<think:opensource>``
+        # to ``<think>`` on the tick the closer arrives while
+        # ``previous_norm`` still ends with ``<think:opensou`` — the
+        # invariant ``previous_norm + delta_norm == current_norm`` breaks
+        # and the base multi-block router routes bytes to the wrong phase.
+        prev_hold = _hy3_straddle_suffix_len(previous_text)
+        curr_hold = _hy3_straddle_suffix_len(current_text)
+        previous_norm = _normalize_hy3_tags(
+            previous_text[: len(previous_text) - prev_hold]
+        )
+        current_norm = _normalize_hy3_tags(
+            current_text[: len(current_text) - curr_hold]
+        )
+        # Recompute delta from the normalised strings so the invariant
+        # ``previous_norm + delta_norm == current_norm`` holds by
+        # construction. If the withhold ate the whole delta (all bytes
+        # were partial-tag), emit nothing — the next tick will surface
+        # them when the tag completes.
         if current_norm.startswith(previous_norm):
             delta_norm = current_norm[len(previous_norm) :]
         else:
+            # Defensive fallback for a still-inconsistent boundary — e.g.
+            # a normalisation that shrank the previous span more than the
+            # withhold reserved. Fall through to plain-delta normalisation
+            # so we don't crash; qwen3's own partial-tag withhold and the
+            # multi-block router recover on the next tick.
             delta_norm = _normalize_hy3_tags(delta_text)
+        if not delta_norm:
+            return None
         return super().extract_reasoning_streaming(
             previous_norm, current_norm, delta_norm
         )

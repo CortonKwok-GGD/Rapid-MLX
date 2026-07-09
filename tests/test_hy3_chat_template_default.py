@@ -17,8 +17,6 @@ so it stays hermetic — no HY3 weights required.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from vllm_mlx.utils.chat_template import _looks_like_hy3, apply_chat_template
@@ -116,16 +114,55 @@ def test_hy3_default_survives_enable_thinking_true():
     assert tok.captured_kwargs.get("enable_thinking") is True
 
 
-def test_hy3_default_dropped_on_type_error_retry():
-    """Belt-and-braces: if the tokenizer raises TypeError (unknown
-    ``reasoning_effort`` kwarg on an older Hy3 checkpoint), the retry
-    path MUST drop the kwarg so the request still succeeds."""
+def test_hy3_default_dropped_only_after_second_type_error():
+    """Two-stage retry (codex round-1 NIT fix). The first retry drops
+    ``enable_thinking`` and KEEPS ``reasoning_effort`` — a Hy3
+    checkpoint that supports the effort override but rejects
+    ``enable_thinking`` MUST still see the ``low`` value on retry.
+    Only the SECOND TypeError drops ``reasoning_effort``."""
 
-    class FlakyTokenizer:
-        """Rejects ``reasoning_effort`` on first call, accepts on retry."""
+    class EnableThinkingFlakyTokenizer:
+        """Rejects ``enable_thinking`` only; accepts ``reasoning_effort``."""
 
         def __init__(self):
-            self.calls = []
+            self.calls: list[dict] = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "enable_thinking" in kwargs:
+                raise TypeError(
+                    "apply_chat_template() got unexpected keyword "
+                    "argument 'enable_thinking'"
+                )
+            return "<enable_thinking-dropped ok>"
+
+    tok = EnableThinkingFlakyTokenizer()
+    result = apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        model_name="hy3-preview-4bit",
+    )
+    # First call had both; retry dropped enable_thinking but preserved
+    # reasoning_effort=low.
+    assert len(tok.calls) == 2
+    assert tok.calls[0].get("enable_thinking") is not None
+    assert tok.calls[0].get("reasoning_effort") == "low"
+    assert "enable_thinking" not in tok.calls[1]
+    assert tok.calls[1].get("reasoning_effort") == "low"
+    assert result == "<enable_thinking-dropped ok>"
+
+
+def test_hy3_default_dropped_when_reasoning_effort_alone_is_rejected():
+    """Realistic degradation path — checkpoint accepts ``enable_thinking``
+    but not ``reasoning_effort``. First call fails because of
+    ``reasoning_effort``; the two-stage retry drops it and Step 2's
+    tools-restore path (which re-adds ``enable_thinking``) succeeds."""
+
+    class ReasoningEffortFlakyTokenizer:
+        """Rejects ``reasoning_effort`` only; accepts ``enable_thinking``."""
+
+        def __init__(self):
+            self.calls: list[dict] = []
 
         def apply_chat_template(self, messages, **kwargs):
             self.calls.append(dict(kwargs))
@@ -134,16 +171,18 @@ def test_hy3_default_dropped_on_type_error_retry():
                     "apply_chat_template() got unexpected keyword "
                     "argument 'reasoning_effort'"
                 )
-            return "<retry ok>"
+            return "<reasoning_effort-dropped ok>"
 
-    tok = FlakyTokenizer()
+    tok = ReasoningEffortFlakyTokenizer()
     result = apply_chat_template(
         tok,
         messages=[{"role": "user", "content": "hi"}],
         model_name="hy3-preview-4bit",
     )
-    # First call had reasoning_effort; retry succeeded without it.
-    assert len(tok.calls) >= 2
+    # First call had reasoning_effort=low and enable_thinking; failed.
+    # Retry-1 dropped enable_thinking but kept reasoning_effort; failed.
+    # Second-TypeError handler dropped reasoning_effort; Step 2
+    # tools-restore re-added enable_thinking; the final call succeeded.
     assert tok.calls[0].get("reasoning_effort") == "low"
     assert "reasoning_effort" not in tok.calls[-1]
-    assert result == "<retry ok>"
+    assert result == "<reasoning_effort-dropped ok>"
