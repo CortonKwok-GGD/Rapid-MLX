@@ -590,16 +590,61 @@ class HyV3ToolParser(ToolParser):
         # inline think tags that slipped through (only when the closer
         # is actually in this delta, so mid-stream deltas don't lose
         # inter-word spacing).
+        #
+        # Codex round-5 BLOCKING #1 (PR #1070): when a ``<think>`` OPENER
+        # is in ``previous_text`` and only its ``</think>`` CLOSER arrives
+        # in ``delta_text``, ``re.sub`` sees just the closer + tail in
+        # the delta and does NOT strip anything (the pattern requires
+        # opener-in-same-string), leaving the closer literal and any
+        # post-closer content to leak to the client. Fix: compute
+        # ``clean_current`` and ``clean_previous`` with think spans
+        # stripped end-to-end, treating any unclosed opener in
+        # ``previous_text`` as a boundary (its span JUST closed in
+        # ``delta_text``). Emit only the diff — this handles every
+        # straddle pattern (opener-in-prev, opener-and-closer-in-delta,
+        # multiple spans, etc.) with one code path.
         if re.search(rf"</think{_SUFFIX}>", delta_text):
-            clean = re.sub(
-                rf"<think{_SUFFIX}>.*?</think{_SUFFIX}>",
-                "",
-                delta_text,
-                flags=re.DOTALL,
-            )
-            clean = self.strip_think_tags(clean)
-            if clean:
-                return {"content": clean}
+
+            def _strip_all_think(text: str) -> str:
+                """Strip all matched ``<think>...</think>`` pairs from
+                ``text`` (suffix-tolerant), plus the base parser's
+                inline-tag stripper for any unpaired-close residue."""
+                stripped = re.sub(
+                    rf"<think{_SUFFIX}>.*?</think{_SUFFIX}>",
+                    "",
+                    text,
+                    flags=re.DOTALL,
+                )
+                return self.strip_think_tags(stripped)
+
+            # If ``previous_text`` ends with an unclosed think opener,
+            # treat everything from that opener onwards as span content
+            # that JUST closed in this delta — i.e., truncate prev to
+            # the opener boundary before computing the clean baseline.
+            unclosed_open_in_prev: re.Match | None = None
+            for m in re.finditer(rf"<think{_SUFFIX}>", previous_text):
+                tail = previous_text[m.end() :]
+                if not re.search(rf"</think{_SUFFIX}>", tail):
+                    unclosed_open_in_prev = m
+                    break
+            if unclosed_open_in_prev is not None:
+                clean_prev = _strip_all_think(
+                    previous_text[: unclosed_open_in_prev.start()]
+                )
+            else:
+                clean_prev = _strip_all_think(previous_text)
+            clean_curr = _strip_all_think(current_text)
+
+            if clean_curr.startswith(clean_prev):
+                clean_delta = clean_curr[len(clean_prev) :]
+            else:
+                # Defensive fallback — should not happen with well-formed
+                # streams. Emit the full clean current to avoid dropping
+                # content on a defensive-inconsistency edge.
+                clean_delta = clean_curr
+
+            if clean_delta:
+                return {"content": clean_delta}
             return None
         # Codex round-5 BLOCKING #1 (PR #1070): if the ACCUMULATED
         # ``current_text`` ends in a strict prefix of ``<tool_call>``

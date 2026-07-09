@@ -620,3 +620,86 @@ def test_valid_names_filter_preserves_mixed_valid_and_rejected():
     assert res.tool_calls[0]["name"] == "allowed_tool"
     # Exclusive-turn policy — no content when tools_called is True.
     assert res.content is None
+
+
+def test_streaming_think_close_split_across_deltas_does_not_leak_close_tag():
+    """Codex round-5 BLOCKING #1 regression test. A ``<think:opensource>``
+    OPENER lands in ``previous_text`` and only the ``</think:opensource>``
+    CLOSER arrives in ``delta_text`` alongside real content. The prior
+    ``re.sub(<think>.*?</think>, "", delta_text)`` matched full pairs
+    INSIDE delta_text only — so the closer literal AND the reasoning
+    tail that followed leaked into the emitted content, delivering the
+    end-user a broken payload like
+    ``about this</think:opensource>reasoning done``.
+
+    Fix: compute clean-baseline / clean-current with think spans
+    stripped end-to-end (treating any unclosed opener in prev as a
+    boundary that JUST closed), then emit only the diff. This test
+    locks the split-delta close case with real content on both
+    sides."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    # Delta 1 opens the think span with the ``:opensource`` suffix.
+    assert step("<think:opensource>let me think") is None
+    # Delta 2 closes the span AND carries reasoning-done tail content.
+    # The emitted content MUST NOT include the ``</think:opensource>``
+    # literal, and MUST NOT include the pre-close think text.
+    r = step(" about this</think:opensource>reasoning done")
+    assert r is not None
+    content = r["content"]
+    assert "</think" not in content, (
+        f"think closer literal leaked into content: {content!r}"
+    )
+    assert "let me think" not in content, f"pre-close think content leaked: {content!r}"
+    assert "about this" not in content, f"tail-of-think reasoning leaked: {content!r}"
+    # The real post-close content MUST survive.
+    assert "reasoning done" in content
+
+
+def test_streaming_sep_less_xml_pair_across_three_deltas_emits_on_end_of_tool_call():
+    """Codex round-5 BLOCKING #2 was flagged but IS a false positive —
+    the round-4 ``_closed_after_opener`` correctly considers the
+    ``<arg_value>`` opener when scanning the body-prefix. This test
+    locks the working behaviour so a future refactor doesn't
+    accidentally regress on codex's scenario:
+
+    * Delta 1: ``<tool_call>fn<arg_key>x</arg_key>`` — arg_key done,
+      no arg_value opener yet.
+    * Delta 2: ``<arg_value>1</arg_value>`` — opener AND closer both
+      inside delta.
+    * Delta 3: ``<end_of_tool_call>`` — canonical close.
+
+    Codex asserted the parser would think delta 2 was already closed
+    and never emit on delta 3. In reality ``_closed_after_opener``
+    sees the ``<arg_value>`` opener in the body-prefix and correctly
+    skips the ``</arg_value>`` as an argument-close (not tool-close),
+    so delta 3's canonical close cleanly triggers the emit."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    assert step("<tool_call>fn<arg_key>x</arg_key>") is None
+    assert step("<arg_value>1</arg_value>") is None
+    final = step("<end_of_tool_call>")
+    assert final is not None, (
+        "Sep-less XML-pair body did not emit on canonical close — "
+        "regression against codex round-5 BLOCKING #2 (false positive)."
+    )
+    assert final["tool_calls"][0]["function"]["name"] == "fn"
+    assert json.loads(final["tool_calls"][0]["function"]["arguments"]) == {"x": 1}
