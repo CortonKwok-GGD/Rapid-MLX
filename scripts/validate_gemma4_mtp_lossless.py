@@ -225,18 +225,30 @@ def _apply_chat_template(tokenizer: Any, prompt_text: str) -> list[int]:
     tokens looks wrong). Prior 2.4% baseline measurement was on
     un-templated text — the drafter is not broken, the template was.
 
-    Falls back to raw ``encode`` if the tokenizer has no chat template.
+    Falls back to raw ``encode`` ONLY when the tokenizer truly lacks
+    chat-template support (``apply_chat_template`` missing / raises
+    ``ValueError`` for "no template"). Any other exception re-raises —
+    codex round-B round-3 NIT #3 called out that a bare ``except
+    Exception`` here would silently validate against the wrong prompt
+    format if e.g. ``jinja2`` failed to render for a fixable reason.
     """
-    try:
-        messages = [{"role": "user", "content": prompt_text}]
-        rendered = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        return tokenizer.encode(rendered)
-    except Exception:
+    render = getattr(tokenizer, "apply_chat_template", None)
+    if render is None:
         return tokenizer.encode(prompt_text)
+    messages = [{"role": "user", "content": prompt_text}]
+    try:
+        rendered = render(messages, tokenize=False, add_generation_prompt=True)
+    except ValueError as exc:
+        # HF tokenizers raise ``ValueError("Cannot use chat template
+        # functions because tokenizer.chat_template is not set...")``
+        # when a chat template genuinely isn't configured. Fall back to
+        # raw encode ONLY on that path; other ValueErrors (bad template
+        # rendering, malformed messages) must surface.
+        msg = str(exc).lower()
+        if "chat_template" in msg or "chat template" in msg:
+            return tokenizer.encode(prompt_text)
+        raise
+    return tokenizer.encode(rendered)
 
 
 def _run_plain_greedy(
@@ -788,6 +800,18 @@ def main(argv: list[str] | None = None) -> int:
 
     prompts = _load_prompts(args.prompts_file)
 
+    # Codex round-B round-3 BLOCKING #4: empty fixtures crash the
+    # verdict block on ``statistics.median([])``. Fail loud at load
+    # time — an empty prompts file is always operator error, not a
+    # legitimate configuration.
+    if len(prompts) == 0:
+        print(
+            "!! ERROR: prompts file "
+            f"{args.prompts_file!r} contains no entries. Cannot validate.",
+            file=sys.stderr,
+        )
+        return 2
+
     print("# validate_gemma4_mtp_lossless.py")
     print(f"# target: {args.target_model}")
     print(f"# drafter: {args.drafter}")
@@ -811,14 +835,23 @@ def main(argv: list[str] | None = None) -> int:
         print("#   Kept for A/B against the pre-fix harness that #1038 reverted on.")
     # Resolve final min-pass gate now that we have len(prompts).
     #
-    # The auto default for ``quant`` (``len(prompts) - 6``) is calibrated
-    # for the shipped 10-prompt fixture — 6 = the observed SDPA drift
-    # ceiling. On small fixtures (e.g. the 3-prompt mini file used for
-    # the bf16 D-phase evidence) that arithmetic clamps to 0, which
-    # would let a quant run exit 0 while every prompt diverged. Refuse
-    # the auto default for quant + fixtures under 8 prompts and require
-    # the operator to set ``--byte-exact-min-pass`` explicitly.
-    _QUANT_AUTO_MIN_FIXTURE_SIZE = 8
+    # The auto default for ``quant`` was calibrated as
+    # ``len(prompts) - 6`` on the shipped 10-prompt mixed-length
+    # fixture where 6 is the observed SDPA drift ceiling. Codex
+    # round-B round-3 BLOCKING #2 called out that any other fixture
+    # size (even an 8-prompt custom fixture) still hits the same
+    # arithmetic → 8-6=2, which lets a run with 6 divergent prompts
+    # certify as "correct". Tighten to: the auto default fires ONLY
+    # when the fixture is the exact shipped 10-prompt mix (either
+    # ``--prompts-file`` omitted, so ``_DEFAULT_PROMPTS`` is used, or
+    # the fixture has 10 entries with matching IDs). For anything
+    # else, require ``--byte-exact-min-pass`` explicitly.
+    _SHIPPED_FIXTURE_SIZE = 10
+    _SHIPPED_FIXTURE_IDS = frozenset(p["id"] for p in _DEFAULT_PROMPTS)
+    _fixture_is_shipped = args.prompts_file is None or (
+        len(prompts) == _SHIPPED_FIXTURE_SIZE
+        and frozenset(p.get("id", "") for p in prompts) == _SHIPPED_FIXTURE_IDS
+    )
     if byte_exact_min is None:
         if args.target_precision in ("bf16", "fp16"):
             byte_exact_min = len(prompts)
@@ -827,22 +860,25 @@ def main(argv: list[str] | None = None) -> int:
                 "(auto — bf16/fp16 correctness proof requires all)"
             )
         else:
-            if len(prompts) < _QUANT_AUTO_MIN_FIXTURE_SIZE:
+            if not _fixture_is_shipped:
                 print(
-                    "!! ERROR: --target-precision quant + fixture with "
-                    f"{len(prompts)} prompts (< {_QUANT_AUTO_MIN_FIXTURE_SIZE}) "
-                    "cannot use the auto drift-ceiling default (which is "
-                    "calibrated for the shipped 10-prompt fixture). Set "
-                    "--byte-exact-min-pass explicitly for small fixtures — "
-                    "otherwise the gate could clamp to 0 and let a fully "
-                    "divergent run pass.",
+                    "!! ERROR: --target-precision quant + custom fixture "
+                    f"({len(prompts)} prompts) cannot use the auto "
+                    "drift-ceiling default (which was calibrated on the "
+                    "shipped 10-prompt mix). The 4/10 ceiling is not "
+                    "generalizable — a bespoke fixture may exercise the "
+                    "SDPA drift more or less than the shipped mix, and a "
+                    "size-only heuristic (len-6) could certify a run with "
+                    "most prompts divergent. Set --byte-exact-min-pass "
+                    "explicitly for custom fixtures.",
                     file=sys.stderr,
                 )
                 return 2
             byte_exact_min = max(0, len(prompts) - 6)
             print(
                 f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} "
-                "(auto — quant SDPA drift ceiling per gotchas.md)"
+                "(auto — quant SDPA drift ceiling per gotchas.md, "
+                "shipped fixture)"
             )
     else:
         # Guard against an explicit override that's incoherent with the
@@ -1075,7 +1111,40 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 3
 
-    print("\nVERDICT: PASS (correctness + perf)")
+    # Codex round-B round-3 BLOCKING #1 push-back: an operator reading
+    # only the final line must not walk away thinking a partial-
+    # byte-exact quant run has proved lossless spec-decode. Split the
+    # verdict so quant runs make the drift-budget shape explicit and
+    # bf16/fp16 runs remain the "proved lossless" surface. Codex
+    # asked for one of {require byte-exact, split into a perf smoke};
+    # this is the split — bf16 gate is the correctness proof, quant
+    # gate is a drift-budget + perf regression check backed by the
+    # bf16 evidence in the PR body.
+    if args.target_precision == "quant":
+        if byte_exact_count < len(rows):
+            print(
+                "\nVERDICT: PASS (drift-budget + perf) — "
+                f"{byte_exact_count}/{len(rows)} byte-exact against the "
+                f"batched-consistent baseline, above the {byte_exact_min}"
+                "/N drift-ceiling gate. This is NOT a per-run byte-exact "
+                "proof; the injector-lossless claim rests on the "
+                "--target-precision bf16 evidence (see the PR body's "
+                "D-phase table). Re-run with --target-precision bf16 on "
+                "an unquantized mirror to re-verify injector correctness."
+            )
+        else:
+            print(
+                "\nVERDICT: PASS (correctness + perf) — quant run was "
+                "byte-exact on all prompts; SDPA drift did not cross "
+                "argmax on this fixture."
+            )
+    else:
+        print(
+            "\nVERDICT: PASS (correctness + perf) — "
+            f"{byte_exact_count}/{len(rows)} byte-exact under "
+            f"{args.target_precision} target; injector is lossless in "
+            "absence of quant drift."
+        )
     return 0
 
 
