@@ -831,6 +831,27 @@ def _inject_tools_into_messages(messages: list[dict], tools: list[dict]) -> list
     return msgs
 
 
+# Hy3 detection — case-insensitive substring match against the alias name,
+# HF path, or local directory. Covers ``hy3-preview-4bit``,
+# ``mlx-community/Hy3-preview-4bit``, and any future ``Hy3-*`` or
+# ``Hunyuan-3-*`` re-upload without a per-repo allowlist.
+_HY3_MODEL_NAME_RE = re.compile(r"hy3|hy-v3|hunyuan.?3", re.IGNORECASE)
+
+
+def _looks_like_hy3(model_name: str) -> bool:
+    """Return True when the model name is Tencent Hunyuan 3 / Hy3.
+
+    Used to gate the ``reasoning_effort='low'`` chat-template default
+    injection (fixes upstream PR #1211 comment 4927711484 factual-recall
+    regression). Kept as a narrowly-scoped helper so the eventual PR-3
+    (which may add explicit request-side ``reasoning_effort`` plumbing)
+    doesn't have to duplicate the pattern.
+    """
+    if not model_name:
+        return False
+    return bool(_HY3_MODEL_NAME_RE.search(model_name))
+
+
 def apply_chat_template(
     template_applicator,
     messages: list[dict],
@@ -941,12 +962,32 @@ def apply_chat_template(
     if tools:
         template_kwargs["tools"] = tools
 
+    # Hy3 chat_template.jinja defaults ``reasoning_effort=no_think`` which
+    # empirically returns "France" instead of "Paris" on factual-recall
+    # questions (upstream PR #1211 comment 4927711484, 2026-07-09 spike).
+    # Override the default to ``low`` for Hy3 so out-of-the-box requests
+    # produce correct answers without the client having to learn the
+    # template kwarg. Fires ONLY when:
+    #   * model_name signals Hy3 (case-insensitive substring match)
+    #   * ``enable_thinking`` is not False (a client that explicitly
+    #     disabled thinking wants no_think — respect that intent)
+    # A future revision may add explicit request-side ``reasoning_effort``
+    # plumb-through; today it defaults are template-only, so this override
+    # is the correct injection point. Non-Hy3 models never see the kwarg,
+    # so no risk of TypeError on other templates.
+    if _looks_like_hy3(model_name) and enable_thinking is not False:
+        template_kwargs["reasoning_effort"] = "low"
+
     try:
         return template_applicator.apply_chat_template(messages, **template_kwargs)
     except TypeError as e:
         # Step 1: retry without enable_thinking (many templates don't support it)
         logger.debug("Chat template TypeError, retrying without enable_thinking: %s", e)
         template_kwargs.pop("enable_thinking", None)
+        # If the failure was actually caused by ``reasoning_effort`` (older
+        # Hy3 checkpoints without the kwarg, or a homonym HF path), drop
+        # it too so the retry can succeed. Cheap belt-and-braces defence.
+        template_kwargs.pop("reasoning_effort", None)
         try:
             return template_applicator.apply_chat_template(messages, **template_kwargs)
         except TypeError:
