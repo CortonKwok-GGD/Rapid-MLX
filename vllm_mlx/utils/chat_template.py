@@ -831,11 +831,23 @@ def _inject_tools_into_messages(messages: list[dict], tools: list[dict]) -> list
     return msgs
 
 
-# Hy3 detection — case-insensitive substring match against the alias name,
-# HF path, or local directory. Covers ``hy3-preview-4bit``,
-# ``mlx-community/Hy3-preview-4bit``, and any future ``Hy3-*`` or
+# Hy3 detection — case-insensitive family-boundary match against the
+# alias name, HF path, or local directory. Covers ``hy3-preview-4bit``,
+# ``mlx-community/Hy3-preview-4bit``, ``Hunyuan-3-Preview``,
+# ``hunyuan3``, ``hy-v3-experimental`` and any future ``Hy3-*`` or
 # ``Hunyuan-3-*`` re-upload without a per-repo allowlist.
-_HY3_MODEL_NAME_RE = re.compile(r"hy3|hy-v3|hunyuan.?3", re.IGNORECASE)
+#
+# Codex round-3 NIT (PR #1070 finding #4): earlier form used unanchored
+# ``hunyuan.?3`` which happily matched substrings inside unrelated
+# names / paths (``not-hunyuanx3-test``, any local path containing
+# that character sequence). Tightening to family separators
+# (``/`` ``_`` ``.`` ``-``) plus start / end of string is precise
+# enough for HF repo paths and CLI alias forms while rejecting
+# incidental substrings.
+_HY3_MODEL_NAME_RE = re.compile(
+    r"(?:^|[/_.\-])(?:hy3|hy-v3|hunyuan[-_]?3)(?:$|[/_.\-])",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_hy3(model_name: str) -> bool:
@@ -975,8 +987,15 @@ def apply_chat_template(
     # plumb-through; today it defaults are template-only, so this override
     # is the correct injection point. Non-Hy3 models never see the kwarg,
     # so no risk of TypeError on other templates.
+    #
+    # Codex round-3 BLOCKING #3 (PR #1070): use ``setdefault`` rather
+    # than direct assignment so a caller (or a future request-side
+    # plumb-through that pre-populates ``template_kwargs``) can still
+    # supply an explicit graded effort (``medium`` / ``high``) and see
+    # it survive to the tokenizer. Direct assignment would silently
+    # overwrite that intent.
     if _looks_like_hy3(model_name) and enable_thinking is not False:
-        template_kwargs["reasoning_effort"] = "low"
+        template_kwargs.setdefault("reasoning_effort", "low")
 
     try:
         return template_applicator.apply_chat_template(messages, **template_kwargs)

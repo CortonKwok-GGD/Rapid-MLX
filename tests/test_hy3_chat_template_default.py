@@ -37,6 +37,14 @@ from vllm_mlx.utils.chat_template import _looks_like_hy3, apply_chat_template
         ("mlx-community/Qwen3.6-27B-4bit", False),
         ("gemma4-27b-8bit", False),
         ("", False),
+        # Codex round-3 NIT (PR #1070 finding #4): unanchored substring
+        # matches leaked family detection into unrelated names. Lock the
+        # boundary behaviour so an incidental ``hunyuanx3`` /
+        # ``mymodelhy3embedded`` substring doesn't get Hy3-only kwarg
+        # injection.
+        ("not-hunyuanx3-test", False),
+        ("mymodelhy3embedded", False),
+        ("mlx-community/hunyuan5-preview", False),
     ],
 )
 def test_looks_like_hy3_predicate(name: str, expected: bool) -> None:
@@ -143,9 +151,13 @@ def test_hy3_default_dropped_only_after_second_type_error():
         model_name="hy3-preview-4bit",
     )
     # First call had both; retry dropped enable_thinking but preserved
-    # reasoning_effort=low.
+    # reasoning_effort=low. Codex round-3 NIT (PR #1070 finding #5):
+    # assert the exact expected value (``True`` — the default when the
+    # caller doesn't pass ``enable_thinking`` and the model_name isn't
+    # a coder alias) rather than the looser ``is not None`` which
+    # would silently accept an invalid value.
     assert len(tok.calls) == 2
-    assert tok.calls[0].get("enable_thinking") is not None
+    assert tok.calls[0].get("enable_thinking") is True
     assert tok.calls[0].get("reasoning_effort") == "low"
     assert "enable_thinking" not in tok.calls[1]
     assert tok.calls[1].get("reasoning_effort") == "low"

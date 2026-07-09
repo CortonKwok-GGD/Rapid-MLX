@@ -374,3 +374,96 @@ def test_supports_native_tool_format_flag():
     native-format flag MUST be True to prevent the tool-history
     round-trip from being converted to synthetic text."""
     assert HyV3ToolParser.SUPPORTS_NATIVE_TOOL_FORMAT is True
+
+
+def test_streaming_xml_pair_without_sep_does_not_flush_early():
+    """Codex round-3 BLOCKING #1 regression test. Some 4-bit checkpoints
+    emit an XML-pair body WITHOUT the preceding ``<tool_sep>`` — the
+    stream goes ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V
+    </arg_value>...<end_of_tool_call>``. The round-2 fix gated XML-pair
+    detection on ``<tool_sep>`` only, so this shape falls back to the
+    salvage-mode ``</arg_value>`` close and flushes with truncated
+    ``arguments={}`` on the first ``</arg_value>``. The round-3 fix
+    extends the XML-pair signal to ``<arg_key>`` / ``<arg_value>``
+    openers so the sep-less stream still waits for
+    ``<end_of_tool_call>``.
+
+    This test also covers the split-SSE variant of the same failure
+    mode — sep + first arg pair arriving in a later delta than the
+    opener — which is the actual scenario codex called out."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    assert step("<tool_call:opensource>") is None
+    assert step("do_it") is None
+    # NO <tool_sep> emitted — the checkpoint jumps straight into args.
+    assert step("<arg_key:opensource>x</arg_key:opensource>") is None
+    assert step("<arg_value:opensource>1") is None
+    # First arg-value close arriving alone MUST NOT flush the call —
+    # <arg_key>/<arg_value> openers already flagged XML-pair mode.
+    early = step("</arg_value:opensource>")
+    assert early is None, (
+        "Sep-less XML-pair body flushed on first </arg_value> — "
+        "regressing codex round-3 BLOCKING #1."
+    )
+    # Only the canonical close should trigger the emit.
+    assert step("<arg_key:opensource>y</arg_key:opensource>") is None
+    assert step("<arg_value:opensource>2</arg_value:opensource>") is None
+    final = step("<end_of_tool_call:opensource>")
+    assert final is not None
+    tc = final["tool_calls"][0]
+    assert tc["function"]["name"] == "do_it"
+    args = json.loads(tc["function"]["arguments"])
+    assert args == {"x": 1, "y": 2}
+
+
+def test_valid_names_filter_preserves_rejected_span_in_content():
+    """Codex round-3 BLOCKING #2 regression test. When ``valid_names``
+    is set and every parsed call is filtered out, the raw XML span of
+    the rejected call MUST be preserved in ``content`` — silently
+    dropping it makes the model output look like a refusal to the
+    caller, when in fact the model tried to invoke an off-list tool.
+    Preserving the span lets the caller diagnose the hallucination."""
+    parser = HyV3ToolParser()
+    out = '<tool_call>bogus_tool<tool_sep>{"x": 1}<end_of_tool_call>'
+    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    res = parser.extract_tool_calls(out, request=request)
+    assert res.tools_called is False
+    assert res.tool_calls == []
+    assert res.content is not None
+    # The rejected span MUST survive in the content — the exact bytes
+    # of the tool_call block matter for the caller's diagnostic.
+    assert "<tool_call>bogus_tool<tool_sep>" in res.content
+    assert "bogus_tool" in res.content
+
+
+def test_valid_names_filter_preserves_mixed_valid_and_rejected():
+    """Extension of the round-3 BLOCKING #2 fix: when SOME calls are
+    valid, ``tools_called=True`` and ``content=None`` (per the
+    "tool-call turn is exclusive" policy from round-2). The rejected
+    span is lost in that case by design — the OpenAI-compatible
+    contract does not permit mixed ``tool_calls`` + ``content`` in a
+    single assistant turn. This test locks the mixed-case behaviour so
+    a future edit doesn't accidentally start leaking the rejected span
+    back into ``content`` and break the exclusive-turn contract."""
+    parser = HyV3ToolParser()
+    out = (
+        '<tool_call>allowed_tool<tool_sep>{"y": 2}<end_of_tool_call>'
+        "\n"
+        '<tool_call>bogus_tool<tool_sep>{"x": 1}<end_of_tool_call>'
+    )
+    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    res = parser.extract_tool_calls(out, request=request)
+    assert res.tools_called is True
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0]["name"] == "allowed_tool"
+    # Exclusive-turn policy — no content when tools_called is True.
+    assert res.content is None

@@ -160,18 +160,28 @@ def _parse_hy3_body(body: str) -> tuple[str, dict[str, Any]]:
     # Split at the first <tool_sep> if present.
     sep_match = _TOOL_SEP.search(body)
     if sep_match is None:
-        # No separator — the tool_sep + args block never arrived.
-        # Return the whole trimmed body as the name (defensive strip
-        # case). Extra ``</arg_value>`` / ``</arg_key>`` residue can
-        # leak in when the model emits a partial close pair; strip
-        # those literally so ``get_weather`` doesn't become
-        # ``get_weather</arg_value>``.
-        raw_name = body.strip()
-        raw_name = _ARG_VALUE_CLOSE.sub("", raw_name)
-        raw_name = _ARG_KEY_CLOSE.sub("", raw_name)
-        return raw_name.strip(), {}
-    name = body[: sep_match.start()].strip()
-    tail = body[sep_match.end() :]
+        # No separator — two shapes to disambiguate (codex round-3
+        # BLOCKING #1 extension):
+        #   (a) sep-less XML-pair body:
+        #       ``NAME<arg_key>K</arg_key><arg_value>V</arg_value>...``
+        #       (some 4-bit checkpoints skip <tool_sep> but still emit
+        #       full XML-pair args). Detect via the first arg-key /
+        #       arg-value opener and treat it as an implicit sep.
+        #   (b) short-form salvage: no sep, no arg tags — the whole
+        #       body is the tool name (with ``</arg_value>`` residue
+        #       stripped defensively).
+        arg_open = _ARG_KEY_OPEN.search(body) or _ARG_VALUE_OPEN.search(body)
+        if arg_open is not None:
+            name = body[: arg_open.start()].strip()
+            tail = body[arg_open.start() :]
+        else:
+            raw_name = body.strip()
+            raw_name = _ARG_VALUE_CLOSE.sub("", raw_name)
+            raw_name = _ARG_KEY_CLOSE.sub("", raw_name)
+            return raw_name.strip(), {}
+    else:
+        name = body[: sep_match.start()].strip()
+        tail = body[sep_match.end() :]
 
     # Variant 1: JSON object payload.
     tail_stripped = tail.strip()
@@ -291,6 +301,15 @@ class HyV3ToolParser(ToolParser):
                 cursor = match.end()
                 continue
             if valid_names and name not in valid_names:
+                # Codex round-3 BLOCKING #2: preserve the raw span of the
+                # rejected call in the residual text rather than silently
+                # erasing it. Without this, a request that supplies a
+                # ``tools`` allowlist and a model that hallucinates an
+                # off-list tool name would see ``tools_called=False`` +
+                # empty content — the user never learns the model tried
+                # to call something. Surfacing the raw XML lets the
+                # caller diagnose the hallucination.
+                residual_parts.append(cleaned[match.start() : match.end()])
                 cursor = match.end()
                 continue
             tool_calls.append(
@@ -345,30 +364,46 @@ class HyV3ToolParser(ToolParser):
         already closed.
 
         The close-tag definition is MODE-DEPENDENT (codex round-2
-        BLOCKING #1, PR #1070):
+        BLOCKING #1 + round-3 BLOCKING #1, PR #1070):
 
-        * **XML-pair body** — when a ``<tool_sep>`` appears between the
-          opener and cursor, the body is the ``<arg_key>K</arg_key>
-          <arg_value>V</arg_value>`` variant. Each argument value
-          legitimately ends with ``</arg_value>``, so ONLY the canonical
-          ``<end_of_tool_call>`` marker closes the call. Treating
-          ``</arg_value>`` as a close here would flush the call after
-          the FIRST argument, emitting truncated ``arguments={}``.
-        * **Malformed / no-sep body** — when no ``<tool_sep>`` is in
-          flight, the call shape is either canonical-close (still
-          waiting for ``<end_of_tool_call>``) or the salvage case
-          ``<tool_call>NAME</arg_value>`` where the sep + args never
-          arrived. In the salvage case, ``</arg_value>`` acts as the
-          effective close — recognising it lets the streaming path
-          emit rather than hanging until the request timeout.
+        * **XML-pair body** — when ANY XML-pair marker (``<tool_sep>``,
+          ``<arg_key>`` opener, or ``<arg_value>`` opener) appears
+          between the opener and cursor, the body is the
+          ``<arg_key>K</arg_key><arg_value>V</arg_value>`` variant.
+          Each argument value legitimately ends with ``</arg_value>``,
+          so ONLY the canonical ``<end_of_tool_call>`` marker closes
+          the call. Treating ``</arg_value>`` as a close here would
+          flush after the FIRST argument, emitting truncated
+          ``arguments={}``.
+
+          Round-3 extension over round-2: an XML-pair body can arrive
+          WITHOUT a preceding ``<tool_sep>`` on some 4-bit checkpoints
+          that emit ``<tool_call>NAME<arg_key>...`` directly, or with
+          the sep in a different SSE delta from the first arg pair.
+          Gating only on ``<tool_sep>`` would mis-classify that shape
+          as salvage-mode and flush prematurely on the first
+          ``</arg_value>``. Extending the XML-pair signal to include
+          arg-key / arg-value openers closes that split-stream window.
+        * **Bare / short-form salvage** — no XML-pair marker seen; the
+          call is either awaiting canonical close or the 4-bit salvage
+          shape ``<tool_call>NAME</arg_value>`` where the sep + args
+          never arrived. In the salvage case, ``</arg_value>`` acts as
+          the effective close — recognising it lets the streaming
+          path emit rather than hang until the request timeout.
         """
         openers = [m.start() for m in _TOOL_CALL_OPEN.finditer(text)]
         for opener_pos in reversed(openers):
             after_opener = text[opener_pos:]
-            # Mode split: canonical-only when a tool_sep is already in
-            # flight (XML-pair body); canonical-or-malformed otherwise
-            # (defensive salvage for the sep-less shape).
-            if _TOOL_SEP.search(after_opener):
+            # XML-pair mode signalled by ANY of {tool_sep, arg_key open,
+            # arg_value open}. Canonical-only close in that mode;
+            # canonical-or-malformed otherwise (defensive salvage for
+            # the sep-less short-form shape).
+            has_xml_pair_marker = (
+                _TOOL_SEP.search(after_opener) is not None
+                or _ARG_KEY_OPEN.search(after_opener) is not None
+                or _ARG_VALUE_OPEN.search(after_opener) is not None
+            )
+            if has_xml_pair_marker:
                 close_re = _TOOL_CALL_CANONICAL_CLOSE
             else:
                 close_re = _TOOL_CALL_CLOSE_ANY
