@@ -554,10 +554,19 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
     # Tencent Hy3 / Hunyuan 3 (295B/21B active MoE, 166 GB at 4-bit) is
     # served via the vendored ``vllm_mlx/models/hy_v3.py`` shim (PR
     # #1069) — Ultra-only launch, gated by the ``min_memory_gb: 192``
-    # metadata on the ``hy3-preview-4bit`` alias. Tool + reasoning
-    # parsers land in the PR-2 follow-up; parsers stay ``None`` here
-    # so the auto-config resolver treats HY3 as an unknown family
-    # until PR-2 wires the defensive tag-parser.
+    # metadata on the ``hy3-preview-4bit`` alias. PR-2 (#1069 follow-up)
+    # wires the suffix-tolerant ``hy_v3`` tool + reasoning parsers so a
+    # direct HF path serve (``mlx-community/Hy3-preview-4bit``, or any
+    # future Hy3 quant re-upload) auto-configures without requiring the
+    # alias-profile lookup path. Pattern matches ``Hy3``/``hy3``/``hunyuan-3``
+    # case-insensitively so future community re-quants inherit routing.
+    (
+        re.compile(r"hy3|hy-v3|hunyuan.?3", re.IGNORECASE),
+        ModelConfig(
+            tool_call_parser="hy_v3",
+            reasoning_parser="hy_v3",
+        ),
+    ),
     # Pure recurrent / linear-attention families (Mamba, Jamba, RWKV).
     # Tool/reasoning parsers unknown → leave defaults; capability flags
     # block batched-verify-style optimizations.
