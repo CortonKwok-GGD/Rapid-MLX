@@ -558,10 +558,22 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
     # wires the suffix-tolerant ``hy_v3`` tool + reasoning parsers so a
     # direct HF path serve (``mlx-community/Hy3-preview-4bit``, or any
     # future Hy3 quant re-upload) auto-configures without requiring the
-    # alias-profile lookup path. Pattern matches ``Hy3``/``hy3``/``hunyuan-3``
-    # case-insensitively so future community re-quants inherit routing.
+    # alias-profile lookup path.
+    #
+    # Codex round-4 BLOCKING #1 (PR #1070): the earlier form was
+    # unanchored (``hy3|hy-v3|hunyuan.?3``), matching substrings inside
+    # unrelated HF paths (``mymodelhy3embedded``, ``not-hunyuanx3-test``)
+    # and auto-wiring them to the Hy3 parsers. Tighten to the same
+    # family-boundary form used in ``chat_template._HY3_MODEL_NAME_RE``:
+    # start-of-string OR a path/name separator (``/`` ``_`` ``.`` ``-``)
+    # precedes the family root, and end-of-string OR the same separator
+    # follows it. Precise enough for HF repo paths and CLI alias forms
+    # while rejecting incidental substrings.
     (
-        re.compile(r"hy3|hy-v3|hunyuan.?3", re.IGNORECASE),
+        re.compile(
+            r"(?:^|[/_.\-])(?:hy3|hy-v3|hunyuan[-_]?3)(?:$|[/_.\-])",
+            re.IGNORECASE,
+        ),
         ModelConfig(
             tool_call_parser="hy_v3",
             reasoning_parser="hy_v3",

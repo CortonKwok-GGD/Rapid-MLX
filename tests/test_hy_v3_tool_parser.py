@@ -425,6 +425,90 @@ def test_streaming_xml_pair_without_sep_does_not_flush_early():
     assert args == {"x": 1, "y": 2}
 
 
+def test_streaming_json_body_with_corrupted_arg_value_tail_salvages():
+    """Codex round-4 BLOCKING #2 regression test. A JSON-body stream can
+    end with a stray ``</arg_value>`` (4-bit noise corrupting the JSON
+    tail) — no ``<arg_key>`` opener, no ``<arg_value>`` opener, just
+    ``NAME<tool_sep>{"k":"v"}</arg_value>``. The round-3 fix put this
+    into XML-pair mode (canonical-only close) because ``<tool_sep>`` was
+    present, so the salvage close never fired and the streaming path
+    hung waiting for ``<end_of_tool_call>`` that never arrives. The
+    round-4 fix inspects the body-prefix of EACH ``</arg_value>``
+    individually — a prefix with no arg-key/value opener still fires the
+    salvage close, letting the parser emit rather than hang."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    assert step("<tool_call:opensource>") is None
+    assert step("get_weather") is None
+    assert step("<tool_sep:opensource>") is None
+    # JSON body — well-formed argument dict, then a stray malformed
+    # close in the tail (no <arg_key>/<arg_value> ever emitted).
+    assert step('{"city": "NYC"}') is None
+    final = step("</arg_value:opensource>")
+    assert final is not None, (
+        "Corrupted JSON tail with </arg_value> failed to trigger "
+        "salvage close — regressing codex round-4 BLOCKING #2."
+    )
+    tc = final["tool_calls"][0]
+    assert tc["function"]["name"] == "get_weather"
+
+
+def test_auto_config_regex_boundary_rejects_incidental_substring():
+    """Codex round-4 BLOCKING #1 regression test. The Hy3 auto-config
+    regex in ``model_auto_config.py`` MUST reject incidental substring
+    matches — an unrelated HF path like ``mymodelhy3embedded`` must NOT
+    auto-wire to the Hy3 tool/reasoning parsers just because it happens
+    to contain ``hy3`` as a substring.
+
+    Duplicated across ``model_auto_config`` and ``chat_template`` so a
+    future refactor to a shared helper can drop one without losing
+    coverage — the two entry points share the same boundary policy."""
+    import re as _re
+
+    from vllm_mlx.model_auto_config import _MODEL_PATTERNS
+
+    # Locate the Hy3 pattern in the auto-config table.
+    hy3_pattern = None
+    for pattern, config in _MODEL_PATTERNS:
+        if getattr(config, "tool_call_parser", None) == "hy_v3":
+            hy3_pattern = pattern
+            break
+    assert hy3_pattern is not None, "Hy3 auto-config pattern not found"
+
+    # Positives — must match.
+    for name in [
+        "hy3-preview-4bit",
+        "mlx-community/Hy3-preview-4bit",
+        "Hunyuan-3-Preview",
+        "hunyuan3",
+        "hy-v3-experimental",
+    ]:
+        assert hy3_pattern.search(name), f"expected match on {name!r}"
+
+    # Negatives — must NOT match. These are the exact strings codex
+    # cited as auto-wiring wrongly under the unanchored regex.
+    for name in [
+        "mymodelhy3embedded",
+        "not-hunyuanx3-test",
+        "qwen3.5-4b-4bit",
+        "gemma4-27b-8bit",
+    ]:
+        assert not hy3_pattern.search(name), (
+            f"unexpected match on {name!r} — regressing round-4 BLOCKING #1"
+        )
+    # Silence unused-import lint on ``re`` — imported for reader clarity.
+    _ = _re
+
+
 def test_valid_names_filter_preserves_rejected_span_in_content():
     """Codex round-3 BLOCKING #2 regression test. When ``valid_names``
     is set and every parsed call is filtered out, the raw XML span of

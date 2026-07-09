@@ -208,6 +208,45 @@ def _parse_hy3_body(body: str) -> tuple[str, dict[str, Any]]:
     return name, args
 
 
+def _closed_after_opener(after_opener: str) -> bool:
+    """Return True iff ``after_opener`` (the substring starting AT the
+    ``<tool_call>`` opener) already contains an effective close.
+
+    An "effective close" is either:
+
+    * the canonical ``<end_of_tool_call>`` tag anywhere in the substring,
+      OR
+    * a ``</arg_value>`` tag whose body-prefix (from the opener up to
+      that ``</arg_value>``) contains NO ``<arg_value>`` opener AND NO
+      ``<arg_key>`` opener — that is, the true malformed-salvage shape
+      ``<tool_call>NAME</arg_value>`` (empirically observed on 4-bit
+      Hy3 quants). Any earlier ``</arg_value>`` in a body that has
+      already emitted an ``<arg_value>`` / ``<arg_key>`` opener is
+      closing a real argument value, not the tool_call itself.
+
+    Codex round-4 BLOCKING #2 (PR #1070): the round-3 implementation
+    used any-marker XML-pair mode detection (tool_sep OR arg_key OR
+    arg_value openers all counted). But ``<tool_sep>`` appears in BOTH
+    JSON-body streams (``NAME<tool_sep>{...}``) and XML-pair streams,
+    so a JSON stream with corrupted-tail ``</arg_value>`` would fall
+    to canonical-only mode and hang until timeout waiting for
+    ``<end_of_tool_call>``. Switching the discriminator to
+    per-``</arg_value>`` prefix inspection recovers the salvage path
+    on corrupted JSON while still preventing early flushes on real
+    XML-pair bodies.
+    """
+    if _TOOL_CALL_CANONICAL_CLOSE.search(after_opener):
+        return True
+    for m in _ARG_VALUE_CLOSE.finditer(after_opener):
+        prefix = after_opener[: m.start()]
+        if _ARG_VALUE_OPEN.search(prefix):
+            continue
+        if _ARG_KEY_OPEN.search(prefix):
+            continue
+        return True
+    return False
+
+
 @ToolParserManager.register_module(["hy_v3", "hy3"])
 class HyV3ToolParser(ToolParser):
     """
@@ -363,52 +402,35 @@ class HyV3ToolParser(ToolParser):
         no matching close tag after it, or ``-1`` when every opener
         already closed.
 
-        The close-tag definition is MODE-DEPENDENT (codex round-2
-        BLOCKING #1 + round-3 BLOCKING #1, PR #1070):
+        Close-tag semantics (codex round-2 / round-3 / round-4 BLOCKING
+        #1 on PR #1070):
 
-        * **XML-pair body** — when ANY XML-pair marker (``<tool_sep>``,
-          ``<arg_key>`` opener, or ``<arg_value>`` opener) appears
-          between the opener and cursor, the body is the
-          ``<arg_key>K</arg_key><arg_value>V</arg_value>`` variant.
-          Each argument value legitimately ends with ``</arg_value>``,
-          so ONLY the canonical ``<end_of_tool_call>`` marker closes
-          the call. Treating ``</arg_value>`` as a close here would
-          flush after the FIRST argument, emitting truncated
-          ``arguments={}``.
+        * The canonical ``<end_of_tool_call>`` tag ALWAYS closes the
+          call — anywhere after the opener.
+        * A ``</arg_value>`` closes the call ONLY when it is the
+          "malformed-salvage" shape — i.e., the body-prefix between the
+          opener and that specific ``</arg_value>`` contains no
+          ``<arg_value>`` opener AND no ``<arg_key>`` opener. In both
+          the JSON-body wire (``NAME<tool_sep>{...}``) and the
+          XML-pair-in-flight case, an ``</arg_value>`` after real body
+          content is closing an argument value, not the call.
 
-          Round-3 extension over round-2: an XML-pair body can arrive
-          WITHOUT a preceding ``<tool_sep>`` on some 4-bit checkpoints
-          that emit ``<tool_call>NAME<arg_key>...`` directly, or with
-          the sep in a different SSE delta from the first arg pair.
-          Gating only on ``<tool_sep>`` would mis-classify that shape
-          as salvage-mode and flush prematurely on the first
-          ``</arg_value>``. Extending the XML-pair signal to include
-          arg-key / arg-value openers closes that split-stream window.
-        * **Bare / short-form salvage** — no XML-pair marker seen; the
-          call is either awaiting canonical close or the 4-bit salvage
-          shape ``<tool_call>NAME</arg_value>`` where the sep + args
-          never arrived. In the salvage case, ``</arg_value>`` acts as
-          the effective close — recognising it lets the streaming
-          path emit rather than hang until the request timeout.
+        The round-4 refinement over round-3: gating on ``<tool_sep>`` +
+        arg-pair markers TREATED ``<tool_sep>`` alone as XML-pair mode,
+        which mis-classified JSON-body streams — a JSON body with a
+        stray ``</arg_value>`` (4-bit noise corrupting the JSON tail)
+        would then wait forever for a canonical close that never
+        arrives. Switching the discriminator to arg-key / arg-value
+        openers ONLY (which are exclusive to the XML-pair shape) lets
+        the salvage path recover a corrupted JSON body while still
+        preventing early flushes on well-formed XML-pair bodies.
         """
         openers = [m.start() for m in _TOOL_CALL_OPEN.finditer(text)]
         for opener_pos in reversed(openers):
             after_opener = text[opener_pos:]
-            # XML-pair mode signalled by ANY of {tool_sep, arg_key open,
-            # arg_value open}. Canonical-only close in that mode;
-            # canonical-or-malformed otherwise (defensive salvage for
-            # the sep-less short-form shape).
-            has_xml_pair_marker = (
-                _TOOL_SEP.search(after_opener) is not None
-                or _ARG_KEY_OPEN.search(after_opener) is not None
-                or _ARG_VALUE_OPEN.search(after_opener) is not None
-            )
-            if has_xml_pair_marker:
-                close_re = _TOOL_CALL_CANONICAL_CLOSE
-            else:
-                close_re = _TOOL_CALL_CLOSE_ANY
-            if not close_re.search(after_opener):
-                return opener_pos
+            if _closed_after_opener(after_opener):
+                continue
+            return opener_pos
         return -1
 
     def extract_tool_calls_streaming(
