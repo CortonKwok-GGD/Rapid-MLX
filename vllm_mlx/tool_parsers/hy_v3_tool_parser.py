@@ -122,6 +122,12 @@ _ARG_PAIR = re.compile(
     re.DOTALL,
 )
 
+# Streaming JSON-decoder used by ``_parse_hy3_body`` to consume only a
+# well-formed JSON prefix of the argument tail. Round-5 BLOCKING #3
+# fix — avoids corrupting a valid JSON body whose string values
+# legitimately contain the literal ``</arg_value>`` substring.
+_JSON_DECODER = json.JSONDecoder()
+
 
 def _deserialize_arg_value(value: str) -> Any:
     """Coerce a raw ``<arg_value>`` payload to a JSON-native Python type.
@@ -185,18 +191,27 @@ def _parse_hy3_body(body: str) -> tuple[str, dict[str, Any]]:
 
     # Variant 1: JSON object payload.
     tail_stripped = tail.strip()
-    # Trim any trailing structural residue (``</arg_value>`` etc.) so
-    # ``{"k":"v"}</arg_value>`` still json.loads cleanly.
-    trailing_start = _ARG_VALUE_CLOSE.search(tail_stripped)
-    if trailing_start is not None:
-        tail_stripped = tail_stripped[: trailing_start.start()].strip()
     if tail_stripped.startswith("{"):
+        # Codex round-5 BLOCKING #3 (PR #1070): DO NOT truncate at the
+        # first ``</arg_value>`` before json.loads — a valid JSON
+        # payload can legitimately contain that literal inside a
+        # string value (``{"snippet": "see </arg_value> below"}``) and
+        # slicing there would corrupt the args into empty/truncated.
+        # Use ``raw_decode`` to consume only a well-formed JSON prefix
+        # of the tail; any structural residue after that (the
+        # ``</arg_value>`` malformed close, whitespace, extra tags) is
+        # discarded harmlessly.
         try:
-            parsed = json.loads(tail_stripped)
+            parsed, _end = _JSON_DECODER.raw_decode(tail_stripped)
             if isinstance(parsed, dict):
                 return name, parsed
         except (json.JSONDecodeError, ValueError):
-            pass  # Fall through to variant 2.
+            # Fall through to variant 2 (XML-pair) — same as before.
+            # If raw_decode failed on the untrimmed tail, structural
+            # residue is unlikely to be the cause (JSON is delimited);
+            # a genuinely malformed JSON body degrades cleanly to the
+            # XML-pair walker.
+            pass
 
     # Variant 2: <arg_key>K</arg_key><arg_value>V</arg_value> pairs.
     args: dict[str, Any] = {}
@@ -206,6 +221,76 @@ def _parse_hy3_body(body: str) -> tuple[str, dict[str, Any]]:
             continue
         args[key] = _deserialize_arg_value(m.group("val"))
     return name, args
+
+
+def _tool_call_open_straddle_suffix_len(text: str) -> int:
+    r"""Return the byte length of a trailing partial ``<tool_call>`` /
+    ``<tool_call:label>`` opener that hasn't fully arrived yet.
+
+    The Hy3 opener regex is ``<tool_call(?::[\w-]+)?>``; on an SSE
+    boundary a delta can end with any strict prefix of that string,
+    e.g. ``<``, ``<t``, ``<tool_c``, ``<tool_call``, ``<tool_call:``,
+    ``<tool_call:opens``. Codex round-5 BLOCKING #1: emitting those
+    bytes as ``content`` leaks tool markup to OpenAI-compatible
+    clients seconds before the opener completes and the parser
+    switches to tool-call turn suppression.
+
+    Returns 0 when no straddle exists (the trailing bytes cannot
+    become a valid opener no matter what arrives next).
+    """
+    if not text:
+        return 0
+    # Longest possible partial-opener length is
+    #   len("<tool_call:") + reasonable suffix len bound.
+    # Any label longer than 32 chars is unrealistic — cap the scan.
+    max_len = min(len(text), 48)
+    # Walk from longest candidate suffix down to length 1; return the
+    # first (longest) one that is a strict prefix of a valid opener.
+    for cand_len in range(max_len, 0, -1):
+        cand = text[-cand_len:]
+        if _is_strict_prefix_of_tool_call_opener(cand):
+            return cand_len
+    return 0
+
+
+def _is_strict_prefix_of_tool_call_opener(cand: str) -> bool:
+    r"""Return True iff ``cand`` is a strict prefix of some valid Hy3
+    tool_call opener (``<tool_call>`` or ``<tool_call:LABEL>`` with
+    a non-empty ``[\w-]+`` label). A prefix is "strict" when the
+    opener isn't complete yet — the parser hasn't emitted the ``>``.
+    """
+    # Must start at the ``<`` so it's a real straddle, not incidental
+    # text.
+    base = "<tool_call"
+    if not cand:
+        return False
+    if not base.startswith(cand) and not cand.startswith(base):
+        return False
+    if base.startswith(cand):
+        # Prefix of the bare opener itself (``<``, ``<t``, ... up to
+        # ``<tool_call``). Strict because ``>`` hasn't arrived.
+        return cand != base + ">"
+    # cand starts with ``<tool_call`` — is the tail either the ``:``
+    # prefix, a partial label, or exactly the terminator ``>``?
+    tail = cand[len(base) :]
+    if tail == "":
+        return True
+    if tail == ">":
+        # Complete bare opener — NOT a straddle.
+        return False
+    if not tail.startswith(":"):
+        # ``<tool_call?`` — cannot become a valid opener.
+        return False
+    label = tail[1:]
+    if label == "":
+        # ``<tool_call:`` — awaiting label.
+        return True
+    # ``<tool_call:LABEL`` — accept if the LABEL is [\w-]+ so far, no
+    # trailing ``>`` yet.
+    if label.endswith(">"):
+        # Complete labelled opener — NOT a straddle.
+        return False
+    return all(c.isalnum() or c == "_" or c == "-" for c in label)
 
 
 def _closed_after_opener(after_opener: str) -> bool:
@@ -515,6 +600,27 @@ class HyV3ToolParser(ToolParser):
             clean = self.strip_think_tags(clean)
             if clean:
                 return {"content": clean}
+            return None
+        # Codex round-5 BLOCKING #1 (PR #1070): if the ACCUMULATED
+        # ``current_text`` ends in a strict prefix of ``<tool_call>``
+        # / ``<tool_call:suffix>``, the full opener hasn't arrived yet
+        # — withhold the tail so it doesn't leak to the client as
+        # plain content only to be suppressed a delta later once the
+        # opener completes. Compute how many trailing bytes belong to
+        # the partial-opener straddle and slice them off the delta.
+        straddle = _tool_call_open_straddle_suffix_len(current_text)
+        if straddle > 0:
+            # ``straddle`` is bytes at the end of current_text that
+            # form a partial opener. Only withhold those bytes if they
+            # fall entirely within the current delta; otherwise the
+            # withhold happened on a prior tick and the delta itself
+            # is unrelated.
+            if straddle >= len(delta_text):
+                return None
+            # Trim the trailing partial-opener bytes off the delta.
+            trimmed = delta_text[:-straddle]
+            if trimmed:
+                return {"content": trimmed}
             return None
         if delta_text:
             return {"content": delta_text}

@@ -48,12 +48,19 @@ _HY3_OPEN_TAG_RE = re.compile(r"<think(?::[\w-]+)?>")
 _HY3_CLOSE_TAG_RE = re.compile(r"</think(?::[\w-]+)?>")
 
 # Straddle-boundary detector: strict prefix of a suffixed close/open tag
-# that MAY complete on the next delta. Anchored on the exact `<think:`
-# opener (or `</think:`) followed by 0+ label chars but with no closing
-# `>`. Matching this suffix means we must withhold those bytes so the
-# next tick sees the whole tag and normalisation stays consistent.
-_HY3_OPEN_STRADDLE_RE = re.compile(r"<think:[\w-]*$")
-_HY3_CLOSE_STRADDLE_RE = re.compile(r"</think:[\w-]*$")
+# that MAY complete on the next delta. Codex round-5 BLOCKING #2
+# (PR #1070) widened the pattern to include the ``:``-less prefix
+# (``<think`` / ``</think``) — the qwen3 base withhold only reserves
+# the plain form up to (but not including) the ``>``; without extra
+# coverage a boundary split like ``"<think"`` then ``":opensource>"``
+# would release ``<think`` from qwen3's hold on tick N and then leak
+# ``:opensource>`` as plain content on tick N+1 (because the ``:``
+# character isn't the ``>`` qwen3 was waiting for, so qwen3 falls
+# through). Anchoring on the exact ``<think`` root plus an optional
+# ``:LABEL`` suffix covers both the ``:``-less prefix AND the labelled
+# variants uniformly.
+_HY3_OPEN_STRADDLE_RE = re.compile(r"<think(?::[\w-]*)?$")
+_HY3_CLOSE_STRADDLE_RE = re.compile(r"</think(?::[\w-]*)?$")
 
 
 def _normalize_hy3_tags(text: str) -> str:

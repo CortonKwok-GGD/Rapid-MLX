@@ -425,6 +425,75 @@ def test_streaming_xml_pair_without_sep_does_not_flush_early():
     assert args == {"x": 1, "y": 2}
 
 
+def test_streaming_partial_opener_does_not_leak_as_content():
+    """Codex round-5 BLOCKING #1 regression test. A ``<tool_call:opensource>``
+    opener that arrives split across SSE deltas (e.g. delta 1
+    ``"Sure, <tool_ca"``, delta 2 ``"ll:opensource>..."``) MUST NOT
+    leak the ``<tool_ca`` bytes as plain content — an OpenAI-compatible
+    client would render tool markup before the tool-call turn engages,
+    then have to interpret it as prose.
+
+    The fix withholds the trailing partial-opener bytes on the delta
+    that contains them, and releases the withheld bytes as content
+    ONLY if the next chunk falsifies the opener guess (rare but
+    handled: the bytes are re-derivable from ``current_text`` on the
+    next tick)."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    # Delta 1: prose + partial opener. The prose bytes pass through as
+    # content; the partial-opener bytes MUST be withheld.
+    m1 = step("Sure, <tool_ca")
+    if m1 is not None:
+        # If anything emitted, it MUST be prose only — no ``<tool_ca``
+        # bytes may reach the content channel.
+        assert "<tool" not in (m1.get("content") or ""), (
+            f"Partial opener leaked as content: {m1!r}"
+        )
+    # Delta 2: opener completes. The turn is now a tool-call turn.
+    m2 = step("ll:opensource>get_weather<tool_sep:opensource>{}")
+    # Once the opener has appeared, all further deltas are suppressed
+    # until the close arrives. This delta MUST NOT emit content.
+    assert m2 is None
+    # Delta 3: canonical close — emit the tool_calls array.
+    m3 = step("<end_of_tool_call:opensource>")
+    assert m3 is not None
+    assert m3["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_json_body_containing_literal_arg_value_close_parses_correctly():
+    """Codex round-5 BLOCKING #3 regression test. A JSON body whose
+    STRING VALUE legitimately contains the literal substring
+    ``</arg_value>`` MUST round-trip unchanged through the parser.
+    The round-1..4 code truncated the tail at the first ``</arg_value>``
+    before ``json.loads``, corrupting ``{"snippet": "see </arg_value>
+    here"}`` into ``{"snippet": "see``. Using ``JSONDecoder.raw_decode``
+    to consume only a well-formed JSON prefix of the tail preserves
+    the string content exactly."""
+    parser = HyV3ToolParser()
+    out = (
+        "<tool_call:opensource>log_message<tool_sep:opensource>"
+        '{"snippet": "The tag </arg_value> is not a close here.", "level": "info"}'
+        "<end_of_tool_call:opensource>"
+    )
+    res = parser.extract_tool_calls(out)
+    assert res.tools_called is True
+    assert len(res.tool_calls) == 1
+    args = json.loads(res.tool_calls[0]["arguments"])
+    assert args == {
+        "snippet": "The tag </arg_value> is not a close here.",
+        "level": "info",
+    }
+
+
 def test_streaming_json_body_with_corrupted_arg_value_tail_salvages():
     """Codex round-4 BLOCKING #2 regression test. A JSON-body stream can
     end with a stray ``</arg_value>`` (4-bit noise corrupting the JSON

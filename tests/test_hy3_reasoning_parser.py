@@ -161,6 +161,83 @@ def test_streaming_suffix_tag_split_across_boundary_preserves_invariant():
     assert m4.content == "Paris"
 
 
+def test_streaming_pre_colon_prefix_still_withholds():
+    """Codex round-5 BLOCKING #2 regression test. Boundary split
+    ``"<think"`` then ``":opensource>Hello"`` — the FIRST delta ends
+    with just ``<think`` (no colon). The round-1 straddle regex
+    required the colon to be present, so the ``<think`` prefix fell
+    through to the qwen3 base withhold. Qwen3's base hold only reserves
+    prefixes of the plain ``<think>`` shape and releases when the
+    trailing char is not ``>`` — the next tick's ``:`` character caused
+    qwen3 to release the hold and leak ``:opensource>`` as plain
+    content.
+
+    Widening the straddle regex to make the ``:LABEL`` suffix optional
+    fixes this — ``<think`` and ``</think`` are now withheld until the
+    tag either completes as bare ``<think>`` or gains a suffix and
+    completes as ``<think:LABEL>``."""
+    parser = Hy3ReasoningParser()
+    parser.reset_state()
+
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_reasoning_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    # Delta 1: ``<think`` alone — no colon yet. Must NOT leak the ``<think``
+    # bytes to any channel; must NOT enter reasoning mode either.
+    m1 = step("<think")
+    assert m1 is None or (m1.content is None and m1.reasoning is None), (
+        f"Colon-less <think prefix leaked to a channel: {m1!r}"
+    )
+    # Delta 2: ``:opensource>`` + reasoning body. The completed tag
+    # should now enter reasoning mode; ``:opensource>`` MUST NOT surface
+    # as content.
+    m2 = step(":opensource>Hello")
+    assert m2 is not None
+    assert m2.content is None, (
+        f":opensource> leaked as content — regressing round-5 BLOCKING #2: {m2!r}"
+    )
+    assert m2.reasoning == "Hello"
+
+
+def test_streaming_pre_colon_close_prefix_still_withholds():
+    """Codex round-5 BLOCKING #2 companion — same shape for the close
+    tag. ``</think`` alone on delta N, ``:opensource>tail`` on delta
+    N+1. Must not leak ``:opensource>`` as reasoning or content."""
+    parser = Hy3ReasoningParser()
+    parser.reset_state()
+
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_reasoning_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    # Establish reasoning mode.
+    step("<think:opensource>")
+    step("body")
+    # Now split the close tag: bare ``</think`` first.
+    m1 = step("</think")
+    assert m1 is None or (m1.content is None and m1.reasoning is None), (
+        f"Colon-less </think close prefix leaked to a channel: {m1!r}"
+    )
+    # Complete with suffix + tail content.
+    m2 = step(":opensource>tail")
+    assert m2 is not None
+    assert m2.reasoning is None
+    # The tail content MUST reach ``content`` unadulterated — no
+    # ``:opensource>`` leak.
+    assert m2.content == "tail", f"Close suffix leaked with the tail content: {m2!r}"
+
+
 def test_finalize_streaming_delegates_to_qwen3():
     """``finalize_streaming`` MUST inherit qwen3's D-STOP-THINK
     suppression semantics on truncation. Smoke-test that the delegation
