@@ -128,6 +128,12 @@ _ARG_PAIR = re.compile(
 # legitimately contain the literal ``</arg_value>`` substring.
 _JSON_DECODER = json.JSONDecoder()
 
+# Same character class as the ``:LABEL`` suffix in the tool_call opener
+# regex — kept in lockstep with ``_SUFFIX`` (``(?::[\w-]+)?``) so
+# ``_is_strict_prefix_of_tool_call_opener`` accepts exactly the alphabet
+# that a real opener would (codex round-6 NIT, PR #1070).
+_LABEL_CHAR_RE = re.compile(r"[\w-]+")
+
 
 def _deserialize_arg_value(value: str) -> Any:
     """Coerce a raw ``<arg_value>`` payload to a JSON-native Python type.
@@ -285,12 +291,18 @@ def _is_strict_prefix_of_tool_call_opener(cand: str) -> bool:
     if label == "":
         # ``<tool_call:`` — awaiting label.
         return True
-    # ``<tool_call:LABEL`` — accept if the LABEL is [\w-]+ so far, no
-    # trailing ``>`` yet.
+    # ``<tool_call:LABEL`` — accept if the LABEL matches the same
+    # character set as the compiled opener regex (``[\w-]+``). Codex
+    # round-6 NIT (PR #1070) flagged an earlier ``str.isalnum()``
+    # variant as accepting a slightly different alphabet than the
+    # actual opener regex (Python ``\w`` covers underscore too,
+    # ``isalnum`` doesn't; both accept Unicode letters). Delegate to
+    # the same regex character class to keep the two definitions
+    # in lockstep.
     if label.endswith(">"):
         # Complete labelled opener — NOT a straddle.
         return False
-    return all(c.isalnum() or c == "_" or c == "-" for c in label)
+    return _LABEL_CHAR_RE.fullmatch(label) is not None
 
 
 def _closed_after_opener(after_opener: str) -> bool:
@@ -328,6 +340,34 @@ def _closed_after_opener(after_opener: str) -> bool:
             continue
         if _ARG_KEY_OPEN.search(prefix):
             continue
+        # Codex round-6 BLOCKING #2 (PR #1070): if a ``<tool_sep>`` is
+        # in the body prefix AND the material after it starts with an
+        # opening JSON brace, we're in JSON-body mode. A ``</arg_value>``
+        # inside a JSON string value is NOT a call close — the
+        # non-streaming ``_parse_hy3_body`` uses ``raw_decode`` to
+        # tolerate the literal, but the streaming close-check would
+        # otherwise flush the call before the JSON body is complete.
+        # Only treat the ``</arg_value>`` as salvage when it appears
+        # AFTER a well-formed JSON prefix has been decoded.
+        sep_m = _TOOL_SEP.search(prefix)
+        if sep_m is not None:
+            tail_after_sep = prefix[sep_m.end() :].lstrip()
+            if tail_after_sep.startswith("{"):
+                try:
+                    _, consumed = _JSON_DECODER.raw_decode(tail_after_sep)
+                except (json.JSONDecodeError, ValueError):
+                    # JSON is still incomplete — don't fire salvage yet.
+                    continue
+                # JSON parsed OK. The ``</arg_value>`` is legitimate
+                # salvage only if it lands AFTER the decoded prefix
+                # (i.e., the ``</arg_value>`` is trailing structural
+                # residue, not inside the JSON body). Otherwise the
+                # literal was consumed inside a string value.
+                trailing_offset = sep_m.end() + (
+                    len(prefix[sep_m.end() :]) - len(tail_after_sep) + consumed
+                )
+                if m.start() < trailing_offset:
+                    continue
         return True
     return False
 
@@ -362,6 +402,20 @@ class HyV3ToolParser(ToolParser):
     # rather than converting them to synthetic text.
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("hy3_native",)
+
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        # Watermark tracking how many bytes of ``current_text`` have
+        # been emitted as ``content`` on the streaming path. Used to
+        # release bytes withheld by the partial-opener straddle guard
+        # once the straddle either resolves into an opener (bytes are
+        # dropped per exclusive-turn) or falsifies (bytes are emitted
+        # on the next tick). Codex round-6 BLOCKING #1 (PR #1070).
+        self._streamed_bytes: int = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self._streamed_bytes = 0
 
     def _get_tool_names(self, request: dict[str, Any] | None) -> set[str]:
         """Extract valid tool names from the request payload."""
@@ -586,6 +640,21 @@ class HyV3ToolParser(ToolParser):
             # transition branch above handles that).
             return None
 
+        # Codex round-6 BLOCKING #1/#2 (PR #1070): if ``current_text``
+        # ends in a strict prefix of a ``<tool_call>`` opener, WITHHOLD
+        # the whole delta — including any pre-straddle prose. Emitting
+        # ``"Sure, "`` before the opener resolves would violate the
+        # exclusive tool-call turn contract if the opener ends up
+        # completing (an OpenAI-compatible client that already routed
+        # the turn to a plain-content callback then has to switch to
+        # tool_calls). Round-5's "pass through pre-straddle prefix"
+        # behaviour was flagged as regressing this contract; the
+        # correct policy is buffer-until-resolved, and this branch
+        # runs BEFORE the think-close emit path so a straddle in the
+        # same delta as a ``</think>`` still short-circuits.
+        if _tool_call_open_straddle_suffix_len(current_text) > 0:
+            return None
+
         # No opener seen yet — pass plain content through. Trim any
         # inline think tags that slipped through (only when the closer
         # is actually in this delta, so mid-stream deltas don't lose
@@ -646,29 +715,21 @@ class HyV3ToolParser(ToolParser):
             if clean_delta:
                 return {"content": clean_delta}
             return None
-        # Codex round-5 BLOCKING #1 (PR #1070): if the ACCUMULATED
-        # ``current_text`` ends in a strict prefix of ``<tool_call>``
-        # / ``<tool_call:suffix>``, the full opener hasn't arrived yet
-        # — withhold the tail so it doesn't leak to the client as
-        # plain content only to be suppressed a delta later once the
-        # opener completes. Compute how many trailing bytes belong to
-        # the partial-opener straddle and slice them off the delta.
-        straddle = _tool_call_open_straddle_suffix_len(current_text)
-        if straddle > 0:
-            # ``straddle`` is bytes at the end of current_text that
-            # form a partial opener. Only withhold those bytes if they
-            # fall entirely within the current delta; otherwise the
-            # withhold happened on a prior tick and the delta itself
-            # is unrelated.
-            if straddle >= len(delta_text):
-                return None
-            # Trim the trailing partial-opener bytes off the delta.
-            trimmed = delta_text[:-straddle]
-            if trimmed:
-                return {"content": trimmed}
+        # Straddle-falsified / no-straddle path: emit any bytes past
+        # the watermark ``self._streamed_bytes`` as content. This
+        # releases the bytes that a prior tick's straddle check
+        # withheld, if the straddle turned out not to be an opener.
+        # In the common "no prior straddle" case, ``_streamed_bytes``
+        # equals ``len(previous_text)`` and the returned content is
+        # exactly ``delta_text``.
+        emit_start = self._streamed_bytes
+        emit_end = len(current_text)
+        if emit_end <= emit_start:
             return None
-        if delta_text:
-            return {"content": delta_text}
+        content = current_text[emit_start:emit_end]
+        self._streamed_bytes = emit_end
+        if content:
+            return {"content": content}
         return None
 
     def has_pending_tool_call(self, text: str) -> bool:

@@ -425,19 +425,20 @@ def test_streaming_xml_pair_without_sep_does_not_flush_early():
     assert args == {"x": 1, "y": 2}
 
 
-def test_streaming_partial_opener_does_not_leak_as_content():
-    """Codex round-5 BLOCKING #1 regression test. A ``<tool_call:opensource>``
-    opener that arrives split across SSE deltas (e.g. delta 1
-    ``"Sure, <tool_ca"``, delta 2 ``"ll:opensource>..."``) MUST NOT
-    leak the ``<tool_ca`` bytes as plain content — an OpenAI-compatible
-    client would render tool markup before the tool-call turn engages,
-    then have to interpret it as prose.
+def test_streaming_partial_opener_withholds_entire_delta():
+    """Codex round-5 BLOCKING #1 + round-6 BLOCKING #1/#2 regression
+    test. When a delta ends in a strict prefix of ``<tool_call>`` /
+    ``<tool_call:LABEL>`` (e.g. delta 1 = ``"Sure, <tool_ca"``, delta
+    2 = ``"ll:opensource>..."``), the parser MUST return ``None`` for
+    the entire delta — including any pre-straddle prose bytes.
+    Emitting ``"Sure, "`` as content before the opener resolves would
+    violate the exclusive tool-call turn contract: if the opener
+    completes, the assistant turn is a tool-call turn and prose that
+    already reached the client can't be un-emitted.
 
-    The fix withholds the trailing partial-opener bytes on the delta
-    that contains them, and releases the withheld bytes as content
-    ONLY if the next chunk falsifies the opener guess (rare but
-    handled: the bytes are re-derivable from ``current_text`` on the
-    next tick)."""
+    Round-5's original fix emitted the pre-straddle prefix; codex
+    round-6 flagged that as a protocol violation. The stricter policy
+    (buffer-until-resolved) is what this test locks in."""
     parser = HyV3ToolParser()
     parser.reset()
     prev = ""
@@ -449,24 +450,54 @@ def test_streaming_partial_opener_does_not_leak_as_content():
         prev = cur
         return msg
 
-    # Delta 1: prose + partial opener. The prose bytes pass through as
-    # content; the partial-opener bytes MUST be withheld.
+    # Delta 1: prose + partial opener. Straddle is at end. Contract:
+    # WITHHOLD the whole delta — no content emitted, prose stays
+    # buffered pending opener resolution.
     m1 = step("Sure, <tool_ca")
-    if m1 is not None:
-        # If anything emitted, it MUST be prose only — no ``<tool_ca``
-        # bytes may reach the content channel.
-        assert "<tool" not in (m1.get("content") or ""), (
-            f"Partial opener leaked as content: {m1!r}"
-        )
+    assert m1 is None, f"Partial-opener delta must be fully withheld; got: {m1!r}"
     # Delta 2: opener completes. The turn is now a tool-call turn.
+    # All pre-opener prose gets absorbed into the tool-call turn per
+    # exclusive-turn policy — no content delta.
     m2 = step("ll:opensource>get_weather<tool_sep:opensource>{}")
-    # Once the opener has appeared, all further deltas are suppressed
-    # until the close arrives. This delta MUST NOT emit content.
-    assert m2 is None
+    assert m2 is None, f"Post-opener content leaked: {m2!r}"
     # Delta 3: canonical close — emit the tool_calls array.
     m3 = step("<end_of_tool_call:opensource>")
     assert m3 is not None
     assert m3["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_streaming_partial_opener_falsified_releases_buffered_prose():
+    """Round-6 falsification path — when the straddle turns out NOT
+    to be a real opener (e.g. ``"<tool_ca"`` followed by ``"rrot"``
+    forming ``"<tool_carrot"``), the previously-withheld pre-straddle
+    prose plus the falsifying bytes MUST be emitted as content on the
+    tick when the straddle resolves. Otherwise the client would
+    permanently lose the ``"Sure, "`` prose that was withheld pending
+    opener resolution."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    m1 = step("Look at this: <tool_ca")
+    assert m1 is None, "straddle must withhold"
+    # Falsifying delta — ``rrot`` makes ``<tool_carrot`` which is NOT
+    # a valid opener anymore. Watermark releases the withheld bytes.
+    m2 = step("rrot recipe")
+    assert m2 is not None, "falsification must release buffered prose"
+    content = m2.get("content") or ""
+    assert "Look at this:" in content, (
+        f"buffered prose lost on falsification: {content!r}"
+    )
+    assert "<tool_carrot recipe" in content, (
+        f"falsifying bytes not included on release: {content!r}"
+    )
 
 
 def test_json_body_containing_literal_arg_value_close_parses_correctly():
@@ -492,6 +523,107 @@ def test_json_body_containing_literal_arg_value_close_parses_correctly():
         "snippet": "The tag </arg_value> is not a close here.",
         "level": "info",
     }
+
+
+def test_streaming_respects_request_tool_allowlist():
+    """Codex round-6 BLOCKING #1 regression test. The streaming path
+    MUST pass ``request`` through to ``extract_tool_calls`` so a
+    hallucinated tool name filtered by the request's ``tools``
+    allowlist is suppressed in the streaming emit just as it is in the
+    non-streaming path. Otherwise streaming leaks off-list tool calls
+    that non-streaming would filter."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str, request=None):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta, request=request)
+        prev = cur
+        return msg
+
+    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    step("<tool_call:opensource>", request=request)
+    step("hallucinated_tool", request=request)
+    step("<tool_sep:opensource>", request=request)
+    step("{}", request=request)
+    final = step("<end_of_tool_call:opensource>", request=request)
+    # The filtered call MUST NOT surface as tool_calls. Either the
+    # streaming emit returns None (call silently dropped, matching
+    # exclusive-turn) OR returns content with the raw span preserved
+    # — but it MUST NOT emit tool_calls with the off-list name.
+    if final is not None:
+        tool_calls = final.get("tool_calls") or []
+        for tc in tool_calls:
+            assert tc["function"]["name"] != "hallucinated_tool", (
+                f"Streaming emitted off-list tool_call: {tc!r}"
+            )
+
+
+def test_streaming_json_body_with_literal_arg_value_close_does_not_flush_early():
+    """Codex round-6 BLOCKING #2 regression test. A streaming JSON body
+    whose value string contains the literal ``</arg_value>`` MUST NOT
+    trigger the salvage close mid-body. The round-4 fix used a
+    per-``</arg_value>`` body-prefix check (no arg_key/arg_value opener
+    in prefix → treat as salvage), but that misfires on a JSON body
+    where the ``</arg_value>`` sits inside a string value — the JSON
+    hasn't finished yet, and the salvage close would emit truncated
+    args. Round-6 guards this by attempting a ``json.raw_decode`` of
+    the tail-after-sep; if the ``</arg_value>`` lands INSIDE the JSON
+    prefix, it's a string literal, not salvage."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    prev = ""
+
+    def step(delta: str):
+        nonlocal prev
+        cur = prev + delta
+        msg = parser.extract_tool_calls_streaming(prev, cur, delta)
+        prev = cur
+        return msg
+
+    step("<tool_call:opensource>")
+    step("log_message")
+    step("<tool_sep:opensource>")
+    # The JSON body contains a literal ``</arg_value>`` inside a
+    # string value. Emit the whole body at once — no interior chunk
+    # boundary — so the salvage check runs on the complete prefix.
+    step('{"snippet": "see </arg_value> below", "level": "info"}')
+    # The literal ``</arg_value>`` inside the JSON string MUST NOT
+    # trigger the salvage close.
+    # ``_closed_after_opener`` should recognise the JSON body and
+    # skip that ``</arg_value>``.
+    # Only the canonical close should fire the emit.
+    final = step("<end_of_tool_call:opensource>")
+    assert final is not None
+    tc = final["tool_calls"][0]
+    args = json.loads(tc["function"]["arguments"])
+    assert args == {"snippet": "see </arg_value> below", "level": "info"}, (
+        f"JSON literal </arg_value> was mishandled: {args!r}"
+    )
+
+
+def test_prefix_check_rejects_unicode_label_matching_isalnum_only():
+    r"""Codex round-6 NIT regression test. ``_is_strict_prefix_of_tool_call_opener``
+    MUST use the same alphabet as the compiled opener regex
+    (``[\w-]+``). A Unicode letter that ``str.isalnum()`` accepts but
+    isn't in ``\w`` is a subtle drift point; using the same regex
+    keeps them locked in step."""
+    from vllm_mlx.tool_parsers.hy_v3_tool_parser import (
+        _is_strict_prefix_of_tool_call_opener,
+    )
+
+    # Plain ASCII label — accepted.
+    assert _is_strict_prefix_of_tool_call_opener("<tool_call:opensource")
+    assert _is_strict_prefix_of_tool_call_opener("<tool_call:foo-bar_v2")
+    # Space is not in ``[\w-]`` — rejected.
+    assert not _is_strict_prefix_of_tool_call_opener("<tool_call:foo bar")
+    # Punctuation is not in ``[\w-]`` — rejected.
+    assert not _is_strict_prefix_of_tool_call_opener("<tool_call:foo.bar")
+    # Complete opener — NOT a strict prefix.
+    assert not _is_strict_prefix_of_tool_call_opener("<tool_call>")
+    assert not _is_strict_prefix_of_tool_call_opener("<tool_call:opensource>")
 
 
 def test_streaming_json_body_with_corrupted_arg_value_tail_salvages():
