@@ -1,0 +1,3 @@
+{"id": "short_1", "target_new_tokens": 32, "prompt": "Explain photosynthesis in one sentence."}
+{"id": "medium_1", "target_new_tokens": 96, "prompt": "Describe how a hash map handles collisions."}
+{"id": "long_1", "target_new_tokens": 200, "prompt": "Write a detailed explanation of how a transformer attention mechanism works, including query/key/value projections, scaled dot-product attention, multi-head attention, and the role of positional encoding. Aim for a high-school-graduate audience."}
