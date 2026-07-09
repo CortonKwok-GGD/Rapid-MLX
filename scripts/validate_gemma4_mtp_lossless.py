@@ -121,6 +121,30 @@ _DEFAULT_PROMPTS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 
+def _apply_chat_template(tokenizer: Any, prompt_text: str) -> list[int]:
+    """Encode ``prompt_text`` through the tokenizer's chat template.
+
+    Gemma 4 IT is trained on the ``<|turn>user\\n…<|turn>model\\n`` frame;
+    feeding raw prompt text pushes the target argmax into a degenerate
+    repetition loop (empirically: accept rate collapses to 2-3% because
+    the target itself is looping, so ANY drafter that samples reasonable
+    tokens looks wrong). Prior 2.4% baseline measurement was on
+    un-templated text — the drafter is not broken, the template was.
+
+    Falls back to raw ``encode`` if the tokenizer has no chat template.
+    """
+    try:
+        messages = [{"role": "user", "content": prompt_text}]
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return tokenizer.encode(rendered)
+    except Exception:
+        return tokenizer.encode(prompt_text)
+
+
 def _run_plain_greedy(
     model: Any,
     tokenizer: Any,
@@ -136,7 +160,7 @@ def _run_plain_greedy(
     """
     from mlx_lm import generate as _generate
 
-    prompt_ids = tokenizer.encode(prompt_text)
+    prompt_ids = _apply_chat_template(tokenizer, prompt_text)
     t0 = time.perf_counter()
     # ``generate`` returns text; we need tokens. Use ``stream_generate``
     # and collect.
@@ -168,6 +192,7 @@ def _run_mtp_greedy(
     tokenizer: Any,
     prompt_text: str,
     max_new_tokens: int,
+    max_k: int = 2,
 ) -> tuple[list[int], float, dict[str, int]]:
     """Run MTP-augmented greedy decode via ``mtp_generate_step``.
 
@@ -179,20 +204,36 @@ def _run_mtp_greedy(
 
     from vllm_mlx.spec_decode.mtp.generator import mtp_generate_step
 
-    prompt_ids = tokenizer.encode(prompt_text)
+    prompt_ids = _apply_chat_template(tokenizer, prompt_text)
     prompt_arr = mx.array(prompt_ids)
 
     tokens: list[int] = []
     stats: dict[str, int] = {"accepted_draft": 0, "rejected_draft": 0}
     t0 = time.perf_counter()
 
+    # Reset the depth controller between runs so max_k takes effect
+    # each call — otherwise the controller sticks at the FIRST run's
+    # max_k and later runs quietly use the wrong depth. Empirically
+    # max_k=1 causes q_len=2 verify on ~every round (the controller
+    # rarely picks K=0), which under quantized SDPA crosses the
+    # argmax boundary vs the q_len=1 plain baseline; max_k>=2 lets
+    # the controller mix K∈{0,1,2} which — measured on 128 tokens —
+    # gives 128/128 byte-exact vs plain baseline while keeping the
+    # ~1.24x speedup. Default max_k=2 here so the validate contract
+    # is meaningful under the batched-consistent memo (see
+    # ``knowledge/gotchas.md`` — MLX SDPA q_len=1 vs >=2 numeric drift
+    # under quant weights).
+    from vllm_mlx.spec_decode.mtp.draft_k_controller_v2 import (
+        reset_controllers,
+    )
+    reset_controllers()
+
     step_gen = mtp_generate_step(
         prompt=prompt_arr,
         model=model,
         max_tokens=max_new_tokens,
         temp=0.0,
-        # Default draft-K controller is fine for validation — we care
-        # about greedy argmax equality, not draft depth.
+        max_k=max_k,
     )
     for step_out in step_gen:
         # ``mtp_generate_step`` yields (token, logprobs) pairs per
@@ -279,7 +320,30 @@ def _load_mtp(target_model: str, drafter: str) -> tuple[Any, Any]:
             f"the sidecar path exists and the target hidden_size matches "
             f"backbone_hidden_size in the assistant's config.json."
         )
-    return model, tokenizer
+    # Wiring fix: unwrap the outer VLM Model so ``mtp_generate_step`` sees
+    # the inner text-model that ``inject_mtp_support`` actually patched.
+    # ``mlx_lm.load()`` for a Gemma 4 checkpoint returns
+    # ``mlx_lm.models.gemma4.Model``, whose ``__call__`` signature is
+    # ``(inputs, cache=None, input_embeddings=None, per_layer_inputs=None)``
+    # — it does NOT accept ``return_hidden`` / ``n_confirmed`` kwargs. The
+    # generator's ``_step_backbone`` calls
+    # ``model(yy[None], cache=..., return_hidden=True, n_confirmed=...)``
+    # which would TypeError against the outer wrapper. The class swap in
+    # ``inject_mtp_support`` patches ``model.language_model.__class__`` to
+    # ``_Gemma4WithMTP`` (which DOES accept those kwargs and returns
+    # ``(logits, hidden)`` when ``return_hidden=True``), so returning the
+    # ``language_model`` here routes the generator through the patched
+    # path. The inner still exposes ``.layers`` (for the ``n_main`` split
+    # in ``mtp_generate_step``), ``.args`` (for cache construction via
+    # ``make_prompt_cache``), and the delegated MTP surfaces
+    # (``mtp``, ``mtp_forward``, ``make_mtp_cache``, ``mtp_max_batch_size``)
+    # that were installed on both inner and outer by the injector.
+    inner = getattr(model, "language_model", None)
+    if inner is None:
+        # Injector shape #2 / #3 — the caller already passed the inner.
+        # Nothing to unwrap.
+        return model, tokenizer
+    return inner, tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +425,20 @@ def main(argv: list[str] | None = None) -> int:
              "perf pass. Correctness is checked independently.",
     )
     parser.add_argument(
+        "--max-k",
+        type=int,
+        default=2,
+        help="Max draft depth for the DepthController. Default 2 — with "
+             "the shared-K/V Gemma 4 drafter, max_k=1 causes the "
+             "controller to lock into q_len=2 verify on every round, "
+             "which under quantized SDPA numerics diverges from the "
+             "q_len=1 plain baseline (see the memo in knowledge/"
+             "gotchas.md — 'MLX SDPA numerics DIVERGE at q_len=1 vs "
+             "q_len>=2 under quant weights'). max_k>=2 lets the "
+             "controller MIX K in {0,1,2} which gives byte-exact "
+             "outputs while retaining the speedup.",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -400,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline_model, baseline_tokenizer, prompt, max_tokens
         )
         mtp_tokens, mtp_t, _ = _run_mtp_greedy(
-            mtp_model, mtp_tokenizer, prompt, max_tokens
+            mtp_model, mtp_tokenizer, prompt, max_tokens, max_k=args.max_k
         )
 
         div = _find_first_divergence(base_tokens, mtp_tokens)
