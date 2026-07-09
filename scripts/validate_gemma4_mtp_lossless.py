@@ -147,36 +147,66 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PROMPTS: list[dict[str, Any]] = [
     # Short (~32 tokens target)
-    {"id": "short_1", "target_new_tokens": 32,
-     "prompt": "Explain photosynthesis in one sentence."},
-    {"id": "short_2", "target_new_tokens": 32,
-     "prompt": "List three prime numbers greater than 100."},
-    {"id": "short_3", "target_new_tokens": 32,
-     "prompt": "What is the capital of Portugal?"},
+    {
+        "id": "short_1",
+        "target_new_tokens": 32,
+        "prompt": "Explain photosynthesis in one sentence.",
+    },
+    {
+        "id": "short_2",
+        "target_new_tokens": 32,
+        "prompt": "List three prime numbers greater than 100.",
+    },
+    {
+        "id": "short_3",
+        "target_new_tokens": 32,
+        "prompt": "What is the capital of Portugal?",
+    },
     # Medium (~128 tokens target)
-    {"id": "medium_1", "target_new_tokens": 128,
-     "prompt": "Describe how a hash map handles collisions."},
-    {"id": "medium_2", "target_new_tokens": 128,
-     "prompt": "Compare TCP and UDP in terms of reliability and use cases."},
-    {"id": "medium_3", "target_new_tokens": 128,
-     "prompt": "Write a short haiku about a rainy afternoon on the coast."},
-    {"id": "medium_4", "target_new_tokens": 128,
-     "prompt": "Summarize the plot of Hamlet in five sentences."},
+    {
+        "id": "medium_1",
+        "target_new_tokens": 128,
+        "prompt": "Describe how a hash map handles collisions.",
+    },
+    {
+        "id": "medium_2",
+        "target_new_tokens": 128,
+        "prompt": "Compare TCP and UDP in terms of reliability and use cases.",
+    },
+    {
+        "id": "medium_3",
+        "target_new_tokens": 128,
+        "prompt": "Write a short haiku about a rainy afternoon on the coast.",
+    },
+    {
+        "id": "medium_4",
+        "target_new_tokens": 128,
+        "prompt": "Summarize the plot of Hamlet in five sentences.",
+    },
     # Long (~500 tokens target)
-    {"id": "long_1", "target_new_tokens": 500,
-     "prompt": "Write a detailed explanation of how a transformer attention mechanism works, "
-               "including query/key/value projections, scaled dot-product attention, "
-               "multi-head attention, and the role of positional encoding. Aim for a "
-               "high-school-graduate audience."},
-    {"id": "long_2", "target_new_tokens": 500,
-     "prompt": "Explain the CAP theorem for distributed systems. Cover the three "
-               "guarantees (Consistency, Availability, Partition tolerance), why you can "
-               "only pick two, and give one real-world example each of CP, AP, and CA "
-               "systems (noting how CA is only achievable when partitions are impossible)."},
-    {"id": "long_3", "target_new_tokens": 500,
-     "prompt": "Draft a step-by-step tutorial for setting up a Python project with "
-               "virtualenv, installing dependencies via requirements.txt, and adding "
-               "pytest for unit tests. Include the exact commands and one example test."},
+    {
+        "id": "long_1",
+        "target_new_tokens": 500,
+        "prompt": "Write a detailed explanation of how a transformer attention mechanism works, "
+        "including query/key/value projections, scaled dot-product attention, "
+        "multi-head attention, and the role of positional encoding. Aim for a "
+        "high-school-graduate audience.",
+    },
+    {
+        "id": "long_2",
+        "target_new_tokens": 500,
+        "prompt": "Explain the CAP theorem for distributed systems. Cover the three "
+        "guarantees (Consistency, Availability, Partition tolerance), why you can "
+        "only pick two, and give one real-world example each of CP, AP, and CA "
+        "systems (noting how CA is only achievable when partitions are impossible).",
+    },
+    {
+        "id": "long_3",
+        "target_new_tokens": 500,
+        "prompt": "Draft a step-by-step tutorial for setting up a Python project with "
+        "virtualenv, installing dependencies via requirements.txt, and adding "
+        "pytest for unit tests. Include the exact commands and one example test.",
+    },
 ]
 
 
@@ -330,12 +360,16 @@ def _run_mtp_greedy(
     prompt_text: str,
     max_new_tokens: int,
     max_k: int = 2,
-) -> tuple[list[int], float, dict[str, int]]:
+) -> tuple[list[int], float]:
     """Run MTP-augmented greedy decode via ``mtp_generate_step``.
 
-    Returns (tokens, wall_time, stats) where ``stats`` includes
-    ``accepted_draft`` and ``rejected_draft`` counters. Accept rate =
-    accepted / (accepted + rejected).
+    Returns ``(tokens, wall_time)``. Accept-rate telemetry is not
+    exposed here — the generator's per-step stats aren't surfaced
+    on the current ``mtp_generate_step`` yield contract and reading
+    them out reliably would require patching the generator. The
+    validate harness only needs tokens + wall-clock for its gates
+    (byte-exact + speedup); operator-side accept rate is observable
+    via the Prometheus ``mtp_accept_rate`` metric at serve time.
     """
     import mlx.core as mx
 
@@ -345,7 +379,6 @@ def _run_mtp_greedy(
     prompt_arr = mx.array(prompt_ids)
 
     tokens: list[int] = []
-    stats: dict[str, int] = {"accepted_draft": 0, "rejected_draft": 0}
     t0 = time.perf_counter()
 
     # Reset the depth controller between runs so max_k takes effect
@@ -363,6 +396,7 @@ def _run_mtp_greedy(
     from vllm_mlx.spec_decode.mtp.draft_k_controller_v2 import (
         reset_controllers,
     )
+
     reset_controllers()
 
     step_gen = mtp_generate_step(
@@ -384,7 +418,7 @@ def _run_mtp_greedy(
         if len(tokens) >= max_new_tokens:
             break
 
-    return tokens, time.perf_counter() - t0, stats
+    return tokens, time.perf_counter() - t0
 
 
 # ---------------------------------------------------------------------------
@@ -504,8 +538,18 @@ def _print_header() -> None:
         "| prompt     | plain tok/s | mtp tok/s  | speedup | byte_exact | first_div  "
     )
     print(
-        "|" + "-" * 12 + "|" + "-" * 13 + "|" + "-" * 12 + "|"
-        + "-" * 9 + "|" + "-" * 12 + "|" + "-" * 12
+        "|"
+        + "-" * 12
+        + "|"
+        + "-" * 13
+        + "|"
+        + "-" * 12
+        + "|"
+        + "-" * 9
+        + "|"
+        + "-" * 12
+        + "|"
+        + "-" * 12
     )
 
 
@@ -533,20 +577,20 @@ def main(argv: list[str] | None = None) -> int:
         "--target-model",
         required=True,
         help="Target model HF repo id or local path (e.g. "
-             "mlx-community/gemma-4-31b-it-4bit).",
+        "mlx-community/gemma-4-31b-it-4bit).",
     )
     parser.add_argument(
         "--drafter",
         required=True,
         help="Assistant drafter HF repo id or local path (e.g. "
-             "google/gemma-4-31B-it-assistant).",
+        "google/gemma-4-31B-it-assistant).",
     )
     parser.add_argument(
         "--prompts-file",
         default=None,
         help="Optional JSONL file with prompt entries. Each line: "
-             "{'id': str, 'prompt': str, 'target_new_tokens': int}. "
-             "Omit to use the built-in 10-prompt fixture.",
+        "{'id': str, 'prompt': str, 'target_new_tokens': int}. "
+        "Omit to use the built-in 10-prompt fixture.",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -559,82 +603,82 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=1.25,
         help="Median tok/s ratio that must be met to consider VALIDATE "
-             "a perf pass. Default 1.25x — the 0.10.6 A3 gate after "
-             "raullen accepted 1.27x as the acceptance-verified result "
-             "(prior 1.4x floor pre-dated the batched-consistent "
-             "contract fix). Correctness is checked independently.",
+        "a perf pass. Default 1.25x — the 0.10.6 A3 gate after "
+        "raullen accepted 1.27x as the acceptance-verified result "
+        "(prior 1.4x floor pre-dated the batched-consistent "
+        "contract fix). Correctness is checked independently.",
     )
     parser.add_argument(
         "--baseline-mode",
         choices=("batched-consistent", "plain-decode"),
         default="batched-consistent",
         help="How to run the baseline path. "
-             "``batched-consistent`` (default) routes the baseline "
-             "through the SAME ``mtp_generate_step`` generator with "
-             "``max_k=0`` on the SAME MTP-injected model — same code "
-             "path, same sampler, same cache semantics; the only "
-             "residual difference vs the MTP run is q_len (baseline "
-             "always q_len=1, MTP verify q_len>=2). This is the "
-             "contract the 0.10.6 A3 spike was landed under. "
-             "``plain-decode`` is the LEGACY harness that #1038 "
-             "originally reverted on — kept for A/B debug; do NOT use "
-             "for gate decisions (see memory gotcha 'MLX SDPA numerics "
-             "DIVERGE at q_len=1 vs q_len>=2 under quant weights').",
+        "``batched-consistent`` (default) routes the baseline "
+        "through the SAME ``mtp_generate_step`` generator with "
+        "``max_k=0`` on the SAME MTP-injected model — same code "
+        "path, same sampler, same cache semantics; the only "
+        "residual difference vs the MTP run is q_len (baseline "
+        "always q_len=1, MTP verify q_len>=2). This is the "
+        "contract the 0.10.6 A3 spike was landed under. "
+        "``plain-decode`` is the LEGACY harness that #1038 "
+        "originally reverted on — kept for A/B debug; do NOT use "
+        "for gate decisions (see memory gotcha 'MLX SDPA numerics "
+        "DIVERGE at q_len=1 vs q_len>=2 under quant weights').",
     )
     parser.add_argument(
         "--max-k",
         type=int,
         default=2,
         help="Max draft depth for the DepthController. Default 2 — with "
-             "the shared-K/V Gemma 4 drafter, max_k=1 causes the "
-             "controller to lock into q_len=2 verify on every round, "
-             "which under quantized SDPA numerics diverges from the "
-             "q_len=1 plain baseline (see the memo in knowledge/"
-             "gotchas.md — 'MLX SDPA numerics DIVERGE at q_len=1 vs "
-             "q_len>=2 under quant weights'). max_k>=2 lets the "
-             "controller MIX K in {0,1,2} which gives byte-exact "
-             "outputs while retaining the speedup.",
+        "the shared-K/V Gemma 4 drafter, max_k=1 causes the "
+        "controller to lock into q_len=2 verify on every round, "
+        "which under quantized SDPA numerics diverges from the "
+        "q_len=1 plain baseline (see the memo in knowledge/"
+        "gotchas.md — 'MLX SDPA numerics DIVERGE at q_len=1 vs "
+        "q_len>=2 under quant weights'). max_k>=2 lets the "
+        "controller MIX K in {0,1,2} which gives byte-exact "
+        "outputs while retaining the speedup.",
     )
     parser.add_argument(
         "--target-precision",
         choices=("quant", "bf16", "fp16"),
         default="quant",
         help="Documents which precision the target-model is loaded at. "
-             "``quant`` (default) is the shipped acceptance path — the "
-             "q_len=1-vs-q_len>=2 mlx SDPA drift lives here. "
-             "``bf16`` is the correctness-proof path — no quant drift, "
-             "any byte-inequal is a real injector bug. ``fp16`` is "
-             "reserved; use bf16 in practice since no fp16 mlx-community "
-             "mirror ships at Gemma-4 sizes. This flag does NOT change "
-             "how the target is loaded (mlx_lm.load resolves precision "
-             "from the mirror's config) — it only sets the default gate "
-             "for --byte-exact-min-pass and annotates the run header.",
+        "``quant`` (default) is the shipped acceptance path — the "
+        "q_len=1-vs-q_len>=2 mlx SDPA drift lives here. "
+        "``bf16`` is the correctness-proof path — no quant drift, "
+        "any byte-inequal is a real injector bug. ``fp16`` is "
+        "reserved; use bf16 in practice since no fp16 mlx-community "
+        "mirror ships at Gemma-4 sizes. This flag does NOT change "
+        "how the target is loaded (mlx_lm.load resolves precision "
+        "from the mirror's config) — it only sets the default gate "
+        "for --byte-exact-min-pass and annotates the run header.",
     )
     parser.add_argument(
         "--byte-exact-min-pass",
         type=int,
         default=None,
         help="Minimum number of prompts that must be byte-exact for the "
-             "correctness gate to pass. If unset: for ``bf16``/``fp16`` "
-             "targets the default is len(prompts) (all-or-nothing — any "
-             "divergence indicates a real injector bug); for ``quant`` "
-             "targets the default is len(prompts) minus the documented "
-             "SDPA drift ceiling of 6 prompts (i.e. 4/10 on the shipped "
-             "10-prompt fixture). Setting an explicit value overrides "
-             "both defaults. See the module docstring section "
-             "'Byte-exact-min-pass semantics' for the rationale.",
+        "correctness gate to pass. If unset: for ``bf16``/``fp16`` "
+        "targets the default is len(prompts) (all-or-nothing — any "
+        "divergence indicates a real injector bug); for ``quant`` "
+        "targets the default is len(prompts) minus the documented "
+        "SDPA drift ceiling of 6 prompts (i.e. 4/10 on the shipped "
+        "10-prompt fixture). Setting an explicit value overrides "
+        "both defaults. See the module docstring section "
+        "'Byte-exact-min-pass semantics' for the rationale.",
     )
     parser.add_argument(
         "--runs",
         type=int,
         default=1,
         help="Number of times to repeat each prompt (both baseline and "
-             "MTP). Speedup is reported as the median across runs to "
-             "damp per-run tok/s jitter (thermal / GC / IO). Under "
-             "greedy sampling the emitted token sequence is "
-             "deterministic across runs, so byte-exact is checked "
-             "against run 0 only; a divergence between runs on the "
-             "same prompt is asserted as a bug. Default 1.",
+        "MTP). Speedup is reported as the median across runs to "
+        "damp per-run tok/s jitter (thermal / GC / IO). Under "
+        "greedy sampling the emitted token sequence is "
+        "deterministic across runs, so byte-exact is checked "
+        "against run 0 only; a divergence between runs on the "
+        "same prompt is asserted as a bug. Default 1.",
     )
     parser.add_argument(
         "--verbose",
@@ -661,7 +705,7 @@ def main(argv: list[str] | None = None) -> int:
 
     prompts = _load_prompts(args.prompts_file)
 
-    print(f"# validate_gemma4_mtp_lossless.py")
+    print("# validate_gemma4_mtp_lossless.py")
     print(f"# target: {args.target_model}")
     print(f"# drafter: {args.drafter}")
     print(f"# prompts: {len(prompts)}  (perf floor: {args.perf_floor}x)")
@@ -669,28 +713,71 @@ def main(argv: list[str] | None = None) -> int:
     print(f"# target-precision: {args.target_precision}")
     print(f"# runs per prompt: {args.runs}")
     if args.baseline_mode == "batched-consistent":
-        print("# contract: batched-consistent — SAME generator + SAME model "
-              "+ max_k=0 baseline vs max_k>=1 MTP.")
-        print("#   Any argmax divergence is a REAL drafter/verify bug, not "
-              "harness drift.")
+        print(
+            "# contract: batched-consistent — SAME generator + SAME model "
+            "+ max_k=0 baseline vs max_k>=1 MTP."
+        )
+        print(
+            "#   Any argmax divergence is a REAL drafter/verify bug, not harness drift."
+        )
     else:
-        print("# contract: LEGACY plain-decode (stream_generate vs "
-              "mtp_generate_step) — do NOT use for gate decisions.")
-        print("#   Kept for A/B against the pre-fix harness that #1038 "
-              "reverted on.")
+        print(
+            "# contract: LEGACY plain-decode (stream_generate vs "
+            "mtp_generate_step) — do NOT use for gate decisions."
+        )
+        print("#   Kept for A/B against the pre-fix harness that #1038 reverted on.")
     # Resolve final min-pass gate now that we have len(prompts).
+    #
+    # The auto default for ``quant`` (``len(prompts) - 6``) is calibrated
+    # for the shipped 10-prompt fixture — 6 = the observed SDPA drift
+    # ceiling. On small fixtures (e.g. the 3-prompt mini file used for
+    # the bf16 D-phase evidence) that arithmetic clamps to 0, which
+    # would let a quant run exit 0 while every prompt diverged. Refuse
+    # the auto default for quant + fixtures under 8 prompts and require
+    # the operator to set ``--byte-exact-min-pass`` explicitly.
+    _QUANT_AUTO_MIN_FIXTURE_SIZE = 8
     if byte_exact_min is None:
         if args.target_precision in ("bf16", "fp16"):
             byte_exact_min = len(prompts)
-            print(f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} "
-                  "(auto — bf16/fp16 correctness proof requires all)")
+            print(
+                f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} "
+                "(auto — bf16/fp16 correctness proof requires all)"
+            )
         else:
+            if len(prompts) < _QUANT_AUTO_MIN_FIXTURE_SIZE:
+                print(
+                    "!! ERROR: --target-precision quant + fixture with "
+                    f"{len(prompts)} prompts (< {_QUANT_AUTO_MIN_FIXTURE_SIZE}) "
+                    "cannot use the auto drift-ceiling default (which is "
+                    "calibrated for the shipped 10-prompt fixture). Set "
+                    "--byte-exact-min-pass explicitly for small fixtures — "
+                    "otherwise the gate could clamp to 0 and let a fully "
+                    "divergent run pass.",
+                    file=sys.stderr,
+                )
+                return 2
             byte_exact_min = max(0, len(prompts) - 6)
-            print(f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} "
-                  "(auto — quant SDPA drift ceiling per gotchas.md)")
+            print(
+                f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} "
+                "(auto — quant SDPA drift ceiling per gotchas.md)"
+            )
     else:
-        print(f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} "
-              "(explicit)")
+        # Guard against an explicit override that's incoherent with the
+        # fixture (e.g. ``--byte-exact-min-pass 20`` on a 10-prompt run).
+        if byte_exact_min > len(prompts):
+            print(
+                f"!! ERROR: --byte-exact-min-pass {byte_exact_min} > "
+                f"len(prompts)={len(prompts)}. Cannot pass.",
+                file=sys.stderr,
+            )
+            return 2
+        if byte_exact_min < 0:
+            print(
+                f"!! ERROR: --byte-exact-min-pass {byte_exact_min} < 0.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"# byte-exact-min-pass: {byte_exact_min}/{len(prompts)} (explicit)")
     print()
 
     if args.baseline_mode == "plain-decode":
@@ -711,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows: list[dict[str, Any]] = []
     any_divergence = False
+    determinism_failed = False  # tripped by --runs > 1 between-run drift
     _print_header()
 
     for entry in prompts:
@@ -734,16 +822,12 @@ def main(argv: list[str] | None = None) -> int:
                 base_tokens, base_t = _run_plain_greedy(
                     baseline_model, baseline_tokenizer, prompt, max_tokens
                 )
-            mtp_tokens, mtp_t, _ = _run_mtp_greedy(
+            mtp_tokens, mtp_t = _run_mtp_greedy(
                 mtp_model, mtp_tokenizer, prompt, max_tokens, max_k=args.max_k
             )
 
-            base_tok_s_runs.append(
-                len(base_tokens) / base_t if base_t > 0 else 0.0
-            )
-            mtp_tok_s_runs.append(
-                len(mtp_tokens) / mtp_t if mtp_t > 0 else 0.0
-            )
+            base_tok_s_runs.append(len(base_tokens) / base_t if base_t > 0 else 0.0)
+            mtp_tok_s_runs.append(len(mtp_tokens) / mtp_t if mtp_t > 0 else 0.0)
 
             if run_idx == 0:
                 base_tokens_ref = list(base_tokens)
@@ -752,17 +836,22 @@ def main(argv: list[str] | None = None) -> int:
                 # Determinism gate — greedy sampling MUST produce the
                 # same token sequence across runs on the same prompt.
                 # A between-runs divergence is a REAL bug (RNG leak,
-                # cache eviction, non-deterministic scatter).
+                # cache eviction, non-deterministic scatter). Trip the
+                # correctness verdict so exit 2 propagates — otherwise
+                # ``--runs > 1`` could exit 0 while emitting only a
+                # warning log line, silently masking the bug.
                 if list(base_tokens) != base_tokens_ref:
                     print(
                         f"\n!! BASELINE non-determinism on {pid} "
                         f"run{run_idx}: greedy decode drifted between runs."
                     )
+                    determinism_failed = True
                 if list(mtp_tokens) != mtp_tokens_ref:
                     print(
                         f"\n!! MTP non-determinism on {pid} "
                         f"run{run_idx}: greedy decode drifted between runs."
                     )
+                    determinism_failed = True
 
         # Aggregate across runs — median damps jitter.
         plain_tok_s = statistics.median(base_tok_s_runs)
@@ -804,15 +893,32 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Median MTP tok/s   : {mtp_med:.2f}")
     print(f"Median speedup     : {speedup_med:.2f}x")
     if args.target_precision == "quant":
-        print(f"Byte-exact prompts : {byte_exact_count}/{len(rows)} "
-              f"(gate: >= {byte_exact_min}; quant drift <= MLX q_len=1 vs "
-              f"q_len>=2 numerical ceiling; bf16 target achieves all-pass — "
-              f"see memory gotcha 'MLX SDPA numerics DIVERGE at q_len=1 vs "
-              f"q_len>=2 under quant weights')")
+        print(
+            f"Byte-exact prompts : {byte_exact_count}/{len(rows)} "
+            f"(gate: >= {byte_exact_min}; quant drift <= MLX q_len=1 vs "
+            f"q_len>=2 numerical ceiling; bf16 target achieves all-pass — "
+            f"see memory gotcha 'MLX SDPA numerics DIVERGE at q_len=1 vs "
+            f"q_len>=2 under quant weights')"
+        )
     else:
-        print(f"Byte-exact prompts : {byte_exact_count}/{len(rows)} "
-              f"(gate: >= {byte_exact_min}; {args.target_precision} target — "
-              f"any divergence is a real injector bug)")
+        print(
+            f"Byte-exact prompts : {byte_exact_count}/{len(rows)} "
+            f"(gate: >= {byte_exact_min}; {args.target_precision} target — "
+            f"any divergence is a real injector bug)"
+        )
+
+    if determinism_failed:
+        print("\nVERDICT: FAIL (correctness — between-run non-determinism)")
+        print(
+            "One or more prompts produced different token sequences across "
+            "runs under greedy (temp=0) sampling. This is a real bug — "
+            "possible sources: RNG leak in a sampler chain, cache eviction "
+            "between requests, or non-deterministic mlx scatter into "
+            "duplicate indices (see gotcha 'mlx 0.31.3 scatter into "
+            "duplicate indices is non-deterministic'). Investigate before "
+            "shipping; --runs > 1 is the correct debug lever."
+        )
+        return 2
 
     if byte_exact_count < byte_exact_min:
         print("\nVERDICT: FAIL (correctness)")

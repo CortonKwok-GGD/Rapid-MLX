@@ -2958,14 +2958,22 @@ def serve_command(args):
         dflash_drafter_path=getattr(args, "dflash_drafter_path", "") or "",
         # Optional external MTP sidecar path. ``None`` is the "no
         # sidecar; native-MTP path only" sentinel.
+        # Normalize to match the conflict-scan / eligibility strip
+        # semantics — a whitespace-only ``--mtp-gemma4-sidecar-experimental``
+        # value must NOT flip the experimental gate below (codex round-B
+        # NIT #5). Same treatment as the eligibility block later in
+        # ``serve_command``; keep the two in lockstep.
         mtp_sidecar=(
             # Prefer the experimental Gemma 4 sidecar path when set —
             # it takes over the ``mtp_sidecar`` transport under a
             # distinct opt-in flag (``mtp_gemma4_experimental`` below).
             # Falls back to the pre-existing hidden ``--mtp-sidecar``
             # reserved surface when the new flag is unset.
-            getattr(args, "mtp_gemma4_sidecar_experimental", None)
-            or getattr(args, "mtp_sidecar", None)
+            (
+                (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip()
+                or (getattr(args, "mtp_sidecar", None) or "").strip()
+            )
+            or None
         ),
         # 0.9.13 PR-A codex round-E blocker #2: CLI-resolved
         # ``config.json::model_type`` for the dispatch step. See the
@@ -2977,9 +2985,10 @@ def serve_command(args):
         mtp_disable_auto_k=getattr(args, "mtp_disable_auto_k", False),
         # 0.10.6 A3 spike: Gemma 4 assistant-sidecar MTP experimental
         # gate. Only propagates when the operator opts in via
-        # ``--mtp-gemma4-sidecar-experimental``.
+        # ``--mtp-gemma4-sidecar-experimental``. Strip first — a
+        # whitespace-only value must not flip the gate.
         mtp_gemma4_experimental=bool(
-            getattr(args, "mtp_gemma4_sidecar_experimental", None)
+            (getattr(args, "mtp_gemma4_sidecar_experimental", None) or "").strip()
         ),
         # SuffixDecoding
         enable_suffix_decoding=args.suffix_decoding,
@@ -3057,12 +3066,23 @@ def serve_command(args):
         # is preserved for compatibility but does NOT flip the
         # experimental gate — it stays inert until a future promoted
         # sidecar path lands.
-        gemma4_experimental_sidecar = getattr(
-            args, "mtp_gemma4_sidecar_experimental", None
-        )
-        has_sidecar = bool(
-            gemma4_experimental_sidecar or getattr(args, "mtp_sidecar", None)
-        )
+        # Strip once so " " isn't treated as a truthy sidecar path — the
+        # earlier conflict scan at lines 1606 / 1654 already calls
+        # ``.strip()`` on this arg; the eligibility gate must match to
+        # avoid a whitespace-only value silently flipping
+        # ``experimental_gemma4=True`` while ``has_sidecar`` measures the
+        # unstripped value from ``args.mtp_sidecar``.
+        _gemma4_raw = getattr(args, "mtp_gemma4_sidecar_experimental", None)
+        gemma4_experimental_sidecar = (
+            _gemma4_raw.strip() if isinstance(_gemma4_raw, str) else _gemma4_raw
+        ) or None
+        _mtp_sidecar_raw = getattr(args, "mtp_sidecar", None)
+        _mtp_sidecar_normalized = (
+            _mtp_sidecar_raw.strip()
+            if isinstance(_mtp_sidecar_raw, str)
+            else _mtp_sidecar_raw
+        ) or None
+        has_sidecar = bool(gemma4_experimental_sidecar or _mtp_sidecar_normalized)
         experimental_gemma4 = bool(gemma4_experimental_sidecar)
         eligibility = detect_mtp_eligibility(
             hf_cfg_eligibility,
@@ -3075,9 +3095,8 @@ def serve_command(args):
                 _mt = hf_cfg_eligibility.get("model_type")
                 if isinstance(_mt, str):
                     model_type_str = _mt
-            is_gemma4 = (
-                model_type_str is not None
-                and model_type_str.startswith("gemma4")
+            is_gemma4 = model_type_str is not None and model_type_str.startswith(
+                "gemma4"
             )
             if is_gemma4 and not experimental_gemma4:
                 print(
@@ -3138,14 +3157,10 @@ def serve_command(args):
             logger=logger,
         )
 
-        _effective_sidecar = gemma4_experimental_sidecar or getattr(
-            args, "mtp_sidecar", None
-        )
+        _effective_sidecar = gemma4_experimental_sidecar or _mtp_sidecar_normalized
         experimental_tag = " EXPERIMENTAL" if experimental_gemma4 else ""
         sidecar_note = (
-            f" +sidecar={_effective_sidecar}{experimental_tag}"
-            if has_sidecar
-            else ""
+            f" +sidecar={_effective_sidecar}{experimental_tag}" if has_sidecar else ""
         )
         print(f"Spec-decode: mtp ({eligibility.value}){sidecar_note}")
 

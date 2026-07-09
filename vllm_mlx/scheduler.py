@@ -1812,7 +1812,29 @@ def _install_mtp_vendored(
     return True
 
 
-def _config_vetted_mtp_supports_spec_decode(model_type: str | None) -> bool:
+_QWEN_VETTED_MTP_MODEL_TYPES: frozenset[str] = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_moe",
+    }
+)
+
+_GEMMA4_VETTED_MTP_MODEL_TYPES: frozenset[str] = frozenset(
+    {
+        "gemma4",
+        "gemma4_unified",
+        "gemma4_text",
+        "gemma4_unified_text",
+    }
+)
+
+
+def _config_vetted_mtp_supports_spec_decode(
+    model_type: str | None,
+    *,
+    mtp_sidecar: str | None = None,
+    mtp_gemma4_experimental: bool = False,
+) -> bool:
     """Return True for model types that passed config-driven MTP eligibility.
 
     Some older alias profiles still carry ``supports_spec_decode=False`` even
@@ -1822,21 +1844,28 @@ def _config_vetted_mtp_supports_spec_decode(model_type: str | None) -> bool:
     narrowly tied to the model families this MTP runtime supports.
 
     Gemma 4 model_types (``gemma4`` / ``gemma4_unified`` / ``gemma4_text`` /
-    ``gemma4_unified_text``) are included behind the CLI experimental gate —
-    reaching this function already implies detection accepted the config,
-    which for the Gemma 4 family requires both ``experimental_gemma4=True``
-    and ``has_external_sidecar=True`` (see
-    :func:`vllm_mlx.spec_decode.mtp.detect.detect_mtp_eligibility`).
+    ``gemma4_unified_text``) are included behind the twin experimental gate:
+    ``mtp_gemma4_experimental=True`` AND a truthy ``mtp_sidecar``. The CLI
+    populates both when the operator passes
+    ``--mtp-gemma4-sidecar-experimental``, but codex round-B BLOCKING #3
+    called out that non-CLI SchedulerConfig callers (in-process embedders,
+    tests, integrations) could otherwise reach the ``_install_mtp_vendored``
+    path with only the model_type set. Enforcing the twin gate here matches
+    :func:`vllm_mlx.spec_decode.mtp.detect.detect_mtp_eligibility` and keeps
+    Gemma 4 fail-closed for every promotion path.
+
+    Qwen 3.5 / 3.6 model_types remain gated on model_type alone — their
+    detection reads ``mtp_num_hidden_layers`` directly from ``config.json``
+    and does not require a sidecar (the drafter head is baked into the
+    checkpoint).
     """
 
-    return model_type in {
-        "qwen3_5",
-        "qwen3_5_moe",
-        "gemma4",
-        "gemma4_unified",
-        "gemma4_text",
-        "gemma4_unified_text",
-    }
+    if model_type in _QWEN_VETTED_MTP_MODEL_TYPES:
+        return True
+    if model_type in _GEMMA4_VETTED_MTP_MODEL_TYPES:
+        sidecar_ok = bool(mtp_sidecar and str(mtp_sidecar).strip())
+        return mtp_gemma4_experimental and sidecar_ok
+    return False
 
 
 def _install_suffix_decoding(
@@ -2969,7 +2998,13 @@ class Scheduler:
         # sync lands in PR-C (``feat/mtp-batched-sync-0.9.14``).
         if getattr(self.config, "spec_decode", "none") == "mtp":
             mtp_model_type = getattr(self.config, "mtp_model_type", None)
-            config_vetted_mtp = _config_vetted_mtp_supports_spec_decode(mtp_model_type)
+            config_vetted_mtp = _config_vetted_mtp_supports_spec_decode(
+                mtp_model_type,
+                mtp_sidecar=getattr(self.config, "mtp_sidecar", None),
+                mtp_gemma4_experimental=getattr(
+                    self.config, "mtp_gemma4_experimental", False
+                ),
+            )
             if (
                 getattr(self, "model_config", None) is not None
                 and not self.model_config.supports_spec_decode

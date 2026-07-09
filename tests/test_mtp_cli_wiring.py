@@ -306,23 +306,69 @@ def test_scheduler_config_mtp_model_type_round_trip():
 
 
 def test_config_vetted_mtp_support_allowlist_covers_qwen_and_gemma4_experimental():
-    """Alias-profile false is bypassed for both Qwen and Gemma 4 config-vetted MTP.
+    """Alias-profile false is bypassed for MTP-capable model types.
 
-    Reaching ``_config_vetted_mtp_supports_spec_decode`` implies detection
-    accepted the config; for the Gemma 4 family that already required the
-    experimental gate + sidecar path via
-    ``detect_mtp_eligibility(experimental_gemma4=True, has_external_sidecar=True)``.
+    * Qwen 3.5 / 3.6 model_types return True on model_type alone — the drafter
+      head is baked into the checkpoint and detection reads
+      ``mtp_num_hidden_layers`` directly from ``config.json``.
+    * Gemma 4 model_types require BOTH ``mtp_gemma4_experimental=True`` and a
+      truthy ``mtp_sidecar`` — the twin experimental gate that
+      :func:`vllm_mlx.spec_decode.mtp.detect.detect_mtp_eligibility` enforces
+      on the CLI path. Non-CLI SchedulerConfig callers (in-process embedders,
+      tests, integrations) must not be able to reach ``_install_mtp_vendored``
+      by setting only ``mtp_model_type`` — codex round-B BLOCKING #3.
     """
 
     from vllm_mlx.scheduler import _config_vetted_mtp_supports_spec_decode
 
+    # Qwen — gated on model_type alone (drafter is checkpoint-baked).
     assert _config_vetted_mtp_supports_spec_decode("qwen3_5") is True
     assert _config_vetted_mtp_supports_spec_decode("qwen3_5_moe") is True
-    assert _config_vetted_mtp_supports_spec_decode("gemma4") is True
-    assert _config_vetted_mtp_supports_spec_decode("gemma4_unified") is True
-    assert _config_vetted_mtp_supports_spec_decode("gemma4_text") is True
-    assert _config_vetted_mtp_supports_spec_decode("gemma4_unified_text") is True
+
+    # Gemma 4 without twin gate — refused.
+    for mt in ("gemma4", "gemma4_unified", "gemma4_text", "gemma4_unified_text"):
+        assert _config_vetted_mtp_supports_spec_decode(mt) is False, mt
+        assert (
+            _config_vetted_mtp_supports_spec_decode(
+                mt, mtp_sidecar="/path/to/assistant", mtp_gemma4_experimental=False
+            )
+            is False
+        ), f"{mt}: sidecar without experimental flag must be refused"
+        assert (
+            _config_vetted_mtp_supports_spec_decode(
+                mt, mtp_sidecar=None, mtp_gemma4_experimental=True
+            )
+            is False
+        ), f"{mt}: experimental flag without sidecar must be refused"
+        # Whitespace-only sidecar must be treated as absent — matches the
+        # CLI's ``.strip()`` normalization at the eligibility gate.
+        assert (
+            _config_vetted_mtp_supports_spec_decode(
+                mt, mtp_sidecar="   ", mtp_gemma4_experimental=True
+            )
+            is False
+        ), f"{mt}: whitespace-only sidecar must be refused"
+
+    # Gemma 4 with twin gate — accepted.
+    for mt in ("gemma4", "gemma4_unified", "gemma4_text", "gemma4_unified_text"):
+        assert (
+            _config_vetted_mtp_supports_spec_decode(
+                mt,
+                mtp_sidecar="google/gemma-4-31B-it-assistant",
+                mtp_gemma4_experimental=True,
+            )
+            is True
+        ), mt
+
+    # Unknown / None model_types — refused unconditionally.
+    assert _config_vetted_mtp_supports_spec_decode("llama3") is False
     assert _config_vetted_mtp_supports_spec_decode(None) is False
+    assert (
+        _config_vetted_mtp_supports_spec_decode(
+            None, mtp_sidecar="/x", mtp_gemma4_experimental=True
+        )
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------
