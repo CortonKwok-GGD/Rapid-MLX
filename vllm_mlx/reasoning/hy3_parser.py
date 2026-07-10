@@ -47,20 +47,27 @@ from .qwen3_parser import Qwen3ReasoningParser
 _HY3_OPEN_TAG_RE = re.compile(r"<think(?::[\w-]+)?>")
 _HY3_CLOSE_TAG_RE = re.compile(r"</think(?::[\w-]+)?>")
 
-# Straddle-boundary detector: strict prefix of a suffixed close/open tag
-# that MAY complete on the next delta. Codex round-5 BLOCKING #2
-# (PR #1070) widened the pattern to include the ``:``-less prefix
-# (``<think`` / ``</think``) — the qwen3 base withhold only reserves
-# the plain form up to (but not including) the ``>``; without extra
-# coverage a boundary split like ``"<think"`` then ``":opensource>"``
-# would release ``<think`` from qwen3's hold on tick N and then leak
-# ``:opensource>`` as plain content on tick N+1 (because the ``:``
-# character isn't the ``>`` qwen3 was waiting for, so qwen3 falls
-# through). Anchoring on the exact ``<think`` root plus an optional
-# ``:LABEL`` suffix covers both the ``:``-less prefix AND the labelled
-# variants uniformly.
-_HY3_OPEN_STRADDLE_RE = re.compile(r"<think(?::[\w-]*)?$")
-_HY3_CLOSE_STRADDLE_RE = re.compile(r"</think(?::[\w-]*)?$")
+# Straddle-boundary detector: a trailing text run that is a non-empty PREFIX
+# of a (possibly suffixed) Hy3 think tag and MAY complete on the next delta.
+#
+# It must match EVERY prefix as the tag builds up char-by-char — ``<``, ``<t``,
+# … ``<think``, ``<think:``, ``<think:opensource`` — not only the full
+# ``<think`` root (codex R7 BLOCKING #3). If only the full root were held, the
+# withheld span would grow NON-monotonically (``see <thin`` holds nothing, then
+# ``see <think`` suddenly holds 6 bytes), so the visible span retreats and the
+# base machine — which already emitted the earlier bytes — gets an inconsistent
+# boundary and duplicates/corrupts output (``see `` re-emitted as ``k>see``).
+# Matching all prefixes keeps the hold monotonic: once a ``<`` that could start
+# a think tag appears it stays held until the tag COMPLETES (real tag) or
+# FALSIFIES into ordinary content (``<thinking``), and either way the held
+# bytes are delivered on the tick they resolve — nothing is dropped.
+#
+# ``<`` / ``</`` alone are ambiguous roots shared by both open and close; the
+# open matcher covers ``<`` and ``<t…<think[:label]``, the close matcher covers
+# ``</`` and ``</t…</think[:label]``. A run like ``</`` matches the close
+# matcher (longer, tried first) so both are reserved.
+_HY3_OPEN_STRADDLE_RE = re.compile(r"<(?:t(?:h(?:i(?:n(?:k(?::[\w-]*)?)?)?)?)?)?$")
+_HY3_CLOSE_STRADDLE_RE = re.compile(r"</(?:t(?:h(?:i(?:n(?:k(?::[\w-]*)?)?)?)?)?)?$")
 
 
 def _normalize_hy3_tags(text: str) -> str:
@@ -155,28 +162,48 @@ class Hy3ReasoningParser(Qwen3ReasoningParser):
         # ``previous_norm`` still ends with ``<think:opensou`` — the
         # invariant ``previous_norm + delta_norm == current_norm`` breaks
         # and the base multi-block router routes bytes to the wrong phase.
-        prev_hold = _hy3_straddle_suffix_len(previous_text)
-        curr_hold = _hy3_straddle_suffix_len(current_text)
-        previous_norm = _normalize_hy3_tags(
-            previous_text[: len(previous_text) - prev_hold]
-        )
-        current_norm = _normalize_hy3_tags(
-            current_text[: len(current_text) - curr_hold]
-        )
-        # Recompute delta from the normalised strings so the invariant
-        # ``previous_norm + delta_norm == current_norm`` holds by
-        # construction. If the withhold ate the whole delta (all bytes
-        # were partial-tag), emit nothing — the next tick will surface
-        # them when the tag completes.
-        if current_norm.startswith(previous_norm):
-            delta_norm = current_norm[len(previous_norm) :]
+        # Withhold the trailing bytes of BOTH boundary texts that could still
+        # grow into a Hy3 suffixed tag, working on the RAW text so a byte held
+        # on tick N is delivered on tick N+1 whether the tag COMPLETES (a real
+        # ``<think:opensource>``) or FALSIFIES into ordinary content (``<think``
+        # → ``<thinking``). Both cases are covered because the visible span is
+        # ``text[: len - hold]`` and any held tail that no longer matches
+        # ``_hy3_straddle_suffix_len`` next tick simply becomes part of that
+        # tick's visible span — nothing is dropped (codex R7 BLOCKING #3: the
+        # old ``startswith``-based delta recompute corrupted output when a held
+        # ``<think`` prefix falsified after a completed think block).
+        prev_visible = previous_text[
+            : len(previous_text) - _hy3_straddle_suffix_len(previous_text)
+        ]
+        curr_visible = current_text[
+            : len(current_text) - _hy3_straddle_suffix_len(current_text)
+        ]
+        # Derive the RAW newly-visible span, then normalise ONLY that span. The
+        # raw delta is unambiguous (curr_visible always extends prev_visible —
+        # both are prefixes of the same growing accumulated text truncated at a
+        # non-tag-interior point), so we never double-emit or drop.
+        if curr_visible.startswith(prev_visible):
+            raw_delta = curr_visible[len(prev_visible) :]
         else:
-            # Defensive fallback for a still-inconsistent boundary — e.g.
-            # a normalisation that shrank the previous span more than the
-            # withhold reserved. Fall through to plain-delta normalisation
-            # so we don't crash; qwen3's own partial-tag withhold and the
-            # multi-block router recover on the next tick.
-            delta_norm = _normalize_hy3_tags(delta_text)
+            # Should not happen (both are prefixes of the same text), but guard
+            # against a pathological shrink by falling back to the whole raw
+            # delta so no bytes are lost.
+            raw_delta = delta_text
+        if not raw_delta:
+            return None
+        previous_norm = _normalize_hy3_tags(prev_visible)
+        current_norm = _normalize_hy3_tags(curr_visible)
+        delta_norm = _normalize_hy3_tags(raw_delta)
+        # Guard the base machine's own invariant: only feed it when the
+        # normalised boundaries still concatenate (they do whenever the hold
+        # points fall outside a tag the normaliser rewrites). Otherwise defer —
+        # the withheld bytes surface next tick.
+        if previous_norm + delta_norm != current_norm:
+            delta_norm = (
+                current_norm[len(previous_norm) :]
+                if (current_norm.startswith(previous_norm))
+                else delta_norm
+            )
         if not delta_norm:
             return None
         return super().extract_reasoning_streaming(

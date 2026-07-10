@@ -423,7 +423,7 @@ class HyV3ToolParser(ToolParser):
             # the shared ``[Calling tool="X" k="v"]`` text form, so consult
             # that fallback before returning plain content (codex BLOCKING:
             # the early return otherwise made this branch unreachable).
-            return self._text_format_or_content(model_output)
+            return self._text_format_or_content(model_output, request)
 
         valid_names = self._get_tool_names(request)
         tool_calls: list[dict[str, Any]] = []
@@ -468,18 +468,27 @@ class HyV3ToolParser(ToolParser):
 
         # No native call parsed — try the shared text-format degradation
         # fallback on the residual before giving up.
-        return self._text_format_or_content(residual_text or model_output)
+        return self._text_format_or_content(residual_text or model_output, request)
 
-    def _text_format_or_content(self, text: str) -> ExtractedToolCallInformation:
+    def _text_format_or_content(
+        self, text: str, request: dict[str, Any] | None = None
+    ) -> ExtractedToolCallInformation:
         """Consult the shared ``[Calling tool="X" k="v"]`` text-format
         fallback, else return ``text`` as plain content.
 
         Shared by the no-native-opener early return AND the end of
         ``extract_tool_calls`` so the low-quant text-degradation path is
-        reachable in both (codex BLOCKING #2)."""
+        reachable in both (codex BLOCKING #2).
+
+        Applies the request ``tools`` allowlist to the text-format calls too
+        (codex R7 BLOCKING #1): otherwise a degraded ``[Calling tool="bogus"]``
+        would bypass the ``request["tools"]`` filtering that native Hy3 calls
+        enforce. Off-list names are dropped and their raw span preserved as
+        content, mirroring the native path."""
         if self.has_text_format_tool_call(text):
             text_calls = self.extract_text_format_tool_calls(text)
             if text_calls:
+                valid_names = self._get_tool_names(request)
                 normalised = [
                     {
                         "id": tc.get("id", generate_tool_id()),
@@ -487,10 +496,12 @@ class HyV3ToolParser(ToolParser):
                         "arguments": tc["arguments"],
                     }
                     for tc in text_calls
+                    if not valid_names or tc["name"] in valid_names
                 ]
-                return ExtractedToolCallInformation(
-                    tools_called=True, tool_calls=normalised, content=None
-                )
+                if normalised:
+                    return ExtractedToolCallInformation(
+                        tools_called=True, tool_calls=normalised, content=None
+                    )
         return ExtractedToolCallInformation(
             tools_called=False, tool_calls=[], content=text
         )
@@ -539,12 +550,28 @@ class HyV3ToolParser(ToolParser):
         m = self._tool_call_malformed_re_body.search(segment)
         if m is not None:
             body = m.group("body")
-            block_end = body_start + m.end()
-            return opener, block_end, body
+            # Restrict salvage to the DOCUMENTED ``NAME</arg_value>`` shape only
+            # (codex R7 BLOCKING: a truncated XML-pair call that is simply
+            # missing its ``<end_of_tool_call>`` — but carries ``<tool_sep>`` /
+            # ``<arg_key>`` / ``<arg_value>`` — must NOT be promoted to a
+            # completed executable call; it is incomplete output). The real
+            # 4-bit noise is the bare ``NAME</arg_value>`` with none of those
+            # structural tokens before the malformed close.
+            if not any(
+                t in body
+                for t in (
+                    self.tool_sep_token,
+                    self.arg_key_start_token,
+                    self.arg_value_start_token,
+                )
+            ):
+                block_end = body_start + m.end()
+                return opener, block_end, body
 
-        # Opener with NO close of any kind (truncated / streaming-incomplete):
+        # Opener with NO close of any kind (truncated / streaming-incomplete),
+        # or a malformed-close match that is really a truncated structured call:
         # not a parsed call. Signal end-of-parse so the caller preserves the
-        # raw tail as content rather than fabricating an empty-args call.
+        # raw tail as content rather than fabricating a bogus call.
         return None
 
     def _find_call_close_in_body(self, segment: str) -> int:

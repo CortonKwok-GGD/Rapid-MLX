@@ -266,3 +266,50 @@ def test_is_open_in_think_recognises_suffixed_opener():
         parser.is_open_in_think("<think:opensource>closed</think:opensource>tail")
         is False
     )
+
+
+def _collect_reasoning_stream(full: str) -> tuple[str, str]:
+    """Char-by-char drive a fresh parser over ``full``; return
+    ``(content, reasoning)`` accumulated across deltas + finalize."""
+    parser = Hy3ReasoningParser()
+    parser.reset_state()
+    prev = ""
+    content = ""
+    reasoning = ""
+    for ch in full:
+        cur = prev + ch
+        msg = parser.extract_reasoning_streaming(prev, cur, ch)
+        prev = cur
+        if msg is None:
+            continue
+        if msg.content:
+            content += msg.content
+        if msg.reasoning:
+            reasoning += msg.reasoning
+    return content, reasoning
+
+
+def test_streaming_falsified_think_prefix_in_content_not_dropped():
+    """codex R7 BLOCKING #3 regression. After a completed think block, content
+    that starts with a partial-think prefix which then FALSIFIES into ordinary
+    text (``<think`` → ``<thinking``) must surface intact — NOT be dropped or
+    corrupted. The pre-fix held only the full ``<think`` root, so the withheld
+    span grew non-monotonically (``see <thin`` held nothing, then ``see
+    <think`` held 6 bytes), the visible span retreated, and the base machine
+    re-emitted already-shown bytes as garbage (``see `` → ``k>see``). Widening
+    the straddle matcher to every tag PREFIX keeps the hold monotonic."""
+    content, reasoning = _collect_reasoning_stream(
+        "<think:opensource>ok</think:opensource>see <thinking here"
+    )
+    assert reasoning == "ok"
+    assert content == "see <thinking here"
+
+
+def test_streaming_falsified_think_prefix_inside_reasoning_not_dropped():
+    """The same falsified prefix INSIDE the reasoning span (``<thinker``) must
+    survive as reasoning, and the post-close content must be clean."""
+    content, reasoning = _collect_reasoning_stream(
+        "<think:opensource>weigh <thinker note</think:opensource>answer"
+    )
+    assert reasoning == "weigh <thinker note"
+    assert content == "answer"

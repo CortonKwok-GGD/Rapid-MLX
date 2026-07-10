@@ -198,6 +198,26 @@ def test_malformed_close_suffix_less():
     assert res.tool_calls[0]["arguments"] == "{}"
 
 
+def test_truncated_xml_pair_missing_close_is_not_salvaged():
+    """codex R7 BLOCKING: a truncated XML-pair call that carries structural
+    tokens (``<tool_sep>`` / ``<arg_key>`` / ``<arg_value>``) but is simply
+    MISSING its ``<end_of_tool_call>`` must NOT be promoted to a completed
+    executable call by the malformed-close salvage — that salvage is reserved
+    for the bare ``NAME</arg_value>`` 4-bit-noise shape. It is treated as
+    incomplete output (content), not a call."""
+    parser = HyV3ToolParser()
+    out = (
+        "<tool_call:opensource>lookup<tool_sep:opensource>"
+        "<arg_key:opensource>city</arg_key:opensource>"
+        "<arg_value:opensource>Paris</arg_value:opensource>"
+        # NOTE: no <end_of_tool_call> — truncated mid-stream.
+    )
+    res = parser.extract_tool_calls(out)
+    assert res.tools_called is False
+    assert res.tool_calls == []
+    assert res.content == out
+
+
 def test_json_body_then_stray_arg_value_opener_salvages_args():
     """Second real malformed shape from the spike: a well-formed JSON body
     followed by a STRAY ``<arg_value>`` opener before the canonical close
@@ -436,6 +456,32 @@ def test_text_format_fallback_reachable_without_native_opener():
     assert len(res.tool_calls) == 1
     assert res.tool_calls[0]["name"] == "get_weather"
     assert json.loads(res.tool_calls[0]["arguments"]) == {"city": "Paris"}
+
+
+def test_text_format_fallback_respects_request_allowlist():
+    """codex R7 BLOCKING: the text-format degradation fallback MUST apply the
+    request ``tools`` allowlist too — otherwise a degraded
+    ``[Calling tool="bogus"]`` bypasses the filtering that native Hy3 calls
+    enforce. An off-list name is dropped (no tool_calls) and preserved as
+    content."""
+    parser = HyV3ToolParser()
+    request = {"tools": [{"function": {"name": "get_weather"}}]}
+    out = '[Calling tool="bogus" x="1"]'
+    res = parser.extract_tool_calls(out, request=request)
+    assert res.tools_called is False
+    assert res.tool_calls == []
+    assert res.content == out
+
+
+def test_text_format_fallback_admits_on_list_name_with_allowlist():
+    """The mirror of the above: an ON-list text-format call still fires when a
+    ``tools`` allowlist is present."""
+    parser = HyV3ToolParser()
+    request = {"tools": [{"function": {"name": "get_weather"}}]}
+    out = '[Calling tool="get_weather" city="Paris"]'
+    res = parser.extract_tool_calls(out, request=request)
+    assert res.tools_called is True
+    assert res.tool_calls[0]["name"] == "get_weather"
 
 
 # ---------------------------------------------------------------------------
