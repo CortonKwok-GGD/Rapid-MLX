@@ -218,7 +218,8 @@ def test_dict_form_all_kvcache_stored(cache):
 
 
 @pytest.mark.parametrize(
-    "kv_class", ["RotatingKVCache", "ChunkedKVCache", "ConcatenateKVCache", "QuantizedKVCache"]
+    "kv_class",
+    ["RotatingKVCache", "ChunkedKVCache", "ConcatenateKVCache", "QuantizedKVCache"],
 )
 def test_dict_form_trimmable_kv_variants_still_stored(cache, kv_class):
     """Dict-form sliding-window / other trimmable KV classes must NOT be dropped.
@@ -245,7 +246,11 @@ def test_dict_form_mamba_variant_dropped(cache):
     prompt = list(range(1000, 1100))
     dict_cache = [
         {"class_name": "KVCache", "state": (1, 2), "meta_state": ("0",)},
-        {"class_name": "GatedDeltaNetArraysCache", "state": (3, 4), "meta_state": ("0",)},
+        {
+            "class_name": "GatedDeltaNetArraysCache",
+            "state": (3, 4),
+            "meta_state": ("0",),
+        },
     ]
 
     assert cache.store(prompt, dict_cache) is False
