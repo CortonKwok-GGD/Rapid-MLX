@@ -2,43 +2,66 @@
 """
 Hy3 (Tencent Hunyuan 3) tool call parser for rapid-mlx.
 
-Handles the Hy3 tool call wire format that emerged from mlx-lm PR #1211 and
-Tencent's ``mlx-community/Hy3-preview-4bit`` chat template. The canonical
-form is:
+Ported from vLLM's ``HYV3ToolParser`` (vllm/tool_parsers/hy_v3_tool_parser.py)
+and SGLang's ``hunyuan_detector`` (python/sglang/srt/function_call/
+hunyuan_detector.py::resolve_hunyuan_tokens). The wire format is:
 
     <tool_call:opensource>NAME<tool_sep:opensource>{"k1": "v1", ...}<end_of_tool_call:opensource>
 
-with variant emitting explicit ``<arg_key:opensource>K</arg_key:opensource>
-<arg_value:opensource>V</arg_value:opensource>`` pairs instead of a JSON body.
+with an ``<arg_key:opensource>K</arg_key:opensource><arg_value:opensource>V
+</arg_value:opensource>`` XML-pair variant instead of / in addition to the
+JSON body. The label suffix (``:opensource``) marks the checkpoint's
+reasoning-mode variant; a future revision may drop it or swap it.
 
-**Suffix tolerance.** The tokenizer bakes ``:opensource`` into every wire
-token (marking the "opensource" reasoning-mode variant), but future model
-revisions may drop the suffix or swap it for another label (``:v1``,
-``:internal``, …). All open/close tags in this parser are matched with
-``(?::[\\w-]+)?`` so both the current stream (``<tool_call:opensource>``)
-and the future stream (``<tool_call>``) hit the same code path — no branch
-for wire-shape drift.
+Design (why this file was rewritten from the bespoke full-text-regex design)
+===========================================================================
 
-**Defensive close-tag strip (4-bit numerical noise mitigation).** The 4-bit
-quantized HY3 checkpoint (both REAP50 and REAP75 variants) occasionally
-emits a malformed close boundary — the model skips the ``<tool_sep>`` and
-the arguments block entirely and jumps straight to ``</arg_value>``:
+The earlier rapid-mlx implementation re-parsed the entire accumulated text
+on every streaming delta, used a suffix-alternation regex ``(?::[\\w-]+)?``
+everywhere, and carried ~85 LOC of partial-opener straddle-guard code
+(``_tool_call_open_straddle_suffix_len``, ``_is_strict_prefix_of_tool_call_
+opener``, a ``_streamed_bytes`` content watermark). Seven codex rounds all
+chased symptoms of that architecture. This rewrite ports vLLM/SGLang's
+proven approach instead:
 
-    <tool_call:opensource>get_weather</arg_value:opensource>
+1. **Resolve the suffix ONCE at ``__init__``** by scanning
+   ``tokenizer.get_vocab()`` for ``<tool_call(:LABEL)?>`` and pinning the
+   real tag strings as FIXED strings (``self.tool_call_start_token``,
+   ``self.tool_sep_token``, …). No regex alternation on the hot path.
+   (SGLang ``resolve_hunyuan_tokens`` pattern.)
 
-Empirically observed on 4/32 real prompts against ``Hy3-preview-4bit`` in
-the 2026-07-09 spike (agent ``ac2851864dbd17b07``). The upstream fix will
-land in a full-precision retraining pass, but until then the parser must
-gracefully surface the tool name even when the arguments block is missing —
-otherwise the user sees an empty ``tool_calls`` array and thinks the model
-refused. The recovery: extract the raw name between ``<tool_call>`` and the
-first close-tag artifact, return ``arguments="{}"``, mark tools_called=True.
+2. **Token-ID gate the streaming entry.** ``self.tool_call_start_token_id``
+   is resolved from vocab; special tokens are ATOMIC on the tokenizer
+   boundary so they cannot straddle SSE chunks. Once the start token id is
+   absent from ``current_token_ids`` (and the fixed start string is absent
+   from the accumulated text), the delta is pure content — pass it through.
+   This single gate deletes the entire straddle-guard family.
 
-**Wire format label.** ``hy3_native`` — declared in
-``EXPECTED_WIRE_FORMATS`` so ``test_every_parser_declares_formats``
-recognizes the new format without requiring a symbol-table update
-(``WIRE_FORMAT_LABELS`` in ``abstract_tool_parser.py`` is a documentation
-manifest, not an enforced allowlist against subclass declarations).
+3. **Buffer accumulates only INSIDE the tool-call span**, keyed on
+   ``str.find`` of the pinned fixed strings — never a full-history regex
+   re-scan.
+
+4. **Two-phase state machine**: ``SEEKING_NAME`` (find ``<tool_sep>`` in the
+   buffer → emit the function name) → ``STREAMING_ARGS`` (stream the args
+   body incrementally, emitting a JSON diff and withholding the trailing
+   ``}`` until ``<end_of_tool_call>``).
+
+5. **``<think>`` handling lives entirely in the separate reasoning parser**
+   (``vllm_mlx/reasoning/hy3_parser.py::Hy3ReasoningParser``, registered as
+   ``--reasoning-parser hy_v3``). This tool parser has ZERO ``<think>`` code
+   — the two parsers see disjoint token streams, exactly as vLLM's do.
+
+6. **Watermark on args, not content**: ``self.streamed_args_for_tool`` holds
+   the JSON already emitted per open tool call (vLLM base pattern).
+
+7. **Malformed-close salvage** (``<tool_call>NAME</arg_value>`` — 4-bit
+   numerical noise empirically observed on ``pipenetwork/Hy3-REAP50-MLX-4bit``
+   and ``Hy3-REAP75-MLX-4bit``, 10/10 BFCL simple_python prompts) is
+   rapid-mlx's unique value-add. It runs ONLY on the non-streaming
+   ``extract_tool_calls`` path — 4-bit noise is rare and streaming clients
+   re-parse on completion, so streaming never runs salvage.
+
+**Wire format label.** ``hy3_native`` — declared in ``EXPECTED_WIRE_FORMATS``.
 """
 
 import json
@@ -47,11 +70,22 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from transformers import PreTrainedTokenizerBase
+
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
     ToolParserManager,
 )
+
+# Default label baked into ``pipenetwork/Hy3-*-MLX-4bit`` and the
+# ``chat_template.jinja`` sentinel scheme. Used only when no tokenizer is
+# available to resolve the real suffix from vocab.
+_DEFAULT_LABEL = "opensource"
+
+# Matches a Hy3 wire token in the vocab, capturing the bare name. ``resolve``
+# uses this to pin the real (possibly suffixed) strings.
+_VOCAB_TOKEN_RE = re.compile(r"^<(?P<name>[a-z_]+)(?::[\w-]+)?>$")
 
 
 def generate_tool_id() -> str:
@@ -59,88 +93,39 @@ def generate_tool_id() -> str:
     return f"call_{uuid.uuid4().hex[:8]}"
 
 
-# Suffix-tolerant tag alternation (``:opensource``, ``:v1``, …). ``\w-``
-# covers the label characters upstream is likely to use; a broader
-# character class would risk swallowing genuine punctuation in the model
-# output. Applied to every open/close tag below.
-_SUFFIX = r"(?::[\w-]+)?"
+def _resolve_suffix(tokenizer: PreTrainedTokenizerBase | None) -> str:
+    """Resolve the wire label suffix (e.g. ``:opensource``) ONCE from vocab.
 
-# Canonical tool_call block — non-greedy body up to ``<end_of_tool_call>``.
-# This is the shape emitted by a well-formed Hy3 checkpoint. The XML-pair
-# variant lives inside this block too because ``</arg_value>`` appears
-# BEFORE ``<end_of_tool_call>``.
-_TOOL_CALL_BLOCK = re.compile(
-    rf"<tool_call{_SUFFIX}>"
-    rf"(?P<body>.*?)"
-    rf"<end_of_tool_call{_SUFFIX}>",
-    re.DOTALL,
-)
-
-# Malformed close fallback — ``<tool_call>NAME</arg_value>`` with no
-# ``<end_of_tool_call>`` in sight. Fires only when the canonical block
-# regex misses. The body is captured up to the FIRST ``</arg_value>``
-# because on 4-bit checkpoints the model jumps straight there without
-# emitting ``<tool_sep>`` / args (see module docstring). Explicitly
-# forbids ``<end_of_tool_call>`` inside the body so we don't shadow the
-# canonical parse.
-_TOOL_CALL_MALFORMED = re.compile(
-    rf"<tool_call{_SUFFIX}>"
-    rf"(?P<body>(?:(?!<end_of_tool_call{_SUFFIX}>).)*?)"
-    rf"</arg_value{_SUFFIX}>",
-    re.DOTALL,
-)
-
-# Standalone open-tag detector for suffix-tolerant streaming trigger.
-_TOOL_CALL_OPEN = re.compile(rf"<tool_call{_SUFFIX}>")
-# Canonical close only — the streaming pending-check MUST use this
-# stricter form, not the malformed-tolerant ``_TOOL_CALL_CLOSE_ANY``,
-# because the XML-pair body legitimately contains ``</arg_value>`` for
-# every argument value. Treating those as closes would emit the call
-# prematurely on the first ``</arg_value>`` (codex round-2 BLOCKING #1).
-# The malformed-close fallback (``</arg_value>`` without a matching
-# ``<end_of_tool_call>``) is handled by the non-streaming extractor
-# which sees the whole body at once and can distinguish the "no
-# ``<tool_sep>`` in the body" malformed case from the XML-pair case.
-_TOOL_CALL_CANONICAL_CLOSE = re.compile(rf"<end_of_tool_call{_SUFFIX}>")
-# Malformed OR canonical — used only by ``extract_tool_calls`` (non-
-# streaming) where we can safely distinguish which shape applies.
-_TOOL_CALL_CLOSE_ANY = re.compile(rf"<end_of_tool_call{_SUFFIX}>|</arg_value{_SUFFIX}>")
-
-# Body-level tags.
-_TOOL_SEP = re.compile(rf"<tool_sep{_SUFFIX}>")
-_ARG_KEY_OPEN = re.compile(rf"<arg_key{_SUFFIX}>")
-_ARG_KEY_CLOSE = re.compile(rf"</arg_key{_SUFFIX}>")
-_ARG_VALUE_OPEN = re.compile(rf"<arg_value{_SUFFIX}>")
-_ARG_VALUE_CLOSE = re.compile(rf"</arg_value{_SUFFIX}>")
-
-# Extract an <arg_key>K</arg_key><arg_value>V</arg_value> pair. Both open
-# tags are suffix-tolerant. Reusable at parse-time to walk the argument
-# block sequentially.
-_ARG_PAIR = re.compile(
-    rf"<arg_key{_SUFFIX}>\s*(?P<key>.*?)\s*</arg_key{_SUFFIX}>\s*"
-    rf"<arg_value{_SUFFIX}>(?P<val>.*?)</arg_value{_SUFFIX}>",
-    re.DOTALL,
-)
-
-# Streaming JSON-decoder used by ``_parse_hy3_body`` to consume only a
-# well-formed JSON prefix of the argument tail. Round-5 BLOCKING #3
-# fix — avoids corrupting a valid JSON body whose string values
-# legitimately contain the literal ``</arg_value>`` substring.
-_JSON_DECODER = json.JSONDecoder()
-
-# Same character class as the ``:LABEL`` suffix in the tool_call opener
-# regex — kept in lockstep with ``_SUFFIX`` (``(?::[\w-]+)?``) so
-# ``_is_strict_prefix_of_tool_call_opener`` accepts exactly the alphabet
-# that a real opener would (codex round-6 NIT, PR #1070).
-_LABEL_CHAR_RE = re.compile(r"[\w-]+")
+    Scans ``tokenizer.get_vocab()`` for ``<tool_call(:LABEL)?>`` and returns
+    the ``:LABEL`` string (including the leading colon) if present, or ``""``
+    for the bare form. Falls back to ``:opensource`` when no tokenizer is
+    available (the shape every current ``pipenetwork/Hy3-*-MLX-4bit``
+    checkpoint emits). SGLang ``resolve_hunyuan_tokens`` pattern.
+    """
+    if tokenizer is not None:
+        try:
+            vocab = tokenizer.get_vocab()
+        except Exception:
+            vocab = None
+        if isinstance(vocab, dict):
+            # Anchor on the real ``<tool_call...>`` start token so the resolved
+            # suffix is not an incidental sibling.
+            for tok in vocab:
+                if not isinstance(tok, str):
+                    continue
+                m = _VOCAB_TOKEN_RE.match(tok)
+                if m and m.group("name") == "tool_call":
+                    # ``tok`` is ``<tool_call>`` or ``<tool_call:LABEL>``.
+                    return tok[len("<tool_call") : -1]  # ``""`` or ``:LABEL``
+    return f":{_DEFAULT_LABEL}"
 
 
 def _deserialize_arg_value(value: str) -> Any:
     """Coerce a raw ``<arg_value>`` payload to a JSON-native Python type.
 
     Tries ``json.loads`` first so ``true`` / ``42`` / ``[1,2]`` / ``null``
-    round-trip cleanly; falls back to the trimmed string for free-form
-    text so we don't silently drop the argument.
+    round-trip cleanly; falls back to the trimmed string for free-form text
+    so we do not silently drop the argument.
     """
     stripped = value.strip()
     if not stripped:
@@ -151,271 +136,111 @@ def _deserialize_arg_value(value: str) -> Any:
         return stripped
 
 
-def _parse_hy3_body(body: str) -> tuple[str, dict[str, Any]]:
-    """Parse the body of a ``<tool_call>…</end_of_tool_call>`` (or the
-    malformed ``</arg_value>``) block into ``(name, arguments)``.
-
-    Two on-wire variants coexist:
-
-    1. **JSON body** — ``NAME<tool_sep>{"k": "v", …}`` — the chat-template's
-       default emission when the model spells out a JSON object.
-    2. **XML pair body** — ``NAME<tool_sep><arg_key>k</arg_key>
-       <arg_value>v</arg_value>…`` — the malformed-with-real-args case
-       when the model transcribes each pair separately.
-    3. **Malformed close** — ``NAME`` alone (the ``</arg_value>`` early
-       close ate the sep + args). Returns ``(NAME, {})`` so the outer
-       extractor still surfaces the call rather than dropping it.
-
-    We probe (1) first because the JSON body is what the chat template
-    documents; (2) is the fallback; (3) is the trivial residue.
-    """
-    # Split at the first <tool_sep> if present.
-    sep_match = _TOOL_SEP.search(body)
-    if sep_match is None:
-        # No separator — two shapes to disambiguate (codex round-3
-        # BLOCKING #1 extension):
-        #   (a) sep-less XML-pair body:
-        #       ``NAME<arg_key>K</arg_key><arg_value>V</arg_value>...``
-        #       (some 4-bit checkpoints skip <tool_sep> but still emit
-        #       full XML-pair args). Detect via the first arg-key /
-        #       arg-value opener and treat it as an implicit sep.
-        #   (b) short-form salvage: no sep, no arg tags — the whole
-        #       body is the tool name (with ``</arg_value>`` residue
-        #       stripped defensively).
-        arg_open = _ARG_KEY_OPEN.search(body) or _ARG_VALUE_OPEN.search(body)
-        if arg_open is not None:
-            name = body[: arg_open.start()].strip()
-            tail = body[arg_open.start() :]
-        else:
-            raw_name = body.strip()
-            raw_name = _ARG_VALUE_CLOSE.sub("", raw_name)
-            raw_name = _ARG_KEY_CLOSE.sub("", raw_name)
-            return raw_name.strip(), {}
-    else:
-        name = body[: sep_match.start()].strip()
-        tail = body[sep_match.end() :]
-
-    # Variant 1: JSON object payload.
-    tail_stripped = tail.strip()
-    if tail_stripped.startswith("{"):
-        # Codex round-5 BLOCKING #3 (PR #1070): DO NOT truncate at the
-        # first ``</arg_value>`` before json.loads — a valid JSON
-        # payload can legitimately contain that literal inside a
-        # string value (``{"snippet": "see </arg_value> below"}``) and
-        # slicing there would corrupt the args into empty/truncated.
-        # Use ``raw_decode`` to consume only a well-formed JSON prefix
-        # of the tail; any structural residue after that (the
-        # ``</arg_value>`` malformed close, whitespace, extra tags) is
-        # discarded harmlessly.
-        try:
-            parsed, _end = _JSON_DECODER.raw_decode(tail_stripped)
-            if isinstance(parsed, dict):
-                return name, parsed
-        except (json.JSONDecodeError, ValueError):
-            # Fall through to variant 2 (XML-pair) — same as before.
-            # If raw_decode failed on the untrimmed tail, structural
-            # residue is unlikely to be the cause (JSON is delimited);
-            # a genuinely malformed JSON body degrades cleanly to the
-            # XML-pair walker.
-            pass
-
-    # Variant 2: <arg_key>K</arg_key><arg_value>V</arg_value> pairs.
-    args: dict[str, Any] = {}
-    for m in _ARG_PAIR.finditer(tail):
-        key = m.group("key").strip()
-        if not key:
-            continue
-        args[key] = _deserialize_arg_value(m.group("val"))
-    return name, args
-
-
-def _tool_call_open_straddle_suffix_len(text: str) -> int:
-    r"""Return the byte length of a trailing partial ``<tool_call>`` /
-    ``<tool_call:label>`` opener that hasn't fully arrived yet.
-
-    The Hy3 opener regex is ``<tool_call(?::[\w-]+)?>``; on an SSE
-    boundary a delta can end with any strict prefix of that string,
-    e.g. ``<``, ``<t``, ``<tool_c``, ``<tool_call``, ``<tool_call:``,
-    ``<tool_call:opens``. Codex round-5 BLOCKING #1: emitting those
-    bytes as ``content`` leaks tool markup to OpenAI-compatible
-    clients seconds before the opener completes and the parser
-    switches to tool-call turn suppression.
-
-    Returns 0 when no straddle exists (the trailing bytes cannot
-    become a valid opener no matter what arrives next).
-    """
-    if not text:
-        return 0
-    # Longest possible partial-opener length is
-    #   len("<tool_call:") + reasonable suffix len bound.
-    # Any label longer than 32 chars is unrealistic — cap the scan.
-    max_len = min(len(text), 48)
-    # Walk from longest candidate suffix down to length 1; return the
-    # first (longest) one that is a strict prefix of a valid opener.
-    for cand_len in range(max_len, 0, -1):
-        cand = text[-cand_len:]
-        if _is_strict_prefix_of_tool_call_opener(cand):
-            return cand_len
-    return 0
-
-
-def _is_strict_prefix_of_tool_call_opener(cand: str) -> bool:
-    r"""Return True iff ``cand`` is a strict prefix of some valid Hy3
-    tool_call opener (``<tool_call>`` or ``<tool_call:LABEL>`` with
-    a non-empty ``[\w-]+`` label). A prefix is "strict" when the
-    opener isn't complete yet — the parser hasn't emitted the ``>``.
-    """
-    # Must start at the ``<`` so it's a real straddle, not incidental
-    # text.
-    base = "<tool_call"
-    if not cand:
-        return False
-    if not base.startswith(cand) and not cand.startswith(base):
-        return False
-    if base.startswith(cand):
-        # Prefix of the bare opener itself (``<``, ``<t``, ... up to
-        # ``<tool_call``). Strict because ``>`` hasn't arrived.
-        return cand != base + ">"
-    # cand starts with ``<tool_call`` — is the tail either the ``:``
-    # prefix, a partial label, or exactly the terminator ``>``?
-    tail = cand[len(base) :]
-    if tail == "":
-        return True
-    if tail == ">":
-        # Complete bare opener — NOT a straddle.
-        return False
-    if not tail.startswith(":"):
-        # ``<tool_call?`` — cannot become a valid opener.
-        return False
-    label = tail[1:]
-    if label == "":
-        # ``<tool_call:`` — awaiting label.
-        return True
-    # ``<tool_call:LABEL`` — accept if the LABEL matches the same
-    # character set as the compiled opener regex (``[\w-]+``). Codex
-    # round-6 NIT (PR #1070) flagged an earlier ``str.isalnum()``
-    # variant as accepting a slightly different alphabet than the
-    # actual opener regex (Python ``\w`` covers underscore too,
-    # ``isalnum`` doesn't; both accept Unicode letters). Delegate to
-    # the same regex character class to keep the two definitions
-    # in lockstep.
-    if label.endswith(">"):
-        # Complete labelled opener — NOT a straddle.
-        return False
-    return _LABEL_CHAR_RE.fullmatch(label) is not None
-
-
-def _closed_after_opener(after_opener: str) -> bool:
-    """Return True iff ``after_opener`` (the substring starting AT the
-    ``<tool_call>`` opener) already contains an effective close.
-
-    An "effective close" is either:
-
-    * the canonical ``<end_of_tool_call>`` tag anywhere in the substring,
-      OR
-    * a ``</arg_value>`` tag whose body-prefix (from the opener up to
-      that ``</arg_value>``) contains NO ``<arg_value>`` opener AND NO
-      ``<arg_key>`` opener — that is, the true malformed-salvage shape
-      ``<tool_call>NAME</arg_value>`` (empirically observed on 4-bit
-      Hy3 quants). Any earlier ``</arg_value>`` in a body that has
-      already emitted an ``<arg_value>`` / ``<arg_key>`` opener is
-      closing a real argument value, not the tool_call itself.
-
-    Codex round-4 BLOCKING #2 (PR #1070): the round-3 implementation
-    used any-marker XML-pair mode detection (tool_sep OR arg_key OR
-    arg_value openers all counted). But ``<tool_sep>`` appears in BOTH
-    JSON-body streams (``NAME<tool_sep>{...}``) and XML-pair streams,
-    so a JSON stream with corrupted-tail ``</arg_value>`` would fall
-    to canonical-only mode and hang until timeout waiting for
-    ``<end_of_tool_call>``. Switching the discriminator to
-    per-``</arg_value>`` prefix inspection recovers the salvage path
-    on corrupted JSON while still preventing early flushes on real
-    XML-pair bodies.
-    """
-    if _TOOL_CALL_CANONICAL_CLOSE.search(after_opener):
-        return True
-    for m in _ARG_VALUE_CLOSE.finditer(after_opener):
-        prefix = after_opener[: m.start()]
-        if _ARG_VALUE_OPEN.search(prefix):
-            continue
-        if _ARG_KEY_OPEN.search(prefix):
-            continue
-        # Codex round-6 BLOCKING #2 (PR #1070): if a ``<tool_sep>`` is
-        # in the body prefix AND the material after it starts with an
-        # opening JSON brace, we're in JSON-body mode. A ``</arg_value>``
-        # inside a JSON string value is NOT a call close — the
-        # non-streaming ``_parse_hy3_body`` uses ``raw_decode`` to
-        # tolerate the literal, but the streaming close-check would
-        # otherwise flush the call before the JSON body is complete.
-        # Only treat the ``</arg_value>`` as salvage when it appears
-        # AFTER a well-formed JSON prefix has been decoded.
-        sep_m = _TOOL_SEP.search(prefix)
-        if sep_m is not None:
-            tail_after_sep = prefix[sep_m.end() :].lstrip()
-            if tail_after_sep.startswith("{"):
-                try:
-                    _, consumed = _JSON_DECODER.raw_decode(tail_after_sep)
-                except (json.JSONDecodeError, ValueError):
-                    # JSON is still incomplete — don't fire salvage yet.
-                    continue
-                # JSON parsed OK. The ``</arg_value>`` is legitimate
-                # salvage only if it lands AFTER the decoded prefix
-                # (i.e., the ``</arg_value>`` is trailing structural
-                # residue, not inside the JSON body). Otherwise the
-                # literal was consumed inside a string value.
-                trailing_offset = sep_m.end() + (
-                    len(prefix[sep_m.end() :]) - len(tail_after_sep) + consumed
-                )
-                if m.start() < trailing_offset:
-                    continue
-        return True
-    return False
-
-
 @ToolParserManager.register_module(["hy_v3", "hy3"])
 class HyV3ToolParser(ToolParser):
     """
-    Tool call parser for Tencent Hunyuan 3 (``mlx-community/Hy3-preview-4bit``).
+    Tool call parser for Tencent Hunyuan 3 (``pipenetwork/Hy3-*-MLX-4bit``).
 
     Format:
         <tool_call:opensource>NAME<tool_sep:opensource>{"k":"v",...}
         <end_of_tool_call:opensource>
 
-    or the XML-pair variant:
+    or the XML-pair argument variant:
         <tool_call:opensource>NAME<tool_sep:opensource>
         <arg_key:opensource>K</arg_key:opensource>
         <arg_value:opensource>V</arg_value:opensource>
         <end_of_tool_call:opensource>
 
-    Suffix-tolerant (``:opensource`` optional) and defensive against the
-    4-bit malformed close where the model skips ``<tool_sep>`` and jumps
-    straight to ``</arg_value>``.
+    The label suffix (``:opensource``) is resolved once from the tokenizer
+    vocab at ``__init__``; all matching downstream uses the pinned fixed
+    strings. The 4-bit malformed close (``<tool_call>NAME</arg_value>``) is
+    salvaged on the non-streaming path.
 
-    Used when ``--enable-auto-tool-choice --tool-call-parser hy_v3`` are
-    set, or auto-wired for the ``hy3-preview-4bit`` alias via
-    ``aliases.json``.
+    Used when ``--enable-auto-tool-choice --tool-call-parser hy_v3`` are set,
+    or auto-wired for the ``hy3-*`` aliases via ``aliases.json`` /
+    ``model_auto_config``.
     """
 
     # The Hy3 chat template renders assistant ``tool_calls`` back into the
-    # SAME ``<tool_call:opensource>…<end_of_tool_call:opensource>`` markup
-    # the parser reads. Feed previous-turn tool calls in native format
-    # rather than converting them to synthetic text.
+    # same ``<tool_call:opensource>…<end_of_tool_call:opensource>`` markup the
+    # parser reads. Feed previous-turn tool calls in native format rather
+    # than converting them to synthetic text.
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("hy3_native",)
 
-    def __init__(self, tokenizer=None):
+    def __init__(self, tokenizer: PreTrainedTokenizerBase | None = None):
         super().__init__(tokenizer)
-        # Watermark tracking how many bytes of ``current_text`` have
-        # been emitted as ``content`` on the streaming path. Used to
-        # release bytes withheld by the partial-opener straddle guard
-        # once the straddle either resolves into an opener (bytes are
-        # dropped per exclusive-turn) or falsifies (bytes are emitted
-        # on the next tick). Codex round-6 BLOCKING #1 (PR #1070).
-        self._streamed_bytes: int = 0
+
+        # --- Resolve the suffix ONCE and pin FIXED tag strings (step 1) ---
+        suffix = _resolve_suffix(tokenizer)  # ``":opensource"`` or ``""``
+        self.suffix = suffix
+        self.tool_call_start_token = f"<tool_call{suffix}>"
+        self.tool_sep_token = f"<tool_sep{suffix}>"
+        self.tool_call_end_token = f"<end_of_tool_call{suffix}>"
+        self.arg_key_start_token = f"<arg_key{suffix}>"
+        self.arg_key_end_token = f"</arg_key{suffix}>"
+        self.arg_value_start_token = f"<arg_value{suffix}>"
+        self.arg_value_end_token = f"</arg_value{suffix}>"
+
+        # Non-streaming regex built from the FIXED strings (no alternation).
+        esc = re.escape
+        self._tool_call_block_re = re.compile(
+            esc(self.tool_call_start_token)
+            + r"(?P<body>.*?)"
+            + esc(self.tool_call_end_token),
+            re.DOTALL,
+        )
+        # Malformed close: ``<tool_call>NAME</arg_value>`` with no
+        # ``<end_of_tool_call>`` — body captured up to the FIRST
+        # ``</arg_value>``, explicitly forbidding an interior
+        # ``<end_of_tool_call>`` so a well-formed block never falls here.
+        self._tool_call_malformed_re = re.compile(
+            esc(self.tool_call_start_token)
+            + r"(?P<body>(?:(?!"
+            + esc(self.tool_call_end_token)
+            + r").)*?)"
+            + esc(self.arg_value_end_token),
+            re.DOTALL,
+        )
+        self._arg_pair_re = re.compile(
+            esc(self.arg_key_start_token)
+            + r"\s*(?P<key>.*?)\s*"
+            + esc(self.arg_key_end_token)
+            + r"\s*"
+            + esc(self.arg_value_start_token)
+            + r"(?P<val>.*?)"
+            + esc(self.arg_value_end_token),
+            re.DOTALL,
+        )
+        self._json_decoder = json.JSONDecoder()
+
+        # --- Token-ID gate (step 2). Special tokens are atomic on the ---
+        # tokenizer boundary, so the start id (when present) cannot straddle
+        # an SSE chunk. ``None`` when the tokenizer does not expose the token
+        # as a single id; the streaming path then falls back to the fixed
+        # string containment check, which is still atomic per-delta because
+        # the whole opener arrives in one delta once the model emits it.
+        self.tool_call_start_token_id = self.vocab.get(self.tool_call_start_token)
+        self.tool_call_end_token_id = self.vocab.get(self.tool_call_end_token)
+
+        self._reset_streaming_state()
+
+    # ------------------------------------------------------------------
+    # Streaming state
+    # ------------------------------------------------------------------
+    def _reset_streaming_state(self) -> None:
+        # Phase: name not sent yet = SEEKING_NAME, else STREAMING_ARGS.
+        self.current_tool_id: int = -1
+        self._name_sent: bool = False
+        self._current_tool_ref: str | None = None
+        # JSON already emitted for the current tool's arguments (watermark on
+        # args, NOT content). vLLM base ``streamed_args_for_tool`` pattern.
+        self.streamed_args_for_tool: list[str] = []
+        self.prev_tool_call_arr: list[dict] = []
 
     def reset(self) -> None:
         super().reset()
-        self._streamed_bytes = 0
+        self._reset_streaming_state()
 
     def _get_tool_names(self, request: dict[str, Any] | None) -> set[str]:
         """Extract valid tool names from the request payload."""
@@ -427,40 +252,97 @@ class HyV3ToolParser(ToolParser):
             if isinstance(t, dict)
         }
 
+    # ------------------------------------------------------------------
+    # Body parsing (shared by non-streaming extraction)
+    # ------------------------------------------------------------------
+    def _parse_body(self, body: str) -> tuple[str, dict[str, Any]]:
+        """Parse a ``NAME<tool_sep>ARGS`` body into ``(name, arguments)``.
+
+        Two on-wire arg shapes coexist:
+
+        1. **JSON body** — ``NAME<tool_sep>{"k": "v", …}`` — the chat
+           template's default emission.
+        2. **XML-pair body** — ``NAME<tool_sep><arg_key>k</arg_key>
+           <arg_value>v</arg_value>…`` — each pair transcribed separately.
+
+        A sep-less body (``NAME`` alone, or ``NAME`` followed straight by an
+        ``<arg_key>``/``<arg_value>`` opener) is handled too: the residue is
+        the name and the args are recovered from the pairs if present.
+        """
+        sep_idx = body.find(self.tool_sep_token)
+        if sep_idx == -1:
+            # No separator. Either sep-less XML pairs, or just a bare name.
+            ak = body.find(self.arg_key_start_token)
+            av = body.find(self.arg_value_start_token)
+            candidates = [c for c in (ak, av) if c != -1]
+            if candidates:
+                arg_open = min(candidates)
+                name = body[:arg_open].strip()
+                tail = body[arg_open:]
+            else:
+                raw = body.strip()
+                # Strip any close-tag residue defensively (malformed close).
+                raw = raw.replace(self.arg_value_end_token, "")
+                raw = raw.replace(self.arg_key_end_token, "")
+                return raw.strip(), {}
+        else:
+            name = body[:sep_idx].strip()
+            tail = body[sep_idx + len(self.tool_sep_token) :]
+
+        return name, self._parse_args_tail(tail)
+
+    def _parse_args_tail(self, tail: str) -> dict[str, Any]:
+        """Parse the post-``<tool_sep>`` tail into an arguments dict.
+
+        Probes the JSON-body shape first (``raw_decode`` consumes only a
+        well-formed JSON prefix so a value string containing the literal
+        ``</arg_value>`` round-trips unchanged), then falls back to walking
+        ``<arg_key>K</arg_key><arg_value>V</arg_value>`` pairs.
+        """
+        stripped = tail.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed, _end = self._json_decoder.raw_decode(stripped)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+        args: dict[str, Any] = {}
+        for m in self._arg_pair_re.finditer(tail):
+            key = m.group("key").strip()
+            if not key:
+                continue
+            args[key] = _deserialize_arg_value(m.group("val"))
+        return args
+
+    # ------------------------------------------------------------------
+    # Non-streaming extraction (with malformed-close salvage)
+    # ------------------------------------------------------------------
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
-        """Extract Hy3 tool calls from a complete model response."""
-        tool_calls: list[dict[str, Any]] = []
+        """Extract Hy3 tool calls from a complete model response.
 
-        # Strip <think> and <think:opensource> tags so a call embedded
-        # in the reasoning span still surfaces when no reasoning parser
-        # is configured (defensive parity with hermes / glm47). Handle
-        # the ``:opensource`` variant separately since the base
-        # ``strip_think_tags`` only matches the plain form.
-        cleaned = re.sub(
-            rf"<think{_SUFFIX}>.*?</think{_SUFFIX}>",
-            "",
-            model_output,
-            flags=re.DOTALL,
-        )
-        cleaned = self.strip_think_tags(cleaned)
+        Malformed-close salvage (``<tool_call>NAME</arg_value>``) runs here —
+        4-bit noise is rare and this path sees the whole body at once, so it
+        can distinguish the malformed close from a legitimate interior
+        ``</arg_value>`` in an XML-pair body. Streaming never runs salvage.
+        """
+        if self.tool_call_start_token not in model_output:
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
 
         valid_names = self._get_tool_names(request)
-
-        # Walk left-to-right, preferring the canonical
-        # ``<end_of_tool_call>`` close. When no canonical block matches at
-        # the current cursor position, retry with the malformed-close
-        # regex so the 4-bit ``<tool_call>NAME</arg_value>`` shape still
-        # surfaces the tool name.
+        tool_calls: list[dict[str, Any]] = []
         residual_parts: list[str] = []
         cursor = 0
-        length = len(cleaned)
+        length = len(model_output)
         while cursor < length:
-            canonical = _TOOL_CALL_BLOCK.search(cleaned, cursor)
-            malformed = _TOOL_CALL_MALFORMED.search(cleaned, cursor)
-            # Whichever opener starts earliest wins; canonical wins on ties
-            # so a well-formed block never falls to the malformed regex.
+            canonical = self._tool_call_block_re.search(model_output, cursor)
+            malformed = self._tool_call_malformed_re.search(model_output, cursor)
+            # Whichever opener starts earliest wins; canonical wins on ties so
+            # a well-formed block never falls to the malformed-salvage regex.
             match = None
             if canonical is not None and malformed is not None:
                 match = (
@@ -472,22 +354,17 @@ class HyV3ToolParser(ToolParser):
                 match = malformed
             if match is None:
                 break
-            residual_parts.append(cleaned[cursor : match.start()])
-            body = match.group("body")
-            name, args = _parse_hy3_body(body)
+            residual_parts.append(model_output[cursor : match.start()])
+            name, args = self._parse_body(match.group("body"))
             if not name:
                 cursor = match.end()
                 continue
             if valid_names and name not in valid_names:
-                # Codex round-3 BLOCKING #2: preserve the raw span of the
-                # rejected call in the residual text rather than silently
-                # erasing it. Without this, a request that supplies a
-                # ``tools`` allowlist and a model that hallucinates an
-                # off-list tool name would see ``tools_called=False`` +
-                # empty content — the user never learns the model tried
-                # to call something. Surfacing the raw XML lets the
-                # caller diagnose the hallucination.
-                residual_parts.append(cleaned[match.start() : match.end()])
+                # Preserve the rejected span in residual text so a request
+                # with a ``tools`` allowlist + a hallucinated off-list name
+                # surfaces the attempted call rather than a silent empty
+                # ``tool_calls`` array that looks like a refusal.
+                residual_parts.append(model_output[match.start() : match.end()])
                 cursor = match.end()
                 continue
             tool_calls.append(
@@ -498,24 +375,20 @@ class HyV3ToolParser(ToolParser):
                 }
             )
             cursor = match.end()
-        residual_parts.append(cleaned[cursor:])
+        residual_parts.append(model_output[cursor:])
         residual_text = "".join(residual_parts).strip()
 
         if tool_calls:
-            # Suppress reasoning prose that precedes tool calls (same
-            # policy as glm47: content=None when tools_called is True).
+            # Suppress content that precedes tool calls (exclusive-turn
+            # policy — content=None when tools_called is True).
             return ExtractedToolCallInformation(
-                tools_called=True,
-                tool_calls=tool_calls,
-                content=None,
+                tools_called=True, tool_calls=tool_calls, content=None
             )
 
-        # Text-format degradation fallback (``[Calling tool="X" k="v"]``)
-        # is shared across parsers; consult it before giving up.
+        # Text-format degradation fallback (``[Calling tool="X" k="v"]``).
         if self.has_text_format_tool_call(residual_text):
             text_calls = self.extract_text_format_tool_calls(residual_text)
             if text_calls:
-                # Normalise the shared helper's ``{name, arguments}`` shape.
                 normalised = [
                     {
                         "id": tc.get("id", generate_tool_id()),
@@ -525,53 +398,18 @@ class HyV3ToolParser(ToolParser):
                     for tc in text_calls
                 ]
                 return ExtractedToolCallInformation(
-                    tools_called=True,
-                    tool_calls=normalised,
-                    content=None,
+                    tools_called=True, tool_calls=normalised, content=None
                 )
 
         return ExtractedToolCallInformation(
             tools_called=False,
             tool_calls=[],
-            content=residual_text or cleaned,
+            content=residual_text or model_output,
         )
 
-    def _last_unclosed_tool_call_position(self, text: str) -> int:
-        """Return the offset of the LAST ``<tool_call>`` opener that has
-        no matching close tag after it, or ``-1`` when every opener
-        already closed.
-
-        Close-tag semantics (codex round-2 / round-3 / round-4 BLOCKING
-        #1 on PR #1070):
-
-        * The canonical ``<end_of_tool_call>`` tag ALWAYS closes the
-          call — anywhere after the opener.
-        * A ``</arg_value>`` closes the call ONLY when it is the
-          "malformed-salvage" shape — i.e., the body-prefix between the
-          opener and that specific ``</arg_value>`` contains no
-          ``<arg_value>`` opener AND no ``<arg_key>`` opener. In both
-          the JSON-body wire (``NAME<tool_sep>{...}``) and the
-          XML-pair-in-flight case, an ``</arg_value>`` after real body
-          content is closing an argument value, not the call.
-
-        The round-4 refinement over round-3: gating on ``<tool_sep>`` +
-        arg-pair markers TREATED ``<tool_sep>`` alone as XML-pair mode,
-        which mis-classified JSON-body streams — a JSON body with a
-        stray ``</arg_value>`` (4-bit noise corrupting the JSON tail)
-        would then wait forever for a canonical close that never
-        arrives. Switching the discriminator to arg-key / arg-value
-        openers ONLY (which are exclusive to the XML-pair shape) lets
-        the salvage path recover a corrupted JSON body while still
-        preventing early flushes on well-formed XML-pair bodies.
-        """
-        openers = [m.start() for m in _TOOL_CALL_OPEN.finditer(text)]
-        for opener_pos in reversed(openers):
-            after_opener = text[opener_pos:]
-            if _closed_after_opener(after_opener):
-                continue
-            return opener_pos
-        return -1
-
+    # ------------------------------------------------------------------
+    # Streaming extraction — token-ID gate + 2-phase FSM
+    # ------------------------------------------------------------------
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -584,161 +422,351 @@ class HyV3ToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         """Extract Hy3 tool calls from streaming model output.
 
-        Streaming rules (mirrors ``Glm47ToolParser`` policy):
+        Token-ID gate (step 2): before any ``<tool_call>`` opener has entered
+        the stream, the delta is pure content — pass it through. A special
+        token is atomic on the tokenizer boundary so the opener cannot
+        straddle an SSE chunk; no partial-opener buffering is needed.
 
-        * Once ANY ``<tool_call>`` opener has entered ``current_text``,
-          the assistant turn is a TOOL-CALL turn. Suppress every content
-          delta after that — OpenAI-compatible clients treat
-          ``tool_calls`` and ``content`` as mutually exclusive for a
-          single assistant turn (codex round-2 BLOCKING #2).
-        * The FIRST delta on which ``current_text`` transitions from
-          "has an unclosed canonical opener" to "canonical close seen"
-          is the delta on which we emit the tool_calls array. Compare
-          ``previous_text`` state to ``current_text`` state (not "did
-          the close token appear entirely in this delta") so a close
-          split across SSE chunks still fires (codex round-1 #3).
-        * Before any opener appears, pass content deltas through.
+        2-phase FSM (step 4):
+          * SEEKING_NAME — buffer from the opener until ``<tool_sep>`` lands,
+            then emit the function name (arguments empty).
+          * STREAMING_ARGS — stream the args body incrementally, emitting a
+            JSON diff and withholding the trailing ``}`` until
+            ``<end_of_tool_call>`` arrives.
         """
-        # Skip while inside a suffix-tolerant thinking span. Recompute
-        # think-state on ``current_text`` (source of truth).
-        if re.search(rf"<think{_SUFFIX}>", current_text) and not re.search(
-            rf"</think{_SUFFIX}>", current_text
+        if not previous_text:
+            self._reset_streaming_state()
+
+        # ---- Token-ID gate: no tool call has begun → pure content. ----
+        if not self._opener_seen(current_text, current_token_ids):
+            # Emit content, but hold back a trailing partial-opener prefix so
+            # a char-split ``<tool_call:opensou`` (the tokenizer/driver did
+            # not deliver the opener as one atomic special token) does not
+            # leak raw markup to the client. This is a single-string prefix
+            # hold (the established ``_safe_content_prefix`` idiom), NOT the
+            # deleted 85-LOC suffix-alternation straddle machinery — the held
+            # bytes are released the moment they either complete the opener
+            # (handled below) or falsify into ordinary content.
+            return self._emit_safe_content(previous_text, current_text)
+
+        # A tool call has opened somewhere in ``current_text``. This turn is a
+        # TOOL-CALL turn — content and tool_calls are mutually exclusive for a
+        # single assistant turn, so plain content deltas are suppressed and
+        # only tool-call deltas flow from here.
+        return self._stream_tool_call(current_text, request)
+
+    def _safe_content_prefix(self, text: str) -> str:
+        """Return the portion of ``text`` safe to emit as content now.
+
+        Holds back the longest suffix of ``text`` that is a non-empty proper
+        prefix of the tool-call opener (``<tool_call:opensource>``), so a
+        char-split opener never leaks. Returns ``text`` unchanged when its
+        tail cannot begin the opener.
+        """
+        opener = self.tool_call_start_token
+        max_hold = 0
+        for length in range(min(len(text), len(opener) - 1), 0, -1):
+            if text.endswith(opener[:length]):
+                max_hold = length
+                break
+        return text if max_hold == 0 else text[: len(text) - max_hold]
+
+    def _emit_safe_content(
+        self, previous_text: str, current_text: str
+    ) -> dict[str, Any] | None:
+        """Emit the new content diff with a partial-opener tail held back.
+
+        When everything new is a held opener prefix, returns ``None`` so no
+        content event fires this round; the bytes surface once the tail
+        resolves (opener completes → tool-call turn; or falsifies → content).
+        """
+        safe_current = self._safe_content_prefix(current_text)
+        safe_previous = self._safe_content_prefix(previous_text)
+        if len(safe_current) <= len(safe_previous):
+            return None
+        return {"content": safe_current[len(safe_previous) :]}
+
+    def flush_held_content(self, full_text: str) -> str:
+        """Release any prefix-held opener tail at stream end.
+
+        A stream ending in ``abc<tool_ca`` (a partial opener that never
+        completed) has held those bytes back; they are ordinary content and
+        must be released so the last chars are not dropped.
+        """
+        # Only meaningful when no tool call actually opened — a real opener
+        # commits the turn to tool_calls and the held tail is markup, not
+        # content.
+        if self.tool_call_start_token in full_text:
+            return ""
+        return full_text[len(self._safe_content_prefix(full_text)) :]
+
+    def _opener_seen(
+        self, current_text: str, current_token_ids: Sequence[int] | None
+    ) -> bool:
+        """True once the tool-call opener has entered the stream.
+
+        Prefers the atomic token-ID signal (the opener is a single special
+        token that cannot split across SSE chunks); falls back to the pinned
+        fixed-string containment check when the tokenizer does not expose the
+        opener as a single id.
+        """
+        if (
+            self.tool_call_start_token_id is not None
+            and current_token_ids is not None
+            and self.tool_call_start_token_id in current_token_ids
         ):
+            return True
+        return self.tool_call_start_token in current_text
+
+    def _stream_tool_call(
+        self, current_text: str, request: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Drive the 2-phase FSM against the accumulated ``current_text``.
+
+        Only ever inspects the span from the LAST ``<tool_call>`` opener
+        onward (``str.rfind`` on the pinned fixed string) — never a full
+        re-parse of history.
+        """
+        opener_pos = current_text.rfind(self.tool_call_start_token)
+        if opener_pos == -1:
+            return None
+        buffer = current_text[opener_pos + len(self.tool_call_start_token) :]
+
+        sep_idx = buffer.find(self.tool_sep_token)
+
+        # ---------- Phase 1: SEEKING_NAME ----------
+        if not self._name_sent:
+            if sep_idx == -1:
+                # Name not yet delimited — keep buffering, emit nothing.
+                return None
+            name = buffer[:sep_idx].strip()
+            if not name:
+                return None
+            valid_names = self._get_tool_names(request)
+            if valid_names and name not in valid_names:
+                # Hallucinated off-list name — do not emit a tool_call header.
+                # Suppress (exclusive-turn); the non-streaming path preserves
+                # the raw span for diagnostics on completion re-parse.
+                return None
+            self.current_tool_id += 1
+            self._name_sent = True
+            self._current_tool_ref = generate_tool_id()
+            self.streamed_args_for_tool.append("")
+            self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
+            return {
+                "tool_calls": [
+                    {
+                        "index": self.current_tool_id,
+                        "id": self._current_tool_ref,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    }
+                ]
+            }
+
+        # ---------- Phase 2: STREAMING_ARGS ----------
+        if sep_idx == -1:
+            return None
+        args_tail = buffer[sep_idx + len(self.tool_sep_token) :]
+        end_idx = args_tail.find(self.tool_call_end_token)
+        closed = end_idx != -1
+        if closed:
+            args_tail = args_tail[:end_idx]
+
+        snapshot = self._args_snapshot(args_tail, closed)
+        if snapshot is None:
             return None
 
-        prev_pending = self._last_unclosed_tool_call_position(previous_text)
-        curr_pending = self._last_unclosed_tool_call_position(current_text)
-        seen_opener = _TOOL_CALL_OPEN.search(current_text) is not None
+        already = (
+            self.streamed_args_for_tool[self.current_tool_id]
+            if self.current_tool_id < len(self.streamed_args_for_tool)
+            else ""
+        )
+        if snapshot.startswith(already):
+            diff = snapshot[len(already) :]
+        elif closed:
+            # A snapshot that no longer extends what we streamed (e.g. a
+            # re-parse flipped JSON→pair mode). On close, reconcile by
+            # emitting the full final document as the diff.
+            diff = snapshot
+        else:
+            # Non-monotonic mid-stream — wait for the close to reconcile.
+            return None
 
-        if prev_pending >= 0 and curr_pending < 0:
-            # Transition: canonical close arrived (possibly split across
-            # chunks). Parse and emit the tool_calls array.
-            result = self.extract_tool_calls(current_text, request)
-            if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
+        if not diff:
+            return None
+        if self.current_tool_id < len(self.streamed_args_for_tool):
+            self.streamed_args_for_tool[self.current_tool_id] = snapshot
+        if self.current_tool_id < len(self.prev_tool_call_arr):
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = snapshot
+        return {
+            "tool_calls": [
+                {
+                    "index": self.current_tool_id,
+                    "function": {"arguments": diff},
                 }
-            # Structural close but body didn't parse — suppress the
-            # residue rather than leak <tool_call> literals to content.
+            ]
+        }
+
+    def _args_snapshot(self, args_tail: str, closed: bool) -> str | None:
+        """Return the JSON args snapshot to have streamed SO FAR.
+
+        While the call is open, the snapshot is a growing valid-JSON PREFIX
+        with the trailing ``}`` withheld (vLLM's withhold-close principle) so
+        an OpenAI-compatible client can concatenate deltas into ever-valid
+        JSON. When ``closed`` is True the full args document (including the
+        closing ``}``) is returned.
+
+        Two arg shapes:
+          * JSON body — stream the well-formed JSON prefix directly.
+          * XML pairs — rebuild the args dict from CLOSED pairs and serialize;
+            withhold the trailing ``}`` while open.
+        """
+        stripped = args_tail.strip()
+
+        # --- JSON body shape ---
+        if stripped.startswith("{"):
+            if closed:
+                try:
+                    parsed, _end = self._json_decoder.raw_decode(stripped)
+                    if isinstance(parsed, dict):
+                        return json.dumps(parsed, ensure_ascii=False)
+                except (json.JSONDecodeError, ValueError):
+                    return None
+                return None
+            # Open: emit the longest valid-JSON prefix with ``}`` withheld.
+            return self._partial_json_prefix(stripped)
+
+        # --- XML-pair shape (or empty tail) ---
+        args: dict[str, Any] = {}
+        for m in self._arg_pair_re.finditer(args_tail):
+            key = m.group("key").strip()
+            if not key:
+                continue
+            args[key] = _deserialize_arg_value(m.group("val"))
+        if not args and not closed:
+            # Nothing complete to emit yet.
             return None
+        full = json.dumps(args, ensure_ascii=False)
+        if closed:
+            return full
+        # Withhold the trailing ``}`` so the next pair (or the close) can
+        # append cleanly. ``full`` is at least ``"{}"``; drop the last char.
+        return full[:-1]
 
-        if seen_opener:
-            # Any opener anywhere in the accumulated text — this turn is
-            # a tool-call turn (codex round-2 BLOCKING #2). Suppress
-            # further content deltas until the closer arrives (the
-            # transition branch above handles that).
+    def _partial_json_prefix(self, text: str) -> str | None:
+        """Longest valid-JSON prefix of an in-flight object with ``}`` held.
+
+        If the object already decodes whole (the common single-delta case),
+        stream its serialization minus the trailing ``}``. Otherwise
+        reconstruct from the complete members decoded so far, streaming a
+        partial string value character-by-character (escaped, no closing
+        quote) so the growing prefix stays valid when the consumer appends
+        the withheld ``}``.
+
+        Returns ``None`` when nothing new is safely emittable yet.
+        """
+        try:
+            parsed, _end = self._json_decoder.raw_decode(text)
+            if isinstance(parsed, dict):
+                full = json.dumps(parsed, ensure_ascii=False)
+                return full[:-1]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return self._decode_json_partial(text)
+
+    def _decode_json_partial(self, text: str) -> str | None:
+        """Reconstruct a valid-JSON prefix from an incomplete object.
+
+        Consumes complete ``"key": value`` members and re-serializes them,
+        withholding the trailing ``}``. A partial string value in flight is
+        streamed with the opening quote and escaped chars but no closing
+        quote, so the growing prefix stays valid when ``}`` is appended.
+        Returns ``None`` when no complete member (or partial string) has
+        arrived yet.
+        """
+        s = text
+        n = len(s)
+        i = 0
+        # Expect leading ``{``.
+        if i >= n or s[i] != "{":
             return None
-
-        # Codex round-6 BLOCKING #1/#2 (PR #1070): if ``current_text``
-        # ends in a strict prefix of a ``<tool_call>`` opener, WITHHOLD
-        # the whole delta — including any pre-straddle prose. Emitting
-        # ``"Sure, "`` before the opener resolves would violate the
-        # exclusive tool-call turn contract if the opener ends up
-        # completing (an OpenAI-compatible client that already routed
-        # the turn to a plain-content callback then has to switch to
-        # tool_calls). Round-5's "pass through pre-straddle prefix"
-        # behaviour was flagged as regressing this contract; the
-        # correct policy is buffer-until-resolved, and this branch
-        # runs BEFORE the think-close emit path so a straddle in the
-        # same delta as a ``</think>`` still short-circuits.
-        if _tool_call_open_straddle_suffix_len(current_text) > 0:
-            return None
-
-        # No opener seen yet — pass plain content through. Trim any
-        # inline think tags that slipped through (only when the closer
-        # is actually in this delta, so mid-stream deltas don't lose
-        # inter-word spacing).
-        #
-        # Codex round-5 BLOCKING #1 (PR #1070): when a ``<think>`` OPENER
-        # is in ``previous_text`` and only its ``</think>`` CLOSER arrives
-        # in ``delta_text``, ``re.sub`` sees just the closer + tail in
-        # the delta and does NOT strip anything (the pattern requires
-        # opener-in-same-string), leaving the closer literal and any
-        # post-closer content to leak to the client. Fix: compute
-        # ``clean_current`` and ``clean_previous`` with think spans
-        # stripped end-to-end, treating any unclosed opener in
-        # ``previous_text`` as a boundary (its span JUST closed in
-        # ``delta_text``). Emit only the diff — this handles every
-        # straddle pattern (opener-in-prev, opener-and-closer-in-delta,
-        # multiple spans, etc.) with one code path.
-        if re.search(rf"</think{_SUFFIX}>", delta_text):
-
-            def _strip_all_think(text: str) -> str:
-                """Strip all matched ``<think>...</think>`` pairs from
-                ``text`` (suffix-tolerant), plus the base parser's
-                inline-tag stripper for any unpaired-close residue."""
-                stripped = re.sub(
-                    rf"<think{_SUFFIX}>.*?</think{_SUFFIX}>",
-                    "",
-                    text,
-                    flags=re.DOTALL,
+        i += 1
+        members: list[str] = []
+        while True:
+            while i < n and s[i] in " \t\r\n,":
+                i += 1
+            if i >= n or s[i] == "}":
+                break
+            # Decode a JSON string key.
+            try:
+                key, key_end = self._json_decoder.raw_decode(s, i)
+            except (json.JSONDecodeError, ValueError):
+                break
+            if not isinstance(key, str):
+                break
+            j = key_end
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j >= n or s[j] != ":":
+                break
+            j += 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j >= n:
+                break
+            # Try to decode a complete value.
+            try:
+                value, value_end = self._json_decoder.raw_decode(s, j)
+                members.append(
+                    f"{json.dumps(key, ensure_ascii=False)}: "
+                    f"{json.dumps(value, ensure_ascii=False)}"
                 )
-                return self.strip_think_tags(stripped)
-
-            # If ``previous_text`` ends with an unclosed think opener,
-            # treat everything from that opener onwards as span content
-            # that JUST closed in this delta — i.e., truncate prev to
-            # the opener boundary before computing the clean baseline.
-            unclosed_open_in_prev: re.Match | None = None
-            for m in re.finditer(rf"<think{_SUFFIX}>", previous_text):
-                tail = previous_text[m.end() :]
-                if not re.search(rf"</think{_SUFFIX}>", tail):
-                    unclosed_open_in_prev = m
-                    break
-            if unclosed_open_in_prev is not None:
-                clean_prev = _strip_all_think(
-                    previous_text[: unclosed_open_in_prev.start()]
-                )
-            else:
-                clean_prev = _strip_all_think(previous_text)
-            clean_curr = _strip_all_think(current_text)
-
-            if clean_curr.startswith(clean_prev):
-                clean_delta = clean_curr[len(clean_prev) :]
-            else:
-                # Defensive fallback — should not happen with well-formed
-                # streams. Emit the full clean current to avoid dropping
-                # content on a defensive-inconsistency edge.
-                clean_delta = clean_curr
-
-            if clean_delta:
-                return {"content": clean_delta}
+                i = value_end
+                continue
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # Value incomplete. Stream a partial STRING value char-by-char.
+            if s[j] == '"':
+                partial = self._partial_json_string(s[j:])
+                if partial is not None:
+                    members.append(f"{json.dumps(key, ensure_ascii=False)}: {partial}")
+            # Non-string incomplete value (number / literal mid-flight) cannot
+            # be emitted as a valid prefix — stop at the members so far.
+            break
+        if not members:
             return None
-        # Straddle-falsified / no-straddle path: emit any bytes past
-        # the watermark ``self._streamed_bytes`` as content. This
-        # releases the bytes that a prior tick's straddle check
-        # withheld, if the straddle turned out not to be an opener.
-        # In the common "no prior straddle" case, ``_streamed_bytes``
-        # equals ``len(previous_text)`` and the returned content is
-        # exactly ``delta_text``.
-        emit_start = self._streamed_bytes
-        emit_end = len(current_text)
-        if emit_end <= emit_start:
+        return "{" + ", ".join(members)
+
+    @staticmethod
+    def _partial_json_string(text: str) -> str | None:
+        """Return a valid-JSON-string PREFIX for an in-flight string value.
+
+        ``text`` starts at the opening ``"``. Returns ``"escaped_prefix``
+        (opening quote, escaped body, NO closing quote) so the consumer's
+        appended data extends the same string. Drops a dangling trailing
+        backslash that could start an escape spanning the chunk boundary.
+        """
+        if not text or text[0] != '"':
             return None
-        content = current_text[emit_start:emit_end]
-        self._streamed_bytes = emit_end
-        if content:
-            return {"content": content}
-        return None
+        body = text[1:]
+        if body.endswith("\\"):
+            body = body[:-1]
+        if not body:
+            return '"'
+        # Escape the body as JSON string content (strip the surrounding
+        # quotes ``json.dumps`` adds).
+        escaped = json.dumps(body, ensure_ascii=False)[1:-1]
+        return '"' + escaped
 
     def has_pending_tool_call(self, text: str) -> bool:
-        """Override — Hy3 uses ``<tool_call:opensource>`` (suffix-tolerant).
+        """Override — Hy3 opener/closer are the pinned fixed strings.
 
-        Scoped to UNCLOSED openers so a completed call earlier in
-        ``text`` doesn't falsely leave the parser "pending" forever
-        (aligns with the streaming-gate fix in codex round-1).
+        Pending iff the LAST opener has no ``<end_of_tool_call>`` after it. A
+        completed call earlier in ``text`` does not leave the parser pending
+        forever.
         """
-        if self._last_unclosed_tool_call_position(text) >= 0:
+        opener = text.rfind(self.tool_call_start_token)
+        if opener != -1 and self.tool_call_end_token not in text[opener:]:
             return True
         return self.has_text_format_tool_call(text)
