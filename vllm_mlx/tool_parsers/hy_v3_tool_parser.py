@@ -252,6 +252,24 @@ class HyV3ToolParser(ToolParser):
             if isinstance(t, dict)
         }
 
+    def _opener_positions(self, text: str) -> list[int]:
+        """Byte offsets of every ``<tool_call>`` opener in ``text``.
+
+        A plain ``str.find`` scan on the pinned fixed opener string — the
+        wire never nests tool_call openers, so each occurrence starts a new
+        indexed call (the streaming FSM drives one index per opener)."""
+        positions: list[int] = []
+        start = 0
+        tok = self.tool_call_start_token
+        step = len(tok)
+        while True:
+            pos = text.find(tok, start)
+            if pos == -1:
+                break
+            positions.append(pos)
+            start = pos + step
+        return positions
+
     # ------------------------------------------------------------------
     # Body parsing (shared by non-streaming extraction)
     # ------------------------------------------------------------------
@@ -329,9 +347,11 @@ class HyV3ToolParser(ToolParser):
         ``</arg_value>`` in an XML-pair body. Streaming never runs salvage.
         """
         if self.tool_call_start_token not in model_output:
-            return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
-            )
+            # No native opener. A low-quant checkpoint may still degrade into
+            # the shared ``[Calling tool="X" k="v"]`` text form, so consult
+            # that fallback before returning plain content (codex BLOCKING:
+            # the early return otherwise made this branch unreachable).
+            return self._text_format_or_content(model_output)
 
         valid_names = self._get_tool_names(request)
         tool_calls: list[dict[str, Any]] = []
@@ -385,9 +405,19 @@ class HyV3ToolParser(ToolParser):
                 tools_called=True, tool_calls=tool_calls, content=None
             )
 
-        # Text-format degradation fallback (``[Calling tool="X" k="v"]``).
-        if self.has_text_format_tool_call(residual_text):
-            text_calls = self.extract_text_format_tool_calls(residual_text)
+        # No native call parsed — try the shared text-format degradation
+        # fallback on the residual before giving up.
+        return self._text_format_or_content(residual_text or model_output)
+
+    def _text_format_or_content(self, text: str) -> ExtractedToolCallInformation:
+        """Consult the shared ``[Calling tool="X" k="v"]`` text-format
+        fallback, else return ``text`` as plain content.
+
+        Shared by the no-native-opener early return AND the end of
+        ``extract_tool_calls`` so the low-quant text-degradation path is
+        reachable in both (codex BLOCKING #2)."""
+        if self.has_text_format_tool_call(text):
+            text_calls = self.extract_text_format_tool_calls(text)
             if text_calls:
                 normalised = [
                     {
@@ -400,11 +430,8 @@ class HyV3ToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=True, tool_calls=normalised, content=None
                 )
-
         return ExtractedToolCallInformation(
-            tools_called=False,
-            tool_calls=[],
-            content=residual_text or model_output,
+            tools_called=False, tool_calls=[], content=text
         )
 
     # ------------------------------------------------------------------
@@ -523,15 +550,35 @@ class HyV3ToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         """Drive the 2-phase FSM against the accumulated ``current_text``.
 
-        Only ever inspects the span from the LAST ``<tool_call>`` opener
-        onward (``str.rfind`` on the pinned fixed string) — never a full
-        re-parse of history.
+        Supports MULTIPLE tool calls in one turn: the parser advances index
+        by index. The block for the call currently being streamed is the
+        span from ITS opener up to the next opener (or end of text) — found
+        by ``str.find`` on the pinned fixed strings, never a full re-parse.
+        When the current call's ``<end_of_tool_call>`` lands, the args are
+        finalized and the FSM transitions back to SEEKING_NAME so the next
+        opener starts a fresh indexed call (codex BLOCKING: ``_name_sent``
+        must reset per call).
         """
-        opener_pos = current_text.rfind(self.tool_call_start_token)
-        if opener_pos == -1:
+        opener_positions = self._opener_positions(current_text)
+        if not opener_positions:
             return None
-        buffer = current_text[opener_pos + len(self.tool_call_start_token) :]
 
+        # The call currently being processed. ``current_tool_id`` starts at
+        # -1; the first SEEKING_NAME emit bumps it to 0. While streaming a
+        # call it stays put; on close we advance to the next opener.
+        idx = self.current_tool_id if self.current_tool_id >= 0 else 0
+        if idx >= len(opener_positions):
+            # We finished the last opener we know about and no new opener has
+            # arrived yet — nothing to do this tick.
+            return None
+
+        opener_pos = opener_positions[idx]
+        block_end = (
+            opener_positions[idx + 1]
+            if idx + 1 < len(opener_positions)
+            else len(current_text)
+        )
+        buffer = current_text[opener_pos + len(self.tool_call_start_token) : block_end]
         sep_idx = buffer.find(self.tool_sep_token)
 
         # ---------- Phase 1: SEEKING_NAME ----------
@@ -544,19 +591,28 @@ class HyV3ToolParser(ToolParser):
                 return None
             valid_names = self._get_tool_names(request)
             if valid_names and name not in valid_names:
-                # Hallucinated off-list name — do not emit a tool_call header.
-                # Suppress (exclusive-turn); the non-streaming path preserves
-                # the raw span for diagnostics on completion re-parse.
-                return None
-            self.current_tool_id += 1
+                # Hallucinated off-list name — do not emit a header. Suppress
+                # (exclusive-turn) but still claim the index so the FSM can
+                # advance to the next opener when this call closes; the
+                # non-streaming path preserves the raw span for diagnostics.
+                self.current_tool_id = idx
+                self._name_sent = True
+                self._current_tool_ref = None
+                if idx >= len(self.streamed_args_for_tool):
+                    self.streamed_args_for_tool.append("")
+                    self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
+                # Fall through so a same-tick close still advances the FSM.
+                return self._maybe_advance_on_close(buffer, sep_idx, emit=False)
+            self.current_tool_id = idx
             self._name_sent = True
             self._current_tool_ref = generate_tool_id()
-            self.streamed_args_for_tool.append("")
-            self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
+            if idx >= len(self.streamed_args_for_tool):
+                self.streamed_args_for_tool.append("")
+                self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
             return {
                 "tool_calls": [
                     {
-                        "index": self.current_tool_id,
+                        "index": idx,
                         "id": self._current_tool_ref,
                         "type": "function",
                         "function": {"name": name, "arguments": ""},
@@ -565,6 +621,18 @@ class HyV3ToolParser(ToolParser):
             }
 
         # ---------- Phase 2: STREAMING_ARGS ----------
+        return self._maybe_advance_on_close(buffer, sep_idx, emit=True)
+
+    def _maybe_advance_on_close(
+        self, buffer: str, sep_idx: int, emit: bool
+    ) -> dict[str, Any] | None:
+        """Stream the current call's args and, on close, advance the FSM.
+
+        ``emit`` is False for a suppressed (off-list) call — args are not
+        emitted but the close still transitions the FSM back to SEEKING_NAME
+        so the NEXT opener is processed as a fresh indexed call.
+        """
+        idx = self.current_tool_id
         if sep_idx == -1:
             return None
         args_tail = buffer[sep_idx + len(self.tool_sep_token) :]
@@ -573,40 +641,40 @@ class HyV3ToolParser(ToolParser):
         if closed:
             args_tail = args_tail[:end_idx]
 
-        snapshot = self._args_snapshot(args_tail, closed)
-        if snapshot is None:
-            return None
+        result: dict[str, Any] | None = None
+        if emit:
+            snapshot = self._args_snapshot(args_tail, closed)
+            if snapshot is not None:
+                already = (
+                    self.streamed_args_for_tool[idx]
+                    if idx < len(self.streamed_args_for_tool)
+                    else ""
+                )
+                if snapshot.startswith(already):
+                    diff = snapshot[len(already) :]
+                elif closed:
+                    # Snapshot no longer extends what we streamed (e.g. a
+                    # re-parse flipped JSON→pair mode). On close, reconcile
+                    # by emitting the full final document as the diff.
+                    diff = snapshot
+                else:
+                    diff = ""
+                if diff:
+                    if idx < len(self.streamed_args_for_tool):
+                        self.streamed_args_for_tool[idx] = snapshot
+                    if idx < len(self.prev_tool_call_arr):
+                        self.prev_tool_call_arr[idx]["arguments"] = snapshot
+                    result = {
+                        "tool_calls": [{"index": idx, "function": {"arguments": diff}}]
+                    }
 
-        already = (
-            self.streamed_args_for_tool[self.current_tool_id]
-            if self.current_tool_id < len(self.streamed_args_for_tool)
-            else ""
-        )
-        if snapshot.startswith(already):
-            diff = snapshot[len(already) :]
-        elif closed:
-            # A snapshot that no longer extends what we streamed (e.g. a
-            # re-parse flipped JSON→pair mode). On close, reconcile by
-            # emitting the full final document as the diff.
-            diff = snapshot
-        else:
-            # Non-monotonic mid-stream — wait for the close to reconcile.
-            return None
-
-        if not diff:
-            return None
-        if self.current_tool_id < len(self.streamed_args_for_tool):
-            self.streamed_args_for_tool[self.current_tool_id] = snapshot
-        if self.current_tool_id < len(self.prev_tool_call_arr):
-            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = snapshot
-        return {
-            "tool_calls": [
-                {
-                    "index": self.current_tool_id,
-                    "function": {"arguments": diff},
-                }
-            ]
-        }
+        if closed:
+            # Transition back to SEEKING_NAME so the next opener (if any)
+            # starts a fresh indexed call on the next tick.
+            self.current_tool_id = idx + 1
+            self._name_sent = False
+            self._current_tool_ref = None
+        return result
 
     def _args_snapshot(self, args_tail: str, closed: bool) -> str | None:
         """Return the JSON args snapshot to have streamed SO FAR.

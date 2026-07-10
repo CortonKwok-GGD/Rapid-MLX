@@ -344,6 +344,20 @@ def test_valid_names_filter_preserves_mixed_valid_and_rejected():
     assert res.content is None
 
 
+def test_text_format_fallback_reachable_without_native_opener():
+    """When there is NO native ``<tool_call>`` opener but the model degraded
+    into the shared ``[Calling tool="X" k="v"]`` text form (low-quant
+    degradation), the text-format fallback MUST still fire. codex BLOCKING:
+    the early return on missing opener previously made this unreachable."""
+    parser = HyV3ToolParser()
+    out = '[Calling tool="get_weather" city="Paris"]'
+    res = parser.extract_tool_calls(out)
+    assert res.tools_called is True
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0]["name"] == "get_weather"
+    assert json.loads(res.tool_calls[0]["arguments"]) == {"city": "Paris"}
+
+
 # ---------------------------------------------------------------------------
 # Streaming — token-gate + 2-phase FSM. Boundary cases are now trivially
 # green because the opener gate + fixed-string finds replace the bespoke
@@ -531,6 +545,28 @@ def test_streaming_close_split_across_sse_boundary_still_emits():
     )
     assert tool_acc[0]["name"] == "my_fn"
     assert json.loads(tool_acc[0]["args"]) == {}
+    assert content == ""
+
+
+def test_streaming_multiple_tool_calls_each_get_own_index_and_name():
+    """TWO tool calls streamed char-by-char in one turn MUST each surface with
+    their OWN index, name, and args — the FSM resets to SEEKING_NAME on each
+    ``<end_of_tool_call>`` so the second opener starts a fresh indexed call.
+    codex BLOCKING: the pre-fix ``_name_sent`` never reset, so the second
+    call's name/args were folded into the first index."""
+    parser = HyV3ToolParser()
+    wire = (
+        '<tool_call:opensource>get_a<tool_sep:opensource>{"x": 1}'
+        "<end_of_tool_call:opensource>"
+        '<tool_call:opensource>get_b<tool_sep:opensource>{"y": 2}'
+        "<end_of_tool_call:opensource>"
+    )
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert sorted(tool_acc.keys()) == [0, 1]
+    assert tool_acc[0]["name"] == "get_a"
+    assert json.loads(tool_acc[0]["args"]) == {"x": 1}
+    assert tool_acc[1]["name"] == "get_b"
+    assert json.loads(tool_acc[1]["args"]) == {"y": 2}
     assert content == ""
 
 
