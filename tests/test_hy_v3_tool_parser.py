@@ -313,6 +313,40 @@ def test_xml_pair_argument_variant():
     assert json.loads(res.tool_calls[0]["arguments"]) == {"city": "Paris"}
 
 
+def test_xml_arg_value_containing_literal_end_token_not_truncated():
+    """An ``<arg_value>`` payload can legitimately carry the literal
+    ``<end_of_tool_call>`` string as free-form text (codex R15). A plain
+    ``str.find`` on the non-JSON (XML-pair) close search would truncate the
+    call at that interior literal and DROP the argument. Both the non-streaming
+    (``extract_tool_calls``) and streaming (char-by-char reassembled) paths MUST
+    preserve the full value — including the literal end-token substring — and
+    only close on the REAL trailing ``<end_of_tool_call>``."""
+    parser = HyV3ToolParser()
+    oc = parser.tool_call_start_token
+    sep = parser.tool_sep_token
+    end = parser.tool_call_end_token
+    ak, ake = parser.arg_key_start_token, parser.arg_key_end_token
+    av, ave = parser.arg_value_start_token, parser.arg_value_end_token
+    wire = f"{oc}logit{sep}{ak}msg{ake}{av}contains {end} inside{ave}{end}"
+    expected = {"msg": f"contains {end} inside"}
+
+    # Non-streaming.
+    res = parser.extract_tool_calls(wire)
+    assert res.tools_called is True
+    assert res.tool_calls[0]["name"] == "logit"
+    assert json.loads(res.tool_calls[0]["arguments"]) == expected
+    # The literal end-token substring survives in the extracted value.
+    assert end in json.loads(res.tool_calls[0]["arguments"])["msg"]
+
+    # Streaming — char-by-char, reassembled.
+    parser.reset()
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert tool_acc[0]["name"] == "logit"
+    assert json.loads(tool_acc[0]["args"]) == expected
+    assert end in json.loads(tool_acc[0]["args"])["msg"]
+    assert content == ""
+
+
 def test_xml_pair_multi_key_with_type_coercion():
     """Multi-key XML variant — ``<arg_value>`` payload MUST be JSON-decoded so
     ``1`` → int, ``"two"`` → str, ``true`` → bool."""

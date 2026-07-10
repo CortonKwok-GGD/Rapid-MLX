@@ -665,9 +665,14 @@ class HyV3ToolParser(ToolParser):
         if sep != -1 and first_end != -1 and sep > first_end:
             sep = -1
         if sep == -1:
-            # No sep for THIS call — a plain find of the first end-token is the
-            # close (no JSON body of this call's own to protect).
-            return first_end
+            # No sep for THIS call. A sep-less XML-pair body can still carry an
+            # ``<arg_value>`` whose free-form text contains the literal
+            # ``<end_of_tool_call>`` string, so a plain find would truncate the
+            # call and drop the argument (codex R15 BLOCKING). Use the same
+            # tag-aware scan as the streaming path: accept only an end-token that
+            # lands OUTSIDE any ``<arg_value>…</arg_value>`` span (there is no
+            # JSON body of this call's own to protect).
+            return self._end_token_outside_arg_value(segment)
         args_at = sep + len(self.tool_sep_token)
         rel = self._find_call_close(segment[args_at:])
         return -1 if rel == -1 else args_at + rel
@@ -1218,10 +1223,49 @@ class HyV3ToolParser(ToolParser):
                 # real close. A completed-but-malformed body (``{bad}<end>``,
                 # codex R9) closes because its braces balance before the token.
                 return self._end_token_at_object_close(args_tail)
-        # Non-JSON (XML-pair / empty / bare) — plain find is safe because the
-        # close token never legitimately appears inside a pair value on the
-        # wire (values are themselves tag-delimited).
-        return args_tail.find(self.tool_call_end_token)
+        # Non-JSON (XML-pair / empty / bare). A ``<arg_value>`` payload CAN
+        # legitimately contain the literal ``<end_of_tool_call>`` string
+        # (free-form text), so a plain ``find`` would truncate the call early
+        # and drop the argument (codex R15 BLOCKING). Skip over each complete
+        # ``<arg_value>…</arg_value>`` span so an end-token INSIDE a value is
+        # never mistaken for the real close; accept the first end-token that
+        # lands OUTSIDE any arg-value span.
+        return self._end_token_outside_arg_value(args_tail)
+
+    def _end_token_outside_arg_value(self, body: str) -> int:
+        """Offset of the first ``<end_of_tool_call>`` in ``body`` that is NOT
+        inside a complete ``<arg_value>…</arg_value>`` span, or -1.
+
+        The XML-pair argument form (``<arg_key>K</arg_key><arg_value>V
+        </arg_value>``) may carry the literal wire end-token inside a value ``V``
+        as ordinary text. Walk the body tracking whether we are inside an
+        ``<arg_value>`` span (opened by ``<arg_value>``, closed by
+        ``</arg_value>``); an end-token seen while inside a span is argument
+        text, not the close. An UNTERMINATED trailing ``<arg_value>`` (value
+        still streaming, no ``</arg_value>`` yet) keeps us in-span to the end so
+        a literal end-token in the partial value does not close prematurely —
+        the caller keeps buffering until the value and the real close arrive.
+        """
+        end_tok = self.tool_call_end_token
+        av_open = self.arg_value_start_token
+        av_close = self.arg_value_end_token
+        i = 0
+        n = len(body)
+        in_value = False
+        while i < n:
+            if not in_value:
+                if body.startswith(end_tok, i):
+                    return i
+                if body.startswith(av_open, i):
+                    in_value = True
+                    i += len(av_open)
+                    continue
+            elif body.startswith(av_close, i):
+                in_value = False
+                i += len(av_close)
+                continue
+            i += 1
+        return -1
 
     def _end_token_at_object_close(self, body: str) -> int:
         """First ``<end_of_tool_call>`` in a ``{``-body that closes a
