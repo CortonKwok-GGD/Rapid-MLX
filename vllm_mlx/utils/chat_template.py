@@ -840,12 +840,22 @@ def _inject_tools_into_messages(messages: list[dict], tools: list[dict]) -> list
 # Codex round-3 NIT (PR #1070 finding #4): earlier form used unanchored
 # ``hunyuan.?3`` which happily matched substrings inside unrelated
 # names / paths (``not-hunyuanx3-test``, any local path containing
-# that character sequence). Tightening to family separators
-# (``/`` ``_`` ``.`` ``-``) plus start / end of string is precise
-# enough for HF repo paths and CLI alias forms while rejecting
-# incidental substrings.
+# that character sequence). Tightening to family separators plus
+# start / end of string is precise enough for HF repo paths and CLI
+# alias forms while rejecting incidental substrings.
+#
+# codex R13 BLOCKING: the TRAILING class must NOT include ``/`` (mirrors the
+# same fix in ``model_auto_config.py`` R11) — else a non-Hy3 repo under an HF
+# org / local parent directory named ``hy3`` (``hy3/qwen-model``,
+# ``some/hy3/nested-qwen``) had ``reasoning_effort="low"`` injected because the
+# ``hy3`` PARENT segment matched. The family root must sit in the FINAL path
+# segment (the repo/alias name): a LEADING separator (``/`` ``_`` ``.`` ``-``)
+# may precede the root, but the root must be followed by end-of-string OR an
+# in-segment continuation (``_`` ``.`` ``-``), never a ``/`` path boundary.
+# Still matches ``mlx-community/Hy3-preview-4bit``, bare ``hy3``, ``org/hy3``,
+# ``Hunyuan-3-Preview``.
 _HY3_MODEL_NAME_RE = re.compile(
-    r"(?:^|[/_.\-])(?:hy3|hy-v3|hunyuan[-_]?3)(?:$|[/_.\-])",
+    r"(?:^|[/_.\-])(?:hy3|hy-v3|hunyuan[-_]?3)(?:$|[_.\-])",
     re.IGNORECASE,
 )
 

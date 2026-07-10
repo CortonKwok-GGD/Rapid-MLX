@@ -45,6 +45,14 @@ from vllm_mlx.utils.chat_template import _looks_like_hy3, apply_chat_template
         ("not-hunyuanx3-test", False),
         ("mymodelhy3embedded", False),
         ("mlx-community/hunyuan5-preview", False),
+        # codex R13 BLOCKING: ``hy3`` as a PARENT / org / namespace segment must
+        # NOT match — only the FINAL path segment (repo/alias name) keys the
+        # family. Mirrors the model_auto_config.py R11 fix.
+        ("hy3/qwen-model", False),
+        ("some/hy3/nested-qwen", False),
+        # ``org/hy3`` (a repo literally named hy3) DOES match — hy3 is the
+        # basename there.
+        ("org/hy3", True),
     ],
 )
 def test_looks_like_hy3_predicate(name: str, expected: bool) -> None:
@@ -104,6 +112,23 @@ def test_non_hy3_model_never_sees_reasoning_effort_kwarg():
         tok,
         messages=[{"role": "user", "content": "Hello"}],
         model_name="qwen3.5-4b-4bit",
+    )
+    assert "reasoning_effort" not in tok.captured_kwargs
+
+
+def test_hy3_parent_segment_model_does_not_get_effort_injected():
+    """codex R13 BLOCKING: a non-Hy3 model living under an org / parent
+    directory named ``hy3`` (``hy3/qwen-model``) must NOT get
+    ``reasoning_effort='low'`` injected — the family root must be the repo
+    BASENAME, not a parent path segment. Otherwise a Qwen (or any) model served
+    from such a path would silently receive the Hy3-only kwarg and hit the
+    TypeError fallback chain (or, worse, mis-condition a template that happens
+    to accept it)."""
+    tok = _CapturingTokenizer()
+    apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "Capital of France?"}],
+        model_name="hy3/qwen-model",
     )
     assert "reasoning_effort" not in tok.captured_kwargs
 
