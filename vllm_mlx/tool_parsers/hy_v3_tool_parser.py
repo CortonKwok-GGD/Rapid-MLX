@@ -285,6 +285,12 @@ class HyV3ToolParser(ToolParser):
         # never emitted, so their args must not be emitted either (but the FSM
         # still advances on close so the next opener is a fresh call).
         self._suppressed_tools: set[int] = set()
+        # High-water mark of content chars already emitted (against the raw
+        # ``current_text``). Lets the tool-call entry flush any content that
+        # preceded the FIRST opener when the opener and its leading content
+        # arrive in the SAME delta (codex R3 BLOCKING: pre-opener content was
+        # silently dropped once any opener was present).
+        self._content_emitted: int = 0
 
     def reset(self) -> None:
         super().reset()
@@ -569,10 +575,19 @@ class HyV3ToolParser(ToolParser):
             # (handled below) or falsify into ordinary content.
             return self._emit_safe_content(previous_text, current_text)
 
-        # A tool call has opened somewhere in ``current_text``. This turn is a
-        # TOOL-CALL turn — content and tool_calls are mutually exclusive for a
-        # single assistant turn, so plain content deltas are suppressed and
-        # only tool-call deltas flow from here.
+        # A tool call has opened somewhere in ``current_text``. Before any
+        # tool-call delta, flush content that preceded the FIRST opener but was
+        # never emitted — this happens when the opener and its leading content
+        # arrive in the SAME delta, so ``_emit_safe_content`` above was skipped
+        # (codex R3 BLOCKING). The postprocessor treats a result as EITHER
+        # content OR tool_calls (never both in one delta), so the pending
+        # content is emitted this tick and the tool-call deltas flow on the
+        # next; ``finalize()`` re-parses the full text as a safety net either
+        # way. After the pre-opener gap is drained, plain content is suppressed
+        # (content and tool_calls are exclusive for a single assistant turn).
+        pending_content = self._flush_pre_opener_content(current_text)
+        if pending_content is not None:
+            return pending_content
         return self._stream_tool_call(current_text, request)
 
     def _safe_content_prefix(self, text: str) -> str:
@@ -599,12 +614,31 @@ class HyV3ToolParser(ToolParser):
         When everything new is a held opener prefix, returns ``None`` so no
         content event fires this round; the bytes surface once the tail
         resolves (opener completes → tool-call turn; or falsifies → content).
+        Advances ``_content_emitted`` so the tool-call entry knows exactly how
+        much of the pre-opener content already went out.
         """
         safe_current = self._safe_content_prefix(current_text)
         safe_previous = self._safe_content_prefix(previous_text)
         if len(safe_current) <= len(safe_previous):
             return None
+        self._content_emitted = len(safe_current)
         return {"content": safe_current[len(safe_previous) :]}
+
+    def _flush_pre_opener_content(self, current_text: str) -> dict[str, Any] | None:
+        """Emit content that preceded the FIRST opener but was never sent.
+
+        When the opener and its leading content land in the SAME delta, the
+        streaming entry skipped ``_emit_safe_content`` (an opener is present),
+        so the leading content was never emitted. Flush the gap between the
+        content high-water mark and the first opener exactly once, then advance
+        the mark past the opener so it never re-fires (codex R3 BLOCKING).
+        """
+        first_opener = current_text.find(self.tool_call_start_token)
+        if first_opener <= self._content_emitted:
+            return None
+        pending = current_text[self._content_emitted : first_opener]
+        self._content_emitted = first_opener
+        return {"content": pending} if pending else None
 
     def flush_held_content(self, full_text: str) -> str:
         """Release any prefix-held opener tail at stream end.
@@ -651,18 +685,49 @@ class HyV3ToolParser(ToolParser):
         finalized and the FSM transitions back to SEEKING_NAME so the next
         opener starts a fresh indexed call (codex BLOCKING: ``_name_sent``
         must reset per call).
+
+        DRAINS all calls processable THIS tick: after a call closes, if the
+        next opener is already present in ``current_text`` it is processed in
+        the same invocation, so two complete calls arriving in one streaming
+        delta both emit (codex R3 BLOCKING: one-opener-per-call dropped the
+        second same-delta call). The loop stops at the first call that does
+        not close (still streaming) or when no further opener has arrived.
+        """
+        deltas: list[dict[str, Any]] = []
+        while True:
+            step = self._process_one_call(current_text, request)
+            if step is None:
+                break
+            step_deltas, closed = step
+            deltas.extend(step_deltas)
+            if not closed:
+                # Current call still open — stop; the rest arrives next tick.
+                break
+            # Call closed and the FSM already advanced to the next index; if
+            # its opener is present we loop and drain it too, else stop.
+
+        return {"tool_calls": deltas} if deltas else None
+
+    def _process_one_call(
+        self, current_text: str, request: dict[str, Any] | None
+    ) -> tuple[list[dict[str, Any]], bool] | None:
+        """Process the single call at ``current_tool_id``.
+
+        Returns ``(deltas, closed)`` — the deltas to emit for this call this
+        tick and whether ``<end_of_tool_call>`` was seen (FSM advanced). Returns
+        ``None`` when there is nothing to do (no opener for this index yet, or
+        the name is not yet delimited).
         """
         opener_positions = self._opener_positions(current_text)
         if not opener_positions:
             return None
 
-        # The call currently being processed. ``current_tool_id`` starts at
-        # -1; the first SEEKING_NAME emit bumps it to 0. While streaming a
-        # call it stays put; on close we advance to the next opener.
+        # ``current_tool_id`` starts at -1; the first SEEKING_NAME emit bumps
+        # it to 0. While streaming a call it stays put; on close it advances.
         idx = self.current_tool_id if self.current_tool_id >= 0 else 0
         if idx >= len(opener_positions):
-            # We finished the last opener we know about and no new opener has
-            # arrived yet — nothing to do this tick.
+            # Finished the last opener we know about and no new opener has
+            # arrived yet — nothing to do.
             return None
 
         opener_pos = opener_positions[idx]
@@ -719,14 +784,15 @@ class HyV3ToolParser(ToolParser):
 
     def _emit_args_and_advance(
         self, buffer: str, sep_idx: int, header: dict[str, Any] | None
-    ) -> dict[str, Any] | None:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Emit the args document once the call closes and advance the FSM.
 
-        ``header`` is the phase-1 header dict for a same-delta call (name +
-        empty args); it is folded into the same emission so a whole call in
-        one delta yields BOTH name and args. When the call is a suppressed
-        off-list call, ``header`` is ``None`` and nothing is emitted — but the
-        FSM still advances on close so the next opener is a fresh call.
+        Returns ``(deltas, closed)``. ``header`` is the phase-1 header dict for
+        a same-delta call (name + empty args); it is folded into the same
+        emission so a whole call in one delta yields BOTH name and args. When
+        the call is a suppressed off-list call, ``header`` is ``None`` and
+        nothing is emitted — but the FSM still advances on close so the next
+        opener is a fresh call.
 
         Arguments are ONLY emitted when ``<end_of_tool_call>`` has arrived, as
         a single complete-JSON delta — never a partial fragment.
@@ -766,12 +832,12 @@ class HyV3ToolParser(ToolParser):
 
         if closed:
             # Transition back to SEEKING_NAME so the next opener (if any)
-            # starts a fresh indexed call on the next tick.
+            # starts a fresh indexed call on the next drain iteration / tick.
             self.current_tool_id = idx + 1
             self._name_sent = False
             self._current_tool_ref = None
 
-        return {"tool_calls": deltas} if deltas else None
+        return deltas, closed
 
     def _final_args_json(self, args_tail: str) -> str:
         """Serialize the complete args body (JSON or XML pairs) to a JSON

@@ -691,3 +691,87 @@ def test_has_pending_tool_call_recognises_suffix_variant():
         is False
     )
     assert parser.has_pending_tool_call("just a plain message") is False
+
+
+# ---------------------------------------------------------------------------
+# codex R3 regressions: same-delta multi-call drain + pre-opener content flush
+# ---------------------------------------------------------------------------
+def test_streaming_two_complete_calls_in_one_delta_both_emit():
+    """TWO complete tool calls arriving in a SINGLE streaming delta MUST both
+    emit — the streaming path drains every call processable this tick, not just
+    the first opener. codex R3 BLOCKING: the pre-fix processed one opener per
+    invocation, dropping the second same-delta call until another delta (which
+    may never come) arrived."""
+    parser = HyV3ToolParser()
+    one_delta = (
+        '<tool_call:opensource>get_a<tool_sep:opensource>{"x": 1}'
+        "<end_of_tool_call:opensource>"
+        '<tool_call:opensource>get_b<tool_sep:opensource>{"y": 2}'
+        "<end_of_tool_call:opensource>"
+    )
+    # A SINGLE chunk carrying both complete calls (the exact codex scenario).
+    tool_acc, content = _collect_stream(parser, [one_delta])
+    assert sorted(tool_acc.keys()) == [0, 1]
+    assert tool_acc[0]["name"] == "get_a"
+    assert json.loads(tool_acc[0]["args"]) == {"x": 1}
+    assert tool_acc[1]["name"] == "get_b"
+    assert json.loads(tool_acc[1]["args"]) == {"y": 2}
+    assert content == ""
+
+
+def test_streaming_content_before_opener_in_same_delta_not_dropped():
+    """Content that precedes the FIRST opener in the SAME delta as the tool call
+    MUST be emitted, not silently dropped. codex R3 BLOCKING: once any opener
+    was present, the tool-call branch suppressed all plain text — losing the
+    leading prose when the model emitted content + a complete call in one
+    chunk.
+
+    The postprocessor treats each streaming result as EITHER content OR
+    tool_calls (never both in one delta), so the pre-opener content is emitted
+    on the delta that first carries the opener and the tool-call deltas flow on
+    the NEXT delta. This mirrors the real two-stage flow: here the content is
+    flushed first, then a follow-up (empty) delta drains the now-visible call.
+    """
+    parser = HyV3ToolParser()
+    parser.reset()
+    step = _stepper(parser)
+    m1 = step(
+        "Let me look that up. "
+        "<tool_call:opensource>search<tool_sep:opensource>"
+        '{"q": "weather"}<end_of_tool_call:opensource>'
+    )
+    # First result: the pre-opener content, emitted (not dropped).
+    assert m1 is not None
+    assert m1.get("content") == "Let me look that up. "
+    assert "tool_calls" not in m1
+    # Next invocation (no new bytes) drains the now-visible complete call. The
+    # header (name) and args may arrive as separate list entries in the same
+    # result, so accumulate name/args across all deltas (as a real client does).
+    m2 = step("")
+    assert m2 is not None and "tool_calls" in m2
+    name = ""
+    args = ""
+    for tc in m2["tool_calls"]:
+        fn = tc.get("function", {})
+        if fn.get("name"):
+            name = fn["name"]
+        if fn.get("arguments"):
+            args += fn["arguments"]
+    assert name == "search"
+    assert json.loads(args) == {"q": "weather"}
+
+
+def test_streaming_content_before_opener_char_by_char_not_dropped():
+    """The same pre-opener content, delivered char-by-char, still surfaces
+    exactly once and the call still parses — the incremental content path and
+    the same-delta flush must agree (no double-emit, no drop)."""
+    parser = HyV3ToolParser()
+    wire = (
+        "Sure! "
+        "<tool_call:opensource>search<tool_sep:opensource>"
+        '{"q": "x"}<end_of_tool_call:opensource>'
+    )
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert content == "Sure! "
+    assert tool_acc[0]["name"] == "search"
+    assert json.loads(tool_acc[0]["args"]) == {"q": "x"}

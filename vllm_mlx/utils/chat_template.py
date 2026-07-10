@@ -980,7 +980,8 @@ def apply_chat_template(
     # Override the default to ``low`` for Hy3 so out-of-the-box requests
     # produce correct answers without the client having to learn the
     # template kwarg. Fires ONLY when:
-    #   * model_name signals Hy3 (case-insensitive substring match)
+    #   * model_name signals Hy3 (separator-bounded, case-insensitive family
+    #     match via `_HY3_MODEL_NAME_RE` — not a loose substring)
     #   * ``enable_thinking`` is not False (a client that explicitly
     #     disabled thinking wants no_think — respect that intent)
     # A future revision may add explicit request-side ``reasoning_effort``
