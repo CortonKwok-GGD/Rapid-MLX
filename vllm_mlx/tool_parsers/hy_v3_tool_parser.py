@@ -943,7 +943,16 @@ class HyV3ToolParser(ToolParser):
                 #       parser and emit header + args in one tick, then advance.
                 #   * the block is NOT closed → the name simply is not delimited
                 #     yet; keep buffering, emit nothing.
-                if self.tool_call_end_token in buffer:
+                # Gate on a close-token OUTSIDE any ``<arg_value>…</arg_value>``
+                # span, not a plain ``in`` check: a sep-less XML-pair value may
+                # carry the literal ``<end_of_tool_call>`` as free-form text while
+                # its ``<arg_value>`` is still streaming (no ``</arg_value>`` yet).
+                # A plain ``in`` would fire ``_emit_sepless_closed_call`` on that
+                # interior literal, parse the still-open body to ``{}`` and drop
+                # the argument (codex R16, same hazard as R15's ``_find_call_close``
+                # / ``_find_call_close_in_body`` fixes). Keep buffering until a
+                # real close lands outside every value span.
+                if self._end_token_outside_arg_value(buffer) != -1:
                     return self._emit_sepless_closed_call(buffer, idx, request)
                 if idx + 1 < len(opener_positions):
                     # No sep and no close in this block, but a LATER opener
@@ -1061,7 +1070,11 @@ class HyV3ToolParser(ToolParser):
         delta JSON path. Then the FSM advances to the next index so a following
         opener in the same delta drains too (codex R10 BLOCKING).
         """
-        end_at = buffer.find(self.tool_call_end_token)
+        # A sep-less XML-pair value may carry the literal ``<end_of_tool_call>``
+        # string as free-form text; skip complete ``<arg_value>…</arg_value>``
+        # spans so it is not mistaken for the close (codex R16, same hazard as
+        # R15's ``_find_call_close`` / ``_find_call_close_in_body`` fixes).
+        end_at = self._end_token_outside_arg_value(buffer)
         body = buffer[:end_at] if end_at != -1 else buffer
         name, args = self._parse_body(body)
 

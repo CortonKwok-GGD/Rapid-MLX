@@ -1128,6 +1128,35 @@ def test_streaming_sepless_first_call_char_by_char_both_emit():
     assert content == ""
 
 
+def test_streaming_sepless_xml_arg_value_containing_literal_end_token():
+    """A SEP-LESS XML-pair body whose ``<arg_value>`` carries the literal
+    ``<end_of_tool_call>`` string as free-form text MUST stream to the full
+    value, not truncate at the interior literal (codex R16 — the streaming
+    sep-less path, the THIRD occurrence of the class R15 fixed for the sep-full
+    streaming ``_find_call_close`` and non-streaming ``_find_call_close_in_body``
+    paths). The premature-close hazard is char-by-char: the interior literal
+    end-token completes while its ``<arg_value>`` is still open (no
+    ``</arg_value>`` yet), so a plain ``in`` gate would fire the sep-less drain
+    early and parse the still-open body to ``{}``. The FSM must keep buffering
+    until a close lands OUTSIDE every ``<arg_value>…</arg_value>`` span."""
+    parser = HyV3ToolParser()
+    end = parser.tool_call_end_token
+    oc = parser.tool_call_start_token
+    ak, ake = parser.arg_key_start_token, parser.arg_key_end_token
+    av, ave = parser.arg_value_start_token, parser.arg_value_end_token
+    # No ``<tool_sep>`` — the sep-less XML-pair body. The value carries the
+    # literal wire end-token before the REAL trailing close.
+    wire = f"{oc}doit{ak}m{ake}{av}has {end} literal{ave}{end}"
+    expected = {"m": f"has {end} literal"}
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert sorted(tool_acc.keys()) == [0]
+    assert tool_acc[0]["name"] == "doit"
+    assert json.loads(tool_acc[0]["args"]) == expected
+    # The literal end-token substring survives in the streamed value.
+    assert end in json.loads(tool_acc[0]["args"])["m"]
+    assert content == ""
+
+
 def test_streaming_bare_name_sepless_call_emits_empty_args():
     """A bare-name sep-less call (``<tool_call>ping<end>`` — no separator, no
     args) MUST emit a call with ``{}`` args, not stall the FSM."""
