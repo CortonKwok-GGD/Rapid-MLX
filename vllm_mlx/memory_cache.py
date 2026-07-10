@@ -1052,10 +1052,28 @@ def _needs_kv_trim(layer: Any) -> bool:
 # hybrid entry that fetch will never reuse but store retains forever is pure
 # leak: so we DROP it at store time (whole entry — see below).
 #
-# Class-name allowlist mirrors ``prefix_cache._SEQ_AXIS_KV_CLASSES`` for the
-# dict-form extracted cache (block-aware path, where layers are
-# ``{"class_name": ...}`` dicts, not live objects).
-_TRIMMABLE_CACHE_CLASSES = frozenset({"KVCache", "QuantizedKVCache"})
+# For the dict-form extracted cache (block-aware path, where layers are
+# ``{"class_name": ...}`` dicts, not live objects) we cannot call
+# ``is_trimmable()``, so we match ``class_name`` against a DENYLIST of the
+# known recurrent-state cache classes. A denylist (not an allowlist of KV
+# classes) is deliberate: it keeps the dict path consistent with the
+# conservative object-path default — an UNKNOWN or new trimmable KV class
+# (``RotatingKVCache`` / ``ChunkedKVCache`` / ``ConcatenateKVCache`` / a future
+# addition) stays cacheable (status quo) instead of being wrongly dropped and
+# regressing prefix reuse for dense / sliding-window models. Only classes that
+# are affirmatively recurrent-state (``ArraysCache`` and Mamba-style aliases)
+# are dropped. Names are matched leniently (substring) so vendor-suffixed
+# variants (``MambaCache`` etc.) are also caught.
+_RECURRENT_STATE_CACHE_CLASSES = frozenset({"ArraysCache", "MambaCache"})
+
+
+def _class_name_is_recurrent(class_name: str) -> bool:
+    """True if ``class_name`` names a known recurrent-state (non-trimmable) cache."""
+    if class_name in _RECURRENT_STATE_CACHE_CLASSES:
+        return True
+    # Lenient substring match for vendor/variant names (e.g. "MambaCache2",
+    # "GatedDeltaNetArraysCache"). "KVCache" etc. never contain these tokens.
+    return any(marker in class_name for marker in _RECURRENT_STATE_CACHE_CLASSES)
 
 
 def _layer_is_non_trimmable(layer: Any) -> bool:
@@ -1076,17 +1094,17 @@ def _layer_is_non_trimmable(layer: Any) -> bool:
         non-trimmable here — modern mlx-lm (0.29+) gives every cache class the
         method, so its absence means a test double / unknown shape, which we
         leave cacheable rather than guess from the absence of ``trim``.
-      * dict-form extracted states (block-aware path) — keyed on ``class_name``
-        against the trimmable allowlist (mirrors
-        ``prefix_cache._SEQ_AXIS_KV_CLASSES``).
+      * dict-form extracted states (block-aware path) — matched on
+        ``class_name`` against the recurrent-state DENYLIST (unknown/new KV
+        classes stay cacheable).
     """
     if layer is None:
         return False
     if isinstance(layer, dict):
         class_name = layer.get("class_name")
-        if class_name is None:
+        if not class_name:
             return False
-        return class_name not in _TRIMMABLE_CACHE_CLASSES
+        return _class_name_is_recurrent(class_name)
     is_trimmable = getattr(layer, "is_trimmable", None)
     if callable(is_trimmable):
         try:

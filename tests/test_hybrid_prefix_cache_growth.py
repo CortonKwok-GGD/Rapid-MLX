@@ -217,6 +217,41 @@ def test_dict_form_all_kvcache_stored(cache):
     assert tuple(prompt) in cache._entries
 
 
+@pytest.mark.parametrize(
+    "kv_class", ["RotatingKVCache", "ChunkedKVCache", "ConcatenateKVCache", "QuantizedKVCache"]
+)
+def test_dict_form_trimmable_kv_variants_still_stored(cache, kv_class):
+    """Dict-form sliding-window / other trimmable KV classes must NOT be dropped.
+
+    Regression for codex #1075 finding: an allowlist of only KVCache would
+    wrongly classify RotatingKVCache & friends as non-trimmable and drop the
+    entry, regressing prefix reuse for dense / sliding-window models. The
+    denylist keeps them cacheable.
+    """
+    prompt = list(range(1000, 1100))
+    dict_cache = [
+        {"class_name": kv_class, "state": (1, 2), "meta_state": ("0",)},
+        {"class_name": kv_class, "state": (3, 4), "meta_state": ("0",)},
+    ]
+
+    assert cache.store(prompt, dict_cache) is True, (
+        f"{kv_class} is trimmable and must remain cacheable"
+    )
+    assert tuple(prompt) in cache._entries
+
+
+def test_dict_form_mamba_variant_dropped(cache):
+    """Vendor-suffixed recurrent class names are caught by substring match."""
+    prompt = list(range(1000, 1100))
+    dict_cache = [
+        {"class_name": "KVCache", "state": (1, 2), "meta_state": ("0",)},
+        {"class_name": "GatedDeltaNetArraysCache", "state": (3, 4), "meta_state": ("0",)},
+    ]
+
+    assert cache.store(prompt, dict_cache) is False
+    assert tuple(prompt) not in cache._entries
+
+
 # ---------------------------------------------------------------------------
 # Guards preserved from the #214 era: trim-required matches still MISS. These
 # now also never even reach fetch (store dropped them), but the fetch-side
