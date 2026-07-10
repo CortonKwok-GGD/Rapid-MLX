@@ -150,6 +150,15 @@ def _resolve_suffix(tokenizer: PreTrainedTokenizerBase | None) -> str:
 
     # ONLY consider suffixes whose parsing-critical trio is fully present —
     # an incomplete suffix would break every downstream ``find``.
+    #
+    # The trio is ``tool_call`` / ``tool_sep`` / ``end_of_tool_call`` — the
+    # tokens EVERY call carries. ``arg_key`` / ``arg_value`` are DELIBERATELY
+    # excluded (codex R9 NIT): the XML-pair argument form is an OPTIONAL variant
+    # (a checkpoint may emit only JSON bodies and never carry the arg tokens),
+    # so requiring them would wrongly reject a valid JSON-only suffix. When a
+    # checkpoint does emit XML-pair args it carries the arg tokens under the
+    # SAME suffix as the trio (they are minted together), so the JSON-only
+    # completeness check still resolves the right suffix for XML-pair parsing.
     required = {"tool_call", "tool_sep", "end_of_tool_call"}
     candidates = [s for s in by_suffix if required.issubset(by_suffix[s])]
     if not candidates:
@@ -941,11 +950,19 @@ class HyV3ToolParser(ToolParser):
     def _find_call_close(self, args_tail: str) -> int:
         """Offset of the ``<end_of_tool_call>`` that closes this call, or -1.
 
-        JSON-aware: when the args are a JSON body, a literal
-        ``<end_of_tool_call>`` inside a string value is NOT a close — search
-        for the real close only AFTER the well-formed JSON prefix. Mirrors the
-        ``</arg_value>`` literal handling; ``raw_decode`` consumes only the
-        valid JSON prefix so an interior literal is ignored.
+        JSON-aware: when the args are a WELL-FORMED JSON body, a literal
+        ``<end_of_tool_call>`` inside a string value is NOT a close — search for
+        the real close only AFTER the JSON prefix (``raw_decode`` consumes only
+        the valid JSON prefix so an interior literal is ignored). This mirrors
+        the ``</arg_value>`` literal handling.
+
+        When the ``{``-body does NOT ``raw_decode`` (malformed OR still
+        truncated mid-stream) we distinguish by the presence of the close token
+        (codex R9 BLOCKING): if ``<end_of_tool_call>`` is present, the call IS
+        closed — a completed call whose body is malformed junk (``{bad}``) must
+        still emit (``_final_args_json`` degrades the args to ``"{}"``), NOT be
+        dropped as no-call. If the close token is absent the JSON is simply
+        incomplete and still streaming, so return -1 and wait for more.
         """
         stripped = args_tail.lstrip()
         lead_ws = len(args_tail) - len(stripped)
@@ -957,8 +974,10 @@ class HyV3ToolParser(ToolParser):
                     pos = args_tail.find(after, lead_ws + end)
                     return pos
             except (json.JSONDecodeError, ValueError):
-                # JSON not complete yet — no valid close can precede it.
-                return -1
+                # Malformed or still-truncated body. If the close token is
+                # present the call is complete (degrade args to ``{}``); else
+                # it is still streaming.
+                return args_tail.find(self.tool_call_end_token)
         # Non-JSON (XML-pair / empty / bare) — plain find is safe because the
         # close token never legitimately appears inside a pair value on the
         # wire (values are themselves tag-delimited).

@@ -245,6 +245,17 @@ class Hy3ReasoningParser(Qwen3ReasoningParser):
         into_reasoning = self.is_open_in_think(accumulated_text)
         base_content = getattr(base, "content", None) if base else None
         base_reasoning = getattr(base, "reasoning", None) if base else None
+        # Only append the held tail when the base finalize did NOT already
+        # surface it (codex R9 BLOCKING: ``super().finalize_streaming`` may or
+        # may not have withheld the raw tail; blindly appending risks
+        # double-emitting it, e.g. content ending in ``<think``). The base
+        # operates on the NORMALISED text, so compare against the normalised
+        # tail — if the target channel already ends with it, it is present and
+        # we leave ``base`` untouched.
+        norm_tail = _normalize_hy3_tags(tail)
+        target = base_reasoning if into_reasoning else base_content
+        if target is not None and norm_tail and target.endswith(norm_tail):
+            return base
         if into_reasoning:
             base_reasoning = (base_reasoning or "") + tail
         else:

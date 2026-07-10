@@ -218,6 +218,66 @@ def test_truncated_xml_pair_missing_close_is_not_salvaged():
     assert res.content == out
 
 
+def test_completed_call_with_malformed_json_body_degrades_to_empty_args():
+    """codex R9 BLOCKING: a COMPLETED call (has ``<end_of_tool_call>``) whose
+    JSON body is malformed junk (``{bad}``) must still emit a tool call — with
+    args degraded to ``{}`` — NOT be dropped as no-call. Only a body that is
+    still truncated (no close token) waits."""
+    parser = HyV3ToolParser()
+    out = "<tool_call:opensource>fn<tool_sep:opensource>{bad json}<end_of_tool_call:opensource>"
+    res = parser.extract_tool_calls(out)
+    assert res.tools_called is True
+    assert res.tool_calls[0]["name"] == "fn"
+    assert res.tool_calls[0]["arguments"] == "{}"
+
+
+def test_streaming_completed_call_malformed_json_degrades_to_empty_args():
+    """The streaming mirror of the above — a whole call with a malformed JSON
+    body but a real close emits ``fn`` with ``{}`` args."""
+    parser = HyV3ToolParser()
+    tool_acc, _content = _collect_stream(
+        parser,
+        list(
+            "<tool_call:opensource>fn<tool_sep:opensource>{bad}<end_of_tool_call:opensource>"
+        ),
+    )
+    assert tool_acc[0]["name"] == "fn"
+    assert json.loads(tool_acc[0]["args"]) == {}
+
+
+def test_truncated_json_body_no_close_is_not_a_call():
+    """A ``{``-body that is still TRUNCATED (no ``<end_of_tool_call>`` yet) is
+    NOT a completed call — it is incomplete output, preserved as content."""
+    parser = HyV3ToolParser()
+    out = '<tool_call:opensource>fn<tool_sep:opensource>{"a": 1'  # no close
+    res = parser.extract_tool_calls(out)
+    assert res.tools_called is False
+    assert res.content == out
+
+
+def test_suffix_resolution_is_json_only_complete_xml_tokens_not_required():
+    """codex R9 NIT (documented-as-intentional): the suffix completeness check
+    uses the JSON-only trio (call/sep/end); ``arg_key`` / ``arg_value`` are an
+    optional XML-pair variant and are NOT required. A vocab with a complete trio
+    under ``:opensource`` but NO arg tokens still resolves ``:opensource`` and
+    parses JSON-body calls."""
+    tok = _FakeTokenizer(
+        {
+            "<tool_call:opensource>": 1,
+            "<tool_sep:opensource>": 2,
+            "<end_of_tool_call:opensource>": 3,
+            # deliberately NO <arg_key:...> / <arg_value:...>
+        }
+    )
+    parser = HyV3ToolParser(tokenizer=tok)
+    assert parser.suffix == ":opensource"
+    res = parser.extract_tool_calls(
+        '<tool_call:opensource>fn<tool_sep:opensource>{"a": 1}<end_of_tool_call:opensource>'
+    )
+    assert res.tools_called is True
+    assert json.loads(res.tool_calls[0]["arguments"]) == {"a": 1}
+
+
 def test_json_body_then_stray_arg_value_opener_salvages_args():
     """Second real malformed shape from the spike: a well-formed JSON body
     followed by a STRAY ``<arg_value>`` opener before the canonical close

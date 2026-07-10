@@ -1021,10 +1021,20 @@ def apply_chat_template(
             # would then run without the override, regressing Hy3 factual
             # recall). When the failure is about tools, keep reasoning_effort so
             # the tools fallback preserves it.
-            if "reasoning_effort" in str(e2):
+            # Match Python's ACTUAL unexpected-kwarg error text rather than a
+            # loose substring (codex R9 NIT: a template/user error that merely
+            # mentions ``reasoning_effort`` in another context must not trigger
+            # the drop). CPython raises: "<fn>() got an unexpected keyword
+            # argument 'reasoning_effort'".
+            _e2 = str(e2)
+            reasoning_effort_is_culprit = (
+                "unexpected keyword argument 'reasoning_effort'" in _e2
+                or 'unexpected keyword argument "reasoning_effort"' in _e2
+            )
+            if reasoning_effort_is_culprit:
                 logger.debug(
                     "Chat template TypeError persisted, dropping "
-                    "reasoning_effort (named in error): %s",
+                    "reasoning_effort (named as unexpected kwarg): %s",
                     e2,
                 )
                 template_kwargs.pop("reasoning_effort", None)

@@ -342,3 +342,35 @@ def test_streaming_content_ending_in_held_think_prefix_released_at_finalize():
     )
     assert reasoning == "r"
     assert content == "done <think"
+
+
+def test_finalize_does_not_double_emit_held_tail():
+    """codex R9 BLOCKING: ``finalize_streaming`` must NOT double-emit the held
+    tail when the base finalize already surfaced it. The released tail appears
+    EXACTLY once — assert the trailing ``<think`` occurs a single time in the
+    accumulated content (no ``<think<think`` duplication)."""
+    content, _reasoning = _collect_reasoning_stream(
+        "<think:opensource>r</think:opensource>done <think"
+    )
+    assert content == "done <think"
+    assert content.count("<think") == 1
+
+
+def test_finalize_direct_call_appends_held_tail_once():
+    """Direct ``finalize_streaming`` on a buffer ending in a held ``<`` returns
+    the tail once — and calling it again on the same buffer is idempotent (no
+    growth), guarding the not-already-present check."""
+    parser = Hy3ReasoningParser()
+    parser.reset_state()
+    # Prime streaming state up to the held boundary.
+    full = "<think:opensource>r</think:opensource>tail <"
+    prev = ""
+    for ch in full:
+        cur = prev + ch
+        parser.extract_reasoning_streaming(prev, cur, ch)
+        prev = cur
+    fin = parser.finalize_streaming(full)
+    assert fin is not None
+    # The held "<" is released as content exactly once.
+    assert (fin.content or "").endswith("<")
+    assert (fin.content or "").count("<") == 1

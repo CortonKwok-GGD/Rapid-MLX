@@ -241,3 +241,44 @@ def test_hy3_reasoning_effort_survives_tools_fallback():
     # the second TypeError was about tools, not reasoning_effort.
     assert tok.calls[-1].get("reasoning_effort") == "low"
     assert "tools" not in tok.calls[-1]
+
+
+def test_reasoning_effort_not_dropped_on_unrelated_error_mentioning_it():
+    """codex R9 NIT: the drop decision matches Python's ACTUAL unexpected-kwarg
+    error text, not a loose substring. A ``tools`` failure whose message merely
+    MENTIONS ``reasoning_effort`` in passing must NOT drop the override — only
+    ``unexpected keyword argument 'reasoning_effort'`` triggers the drop."""
+
+    class MisleadingErrorTokenizer:
+        """Rejects enable_thinking, then tools with a message that incidentally
+        mentions reasoning_effort (but is NOT an unexpected-kwarg error for
+        it)."""
+
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "enable_thinking" in kwargs:
+                raise TypeError(
+                    "apply_chat_template() got unexpected keyword "
+                    "argument 'enable_thinking'"
+                )
+            if "tools" in kwargs:
+                # Message mentions reasoning_effort but the CULPRIT is tools.
+                raise TypeError(
+                    "template does not support tools when reasoning_effort is set"
+                )
+            return "<injected ok>"
+
+    tok = MisleadingErrorTokenizer()
+    result = apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        model_name="hy3-preview-4bit",
+        tools=[{"type": "function", "function": {"name": "get_weather"}}],
+    )
+    assert result == "<injected ok>"
+    # reasoning_effort must SURVIVE — the error text was not the exact
+    # unexpected-kwarg shape for reasoning_effort.
+    assert tok.calls[-1].get("reasoning_effort") == "low"
