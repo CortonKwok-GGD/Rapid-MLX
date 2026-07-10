@@ -374,3 +374,43 @@ def test_finalize_direct_call_appends_held_tail_once():
     # The held "<" is released as content exactly once.
     assert (fin.content or "").endswith("<")
     assert (fin.content or "").count("<") == 1
+
+
+def test_finalize_streaming_partial_close_tag_not_leaked_as_reasoning():
+    """codex R17 BLOCKING: a stream truncated mid-CLOSE-tag while still inside
+    an open think span (``<think:opensource>r</think`` — note ``</think`` has
+    NO closing ``>``) must NOT leak the incomplete ``</think`` delimiter into
+    reasoning OR content. A partial close-tag prefix is opaque markup the model
+    started emitting, not user-visible text — drop it. Contrast R8: a partial
+    OPEN-tag prefix in already-closed content (``done <think``) IS legitimate
+    content and is still surfaced (asserted above)."""
+    parser = Hy3ReasoningParser()
+    parser.reset_state()
+    dm = parser.finalize_streaming("<think:opensource>r</think")
+    reasoning = getattr(dm, "reasoning", None) if dm else None
+    content = getattr(dm, "content", None) if dm else None
+    # The incomplete close delimiter must not appear in either channel.
+    assert "</think" not in (reasoning or ""), (
+        f"partial close tag leaked into reasoning: {reasoning!r}"
+    )
+    assert "</think" not in (content or ""), (
+        f"partial close tag leaked into content: {content!r}"
+    )
+    # No stray ``<`` markup from the delimiter should survive anywhere either.
+    assert "</" not in (reasoning or "") and "</" not in (content or "")
+
+
+def test_finalize_streaming_wellformed_close_tag_surfaces_reasoning():
+    """Control for R17: a PROPERLY closed think span
+    (``<think:opensource>r</think:opensource>``) surfaces ``r`` as reasoning
+    with no stray tag markup — the partial-close drop must not disturb the
+    well-formed path."""
+    parser = Hy3ReasoningParser()
+    parser.reset_state()
+    reasoning, content = parser.extract_reasoning(
+        "<think:opensource>r</think:opensource>"
+    )
+    assert reasoning is not None and "r" in reasoning
+    assert "<think" not in reasoning and "</think" not in reasoning
+    # No leftover delimiter markup in content either.
+    assert "</think" not in (content or "") and "<think" not in (content or "")

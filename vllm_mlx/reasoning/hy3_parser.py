@@ -242,6 +242,40 @@ class Hy3ReasoningParser(Qwen3ReasoningParser):
         # it is a delimiter the base handles — do not leak it as content.
         if _HY3_OPEN_TAG_RE.fullmatch(tail) or _HY3_CLOSE_TAG_RE.fullmatch(tail):
             return base
+        # If the tail is a PARTIAL CLOSE-tag prefix (``</`` … ``</think`` …
+        # ``</think:opensou``) the stream was truncated mid-close — the model had
+        # started emitting the close delimiter but the run ended before the ``>``.
+        # An incomplete close delimiter is opaque markup, never user-visible text,
+        # so DROP it rather than leak ``</think`` into reasoning/content (codex
+        # R17). We do NOT drop partial OPEN-tag prefixes (a lone ``<`` or
+        # ``<think`` sitting in already-closed content, e.g. ``done <think``): R8
+        # pins those as legitimate content that must still surface — an unfinished
+        # ``<...`` in the content region is ambiguously text the model typed,
+        # whereas an unfinished ``</...`` can only ever be a close delimiter.
+        #
+        # ``</think`` (no closing ``>``) is NOT rewritten by ``_normalize_hy3_tags``
+        # (which only matches complete tags), so the base finalize — routing the
+        # unclosed think buffer to a channel — can itself surface the raw partial
+        # tag (``<think:opensource>r</think`` → base content ``r</think``). Return
+        # ``base`` with the partial-close bytes STRIPPED off whichever channel ends
+        # with them, so the incomplete delimiter never reaches the wire.
+        if _HY3_CLOSE_STRADDLE_RE.fullmatch(tail):
+            if base is None:
+                return None
+            base_content = getattr(base, "content", None)
+            base_reasoning = getattr(base, "reasoning", None)
+            stripped = False
+            if base_content is not None and base_content.endswith(tail):
+                base_content = base_content[: len(base_content) - len(tail)] or None
+                stripped = True
+            if base_reasoning is not None and base_reasoning.endswith(tail):
+                base_reasoning = (
+                    base_reasoning[: len(base_reasoning) - len(tail)] or None
+                )
+                stripped = True
+            if not stripped:
+                return base
+            return DeltaMessage(content=base_content, reasoning=base_reasoning)
         into_reasoning = self.is_open_in_think(accumulated_text)
         base_content = getattr(base, "content", None) if base else None
         base_reasoning = getattr(base, "reasoning", None) if base else None
