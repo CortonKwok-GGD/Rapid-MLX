@@ -1171,3 +1171,87 @@ def test_text_format_call_still_recovered_by_non_streaming_extract():
     )
     assert result.tools_called is True
     assert [c.get("name") for c in result.tool_calls] == ["get_weather"]
+
+
+# ---------------------------------------------------------------------------
+# codex R11 regressions: literal close-token inside an unterminated JSON
+# string, garbled opener before a real call
+# ---------------------------------------------------------------------------
+def test_streaming_literal_end_token_in_unterminated_json_string_does_not_close():
+    """codex R11 BLOCKING #1: a still-streaming JSON string value that contains
+    the literal ``<end_of_tool_call>`` MUST NOT prematurely close the call.
+
+    On the ``raw_decode``-failed path (JSON not yet complete) the parser used to
+    accept the FIRST ``<end_of_tool_call>`` substring — but an unterminated
+    string can legitimately carry that literal, so the call closed early and
+    emitted ``{}``. The fix accepts only a close token OUTSIDE a JSON string.
+    Delivered char-by-char, the args must reassemble to the full JSON with the
+    literal preserved inside the string value, and no ``{}`` must be emitted
+    early.
+    """
+    parser = HyV3ToolParser()
+    wire = (
+        "<tool_call:opensource>log<tool_sep:opensource>"
+        '{"m": "contains <end_of_tool_call:opensource> inside"}'
+        "<end_of_tool_call:opensource>"
+    )
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert sorted(tool_acc.keys()) == [0]
+    assert tool_acc[0]["name"] == "log"
+    assert json.loads(tool_acc[0]["args"]) == {
+        "m": "contains <end_of_tool_call:opensource> inside"
+    }
+    assert content == ""
+
+
+def test_find_call_close_distinguishes_incomplete_from_malformed_complete():
+    """Unit-level: the ``raw_decode``-failed branch must return -1 for an
+    INCOMPLETE JSON whose only close-token occurrence is inside an unterminated
+    string, but a NON-NEGATIVE offset for a MALFORMED-but-COMPLETE body
+    (``{bad}<end>`` — codex R9) whose close sits outside any string."""
+    parser = HyV3ToolParser()
+    end = parser.tool_call_end_token
+    # Incomplete: unterminated string containing the literal close token.
+    assert parser._find_call_close(f'{{"m": "x {end} y') == -1
+    # Malformed but complete: close token is outside a string.
+    assert parser._find_call_close(f"{{bad}}{end}") >= 0
+
+
+def test_streaming_garbled_opener_before_real_call_does_not_steal_separator():
+    """codex R11 BLOCKING #2: a garbled/truncated opener (no ``<tool_sep>`` and
+    no ``<end_of_tool_call>`` of its own) immediately before a valid call MUST
+    NOT steal the real call's separator and fabricate a bogus name.
+
+    ``_find_call_close_in_body`` used to scan for ``<tool_sep>`` across the whole
+    remaining segment, so the garbled first opener consumed the real call's
+    separator — producing a single call named ``gar<tool_call>realtool``. The
+    fix bounds each call's body to before the next opener and skips a
+    close-less/sep-less residue opener, resuming at the later opener.
+    """
+    parser = HyV3ToolParser()
+    wire = (
+        "<tool_call:opensource>gar"  # garbled: no sep, no close
+        '<tool_call:opensource>realtool<tool_sep:opensource>{"x": 1}'
+        "<end_of_tool_call:opensource>"
+    )
+    tool_acc, _content = _collect_stream(parser, [wire])
+    # Exactly the real call surfaces (at its own index); no fabricated name.
+    names = {v["name"] for v in tool_acc.values() if v["name"]}
+    assert names == {"realtool"}, f"unexpected names: {names}"
+    real = next(v for v in tool_acc.values() if v["name"] == "realtool")
+    assert json.loads(real["args"]) == {"x": 1}
+
+
+def test_opener_positions_skips_garbled_opener_keeps_real_call():
+    """Unit-level for R11 #2: ``_opener_positions`` records BOTH openers (the
+    garbled residue and the real call) as distinct spans rather than merging
+    them — the garbled opener's body no longer swallows the real opener."""
+    parser = HyV3ToolParser()
+    oc = parser.tool_call_start_token
+    sep = parser.tool_sep_token
+    end = parser.tool_call_end_token
+    text = f'{oc}gar{oc}realtool{sep}{{"x": 1}}{end}'
+    positions = parser._opener_positions(text)
+    assert len(positions) == 2
+    assert positions[0] == 0
+    assert positions[1] == len(f"{oc}gar")

@@ -563,15 +563,22 @@ _MODEL_PATTERNS: list[tuple[re.Pattern, ModelConfig]] = [
     # Codex round-4 BLOCKING #1 (PR #1070): the earlier form was
     # unanchored (``hy3|hy-v3|hunyuan.?3``), matching substrings inside
     # unrelated HF paths (``mymodelhy3embedded``, ``not-hunyuanx3-test``)
-    # and auto-wiring them to the Hy3 parsers. Tighten to the same
-    # family-boundary form used in ``chat_template._HY3_MODEL_NAME_RE``:
-    # start-of-string OR a path/name separator (``/`` ``_`` ``.`` ``-``)
-    # precedes the family root, and end-of-string OR the same separator
-    # follows it. Precise enough for HF repo paths and CLI alias forms
-    # while rejecting incidental substrings.
+    # and auto-wiring them to the Hy3 parsers. Tighten to a family-boundary
+    # form: start-of-string OR a path/name separator (``/`` ``_`` ``.`` ``-``)
+    # precedes the family root.
+    #
+    # codex R11 BLOCKING: the TRAILING class must NOT include ``/`` — else a
+    # non-Hy3 model living under an HF org / local parent directory named
+    # ``hy3`` (``hy3/qwen-model``, ``some/hy3/nested-qwen``) was auto-wired to
+    # the Hy3 parsers because the ``hy3`` PARENT segment matched. The family
+    # root must sit in the FINAL path segment (the repo/alias name), so the
+    # root is followed by end-of-string OR an in-segment continuation
+    # (``_`` ``.`` ``-``), never a ``/`` path boundary. This still matches
+    # ``mlx-community/Hy3-preview-4bit``, bare ``hy3``, and ``org/hy3`` while
+    # rejecting a mere parent/namespace segment.
     (
         re.compile(
-            r"(?:^|[/_.\-])(?:hy3|hy-v3|hunyuan[-_]?3)(?:$|[/_.\-])",
+            r"(?:^|[/_.\-])(?:hy3|hy-v3|hunyuan[-_]?3)(?:$|[_.\-])",
             re.IGNORECASE,
         ),
         ModelConfig(

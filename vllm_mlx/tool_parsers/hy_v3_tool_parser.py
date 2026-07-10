@@ -344,9 +344,37 @@ class HyV3ToolParser(ToolParser):
                 break
             positions.append(opener)
             body_start = opener + len(tok)
-            close_rel = self._find_call_close_in_body(text[body_start:])
+            rest = text[body_start:]
+
+            # A ``<tool_call>`` that appears BEFORE this call's own
+            # ``<tool_sep>`` is a genuine separate opener — this opener is a
+            # garbled/sep-less residue and must NOT reach across the later
+            # opener to steal its separator/close (codex R11 BLOCKING #2). A
+            # ``<tool_call>`` that appears AFTER the separator lives inside the
+            # args region: it may be a literal inside a JSON string value and
+            # is resolved JSON-aware by ``_find_call_close_in_body`` (codex R6),
+            # so it is NOT a boundary here. Bounding only at a pre-separator
+            # opener keeps R6 (interior literal opaque) and R11 (garbled residue
+            # split) both correct.
+            own_sep = rest.find(self.tool_sep_token)
+            next_opener_rel = rest.find(tok)
+            garbled_boundary = (
+                next_opener_rel != -1
+                and (own_sep == -1 or next_opener_rel < own_sep)
+            )
+            body_end_rel = next_opener_rel if garbled_boundary else len(rest)
+            close_rel = self._find_call_close_in_body(rest[:body_end_rel])
             if close_rel == -1:
-                # In-progress (or truncated) final call — its interior is opaque.
+                if garbled_boundary:
+                    # No close within THIS opener's own body and a genuine later
+                    # opener precedes any separator → garbled residue. Keep it
+                    # recorded (the streaming FSM / non-stream salvage treats a
+                    # name-only span as residual / bare-name) and resume
+                    # scanning at the later opener.
+                    cursor = body_start + next_opener_rel
+                    continue
+                # Genuine in-progress (or truncated) final call; its interior is
+                # opaque until it closes.
                 break
             cursor = body_start + close_rel + len(self.tool_call_end_token)
         return positions
@@ -868,6 +896,17 @@ class HyV3ToolParser(ToolParser):
                 #     yet; keep buffering, emit nothing.
                 if self.tool_call_end_token in buffer:
                     return self._emit_sepless_closed_call(buffer, idx, request)
+                if idx + 1 < len(opener_positions):
+                    # No sep and no close in this block, but a LATER opener
+                    # exists (codex R11 BLOCKING): this opener is garbled
+                    # residue (a truncated/aborted opener before a real call).
+                    # Skip it — emit nothing, advance the FSM to the next index
+                    # and let the drain loop process the real call. The raw
+                    # residue span is preserved for the non-streaming salvage.
+                    self.current_tool_id = idx + 1
+                    self._name_sent = False
+                    self._current_tool_ref = None
+                    return [], True
                 return None
             name = buffer[:sep_idx].strip()
             if not name:
@@ -1041,12 +1080,17 @@ class HyV3ToolParser(ToolParser):
         the ``</arg_value>`` literal handling.
 
         When the ``{``-body does NOT ``raw_decode`` (malformed OR still
-        truncated mid-stream) we distinguish by the presence of the close token
-        (codex R9 BLOCKING): if ``<end_of_tool_call>`` is present, the call IS
-        closed — a completed call whose body is malformed junk (``{bad}``) must
-        still emit (``_final_args_json`` degrades the args to ``"{}"``), NOT be
-        dropped as no-call. If the close token is absent the JSON is simply
-        incomplete and still streaming, so return -1 and wait for more.
+        truncated mid-stream) we must NOT blindly accept the first
+        ``<end_of_tool_call>`` substring (codex R11 BLOCKING): a still-streaming
+        JSON string value can legitimately contain the literal close token
+        (``{"m": "contains <end_of_tool_call> inside``) with the JSON not yet
+        finished, and treating that literal as the real close prematurely emits
+        ``{}``. So for a ``{``-body we only accept a close token that lies
+        OUTSIDE any JSON string (``_end_token_outside_string``). A completed but
+        malformed body (``{bad}<end>`` — codex R9) still closes because its
+        ``<end>`` sits outside a string; a truncated body whose only close-token
+        occurrence is inside an unterminated string returns -1 and keeps
+        streaming.
         """
         stripped = args_tail.lstrip()
         lead_ws = len(args_tail) - len(stripped)
@@ -1058,14 +1102,46 @@ class HyV3ToolParser(ToolParser):
                     pos = args_tail.find(after, lead_ws + end)
                     return pos
             except (json.JSONDecodeError, ValueError):
-                # Malformed or still-truncated body. If the close token is
-                # present the call is complete (degrade args to ``{}``); else
-                # it is still streaming.
-                return args_tail.find(self.tool_call_end_token)
+                # Malformed OR still-truncated body. Accept only a close token
+                # that is not inside an (open) JSON string, so an interior
+                # literal in an unterminated string does not close the call.
+                return self._end_token_outside_string(args_tail)
         # Non-JSON (XML-pair / empty / bare) — plain find is safe because the
         # close token never legitimately appears inside a pair value on the
         # wire (values are themselves tag-delimited).
         return args_tail.find(self.tool_call_end_token)
+
+    def _end_token_outside_string(self, body: str) -> int:
+        """First ``<end_of_tool_call>`` in ``body`` that is NOT inside a JSON
+        string literal, or -1.
+
+        Walks the ``{``-body tracking JSON string state (a ``"`` toggles
+        in-string unless backslash-escaped). A close-token occurrence found
+        while inside an open string is skipped — it is argument text, not a
+        real close. Used only on the ``raw_decode``-failed path, so the walk is
+        a lightweight lexer, not a full parser: it only needs to know whether a
+        given offset sits inside a string.
+        """
+        end_tok = self.tool_call_end_token
+        in_string = False
+        escaped = False
+        i = 0
+        n = len(body)
+        while i < n:
+            if not in_string and body.startswith(end_tok, i):
+                return i
+            ch = body[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            i += 1
+        return -1
 
     def has_pending_tool_call(self, text: str) -> bool:
         """Override — Hy3 opener/closer are the pinned fixed strings.
