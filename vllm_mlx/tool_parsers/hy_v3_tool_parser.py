@@ -589,11 +589,28 @@ class HyV3ToolParser(ToolParser):
         JSON-aware: locates ``<tool_sep>``, and when the args after it are a
         JSON body, searches for ``<end_of_tool_call>`` only AFTER the
         well-formed JSON prefix so an interior literal is ignored.
+
+        Multi-call safety (codex R10 BLOCKING): ``segment`` may run past THIS
+        call's close into the NEXT call (two calls in one delta). A ``<tool_sep>``
+        that appears only AFTER this call's own ``<end_of_tool_call>`` belongs to
+        the next call and must NOT be treated as this call's separator — else the
+        JSON-aware search would jump to the next call's body and swallow its
+        opener. So a sep found beyond the first end-token is ignored, and the
+        first end-token is taken as the close. This matters for the SEP-LESS
+        first call (XML-pair or bare-name body): its close is the first
+        ``<end_of_tool_call>``; the next call's ``<tool_sep>`` lives past it.
         """
+        first_end = segment.find(self.tool_call_end_token)
         sep = segment.find(self.tool_sep_token)
+        # A sep belonging to a LATER call (after this call's own close) is not
+        # this call's separator. Treat this call as sep-less so the first
+        # end-token bounds it.
+        if sep != -1 and first_end != -1 and sep > first_end:
+            sep = -1
         if sep == -1:
-            # No sep — a plain find is fine (no JSON body to protect).
-            return segment.find(self.tool_call_end_token)
+            # No sep for THIS call — a plain find of the first end-token is the
+            # close (no JSON body of this call's own to protect).
+            return first_end
         args_at = sep + len(self.tool_sep_token)
         rel = self._find_call_close(segment[args_at:])
         return -1 if rel == -1 else args_at + rel
@@ -839,7 +856,18 @@ class HyV3ToolParser(ToolParser):
         header: dict[str, Any] | None = None
         if not self._name_sent:
             if sep_idx == -1:
-                # Name not yet delimited — keep buffering, emit nothing.
+                # No ``<tool_sep>`` in this block. Two sub-cases:
+                #   * the block is already CLOSED (``<end_of_tool_call>`` present)
+                #     → a SEP-LESS call: XML-pair or bare-name body with no
+                #       separator (codex R10 BLOCKING: the second call in a
+                #       ``<xmlpairs><end><tool_call>bar<sep>{}<end>`` delta was
+                #       swallowed because the sep-less first call stalled the
+                #       FSM). Parse it whole via the shared non-streaming body
+                #       parser and emit header + args in one tick, then advance.
+                #   * the block is NOT closed → the name simply is not delimited
+                #     yet; keep buffering, emit nothing.
+                if self.tool_call_end_token in buffer:
+                    return self._emit_sepless_closed_call(buffer, idx, request)
                 return None
             name = buffer[:sep_idx].strip()
             if not name:
@@ -926,6 +954,62 @@ class HyV3ToolParser(ToolParser):
 
         return deltas, closed
 
+    def _emit_sepless_closed_call(
+        self, buffer: str, idx: int, request: dict[str, Any] | None
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Emit a SEP-LESS closed call (no ``<tool_sep>`` in the body).
+
+        The Hy3 wire default is ``NAME<tool_sep>{JSON}<end>``; the streaming FSM
+        is built around that separator. A degraded XML-pair or bare-name body
+        (``NAME<arg_key>k</arg_key><arg_value>v</arg_value><end>`` or ``NAME<end>``)
+        carries no separator, so the incremental phase-1/phase-2 split cannot
+        apply. Since such a call only becomes recognizable ONCE it is closed
+        (``<end_of_tool_call>`` present — the caller gates on that), we parse the
+        whole body via the shared non-streaming ``_parse_body`` and emit the
+        header + complete args in a single tick, mirroring the whole-call-in-one-
+        delta JSON path. Then the FSM advances to the next index so a following
+        opener in the same delta drains too (codex R10 BLOCKING).
+        """
+        end_at = buffer.find(self.tool_call_end_token)
+        body = buffer[:end_at] if end_at != -1 else buffer
+        name, args = self._parse_body(body)
+
+        # Advance the FSM regardless of what we emit (matches the JSON close path).
+        self.current_tool_id = idx
+        self._name_sent = True
+        if idx >= len(self.streamed_args_for_tool):
+            self.streamed_args_for_tool.append("")
+            self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
+
+        deltas: list[dict[str, Any]] = []
+        if name:
+            valid_names = self._get_tool_names(request)
+            suppressed = bool(valid_names) and name not in valid_names
+            if not suppressed:
+                final_args = json.dumps(args, ensure_ascii=False)
+                if idx < len(self.streamed_args_for_tool):
+                    self.streamed_args_for_tool[idx] = final_args
+                if idx < len(self.prev_tool_call_arr):
+                    self.prev_tool_call_arr[idx]["arguments"] = final_args
+                deltas.append(
+                    {
+                        "index": idx,
+                        "id": generate_tool_id(),
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    }
+                )
+                deltas.append({"index": idx, "function": {"arguments": final_args}})
+            else:
+                self._suppressed_tools.add(idx)
+
+        # Close: advance to the next index; the drain loop picks up any
+        # subsequent opener in this same delta.
+        self.current_tool_id = idx + 1
+        self._name_sent = False
+        self._current_tool_ref = None
+        return deltas, True
+
     def _final_args_json(self, args_tail: str) -> str:
         """Serialize the complete args body (JSON or XML pairs) to a JSON
         string. Returns ``"{}"`` on an empty / unparseable body so the
@@ -986,11 +1070,20 @@ class HyV3ToolParser(ToolParser):
     def has_pending_tool_call(self, text: str) -> bool:
         """Override — Hy3 opener/closer are the pinned fixed strings.
 
-        Pending iff the LAST opener has no ``<end_of_tool_call>`` after it. A
-        completed call earlier in ``text`` does not leave the parser pending
+        "Pending" means the stream may end mid-markup and the parser is still
+        waiting for a closing delimiter. That is true ONLY for a NATIVE call:
+        the LAST ``<tool_call>`` opener has no ``<end_of_tool_call>`` after it.
+        A completed call earlier in ``text`` does not leave the parser pending
         forever.
+
+        The text-format degradation (``[Calling tool="X" k="v"]``) is NOT
+        pending (codex R10 BLOCKING): it is a COMPLETE, self-delimited call with
+        no trailing close delimiter to wait for, and it is finalized via the
+        non-streaming recovery path in ``finalize()`` (gated on the ``[Calling``
+        marker, not on this predicate). Reporting it as pending made streaming
+        shutdown treat a finished ``[Calling …]`` message as perpetually
+        in-flight. So a bare ``[Calling …]`` with no unmatched native opener
+        returns ``False``.
         """
         opener = text.rfind(self.tool_call_start_token)
-        if opener != -1 and self.tool_call_end_token not in text[opener:]:
-            return True
-        return self.has_text_format_tool_call(text)
+        return opener != -1 and self.tool_call_end_token not in text[opener:]

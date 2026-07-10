@@ -1033,3 +1033,141 @@ def test_streaming_content_before_opener_char_by_char_not_dropped():
     assert content == "Sure! "
     assert tool_acc[0]["name"] == "search"
     assert json.loads(tool_acc[0]["args"]) == {"q": "x"}
+
+
+# ---------------------------------------------------------------------------
+# codex R10 regressions: sep-less first call in a multi-call delta + the
+# text-format pending predicate
+# ---------------------------------------------------------------------------
+def test_streaming_sepless_first_call_does_not_swallow_second_call():
+    """codex R10 BLOCKING #1: a SEP-LESS first call (XML-pair body, no
+    ``<tool_sep>``) followed by a normal call in the SAME delta MUST NOT swallow
+    the second opener.
+
+    ``_find_call_close_in_body`` used to locate the FIRST ``<tool_sep>`` in the
+    whole segment — which for a sep-less first call is the SECOND call's
+    separator — and then searched past the second call's JSON for the close.
+    That advanced the span cursor past everything, so ``_opener_positions``
+    returned only ``[0]`` and the second call vanished; the streaming FSM also
+    stalled because the sep-less block never delimited a name. The fix bounds
+    the sep to before the first ``<end_of_tool_call>`` (a later sep belongs to
+    the next call) and drains a sep-less CLOSED call via the shared body parser.
+    """
+    parser = HyV3ToolParser()
+    wire = (
+        "<tool_call:opensource>foo"
+        "<arg_key:opensource>k</arg_key:opensource>"
+        "<arg_value:opensource>v</arg_value:opensource>"
+        "<end_of_tool_call:opensource>"
+        '<tool_call:opensource>bar<tool_sep:opensource>{"b": 2}'
+        "<end_of_tool_call:opensource>"
+    )
+    # Single delta carrying both calls — the exact codex scenario.
+    tool_acc, content = _collect_stream(parser, [wire])
+    assert sorted(tool_acc.keys()) == [0, 1], "second call was swallowed"
+    assert tool_acc[0]["name"] == "foo"
+    assert json.loads(tool_acc[0]["args"]) == {"k": "v"}
+    assert tool_acc[1]["name"] == "bar"
+    assert json.loads(tool_acc[1]["args"]) == {"b": 2}
+    assert content == ""
+
+
+def test_streaming_sepless_first_call_char_by_char_both_emit():
+    """The same sep-less-first / normal-second pair delivered char-by-char must
+    still yield both calls with correct args (the incremental path and the
+    single-delta drain must agree)."""
+    parser = HyV3ToolParser()
+    wire = (
+        "<tool_call:opensource>foo"
+        "<arg_key:opensource>k</arg_key:opensource>"
+        "<arg_value:opensource>v</arg_value:opensource>"
+        "<end_of_tool_call:opensource>"
+        '<tool_call:opensource>bar<tool_sep:opensource>{"b": 2}'
+        "<end_of_tool_call:opensource>"
+    )
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert sorted(tool_acc.keys()) == [0, 1]
+    assert tool_acc[0]["name"] == "foo"
+    assert json.loads(tool_acc[0]["args"]) == {"k": "v"}
+    assert tool_acc[1]["name"] == "bar"
+    assert json.loads(tool_acc[1]["args"]) == {"b": 2}
+    assert content == ""
+
+
+def test_streaming_bare_name_sepless_call_emits_empty_args():
+    """A bare-name sep-less call (``<tool_call>ping<end>`` — no separator, no
+    args) MUST emit a call with ``{}`` args, not stall the FSM."""
+    parser = HyV3ToolParser()
+    tool_acc, content = _collect_stream(
+        parser,
+        ["<tool_call:opensource>ping<end_of_tool_call:opensource>"],
+    )
+    assert sorted(tool_acc.keys()) == [0]
+    assert tool_acc[0]["name"] == "ping"
+    assert json.loads(tool_acc[0]["args"]) == {}
+    assert content == ""
+
+
+def test_streaming_sepless_call_respects_request_allowlist():
+    """A sep-less closed call whose name is OFF the request allowlist MUST NOT
+    emit a tool_call (the drain path applies the same suppression as the JSON
+    path)."""
+    parser = HyV3ToolParser()
+    request = {"tools": [{"type": "function", "function": {"name": "allowed"}}]}
+    tool_acc, _content = _collect_stream(
+        parser,
+        [
+            "<tool_call:opensource>forbidden"
+            "<arg_key:opensource>k</arg_key:opensource>"
+            "<arg_value:opensource>v</arg_value:opensource>"
+            "<end_of_tool_call:opensource>"
+        ],
+        request=request,
+    )
+    assert tool_acc == {}, "off-list sep-less call must be suppressed"
+
+
+def test_has_pending_tool_call_text_format_is_not_pending():
+    """codex R10 BLOCKING #2: a COMPLETE ``[Calling tool="X" k="v"]``
+    text-format message MUST NOT report pending. It is a self-delimited call
+    with no trailing close delimiter to wait for, and it is finalized via the
+    non-streaming recovery path (gated on the ``[Calling`` marker, not on this
+    predicate). Reporting it pending made streaming shutdown treat a finished
+    message as perpetually in-flight."""
+    parser = HyV3ToolParser()
+    assert (
+        parser.has_pending_tool_call('[Calling tool="get_weather" city="SF"]')
+        is False
+    )
+    # A native opener with no close IS still pending.
+    assert parser.has_pending_tool_call("<tool_call:opensource>fn") is True
+    # A completed native call followed by a fresh unmatched opener is pending
+    # (the LAST opener has no close).
+    assert (
+        parser.has_pending_tool_call(
+            "<tool_call:opensource>a<tool_sep:opensource>{}"
+            "<end_of_tool_call:opensource><tool_call:opensource>b"
+        )
+        is True
+    )
+    # A completed native call with nothing after it is NOT pending.
+    assert (
+        parser.has_pending_tool_call(
+            "<tool_call:opensource>a<tool_sep:opensource>{}"
+            "<end_of_tool_call:opensource>"
+        )
+        is False
+    )
+
+
+def test_text_format_call_still_recovered_by_non_streaming_extract():
+    """Dropping text-format from ``has_pending_tool_call`` MUST NOT break
+    recovery — the non-streaming ``extract_tool_calls`` (which the postprocessor
+    runs at finalize on any text containing ``[Calling``) still recovers the
+    structured call."""
+    parser = HyV3ToolParser()
+    result = parser.extract_tool_calls(
+        '[Calling tool="get_weather" city="SF"]', request=None
+    )
+    assert result.tools_called is True
+    assert [c.get("name") for c in result.tool_calls] == ["get_weather"]
