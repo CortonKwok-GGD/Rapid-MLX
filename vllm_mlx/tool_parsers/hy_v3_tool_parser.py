@@ -627,14 +627,22 @@ class HyV3ToolParser(ToolParser):
         # --- JSON body shape ---
         if stripped.startswith("{"):
             if closed:
+                # Emit the RAW wire JSON verbatim (validated by raw_decode)
+                # rather than a re-serialized ``json.dumps(parsed)`` — the
+                # two differ for unicode escapes (``\uXXXX`` vs the decoded
+                # char) and whitespace, which would make the closed snapshot
+                # non-monotonic vs the raw prefixes streamed while open and
+                # corrupt the diff. Consume only the well-formed JSON prefix
+                # so trailing structural residue (a stray ``<arg_value>``
+                # opener, whitespace) is dropped.
                 try:
-                    parsed, _end = self._json_decoder.raw_decode(stripped)
-                    if isinstance(parsed, dict):
-                        return json.dumps(parsed, ensure_ascii=False)
+                    _parsed, end = self._json_decoder.raw_decode(stripped)
+                    if isinstance(_parsed, dict):
+                        return stripped[:end]
                 except (json.JSONDecodeError, ValueError):
                     return None
                 return None
-            # Open: emit the longest valid-JSON prefix with ``}`` withheld.
+            # Open: emit the longest valid raw-JSON prefix with ``}`` withheld.
             return self._partial_json_prefix(stripped)
 
         # --- XML-pair shape (or empty tail) ---
@@ -657,48 +665,61 @@ class HyV3ToolParser(ToolParser):
     def _partial_json_prefix(self, text: str) -> str | None:
         """Longest valid-JSON prefix of an in-flight object with ``}`` held.
 
+        Emits the RAW wire text verbatim (the model emits valid JSON) so the
+        prefixes streamed while open match the raw document emitted on close
+        — re-serializing via ``json.dumps`` would diverge on unicode escapes
+        and whitespace and corrupt the monotonic diff.
+
         If the object already decodes whole (the common single-delta case),
-        stream its serialization minus the trailing ``}``. Otherwise
-        reconstruct from the complete members decoded so far, streaming a
-        partial string value character-by-character (escaped, no closing
-        quote) so the growing prefix stays valid when the consumer appends
-        the withheld ``}``.
+        emit the raw decoded span minus the trailing ``}``. Otherwise
+        reconstruct a raw-faithful prefix from the complete members plus a
+        partial string value in flight.
 
         Returns ``None`` when nothing new is safely emittable yet.
         """
         try:
-            parsed, _end = self._json_decoder.raw_decode(text)
+            parsed, end = self._json_decoder.raw_decode(text)
             if isinstance(parsed, dict):
-                full = json.dumps(parsed, ensure_ascii=False)
-                return full[:-1]
+                raw = text[:end]
+                # Emit raw up to (not including) the final ``}`` so the closed
+                # snapshot — which is the same ``raw`` including ``}`` — is a
+                # clean superstring. No rstrip: keep byte-for-byte alignment.
+                close = raw.rfind("}")
+                if close != -1:
+                    return raw[:close]
         except (json.JSONDecodeError, ValueError):
             pass
         return self._decode_json_partial(text)
 
     def _decode_json_partial(self, text: str) -> str | None:
-        """Reconstruct a valid-JSON prefix from an incomplete object.
+        """Return a RAW-faithful valid-JSON prefix of an incomplete object.
 
-        Consumes complete ``"key": value`` members and re-serializes them,
-        withholding the trailing ``}``. A partial string value in flight is
-        streamed with the opening quote and escaped chars but no closing
-        quote, so the growing prefix stays valid when ``}`` is appended.
+        Walks the raw wire text ``{ "k": v, "k2": v2, "k3": "partial…`` and
+        returns ``text[:cut]`` where ``cut`` is the safe boundary — the end
+        of the last COMPLETE ``"key": value`` member, or the safe end of a
+        partial STRING value in flight. Emitting the raw span (not a
+        ``json.dumps`` reconstruction) keeps every streamed prefix
+        byte-aligned with the raw closed snapshot, so the diff stays
+        monotonic across the partial→complete transition even when values
+        contain unicode escapes.
+
         Returns ``None`` when no complete member (or partial string) has
         arrived yet.
         """
         s = text
         n = len(s)
         i = 0
-        # Expect leading ``{``.
         if i >= n or s[i] != "{":
             return None
-        i += 1
-        members: list[str] = []
+        i += 1  # past ``{``
+        cut = i  # after ``{`` (yields ``{`` alone if no member completes)
+        first = True
         while True:
             while i < n and s[i] in " \t\r\n,":
                 i += 1
             if i >= n or s[i] == "}":
                 break
-            # Decode a JSON string key.
+            # Decode the key string.
             try:
                 key, key_end = self._json_decoder.raw_decode(s, i)
             except (json.JSONDecodeError, ValueError):
@@ -715,49 +736,74 @@ class HyV3ToolParser(ToolParser):
                 j += 1
             if j >= n:
                 break
-            # Try to decode a complete value.
+            # Try to decode a complete value → advance the safe cut.
             try:
-                value, value_end = self._json_decoder.raw_decode(s, j)
-                members.append(
-                    f"{json.dumps(key, ensure_ascii=False)}: "
-                    f"{json.dumps(value, ensure_ascii=False)}"
-                )
+                _value, value_end = self._json_decoder.raw_decode(s, j)
+                cut = value_end
                 i = value_end
+                first = False
                 continue
             except (json.JSONDecodeError, ValueError):
                 pass
-            # Value incomplete. Stream a partial STRING value char-by-char.
+            # Value incomplete. Only a partial STRING can be emitted safely.
             if s[j] == '"':
                 partial = self._partial_json_string(s[j:])
                 if partial is not None:
-                    members.append(f"{json.dumps(key, ensure_ascii=False)}: {partial}")
-            # Non-string incomplete value (number / literal mid-flight) cannot
-            # be emitted as a valid prefix — stop at the members so far.
+                    # Splice the raw member prefix: everything up to the value
+                    # start plus the safe partial-string body. ``partial``
+                    # already carries the opening quote.
+                    return s[:j] + partial
             break
-        if not members:
+        if cut <= 1:
+            # Only ``{`` seen (or nothing complete) — hold until a member or
+            # partial string arrives so we never emit a bare ``{``.
             return None
-        return "{" + ", ".join(members)
+        _ = first
+        return s[:cut]
 
     @staticmethod
     def _partial_json_string(text: str) -> str | None:
         """Return a valid-JSON-string PREFIX for an in-flight string value.
 
-        ``text`` starts at the opening ``"``. Returns ``"escaped_prefix``
-        (opening quote, escaped body, NO closing quote) so the consumer's
-        appended data extends the same string. Drops a dangling trailing
-        backslash that could start an escape spanning the chunk boundary.
+        ``text`` starts at the opening ``"`` of a JSON string value taken
+        VERBATIM from the wire — its body is ALREADY JSON-escaped source
+        (``\\n``, ``\\"``, ``\\uXXXX`` are literal two/six-char sequences on
+        the wire, not decoded). We must NOT re-escape it; we emit the raw
+        body unchanged (opening quote + safe body, NO closing quote) so the
+        consumer's next chunk extends the same string.
+
+        The safe body is the longest prefix that does not end mid-escape.
+        We scan escape sequences so a trailing ``\\`` (dangling escape) or a
+        partial ``\\uXX`` (fewer than 4 hex digits) is held back until the
+        rest of the escape arrives.
         """
         if not text or text[0] != '"':
             return None
         body = text[1:]
-        if body.endswith("\\"):
-            body = body[:-1]
-        if not body:
+        safe_len = 0
+        i = 0
+        n = len(body)
+        while i < n:
+            ch = body[i]
+            if ch == "\\":
+                # An escape sequence needs its payload to be complete before
+                # the position past it is a safe cut point.
+                if i + 1 >= n:
+                    break  # dangling backslash — hold from here
+                esc = body[i + 1]
+                if esc == "u":
+                    if i + 6 > n:
+                        break  # partial \uXXXX — hold from here
+                    i += 6
+                else:
+                    i += 2
+                safe_len = i
+            else:
+                i += 1
+                safe_len = i
+        if safe_len == 0:
             return '"'
-        # Escape the body as JSON string content (strip the surrounding
-        # quotes ``json.dumps`` adds).
-        escaped = json.dumps(body, ensure_ascii=False)[1:-1]
-        return '"' + escaped
+        return '"' + body[:safe_len]
 
     def has_pending_tool_call(self, text: str) -> bool:
         """Override — Hy3 opener/closer are the pinned fixed strings.

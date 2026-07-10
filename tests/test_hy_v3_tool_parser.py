@@ -426,6 +426,48 @@ def test_streaming_char_by_char_json_body_no_leak():
     assert content == "", f"raw markup leaked as content: {content!r}"
 
 
+def test_streaming_json_body_with_escapes_and_unicode_reassembles():
+    """Char-by-char streaming of a JSON body whose string values contain
+    escape sequences (``\\n``, ``\\"``, ``\\\\``) AND a ``\\uXXXX`` unicode
+    escape MUST reassemble to the exact wire JSON. The parser streams the RAW
+    wire text verbatim (never re-serializing via ``json.dumps``), so the
+    open prefixes stay byte-aligned with the closed document even when the
+    value contains ``\\uXXXX`` — a re-serialize would decode it to the char
+    and make the diff non-monotonic (regression guard for the escape-stream
+    snapshot bug)."""
+    parser = HyV3ToolParser()
+    # ``json.dumps`` default (ensure_ascii=True) puts a ``\\uXXXX`` escape on
+    # the wire for the é; the other escapes exercise the dangling-backslash
+    # and quote-in-value hold logic.
+    args_obj = {"path": "/a/b.txt", "content": 'line1\nline2 "q" \\ café'}
+    body = json.dumps(args_obj)
+    assert "\\u" in body  # confirm the wire really carries a unicode escape
+    wire = (
+        "<tool_call:opensource>write_file<tool_sep:opensource>"
+        + body
+        + "<end_of_tool_call:opensource>"
+    )
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert tool_acc[0]["name"] == "write_file"
+    assert json.loads(tool_acc[0]["args"]) == args_obj
+    assert content == "", f"raw markup leaked as content: {content!r}"
+
+
+def test_streaming_json_body_nested_and_mixed_types_reassembles():
+    """A JSON body with nested objects/arrays and mixed scalar types streams
+    char-by-char and reassembles exactly."""
+    parser = HyV3ToolParser()
+    args_obj = {"n": 3, "flag": True, "z": None, "list": [1, 2], "obj": {"k": "v"}}
+    wire = (
+        "<tool_call:opensource>f<tool_sep:opensource>"
+        + json.dumps(args_obj)
+        + "<end_of_tool_call:opensource>"
+    )
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert json.loads(tool_acc[0]["args"]) == args_obj
+    assert content == ""
+
+
 def test_streaming_xml_pair_reassembles_args():
     """The XML-pair variant streams pairs into a growing JSON object; the
     reassembled args MUST equal the wire pairs with type coercion."""
