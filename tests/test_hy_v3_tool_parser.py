@@ -1136,8 +1136,7 @@ def test_has_pending_tool_call_text_format_is_not_pending():
     message as perpetually in-flight."""
     parser = HyV3ToolParser()
     assert (
-        parser.has_pending_tool_call('[Calling tool="get_weather" city="SF"]')
-        is False
+        parser.has_pending_tool_call('[Calling tool="get_weather" city="SF"]') is False
     )
     # A native opener with no close IS still pending.
     assert parser.has_pending_tool_call("<tool_call:opensource>fn") is True
@@ -1338,9 +1337,7 @@ def test_non_streaming_garbled_opener_then_two_real_calls():
     oc = parser.tool_call_start_token
     sep = parser.tool_sep_token
     end = parser.tool_call_end_token
-    text = (
-        f'{oc}gar{oc}a{sep}{{"x": 1}}{end}{oc}b{sep}{{"y": 2}}{end}'
-    )
+    text = f'{oc}gar{oc}a{sep}{{"x": 1}}{end}{oc}b{sep}{{"y": 2}}{end}'
     result = parser.extract_tool_calls(text, request=None)
     assert [c.get("name") for c in result.tool_calls] == ["a", "b"]
 

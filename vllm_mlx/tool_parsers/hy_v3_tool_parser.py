@@ -358,9 +358,8 @@ class HyV3ToolParser(ToolParser):
             # split) both correct.
             own_sep = rest.find(self.tool_sep_token)
             next_opener_rel = rest.find(tok)
-            garbled_boundary = (
-                next_opener_rel != -1
-                and (own_sep == -1 or next_opener_rel < own_sep)
+            garbled_boundary = next_opener_rel != -1 and (
+                own_sep == -1 or next_opener_rel < own_sep
             )
             body_end_rel = next_opener_rel if garbled_boundary else len(rest)
             close_rel = self._find_call_close_in_body(rest[:body_end_rel])
