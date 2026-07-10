@@ -70,6 +70,18 @@ def _normalize_hy3_tags(text: str) -> str:
     ``</think:opensource>`` → ``</think>``
 
     Non-matching input is returned unchanged (empty-string safe).
+
+    Parser policy (codex R4 NIT #5). This is an unconditional substitution over
+    the whole reasoning stream, so a LITERAL ``<think:opensource>`` string that
+    a model happened to emit as visible content would also be rewritten. That
+    is the accepted, intentional contract: for an Hy3 model the think-tag
+    namespace (``<think(:LABEL)?>``) is reserved for reasoning delimiters — it
+    is exactly how every other thinking family's reasoning parser treats
+    ``<think>`` (the plain-tag parsers rewrite/strip any literal ``<think>`` in
+    content too). The alternative — a full regex-driven state machine that only
+    transforms tags at genuine state transitions — would duplicate the
+    ~1500-line qwen3 streaming machine for a payload no real Hy3 checkpoint
+    produces, so we keep the simple normalization and document the tradeoff.
     """
     if not text:
         return text

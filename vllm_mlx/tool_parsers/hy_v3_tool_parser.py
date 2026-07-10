@@ -108,20 +108,19 @@ def generate_tool_id() -> str:
 def _resolve_suffix(tokenizer: PreTrainedTokenizerBase | None) -> str:
     """Resolve the wire label suffix (e.g. ``:opensource``) ONCE from vocab.
 
-    Collects EVERY suffix under which a ``<tool_call(:LABEL)?>`` token exists,
-    then picks deterministically (codex R2 NIT — dict iteration order must not
-    decide the wire shape when a vocab carries both bare and labelled
-    variants):
+    Collects EVERY suffix under which the Hy3 wire tokens exist, then selects
+    ONLY among suffixes carrying a COMPLETE token set (``tool_call``,
+    ``tool_sep``, ``end_of_tool_call`` all present) — a suffix that has only
+    ``<tool_call>`` but not its matching ``<tool_sep>`` / ``<end_of_tool_call>``
+    would make every downstream fixed-string ``find`` look for a non-existent
+    separator/close and silently drop valid calls (codex R4 BLOCKING). Among
+    complete candidates the choice is deterministic (codex R2 NIT — dict
+    iteration order must not decide the wire shape): prefer the labelled
+    ``:opensource`` default, then any other label sorted, then the bare form.
 
-      1. Prefer a suffix that has a COMPLETE token set (``tool_call``,
-         ``tool_sep``, ``end_of_tool_call`` all present under it) — that is
-         the shape the model actually emits.
-      2. Among equally-complete suffixes, prefer the labelled ``:opensource``
-         default, then any other label sorted, then the bare form.
-
-    Falls back to ``:opensource`` when no tokenizer is available (the shape
-    every current ``pipenetwork/Hy3-*-MLX-4bit`` checkpoint emits). SGLang
-    ``resolve_hunyuan_tokens`` pattern.
+    Falls back to ``:opensource`` when no tokenizer is available OR no complete
+    candidate exists (the shape every current ``pipenetwork/Hy3-*-MLX-4bit``
+    checkpoint emits). SGLang ``resolve_hunyuan_tokens`` pattern.
     """
     default = f":{_DEFAULT_LABEL}"
     if tokenizer is None:
@@ -149,23 +148,23 @@ def _resolve_suffix(tokenizer: PreTrainedTokenizerBase | None) -> str:
         suffix = tok[1 + len(name) : -1]  # ``""`` or ``:LABEL``
         by_suffix.setdefault(suffix, set()).add(name)
 
-    candidates = [s for s in by_suffix if "tool_call" in by_suffix[s]]
+    # ONLY consider suffixes whose parsing-critical trio is fully present —
+    # an incomplete suffix would break every downstream ``find``.
+    required = {"tool_call", "tool_sep", "end_of_tool_call"}
+    candidates = [s for s in by_suffix if required.issubset(by_suffix[s])]
     if not candidates:
         return default
 
     def _rank(suffix: str) -> tuple:
-        # Lower tuple sorts first: complete set first, then :opensource
-        # default, then other labels alphabetically, then the bare form.
-        complete = {"tool_call", "tool_sep", "end_of_tool_call"}.issubset(
-            by_suffix[suffix]
-        )
+        # Lower tuple sorts first: :opensource default, then other labels
+        # alphabetically, then the bare form.
         if suffix == default:
             tier = 1
         elif suffix == "":
             tier = 3
         else:
             tier = 2
-        return (0 if complete else 1, tier, suffix)
+        return (tier, suffix)
 
     return min(candidates, key=_rank)
 
@@ -478,14 +477,20 @@ class HyV3ToolParser(ToolParser):
         )
 
     def _next_block(self, text: str, cursor: int) -> tuple[int, int, str] | None:
-        """Locate the next tool-call block at/after ``cursor``.
+        """Locate the next COMPLETE tool-call block at/after ``cursor``.
 
         Returns ``(block_start, block_end, body)`` where ``body`` is the span
         between the opener and its close. Prefers the canonical
         ``<end_of_tool_call>`` close found JSON-aware (so a literal end-token
         inside a JSON string value is not mistaken for the close); falls back
         to the malformed-close regex (``<tool_call>NAME</arg_value>``) when no
-        canonical close exists. Returns ``None`` when no opener remains.
+        canonical close exists.
+
+        Returns ``None`` when no opener remains OR when an opener is present but
+        has NEITHER a canonical NOR a malformed close (codex R4 BLOCKING: a
+        truncated ``<tool_call>get_weather`` must NOT become a parsed call with
+        ``{}`` args — the caller then keeps the raw tail as residual content,
+        i.e. pending/plain text, not a fabricated empty call).
         """
         opener = text.find(self.tool_call_start_token, cursor)
         if opener == -1:
@@ -510,10 +515,10 @@ class HyV3ToolParser(ToolParser):
             block_end = body_start + m.end()
             return opener, block_end, body
 
-        # Opener with no close of any kind in this segment — surface the whole
-        # remaining segment as the body (salvage the name at least). Advance
-        # past the opener so the loop terminates.
-        return opener, scan_end, segment
+        # Opener with NO close of any kind (truncated / streaming-incomplete):
+        # not a parsed call. Signal end-of-parse so the caller preserves the
+        # raw tail as content rather than fabricating an empty-args call.
+        return None
 
     def _find_call_close_in_body(self, segment: str) -> int:
         """Offset of the canonical close within a post-opener ``segment``.

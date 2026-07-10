@@ -91,17 +91,45 @@ def test_suffix_resolved_from_vocab_suffixless():
 
 
 def test_suffix_resolved_from_vocab_labelled():
-    """When the vocab carries the labelled ``<tool_call:opensource>`` token,
-    the resolver pins the labelled strings AND the token id."""
+    """When the vocab carries the COMPLETE labelled token trio, the resolver
+    pins the labelled strings AND the token id."""
     tok = _FakeTokenizer(
         {
             "<tool_call:opensource>": 2000,
             "<tool_sep:opensource>": 2001,
+            "<end_of_tool_call:opensource>": 2002,
         }
     )
     p = HyV3ToolParser(tokenizer=tok)
     assert p.suffix == ":opensource"
     assert p.tool_call_start_token_id == 2000
+
+
+def test_suffix_incomplete_set_falls_back_to_default():
+    """codex R4 BLOCKING: a vocab exposing only ``<tool_call:foo>`` but not its
+    matching ``<tool_sep:foo>`` / ``<end_of_tool_call:foo>`` MUST NOT pin the
+    incomplete ``:foo`` suffix (every downstream ``find`` would look for a
+    non-existent separator/close). It falls back to the ``:opensource``
+    default instead."""
+    tok = _FakeTokenizer({"<tool_call:foo>": 5000})
+    p = HyV3ToolParser(tokenizer=tok)
+    assert p.suffix == ":opensource"
+    assert p.tool_call_start_token == "<tool_call:opensource>"
+
+
+def test_suffix_prefers_complete_over_incomplete_candidate():
+    """When one suffix has the complete trio and another has only
+    ``<tool_call>``, the COMPLETE suffix is chosen regardless of dict order."""
+    tok = _FakeTokenizer(
+        {
+            "<tool_call:foo>": 6000,  # incomplete — must be ignored
+            "<tool_call:opensource>": 6001,
+            "<tool_sep:opensource>": 6002,
+            "<end_of_tool_call:opensource>": 6003,
+        }
+    )
+    p = HyV3ToolParser(tokenizer=tok)
+    assert p.suffix == ":opensource"
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +157,7 @@ def test_canonical_json_body_without_suffix():
     """Future-proof: a parser whose vocab pinned the suffix-less strings MUST
     accept the plain variant so upstream can drop the ``:opensource`` label
     in a later revision."""
-    tok = _FakeTokenizer({"<tool_call>": 1})
+    tok = _FakeTokenizer({"<tool_call>": 1, "<tool_sep>": 2, "<end_of_tool_call>": 3})
     parser = HyV3ToolParser(tokenizer=tok)
     out = '<tool_call>get_weather<tool_sep>{"city": "Paris"}<end_of_tool_call>'
     res = parser.extract_tool_calls(out)
@@ -159,8 +187,10 @@ def test_malformed_close_defensive_strip():
 
 def test_malformed_close_suffix_less():
     """Same defensive strip works when the suffix is absent (vocab pinned the
-    suffix-less strings)."""
-    tok = _FakeTokenizer({"<tool_call>": 1})
+    suffix-less strings). The vocab exposes the COMPLETE bare token trio, as a
+    real suffix-less checkpoint would (codex R4 BLOCKING: an incomplete set is
+    never selected)."""
+    tok = _FakeTokenizer({"<tool_call>": 1, "<tool_sep>": 2, "<end_of_tool_call>": 3})
     parser = HyV3ToolParser(tokenizer=tok)
     res = parser.extract_tool_calls("<tool_call>get_weather</arg_value>")
     assert res.tools_called is True
@@ -206,7 +236,7 @@ def test_xml_pair_argument_variant():
 def test_xml_pair_multi_key_with_type_coercion():
     """Multi-key XML variant — ``<arg_value>`` payload MUST be JSON-decoded so
     ``1`` → int, ``"two"`` → str, ``true`` → bool."""
-    tok = _FakeTokenizer({"<tool_call>": 1})
+    tok = _FakeTokenizer({"<tool_call>": 1, "<tool_sep>": 2, "<end_of_tool_call>": 3})
     parser = HyV3ToolParser(tokenizer=tok)
     out = (
         "<tool_call>lookup<tool_sep>"
@@ -228,7 +258,7 @@ def test_sep_less_xml_pair_body():
     """Some 4-bit checkpoints skip ``<tool_sep>`` but still emit full XML
     pairs. The name is the residue before the first ``<arg_key>`` opener and
     the args are recovered from the pairs."""
-    tok = _FakeTokenizer({"<tool_call>": 1})
+    tok = _FakeTokenizer({"<tool_call>": 1, "<tool_sep>": 2, "<end_of_tool_call>": 3})
     parser = HyV3ToolParser(tokenizer=tok)
     out = (
         "<tool_call>do_it"
@@ -289,6 +319,34 @@ def test_no_tool_call_returns_content_unchanged():
     assert res.tools_called is False
     assert res.tool_calls == []
     assert res.content == "The answer is Paris."
+
+
+def test_truncated_opener_no_close_is_not_a_call():
+    """codex R4 BLOCKING: an opener with NEITHER a canonical NOR a malformed
+    close (truncated / streaming-incomplete output like
+    ``<tool_call:opensource>get_weather``) MUST NOT become a parsed call with
+    ``{}`` args — it is pending/plain content. ``tools_called`` is False and the
+    raw tail is preserved as content."""
+    parser = HyV3ToolParser()
+    res = parser.extract_tool_calls("<tool_call:opensource>get_weather")
+    assert res.tools_called is False
+    assert res.tool_calls == []
+    assert res.content == "<tool_call:opensource>get_weather"
+
+
+def test_completed_call_then_truncated_opener_keeps_only_completed():
+    """A completed call followed by a truncated opener returns ONLY the
+    completed call — the dangling opener is not fabricated into a second empty
+    call."""
+    parser = HyV3ToolParser()
+    out = (
+        "<tool_call:opensource>a<tool_sep:opensource>{}<end_of_tool_call:opensource>"
+        "<tool_call:opensource>b_trunc"  # no close
+    )
+    res = parser.extract_tool_calls(out)
+    assert res.tools_called is True
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0]["name"] == "a"
 
 
 def test_tool_name_filter_via_request_tools():
@@ -632,25 +690,58 @@ def test_streaming_partial_opener_prefix_resolves_to_tool_call():
     assert content == ""
 
 
+def _stream_raw(parser, chunks, request=None):
+    """Feed ``chunks`` and return the list of every non-None per-delta result
+    (so a test can assert on argument-only deltas, not just accumulated
+    name/args)."""
+    parser.reset()
+    step = _stepper(parser, request=request)
+    results = []
+    for d in chunks:
+        msg = step(d)
+        if msg is not None:
+            results.append(msg)
+    return results
+
+
 def test_streaming_respects_request_tool_allowlist():
     """The streaming path MUST honour the request ``tools`` allowlist so a
-    hallucinated off-list name is not surfaced as a ``tool_calls`` header."""
+    hallucinated off-list name emits NEITHER a header NOR argument deltas
+    (codex R4 NIT: a name-only assertion would pass even if args leaked)."""
     parser = HyV3ToolParser()
     request = {"tools": [{"function": {"name": "allowed_tool"}}]}
-    tool_acc, _content = _collect_stream(
-        parser,
-        [
-            "<tool_call:opensource>",
-            "hallucinated_tool",
-            "<tool_sep:opensource>",
-            "{}",
-            "<end_of_tool_call:opensource>",
-        ],
-        request=request,
+    chunks = [
+        "<tool_call:opensource>",
+        "hallucinated_tool",
+        "<tool_sep:opensource>",
+        '{"leak": "me"}',
+        "<end_of_tool_call:opensource>",
+    ]
+    tool_acc, content = _collect_stream(parser, chunks, request=request)
+    # No tool-call surfaces AT ALL for an off-list name — no header, no args.
+    assert tool_acc == {}
+    assert content == ""
+    # And no result ever carried a tool_calls delta for the suppressed index.
+    results = _stream_raw(parser, chunks, request=request)
+    assert all("tool_calls" not in msg for msg in results)
+
+
+def test_streaming_off_list_call_in_one_delta_emits_no_args():
+    """The suppressed off-list call arriving WHOLE in one delta (name + args +
+    close together) must still emit NO argument delta — the same-delta path is
+    the exact scenario codex R4 BLOCKING #3 raised for the args leak."""
+    parser = HyV3ToolParser()
+    request = {"tools": [{"function": {"name": "allowed_tool"}}]}
+    one_delta = (
+        "<tool_call:opensource>hallucinated<tool_sep:opensource>"
+        '{"leak": "me"}<end_of_tool_call:opensource>'
     )
-    # The off-list call must not surface as a tool_call header.
-    for entry in tool_acc.values():
-        assert entry["name"] != "hallucinated_tool"
+    results = _stream_raw(parser, [one_delta], request=request)
+    for msg in results:
+        for tc in msg.get("tool_calls", []):
+            fn = tc.get("function", {})
+            assert not fn.get("arguments"), f"args leaked: {tc!r}"
+            assert fn.get("name") != "hallucinated"
 
 
 def test_streaming_flush_held_content_releases_dangling_prefix():
