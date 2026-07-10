@@ -1239,6 +1239,33 @@ def test_streaming_garbled_opener_before_real_call_does_not_steal_separator():
     assert names == {"realtool"}, f"unexpected names: {names}"
     real = next(v for v in tool_acc.values() if v["name"] == "realtool")
     assert json.loads(real["args"]) == {"x": 1}
+    # codex R14 BLOCKING: the CLIENT-VISIBLE emitted index for the first (and
+    # only) real call MUST be 0, not 1 — the skipped garbled residue opener
+    # consumes a PHYSICAL opener slot but must NOT consume a client-visible
+    # index. A first real call emitted at index 1 leaves a null hole at 0 in
+    # the OpenAI-SDK reconstruction. ``_collect_stream`` keys ``tool_acc`` by
+    # the emitted index, so the real call must live at key 0.
+    real_indices = [k for k, v in tool_acc.items() if v["name"] == "realtool"]
+    assert real_indices == [0], f"client-visible index for realtool: {real_indices}"
+
+
+def test_streaming_two_real_calls_emit_dense_client_indices():
+    """codex R14: two genuine calls must still emit client-visible indices 0
+    then 1 in order — the client-index decoupling must not disturb the normal
+    multi-call sequence."""
+    parser = HyV3ToolParser()
+    wire = (
+        '<tool_call:opensource>a<tool_sep:opensource>{"x": 1}'
+        "<end_of_tool_call:opensource>"
+        '<tool_call:opensource>b<tool_sep:opensource>{"y": 2}'
+        "<end_of_tool_call:opensource>"
+    )
+    tool_acc, _content = _collect_stream(parser, [wire])
+    assert sorted(tool_acc.keys()) == [0, 1]
+    assert tool_acc[0]["name"] == "a"
+    assert json.loads(tool_acc[0]["args"]) == {"x": 1}
+    assert tool_acc[1]["name"] == "b"
+    assert json.loads(tool_acc[1]["args"]) == {"y": 2}
 
 
 def test_opener_positions_skips_garbled_opener_keeps_real_call():
@@ -1277,10 +1304,35 @@ def test_find_call_close_incomplete_open_object_is_still_streaming():
     assert parser._find_call_close(f'{{"a": {{bad}}}}{end}') >= 0
 
 
+def test_find_call_close_resyncs_past_noise_end_token():
+    """codex R14 BLOCKING: a mid-stream noise ``<end_of_tool_call>`` that lands
+    outside a string while an object is still OPEN (``{"a": <end>``) must NOT
+    poison brace-depth forever. The scan RESYNCHRONIZES past the noise token and
+    still accepts the REAL later ``{...}<end>`` close, and the serialized args
+    must be the real object — not ``{}``."""
+    parser = HyV3ToolParser()
+    end = parser.tool_call_end_token
+    # Noise open-object close-token, then the real object + real close.
+    body = f'{{"a": {end}{{"a": 42}}{end}'
+    off = parser._find_call_close(body)
+    assert off >= 0, "resync failed: real close never accepted"
+    # The accepted close is the LAST end-token (the real one).
+    assert body[off:] == end
+    # The args serialize to the real object, not {} — the noise prefix is
+    # resynchronized away.
+    args_tail = body[:off]
+    assert json.loads(parser._final_args_json(args_tail)) == {"a": 42}
+    # A genuinely still-open object with no later balanced object stays -1.
+    assert parser._find_call_close(f'{{"a": {end}') == -1
+
+
 def test_streaming_close_token_after_open_object_waits_for_completion():
     """The same open-object case delivered as a stream: a delta ending in
     ``{"a": <end_of_tool_call>`` (value not yet present) must NOT emit a
-    premature ``{}``; the args only emit once the real object closes."""
+    premature ``{}``; the args only emit once the REAL object closes AND must
+    then carry the real object (codex R14: a poisoned brace-depth used to reject
+    the real close forever, so the args never emitted — this test was
+    false-green because it only checked the name, not the args)."""
     parser = HyV3ToolParser()
     parser.reset()
     step = _stepper(parser)
@@ -1310,6 +1362,9 @@ def test_streaming_close_token_after_open_object_waits_for_completion():
     # The parser holds until a real (brace-balanced) close; final args parse.
     assert 0 in tool_acc
     assert tool_acc[0]["name"] == "calc"
+    # The noise prefix must be resynchronized away and the REAL args emitted —
+    # not left empty (the false-green this test used to hide, codex R14).
+    assert json.loads(tool_acc[0]["args"]) == {"a": 42}
 
 
 def test_non_streaming_garbled_opener_before_real_call_recovers_real_call():

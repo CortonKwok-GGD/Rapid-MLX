@@ -293,6 +293,23 @@ class HyV3ToolParser(ToolParser):
         # never emitted, so their args must not be emitted either (but the FSM
         # still advances on close so the next opener is a fresh call).
         self._suppressed_tools: set[int] = set()
+        # Client-visible tool-call index decoupled from the PHYSICAL opener
+        # index (``current_tool_id`` / index into ``_opener_positions``). The
+        # physical index advances for EVERY opener span the FSM consumes —
+        # including garbled/sep-less residue openers that are skipped for
+        # EMISSION and suppressed off-allowlist calls that emit nothing. The
+        # client (OpenAI SDK) accumulates tool calls into an array keyed by
+        # the emitted ``index``, so a first REAL call emitted at physical index
+        # 1 (after a skipped residue at 0) would leave a null hole at 0 and
+        # corrupt the reconstructed array. ``_client_index_of`` maps a physical
+        # idx → the client-visible index it was ASSIGNED when its header was
+        # actually emitted; ``_next_client_index`` is the monotonic counter
+        # that only advances for calls the client actually sees. Physical
+        # bookkeeping (``streamed_args_for_tool`` / ``prev_tool_call_arr`` /
+        # positions) stays keyed by the physical idx; only the EMITTED
+        # ``{"index": ...}`` uses the client-visible value.
+        self._client_index_of: dict[int, int] = {}
+        self._next_client_index: int = 0
         # High-water mark of content chars already emitted (against the raw
         # ``current_text``). Lets the tool-call entry flush any content that
         # preceded the FIRST opener when the opener and its leading content
@@ -852,6 +869,21 @@ class HyV3ToolParser(ToolParser):
 
         return {"tool_calls": deltas} if deltas else None
 
+    def _assign_client_index(self, physical_idx: int) -> int:
+        """Return the client-visible index for a call being EMITTED now.
+
+        Assigns the next monotonic client index to ``physical_idx`` the first
+        time its header is emitted and caches it so a later args delta (a
+        different tick) reuses the SAME client index. Only called on the
+        emission path, so skipped residue openers and suppressed off-allowlist
+        calls never consume a client index — the client sees a dense 0,1,2…
+        sequence regardless of how many physical openers were skipped.
+        """
+        if physical_idx not in self._client_index_of:
+            self._client_index_of[physical_idx] = self._next_client_index
+            self._next_client_index += 1
+        return self._client_index_of[physical_idx]
+
     def _process_one_call(
         self, current_text: str, request: dict[str, Any] | None
     ) -> tuple[list[dict[str, Any]], bool] | None:
@@ -939,7 +971,7 @@ class HyV3ToolParser(ToolParser):
             else:
                 self._current_tool_ref = generate_tool_id()
                 header = {
-                    "index": idx,
+                    "index": self._assign_client_index(idx),
                     "id": self._current_tool_ref,
                     "type": "function",
                     "function": {"name": name, "arguments": ""},
@@ -993,7 +1025,10 @@ class HyV3ToolParser(ToolParser):
                         if idx < len(self.prev_tool_call_arr):
                             self.prev_tool_call_arr[idx]["arguments"] = final_args
                         deltas.append(
-                            {"index": idx, "function": {"arguments": final_args}}
+                            {
+                                "index": self._assign_client_index(idx),
+                                "function": {"arguments": final_args},
+                            }
                         )
 
         if closed:
@@ -1042,15 +1077,18 @@ class HyV3ToolParser(ToolParser):
                     self.streamed_args_for_tool[idx] = final_args
                 if idx < len(self.prev_tool_call_arr):
                     self.prev_tool_call_arr[idx]["arguments"] = final_args
+                client_idx = self._assign_client_index(idx)
                 deltas.append(
                     {
-                        "index": idx,
+                        "index": client_idx,
                         "id": generate_tool_id(),
                         "type": "function",
                         "function": {"name": name, "arguments": ""},
                     }
                 )
-                deltas.append({"index": idx, "function": {"arguments": final_args}})
+                deltas.append(
+                    {"index": client_idx, "function": {"arguments": final_args}}
+                )
             else:
                 self._suppressed_tools.add(idx)
 
@@ -1061,10 +1099,67 @@ class HyV3ToolParser(ToolParser):
         self._current_tool_ref = None
         return deltas, True
 
+    def _resync_args_body(self, args_tail: str) -> str:
+        """Strip a poisoned/noise prefix from an args body up to its last
+        resync boundary (codex R14).
+
+        ``_find_call_close`` accepts a close after RESYNCHRONIZING past a
+        mid-stream noise ``<end_of_tool_call>`` that appears outside a string
+        while an object is still open (``{"a": <end>{"a": 42}`` — a never-closed
+        leading object then the REAL one). The close offset it returns points
+        at the REAL close, so the sliced ``args_tail`` still carries the broken
+        noise prefix (``{"a": <end>`` before the real ``{"a": 42}``). Serializing
+        from the START would ``raw_decode``-fail on that prefix and yield
+        ``{}``. Apply the SAME resync rule the close-finder uses: walk the body,
+        and each time an ``<end_of_tool_call>`` lands outside a string while an
+        object is still open (depth > 0), discard everything up to and including
+        it and restart at depth 0. What remains after the last such boundary is
+        the real object body. A clean body (no noise ``<end>``) is returned
+        unchanged.
+        """
+        end_tok = self.tool_call_end_token
+        in_string = False
+        escaped = False
+        depth = 0
+        i = 0
+        n = len(args_tail)
+        start = 0
+        while i < n:
+            if not in_string and args_tail.startswith(end_tok, i):
+                if depth > 0:
+                    # Noise close inside a still-open object — resync: everything
+                    # up to and including this token is broken prefix.
+                    i += len(end_tok)
+                    start = i
+                    depth = 0
+                    continue
+                # A close at depth <= 0 should already have bounded args_tail
+                # upstream; nothing more to strip.
+                break
+            ch = args_tail[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            i += 1
+        return args_tail[start:]
+
     def _final_args_json(self, args_tail: str) -> str:
         """Serialize the complete args body (JSON or XML pairs) to a JSON
         string. Returns ``"{}"`` on an empty / unparseable body so the
         emitted ``arguments`` is always valid JSON."""
+        # Drop any poisoned noise prefix left in place by the close-finder's
+        # resync (codex R14), so the real trailing object decodes cleanly.
+        args_tail = self._resync_args_body(args_tail)
         stripped = args_tail.strip()
         if stripped.startswith("{"):
             try:
@@ -1129,9 +1224,8 @@ class HyV3ToolParser(ToolParser):
         return args_tail.find(self.tool_call_end_token)
 
     def _end_token_at_object_close(self, body: str) -> int:
-        """First ``<end_of_tool_call>`` in a ``{``-body that lands OUTSIDE a JSON
-        string AND after the object's braces have balanced back to depth 0, or
-        -1 (codex R12 BLOCKING).
+        """First ``<end_of_tool_call>`` in a ``{``-body that closes a
+        brace-balanced object outside a JSON string, or -1 (codex R12 / R14).
 
         Walks the body as a lightweight lexer tracking two things:
           * JSON string state — a ``"`` toggles in-string unless
@@ -1140,12 +1234,25 @@ class HyV3ToolParser(ToolParser):
           * brace depth — ``{`` / ``}`` outside strings raise / lower depth.
 
         A close token is a real close only when it is reached while NOT in a
-        string and with brace depth ``<= 0`` (the object has closed). This
-        rejects both an interior literal in an unterminated string
-        (``{"m": "…<end>``, in-string) and a close after a still-open object
-        (``{"a": <end>``, depth 1 — the value has not arrived yet), while still
-        accepting a completed-but-malformed body (``{bad}<end>`` — its ``}``
-        drops depth to 0 before the token). Used only on the
+        string and with brace depth ``<= 0`` (the object immediately preceding
+        it has balanced closed). This rejects both an interior literal in an
+        unterminated string (``{"m": "…<end>``, in-string) and a close after a
+        still-open object (``{"a": <end>``, depth 1 — the value has not arrived
+        yet), while still accepting a completed-but-malformed body
+        (``{bad}<end>`` — its ``}`` drops depth to 0 before the token).
+
+        RESYNC on noise (codex R14 BLOCKING): when a close token is reached
+        OUTSIDE a string but while an object is still OPEN (depth > 0), that
+        token is mid-stream NOISE — an ``<end_of_tool_call>`` cannot legitimately
+        appear outside a string inside a well-formed JSON object, so the object
+        so far is broken. Rather than let the never-closed leading ``{`` poison
+        depth forever (so the REAL later ``{…}<end>`` never balances back to 0
+        and the call hangs pending), we ABANDON the broken prefix: skip PAST the
+        noise close token and RESET depth to 0, treating the bytes after it as a
+        fresh object candidate. So ``{"a": <end>{"a": 42}<end>`` (noise open +
+        real object) resynchronizes and accepts the real close, while a
+        genuinely still-open object with no later balanced object
+        (``{"a": <end>``) still returns -1 (keep streaming). Used only on the
         ``raw_decode``-failed path.
         """
         end_tok = self.tool_call_end_token
@@ -1155,8 +1262,17 @@ class HyV3ToolParser(ToolParser):
         i = 0
         n = len(body)
         while i < n:
-            if not in_string and depth <= 0 and body.startswith(end_tok, i):
-                return i
+            if not in_string and body.startswith(end_tok, i):
+                if depth <= 0:
+                    # Brace-balanced object precedes this close → real close.
+                    return i
+                # Depth > 0: an ``<end>`` outside a string but inside a still-open
+                # object is noise. Abandon the broken prefix — skip past this
+                # token and resync depth to 0 so a later balanced ``{…}<end>``
+                # is still recognized (codex R14).
+                i += len(end_tok)
+                depth = 0
+                continue
             ch = body[i]
             if in_string:
                 if escaped:
