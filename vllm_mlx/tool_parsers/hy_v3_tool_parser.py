@@ -546,10 +546,13 @@ class HyV3ToolParser(ToolParser):
 
         2-phase FSM (step 4):
           * SEEKING_NAME — buffer from the opener until ``<tool_sep>`` lands,
-            then emit the function name (arguments empty).
-          * STREAMING_ARGS — stream the args body incrementally, emitting a
-            JSON diff and withholding the trailing ``}`` until
-            ``<end_of_tool_call>`` arrives.
+            then emit the function-name header (arguments empty).
+          * STREAMING_ARGS — buffer the args body until ``<end_of_tool_call>``
+            arrives, then emit the COMPLETE args document as a single
+            valid-JSON delta. Args are never emitted as a partial fragment, so
+            every ``function.arguments`` delta is a valid-JSON piece whose
+            concatenation is the final document (OpenAI streaming contract). A
+            call arriving whole in one delta emits BOTH header and args.
         """
         if not previous_text:
             self._reset_streaming_state()
