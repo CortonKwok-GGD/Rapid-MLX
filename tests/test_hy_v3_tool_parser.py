@@ -817,11 +817,11 @@ def test_streaming_content_before_opener_in_same_delta_not_dropped():
     leading prose when the model emitted content + a complete call in one
     chunk.
 
-    The postprocessor treats each streaming result as EITHER content OR
-    tool_calls (never both in one delta), so the pre-opener content is emitted
-    on the delta that first carries the opener and the tool-call deltas flow on
-    the NEXT delta. This mirrors the real two-stage flow: here the content is
-    flushed first, then a follow-up (empty) delta drains the now-visible call.
+    codex R5 BLOCKING: the pre-opener content AND the tool-call deltas are now
+    emitted in the SAME return (the postprocessor's mixed-content contract —
+    ``content`` key alongside ``tool_calls`` — splits them into a leading
+    content event then the tool events). Nothing is deferred to a later
+    invocation that might never happen on the FINAL delta.
     """
     parser = HyV3ToolParser()
     parser.reset()
@@ -831,18 +831,13 @@ def test_streaming_content_before_opener_in_same_delta_not_dropped():
         "<tool_call:opensource>search<tool_sep:opensource>"
         '{"q": "weather"}<end_of_tool_call:opensource>'
     )
-    # First result: the pre-opener content, emitted (not dropped).
+    # ONE result carries BOTH the pre-opener content and the complete call.
     assert m1 is not None
     assert m1.get("content") == "Let me look that up. "
-    assert "tool_calls" not in m1
-    # Next invocation (no new bytes) drains the now-visible complete call. The
-    # header (name) and args may arrive as separate list entries in the same
-    # result, so accumulate name/args across all deltas (as a real client does).
-    m2 = step("")
-    assert m2 is not None and "tool_calls" in m2
+    assert "tool_calls" in m1
     name = ""
     args = ""
-    for tc in m2["tool_calls"]:
+    for tc in m1["tool_calls"]:
         fn = tc.get("function", {})
         if fn.get("name"):
             name = fn["name"]

@@ -584,16 +584,25 @@ class HyV3ToolParser(ToolParser):
         # tool-call delta, flush content that preceded the FIRST opener but was
         # never emitted — this happens when the opener and its leading content
         # arrive in the SAME delta, so ``_emit_safe_content`` above was skipped
-        # (codex R3 BLOCKING). The postprocessor treats a result as EITHER
-        # content OR tool_calls (never both in one delta), so the pending
-        # content is emitted this tick and the tool-call deltas flow on the
-        # next; ``finalize()`` re-parses the full text as a safety net either
-        # way. After the pre-opener gap is drained, plain content is suppressed
-        # (content and tool_calls are exclusive for a single assistant turn).
+        # (codex R3 BLOCKING). Emit that pending content AND the tool-call
+        # deltas in the SAME return via the postprocessor's mixed-content
+        # contract (``_detect_tool_calls`` preserves a ``content`` key alongside
+        # ``tool_calls`` and the caller splits it into a leading content event
+        # then the tool events). This drains everything this tick — no deferral
+        # to a "later invocation that may never happen" on the FINAL delta
+        # (codex R5 BLOCKING). After the pre-opener gap is drained, plain
+        # content is suppressed (content and tool_calls are exclusive for the
+        # rest of the turn).
         pending_content = self._flush_pre_opener_content(current_text)
+        tool_result = self._stream_tool_call(current_text, request)
         if pending_content is not None:
+            content_str = pending_content.get("content", "")
+            if tool_result is not None:
+                # Fold the leading content into the tool-call result so both
+                # halves reach the wire in one tick.
+                return {"content": content_str, **tool_result}
             return pending_content
-        return self._stream_tool_call(current_text, request)
+        return tool_result
 
     def _safe_content_prefix(self, text: str) -> str:
         """Return the portion of ``text`` safe to emit as content now.
