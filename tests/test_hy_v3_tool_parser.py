@@ -706,6 +706,28 @@ def test_streaming_passthrough_content_when_no_tool_call():
     assert msg["content"] == "Hello "
 
 
+def test_streaming_text_format_flows_as_content_recovered_at_finalize():
+    """codex R8 BLOCKING (parity note): the ``[Calling tool="X"]`` text-format
+    degradation is NOT streamed incrementally as tool_calls — it has no native
+    token boundaries. During streaming its bytes flow as ordinary CONTENT; the
+    postprocessor's finalize re-runs the (allowlist-aware) non-streaming
+    ``extract_tool_calls`` over the full text to recover the structured call.
+    This test pins the documented contract: streaming yields content only, and
+    the non-streaming extractor recovers the call from the same full text."""
+    parser = HyV3ToolParser()
+    wire = '[Calling tool="get_weather" city="Paris"]'
+    # Streaming: no tool_calls, bytes surface as content (no native opener).
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert tool_acc == {}
+    assert content == wire
+    # Finalize-equivalent: the non-streaming path recovers the structured call.
+    parser.reset()
+    res = parser.extract_tool_calls(wire)
+    assert res.tools_called is True
+    assert res.tool_calls[0]["name"] == "get_weather"
+    assert json.loads(res.tool_calls[0]["arguments"]) == {"city": "Paris"}
+
+
 def test_streaming_content_after_completed_tool_call_is_suppressed():
     """Once an assistant turn is a TOOL-CALL turn (any ``<tool_call>`` opener
     has appeared), post-close plain-content deltas MUST be suppressed —

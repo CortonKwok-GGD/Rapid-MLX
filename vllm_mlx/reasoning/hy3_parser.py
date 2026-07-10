@@ -218,12 +218,38 @@ class Hy3ReasoningParser(Qwen3ReasoningParser):
         prompt_thinking_active: bool = False,
         finish_reason: str | None = None,
     ) -> DeltaMessage | None:
-        return super().finalize_streaming(
+        base = super().finalize_streaming(
             _normalize_hy3_tags(accumulated_text),
             matched_stop=matched_stop,
             prompt_thinking_active=prompt_thinking_active,
             finish_reason=finish_reason,
         )
+        # Release any trailing straddle suffix the streaming path withheld that
+        # never completed a real Hy3 tag (codex R8 BLOCKING: content ending in a
+        # lone ``<`` or ``<think`` was dropped at stream end because our widened
+        # hold reserved it every tick and ``super().finalize_streaming`` — which
+        # tracks its own emit position — does not re-surface it). A held run
+        # that IS a full tag prefix but never closed is opaque markup, not
+        # content, so only release when it is NOT itself the start of a tag that
+        # the base already accounts for — i.e. release the raw withheld bytes as
+        # the appropriate channel (reasoning if still inside an open think span,
+        # else content).
+        held = _hy3_straddle_suffix_len(accumulated_text)
+        if held == 0:
+            return base
+        tail = accumulated_text[len(accumulated_text) - held :]
+        # If the tail is a COMPLETE tag (``<think>`` / ``</think>`` / labelled),
+        # it is a delimiter the base handles — do not leak it as content.
+        if _HY3_OPEN_TAG_RE.fullmatch(tail) or _HY3_CLOSE_TAG_RE.fullmatch(tail):
+            return base
+        into_reasoning = self.is_open_in_think(accumulated_text)
+        base_content = getattr(base, "content", None) if base else None
+        base_reasoning = getattr(base, "reasoning", None) if base else None
+        if into_reasoning:
+            base_reasoning = (base_reasoning or "") + tail
+        else:
+            base_content = (base_content or "") + tail
+        return DeltaMessage(content=base_content, reasoning=base_reasoning)
 
     def is_open_in_think(self, accumulated_text: str) -> bool:
         return super().is_open_in_think(_normalize_hy3_tags(accumulated_text))

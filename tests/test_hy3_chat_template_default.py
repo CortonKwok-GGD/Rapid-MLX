@@ -198,3 +198,46 @@ def test_hy3_default_dropped_when_reasoning_effort_alone_is_rejected():
     assert tok.calls[0].get("reasoning_effort") == "low"
     assert "reasoning_effort" not in tok.calls[-1]
     assert result == "<reasoning_effort-dropped ok>"
+
+
+def test_hy3_reasoning_effort_survives_tools_fallback():
+    """codex R8 BLOCKING: when the template rejects ``tools`` (NOT
+    ``reasoning_effort``), the two-stage retry must NOT drop
+    ``reasoning_effort`` before the prompt-injection tools fallback — otherwise
+    a Hy3 request on a tools-rejecting template silently loses the load-bearing
+    ``reasoning_effort='low'`` override. The tools fallback must carry it."""
+
+    class ToolsRejectingTokenizer:
+        """Rejects ``enable_thinking`` and ``tools``; accepts
+        ``reasoning_effort``. The first call fails on enable_thinking, retry-1
+        fails on tools, and the prompt-injection fallback (no tools kwarg)
+        must succeed WITH reasoning_effort still present."""
+
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "enable_thinking" in kwargs:
+                raise TypeError(
+                    "apply_chat_template() got unexpected keyword "
+                    "argument 'enable_thinking'"
+                )
+            if "tools" in kwargs:
+                raise TypeError(
+                    "apply_chat_template() got unexpected keyword argument 'tools'"
+                )
+            return "<tools-injected ok>"
+
+    tok = ToolsRejectingTokenizer()
+    result = apply_chat_template(
+        tok,
+        messages=[{"role": "user", "content": "hi"}],
+        model_name="hy3-preview-4bit",
+        tools=[{"type": "function", "function": {"name": "get_weather"}}],
+    )
+    assert result == "<tools-injected ok>"
+    # The FINAL (prompt-injection) call MUST still carry reasoning_effort=low —
+    # the second TypeError was about tools, not reasoning_effort.
+    assert tok.calls[-1].get("reasoning_effort") == "low"
+    assert "tools" not in tok.calls[-1]

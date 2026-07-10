@@ -618,6 +618,16 @@ class HyV3ToolParser(ToolParser):
             every ``function.arguments`` delta is a valid-JSON piece whose
             concatenation is the final document (OpenAI streaming contract). A
             call arriving whole in one delta emits BOTH header and args.
+
+        Text-format degradation (``[Calling tool="X" k="v"]``) is handled ONLY
+        on the NON-STREAMING path and at stream end (codex R8 BLOCKING: parity
+        note). Deliberately NOT streamed incrementally: the degraded form is a
+        rare low-quant artifact, has no native token boundaries to drive an
+        incremental FSM, and the postprocessor's ``finalize()`` re-runs
+        ``extract_tool_calls`` (allowlist-aware) over the full accumulated text
+        whenever it contains the ``[Calling`` marker — recovering the structured
+        call. So during streaming the ``[Calling …]`` bytes flow as ordinary
+        content and are promoted to ``tool_calls`` exactly once, at finalize.
         """
         if not previous_text:
             self._reset_streaming_state()

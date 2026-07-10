@@ -286,6 +286,13 @@ def _collect_reasoning_stream(full: str) -> tuple[str, str]:
             content += msg.content
         if msg.reasoning:
             reasoning += msg.reasoning
+    # Flush any withheld trailing straddle suffix at stream end.
+    fin = parser.finalize_streaming(prev)
+    if fin is not None:
+        if fin.content:
+            content += fin.content
+        if fin.reasoning:
+            reasoning += fin.reasoning
     return content, reasoning
 
 
@@ -313,3 +320,25 @@ def test_streaming_falsified_think_prefix_inside_reasoning_not_dropped():
     )
     assert reasoning == "weigh <thinker note"
     assert content == "answer"
+
+
+def test_streaming_content_ending_in_held_lt_released_at_finalize():
+    """codex R8 BLOCKING: content that ENDS in a lone ``<`` (or ``<think``) —
+    a partial-tag prefix the streaming path withholds every tick — must be
+    released at finalize, not dropped. Our widened straddle hold reserves even a
+    lone ``<``, so ``finalize_streaming`` re-surfaces the held non-tag suffix."""
+    content, reasoning = _collect_reasoning_stream(
+        "<think:opensource>r</think:opensource>trailing <"
+    )
+    assert reasoning == "r"
+    assert content == "trailing <"
+
+
+def test_streaming_content_ending_in_held_think_prefix_released_at_finalize():
+    """Same release for a longer held prefix (``<think``) that never completed
+    a tag — the full ``done <think`` must reach content."""
+    content, reasoning = _collect_reasoning_stream(
+        "<think:opensource>r</think:opensource>done <think"
+    )
+    assert reasoning == "r"
+    assert content == "done <think"

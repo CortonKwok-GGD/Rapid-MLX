@@ -1013,17 +1013,27 @@ def apply_chat_template(
         try:
             return template_applicator.apply_chat_template(messages, **template_kwargs)
         except TypeError as e2:
-            # Second failure — the residual unknown kwarg is most likely
-            # ``reasoning_effort`` on a non-Hy3 template that regex-matched
-            # the Hy3 pattern by mistake, or an older Hy3 checkpoint that
-            # never wired the kwarg. Drop it and let the tools-fallback
-            # branch below run without it.
-            logger.debug(
-                "Chat template TypeError persisted after dropping "
-                "enable_thinking, retrying without reasoning_effort: %s",
-                e2,
-            )
-            template_kwargs.pop("reasoning_effort", None)
+            # Second failure. Only drop ``reasoning_effort`` when the error
+            # actually names it (codex R8 BLOCKING: unconditionally popping it
+            # here loses the load-bearing Hy3 ``reasoning_effort="low"`` override
+            # when the REAL culprit is ``tools`` — the template rejects tools,
+            # not reasoning_effort, and the prompt-injection tools fallback below
+            # would then run without the override, regressing Hy3 factual
+            # recall). When the failure is about tools, keep reasoning_effort so
+            # the tools fallback preserves it.
+            if "reasoning_effort" in str(e2):
+                logger.debug(
+                    "Chat template TypeError persisted, dropping "
+                    "reasoning_effort (named in error): %s",
+                    e2,
+                )
+                template_kwargs.pop("reasoning_effort", None)
+            else:
+                logger.debug(
+                    "Chat template TypeError persisted (not reasoning_effort) — "
+                    "keeping reasoning_effort for the tools fallback: %s",
+                    e2,
+                )
 
         # Step 2: template also rejects tools — fall back to prompt injection.
         # Restore enable_thinking: the step-1 pop removed it because we
