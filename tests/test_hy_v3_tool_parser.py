@@ -1255,3 +1255,108 @@ def test_opener_positions_skips_garbled_opener_keeps_real_call():
     assert len(positions) == 2
     assert positions[0] == 0
     assert positions[1] == len(f"{oc}gar")
+
+
+# ---------------------------------------------------------------------------
+# codex R12 regressions: close-token after a still-OPEN object, garbled opener
+# on the NON-STREAMING path
+# ---------------------------------------------------------------------------
+def test_find_call_close_incomplete_open_object_is_still_streaming():
+    """codex R12 BLOCKING #1: a close token that is structurally OUTSIDE a JSON
+    string but reached while the object is still OPEN (braces not balanced back
+    to 0 — the value has not arrived) MUST NOT close the call. Only a close
+    after the object's braces balance is real.
+    """
+    parser = HyV3ToolParser()
+    end = parser.tool_call_end_token
+    # Value after ``"a":`` not arrived — object still open (depth 1).
+    assert parser._find_call_close(f'{{"a": {end}') == -1
+    # Nested object still open (depth 2).
+    assert parser._find_call_close(f'{{"a": {{"b": {end}') == -1
+    # Malformed but brace-balanced (depth back to 0) — closes.
+    assert parser._find_call_close(f"{{bad}}{end}") >= 0
+    assert parser._find_call_close(f'{{"a": {{bad}}}}{end}') >= 0
+
+
+def test_streaming_close_token_after_open_object_waits_for_completion():
+    """The same open-object case delivered as a stream: a delta ending in
+    ``{"a": <end_of_tool_call>`` (value not yet present) must NOT emit a
+    premature ``{}``; the args only emit once the real object closes."""
+    parser = HyV3ToolParser()
+    parser.reset()
+    step = _stepper(parser)
+    # Opener + name + sep + an open object whose value slot is empty, followed
+    # by a stray close token — still streaming.
+    m1 = step(
+        "<tool_call:opensource>calc<tool_sep:opensource>"
+        '{"a": <end_of_tool_call:opensource>'
+    )
+    # Whatever surfaces must NOT be a completed args delta with ``{}``.
+    if m1 and "tool_calls" in m1:
+        for tc in m1["tool_calls"]:
+            args = tc.get("function", {}).get("arguments", "")
+            assert args in ("", None), f"premature args emitted: {args!r}"
+    # Now the real value + real close arrive.
+    step('{"a": 42}<end_of_tool_call:opensource>')
+    # Reassemble across the whole stream.
+    parser2 = HyV3ToolParser()
+    tool_acc, _content = _collect_stream(
+        parser2,
+        [
+            "<tool_call:opensource>calc<tool_sep:opensource>",
+            '{"a": <end_of_tool_call:opensource>',  # noise mid-stream
+            '{"a": 42}<end_of_tool_call:opensource>',
+        ],
+    )
+    # The parser holds until a real (brace-balanced) close; final args parse.
+    assert 0 in tool_acc
+    assert tool_acc[0]["name"] == "calc"
+
+
+def test_non_streaming_garbled_opener_before_real_call_recovers_real_call():
+    """codex R12 BLOCKING #2: the NON-STREAMING ``_next_block`` had the same
+    garbled-opener bug as ``_opener_positions`` — a truncated opener before a
+    valid call stole the real call's separator and fabricated a bogus name
+    (``gar<tool_call>realtool``). The fix bounds the body at a pre-separator
+    opener and resumes at the later opener, so the real call is recovered."""
+    parser = HyV3ToolParser()
+    oc = parser.tool_call_start_token
+    sep = parser.tool_sep_token
+    end = parser.tool_call_end_token
+    text = f'{oc}gar{oc}realtool{sep}{{"x": 1}}{end}'
+    result = parser.extract_tool_calls(text, request=None)
+    assert result.tools_called is True
+    assert [c.get("name") for c in result.tool_calls] == ["realtool"]
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"x": 1}
+
+
+def test_non_streaming_garbled_opener_then_two_real_calls():
+    """A garbled residue opener followed by TWO real calls must recover BOTH,
+    not just the first — ``_next_block`` resumes cleanly after skipping the
+    residue."""
+    parser = HyV3ToolParser()
+    oc = parser.tool_call_start_token
+    sep = parser.tool_sep_token
+    end = parser.tool_call_end_token
+    text = (
+        f'{oc}gar{oc}a{sep}{{"x": 1}}{end}{oc}b{sep}{{"y": 2}}{end}'
+    )
+    result = parser.extract_tool_calls(text, request=None)
+    assert [c.get("name") for c in result.tool_calls] == ["a", "b"]
+
+
+def test_non_streaming_literal_opener_in_json_string_stays_one_call():
+    """Guard the R6 invariant on the non-streaming path after the R12 bounding
+    change: a literal ``<tool_call>`` INSIDE a JSON string value (after the
+    separator) must still be opaque — exactly one call, args intact."""
+    parser = HyV3ToolParser()
+    oc = parser.tool_call_start_token
+    sep = parser.tool_sep_token
+    end = parser.tool_call_end_token
+    text = f'{oc}log{sep}{{"msg": "prefix {oc} suffix", "n": 1}}{end}'
+    result = parser.extract_tool_calls(text, request=None)
+    assert [c.get("name") for c in result.tool_calls] == ["log"]
+    assert json.loads(result.tool_calls[0]["arguments"]) == {
+        "msg": f"prefix {oc} suffix",
+        "n": 1,
+    }

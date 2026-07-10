@@ -984,17 +984,16 @@ def apply_chat_template(
     #     match via `_HY3_MODEL_NAME_RE` — not a loose substring)
     #   * ``enable_thinking`` is not False (a client that explicitly
     #     disabled thinking wants no_think — respect that intent)
-    # A future revision may add explicit request-side ``reasoning_effort``
-    # plumb-through; today it defaults are template-only, so this override
-    # is the correct injection point. Non-Hy3 models never see the kwarg,
+    # NOTE (codex R12 NIT): there is presently NO request-side
+    # ``reasoning_effort`` plumb-through — the value is template-only, and this
+    # override is the sole injection point. ``setdefault`` (not direct
+    # assignment) is deliberate future-proofing: IF a later revision plumbs a
+    # graded effort (``medium`` / ``high``) through and pre-populates
+    # ``template_kwargs["reasoning_effort"]`` upstream of this call, the
+    # explicit value survives instead of being silently overwritten. Until that
+    # plumb-through exists, ``setdefault`` behaves identically to assignment
+    # here (the key is never pre-populated). Non-Hy3 models never see the kwarg,
     # so no risk of TypeError on other templates.
-    #
-    # Codex round-3 BLOCKING #3 (PR #1070): use ``setdefault`` rather
-    # than direct assignment so a caller (or a future request-side
-    # plumb-through that pre-populates ``template_kwargs``) can still
-    # supply an explicit graded effort (``medium`` / ``high``) and see
-    # it survive to the tokenizer. Direct assignment would silently
-    # overwrite that intent.
     if _looks_like_hy3(model_name) and enable_thinking is not False:
         template_kwargs.setdefault("reasoning_effort", "low")
 
