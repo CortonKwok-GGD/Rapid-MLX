@@ -311,6 +311,28 @@ def test_json_body_containing_literal_arg_value_close_parses_correctly():
     }
 
 
+def test_json_body_containing_literal_opener_parses_as_one_call():
+    """codex R6 BLOCKING: a JSON string value that legitimately contains the
+    literal ``<tool_call:opensource>`` opener text MUST NOT be split into a
+    phantom second call. The non-streaming block scan is JSON-aware — it finds
+    the real close over the whole remainder (``raw_decode`` consumes the opener
+    literal inside the string) instead of bounding at the interior substring."""
+    parser = HyV3ToolParser()
+    out = (
+        "<tool_call:opensource>log<tool_sep:opensource>"
+        '{"msg": "prefix <tool_call:opensource> suffix", "n": 1}'
+        "<end_of_tool_call:opensource>"
+    )
+    res = parser.extract_tool_calls(out)
+    assert res.tools_called is True
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0]["name"] == "log"
+    assert json.loads(res.tool_calls[0]["arguments"]) == {
+        "msg": "prefix <tool_call:opensource> suffix",
+        "n": 1,
+    }
+
+
 def test_no_tool_call_returns_content_unchanged():
     """A pure text response must pass through as content with
     ``tools_called=False``."""
@@ -807,6 +829,28 @@ def test_streaming_two_complete_calls_in_one_delta_both_emit():
     assert json.loads(tool_acc[0]["args"]) == {"x": 1}
     assert tool_acc[1]["name"] == "get_b"
     assert json.loads(tool_acc[1]["args"]) == {"y": 2}
+    assert content == ""
+
+
+def test_streaming_literal_opener_in_json_arg_is_not_a_phantom_call():
+    """codex R6 BLOCKING: a JSON string argument value containing the literal
+    ``<tool_call:opensource>`` opener text MUST NOT be split into a phantom
+    second call. ``_opener_positions`` walks call spans JSON-aware, so the
+    interior opener substring is opaque inside the (parsed) body — char-by-char
+    delivery still yields exactly ONE call with the full argument stream."""
+    parser = HyV3ToolParser()
+    wire = (
+        "<tool_call:opensource>log<tool_sep:opensource>"
+        '{"msg": "prefix <tool_call:opensource> suffix", "n": 1}'
+        "<end_of_tool_call:opensource>"
+    )
+    tool_acc, content = _collect_stream(parser, list(wire))
+    assert sorted(tool_acc.keys()) == [0]  # no phantom index 1
+    assert tool_acc[0]["name"] == "log"
+    assert json.loads(tool_acc[0]["args"]) == {
+        "msg": "prefix <tool_call:opensource> suffix",
+        "n": 1,
+    }
     assert content == ""
 
 

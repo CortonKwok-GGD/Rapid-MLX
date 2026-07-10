@@ -306,21 +306,40 @@ class HyV3ToolParser(ToolParser):
         }
 
     def _opener_positions(self, text: str) -> list[int]:
-        """Byte offsets of every ``<tool_call>`` opener in ``text``.
+        """Byte offsets of every GENUINE ``<tool_call>`` call-start in ``text``.
 
-        A plain ``str.find`` scan on the pinned fixed opener string — the
-        wire never nests tool_call openers, so each occurrence starts a new
-        indexed call (the streaming FSM drives one index per opener)."""
+        NOT a plain substring scan (codex R6 BLOCKING): a JSON string argument
+        value may legitimately contain the literal ``<tool_call…>`` opener text,
+        and a raw scan would split that interior substring into a phantom call,
+        corrupting the argument stream. Instead we walk call spans forward:
+
+          * from the cursor, find the next opener → that is a genuine call start;
+          * find its close JSON-aware (``_find_call_close_in_body`` runs
+            ``raw_decode`` over a ``{``-body, so any opener/end-token literal
+            inside a string value is consumed, not treated as a boundary);
+          * advance the cursor PAST that close and repeat.
+
+        The last call may be still streaming (no close yet). Its opener is
+        included (the FSM is driving it), and — crucially — we STOP there: any
+        opener-substring inside its in-progress body is opaque until the body's
+        JSON completes and a real close is seen, so it can never become a
+        phantom boundary.
+        """
         positions: list[int] = []
-        start = 0
         tok = self.tool_call_start_token
-        step = len(tok)
-        while True:
-            pos = text.find(tok, start)
-            if pos == -1:
+        cursor = 0
+        n = len(text)
+        while cursor <= n:
+            opener = text.find(tok, cursor)
+            if opener == -1:
                 break
-            positions.append(pos)
-            start = pos + step
+            positions.append(opener)
+            body_start = opener + len(tok)
+            close_rel = self._find_call_close_in_body(text[body_start:])
+            if close_rel == -1:
+                # In-progress (or truncated) final call — its interior is opaque.
+                break
+            cursor = body_start + close_rel + len(self.tool_call_end_token)
         return positions
 
     # ------------------------------------------------------------------
@@ -496,19 +515,27 @@ class HyV3ToolParser(ToolParser):
         if opener == -1:
             return None
         body_start = opener + len(self.tool_call_start_token)
-        # Bound the search at the NEXT opener so one call's close-scan can't
-        # run into the following call's body.
-        next_opener = text.find(self.tool_call_start_token, body_start)
-        scan_end = next_opener if next_opener != -1 else len(text)
-        segment = text[body_start:scan_end]
 
-        close_rel = self._find_call_close_in_body(segment)
+        # Find the canonical close JSON-aware over the WHOLE remaining text —
+        # NOT bounded at the next raw opener (codex R6 BLOCKING: a JSON string
+        # argument may legitimately contain the literal ``<tool_call…>`` opener
+        # text; bounding at that substring truncated the body and dropped the
+        # real close). ``_find_call_close_in_body`` runs ``raw_decode`` over the
+        # JSON body, which consumes any literal opener/end-token inside a string
+        # value, so the offset it returns is the REAL close after the JSON.
+        remainder = text[body_start:]
+        close_rel = self._find_call_close_in_body(remainder)
         if close_rel != -1:
-            body = segment[:close_rel]
+            body = remainder[:close_rel]
             block_end = body_start + close_rel + len(self.tool_call_end_token)
             return opener, block_end, body
 
-        # No canonical close — try the malformed-close regex on the segment.
+        # No canonical close. For the malformed-close salvage (``</arg_value>``,
+        # no JSON body to protect) bound the segment at the next opener so one
+        # call's regex can't run into the following call's body.
+        next_opener = text.find(self.tool_call_start_token, body_start)
+        scan_end = next_opener if next_opener != -1 else len(text)
+        segment = text[body_start:scan_end]
         m = self._tool_call_malformed_re_body.search(segment)
         if m is not None:
             body = m.group("body")
