@@ -297,11 +297,25 @@ def inject_hy3_mtp_support(
                 sorted(missing)[:8],
             )
             return False
-        # Shape/dtype guard (codex BLOCKING #3): the key-name coverage above
-        # does NOT catch a sidecar quantized for a different base (e.g. 8-bit
-        # packed tensors landing on a 4-bit head), which would either error
-        # opaquely in load_weights or corrupt inference. Reject up-front with
-        # an actionable message.
+
+        # Shape / dtype-category guard (codex BLOCKING): the key-name coverage
+        # above does NOT catch a sidecar quantized for a different base (e.g.
+        # 8-bit packed tensors landing on a 4-bit head), which would either
+        # error opaquely in load_weights or corrupt inference. A quant mismatch
+        # shows up as (a) a packed-shape mismatch and/or (b) a floating-vs-
+        # integer dtype-category flip (packed quant weights are uint32; the
+        # freshly-initialised template's unquantized tensors are floating).
+        #
+        # We deliberately do NOT require exact floating dtype equality: the
+        # real sidecar carries bf16 unquantized tensors (RMSNorm weights,
+        # biases) while the template initialises them in fp32, and
+        # ``load_weights`` casts float->float losslessly-in-kind. Comparing the
+        # raw dtype here (as an earlier revision did) rejected a perfectly
+        # valid bf16 sidecar. So compare the dtype *category* (floating vs
+        # integer/packed), not the exact float width.
+        def _kind(dt: Any) -> str:
+            return "float" if mx.issubdtype(dt, mx.floating) else "int"
+
         expected = {k: (v.shape, v.dtype) for k, v in tree_flatten(mtp.parameters())}
         bad = [
             (
@@ -311,13 +325,13 @@ def inject_hy3_mtp_support(
             )
             for k in expected_keys
             if tuple(mtp_weights[k].shape) != tuple(expected[k][0])
-            or mtp_weights[k].dtype != expected[k][1]
+            or _kind(mtp_weights[k].dtype) != _kind(expected[k][1])
         ]
         if bad:
             logger.warning(
                 "[mtp.inject.hy3] sidecar %s has %d shape/dtype-mismatched "
                 "tensor(s) (likely a quantization mismatch vs the base). "
-                "First (key, expected(shape,dtype), got(shape,dtype)): %s. "
+                "First (key, expected(shape,dtype-kind), got(shape,dtype)): %s. "
                 "Refusing to load. Use a sidecar extracted for this base quant.",
                 weights_file.name,
                 len(bad),

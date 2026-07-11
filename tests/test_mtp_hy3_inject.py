@@ -289,6 +289,74 @@ def test_inject_loads_synthetic_full_sidecar(tmp_path):
     assert validate_hy3_mtp_support(model) is True
 
 
+def test_inject_accepts_bf16_sidecar_against_fp32_template(tmp_path):
+    """A real sidecar carries bf16 unquantized tensors (RMSNorm weights,
+    biases) while the freshly-initialised template is fp32. The shape/dtype
+    guard must compare the dtype *category* (float vs int/packed), NOT the
+    exact float width, or it rejects a perfectly valid bf16 sidecar.
+
+    Regression for the codex-BLOCKING finding: the earlier synthetic test
+    (``test_inject_loads_synthetic_full_sidecar``) missed this because both
+    the sidecar and the template originated from the same fp32 initialiser.
+    Here we force the sidecar to bf16 so the two sides differ in float width.
+    """
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.hy3_head import build_hy3_mtp_module
+    from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        inject_hy3_mtp_support,
+        validate_hy3_mtp_support,
+    )
+
+    args = _tiny_hy3_args()
+    template = build_hy3_mtp_module(args, 1)
+    weights = {}
+    for k, v in tree_flatten(template.parameters()):
+        vb = v.astype(mx.bfloat16)  # sidecar ships bf16, template is fp32
+        mx.eval(vb)
+        weights[k] = vb
+    assert any(v.dtype == mx.bfloat16 for v in weights.values())
+    side_dir = tmp_path / "sidecar"
+    side_dir.mkdir()
+    mx.save_safetensors(str(side_dir / "model-mtp.safetensors"), weights)
+
+    model = _build_tiny_hy3_model()
+    assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is True
+    assert validate_hy3_mtp_support(model) is True
+
+
+def test_inject_refuses_integer_packed_wrong_kind(tmp_path):
+    """The guard must still reject a genuine quant mismatch: a tensor that
+    arrives as a packed integer (uint32) where the unquantized template
+    expects a floating tensor is a float-vs-int category flip and is refused
+    (this is what an 8-bit-packed sidecar landing on an unquantized/4-bit
+    head looks like)."""
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.hy3_head import build_hy3_mtp_module
+    from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        inject_hy3_mtp_support,
+        validate_hy3_mtp_support,
+    )
+
+    args = _tiny_hy3_args()
+    template = build_hy3_mtp_module(args, 1)
+    weights = dict(tree_flatten(template.parameters()))
+    for k in list(weights):
+        mx.eval(weights[k])
+    # Corrupt one float tensor into a packed-integer of a different shape,
+    # simulating a wrong-quant sidecar. Must be caught by the guard.
+    weights["eh_proj.weight"] = mx.zeros((4, 2), dtype=mx.uint32)
+    mx.eval(weights["eh_proj.weight"])
+    side_dir = tmp_path / "sidecar"
+    side_dir.mkdir()
+    mx.save_safetensors(str(side_dir / "model-mtp.safetensors"), weights)
+
+    model = _build_tiny_hy3_model()
+    assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is False
+    assert validate_hy3_mtp_support(model) is False
+
+
 # ---------------------------------------------------------------------------
 # 5. Architecture guard
 # ---------------------------------------------------------------------------

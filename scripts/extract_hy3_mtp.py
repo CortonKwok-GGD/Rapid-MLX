@@ -145,9 +145,20 @@ def main() -> int:
     ap.add_argument(
         "--out", default=DEFAULT_OUT, help="Output path for model-mtp.safetensors."
     )
+    ap.add_argument(
+        "--base-rev",
+        default=None,
+        help="Immutable commit SHA for --base-repo (recommended for "
+        "reproducible provenance; defaults to repo HEAD).",
+    )
+    ap.add_argument(
+        "--upstream-rev",
+        default=None,
+        help="Immutable commit SHA for --upstream-repo (defaults to repo HEAD).",
+    )
     args = ap.parse_args()
 
-    base_cfg = _base_config(args.base_repo)
+    base_cfg = _base_config(args.base_repo, args.base_rev)
     mtp_layer = _resolve_mtp_layer(base_cfg, args.base_repo)
     num_experts = _resolve_num_experts(base_cfg)
     base_quant = _resolve_base_quant(base_cfg)
