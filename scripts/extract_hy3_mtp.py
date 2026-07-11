@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import mlx.core as mx
@@ -296,11 +297,32 @@ def main() -> int:
         )
 
     if all_weights:
-        logger.warning(
-            "UNCONSUMED layer-%d tensors (first 8): %s",
-            mtp_layer,
-            sorted(all_weights)[:8],
-        )
+        # Schema-drift guard (codex NIT): unconsumed layer tensors mean the
+        # upstream head grew params this extractor does not map, so a warning-
+        # only path could publish a silently-incomplete sidecar. Fail hard
+        # unless the operator explicitly acknowledges via
+        # HY3_MTP_ALLOW_UNCONSUMED=1 (e.g. deliberately dropping a known-unused
+        # tensor during a controlled re-extract).
+        leftover = sorted(all_weights)
+        if os.environ.get("HY3_MTP_ALLOW_UNCONSUMED") == "1":
+            logger.warning(
+                "UNCONSUMED layer-%d tensors ignored via HY3_MTP_ALLOW_UNCONSUMED "
+                "(count=%d, first 8): %s",
+                mtp_layer,
+                len(leftover),
+                leftover[:8],
+            )
+        else:
+            logger.error(
+                "UNCONSUMED layer-%d tensors (count=%d, first 8): %s. The upstream "
+                "MTP head carries params this extractor does not map — refusing to "
+                "publish a silently-incomplete sidecar. Update the remap, or set "
+                "HY3_MTP_ALLOW_UNCONSUMED=1 to override deliberately.",
+                mtp_layer,
+                len(leftover),
+                leftover[:8],
+            )
+            return 1
 
     # --- 3. Quantize to match the base checkpoint. ---
     # Norms (1-D) + expert_bias stay FP. eh_proj / attn proj / switch_mlp /
@@ -323,10 +345,25 @@ def main() -> int:
         quantized[k.replace(".weight", ".biases")] = q_b
 
     # --- 4. Save into a DEDICATED sidecar dir (see the module note above). ---
+    # Atomic write (codex NIT): serialize to a temp sibling then os.replace onto
+    # the destination, so an interrupt / disk-full mid-write can't truncate or
+    # destroy a previously-valid sidecar at ``out``.
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Saving %d tensors to %s", len(quantized), out)
-    mx.save_safetensors(str(out), quantized)
+    # mx.save_safetensors SILENTLY no-ops unless the path ends in .safetensors,
+    # so the temp sibling must keep that suffix (…​.tmp.safetensors), not a bare
+    # .tmp. os.replace within the same dir is atomic.
+    tmp_out = out.with_name(out.stem + ".tmp" + out.suffix)
+    logger.info("Saving %d tensors to %s (atomic via %s)", len(quantized), out, tmp_out)
+    mx.save_safetensors(str(tmp_out), quantized)
+    if not tmp_out.exists():
+        logger.error(
+            "mx.save_safetensors wrote nothing to %s (path must end in "
+            ".safetensors); aborting before replace.",
+            tmp_out,
+        )
+        return 1
+    os.replace(tmp_out, out)
 
     # --- 5. Spot-checks. ---
     total_bytes = sum(v.nbytes for v in quantized.values())
