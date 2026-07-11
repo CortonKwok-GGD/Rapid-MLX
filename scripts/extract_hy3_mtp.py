@@ -352,8 +352,10 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     # mx.save_safetensors SILENTLY no-ops unless the path ends in .safetensors,
     # so the temp sibling must keep that suffix (…​.tmp.safetensors), not a bare
-    # .tmp. os.replace within the same dir is atomic.
-    tmp_out = out.with_name(out.stem + ".tmp" + out.suffix)
+    # .tmp. A per-process pid tag (codex NIT) keeps concurrent extractions
+    # targeting the same output from clobbering each other's temp file.
+    # os.replace within the same dir is atomic.
+    tmp_out = out.with_name(f"{out.stem}.tmp.{os.getpid()}{out.suffix}")
     logger.info("Saving %d tensors to %s (atomic via %s)", len(quantized), out, tmp_out)
     mx.save_safetensors(str(tmp_out), quantized)
     if not tmp_out.exists():

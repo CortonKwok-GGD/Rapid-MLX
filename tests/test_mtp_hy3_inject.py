@@ -428,6 +428,38 @@ def test_inject_refuses_integer_packed_wrong_kind(tmp_path):
     assert validate_hy3_mtp_support(model) is False
 
 
+def test_inject_refuses_same_shape_wrong_integer_dtype(tmp_path):
+    """Tighter dtype guard (codex R8 BLOCKING #1): the check requires EXACT
+    dtype equality unless BOTH sides are floating. A same-shape tensor whose
+    dtype is a *different* non-float type than expected — e.g. a signed int32 or
+    a bool where a floating (or packed uint32) parameter is expected — must be
+    refused, not waved through by a coarse float-vs-int category test."""
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.hy3_head import build_hy3_mtp_module
+    from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        inject_hy3_mtp_support,
+        validate_hy3_mtp_support,
+    )
+
+    args = _tiny_hy3_args()
+    template = build_hy3_mtp_module(args, 1)
+    weights = dict(tree_flatten(template.parameters()))
+    for k in list(weights):
+        mx.eval(weights[k])
+    # bool where a float weight is expected: same shape, not floating -> refuse.
+    shape = weights["eh_proj.weight"].shape
+    weights["eh_proj.weight"] = mx.zeros(shape, dtype=mx.bool_)
+    mx.eval(weights["eh_proj.weight"])
+    side_dir = tmp_path / "sidecar"
+    side_dir.mkdir()
+    mx.save_safetensors(str(side_dir / "model-mtp.safetensors"), weights)
+
+    model = _build_tiny_hy3_model()
+    assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is False
+    assert validate_hy3_mtp_support(model) is False
+
+
 def test_inject_quantized_base_packed_sidecar_round_trip(tmp_path):
     """Exercise the PRODUCTION packed path (codex R5 NIT): quantize the base
     model so inject detects a quant spec and quantizes the head, build a sidecar
