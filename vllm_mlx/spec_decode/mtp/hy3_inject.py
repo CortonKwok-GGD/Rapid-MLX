@@ -432,6 +432,14 @@ def inject_hy3_mtp_support(
             # Single-node inline of hy_v3.HYV3Model.__call__ (pipeline_size=1,
             # rank=0 => no distributed branches). n_confirmed is a no-op:
             # HY3 is pure-attention, no SSM/conv state to snapshot.
+            #
+            # NOTE: pass cache[0] (a single KVCache), NOT the list. mlx-lm's
+            # create_attention_mask does `if cache and hasattr(cache, "make_mask")`
+            # and calls that single cache's offset-aware make_mask(N). Passing the
+            # LIST would fail that hasattr (lists have no make_mask), silently drop
+            # to a plain causal mask, and LOSE the warm-cache offset. This mirrors
+            # upstream hy_v3.HYV3Model.__call__ exactly (models/hy_v3.py:309) and
+            # is covered by test_inject_forward_warm_cache_offset.
             mask = create_attention_mask(h, cache[0])
             for layer, c in zip(backbone.layers, cache):
                 h = layer(h, mask, cache=c)

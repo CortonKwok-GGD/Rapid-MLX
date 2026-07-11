@@ -235,6 +235,45 @@ def test_inject_attaches_four_surfaces_random_init():
     )
 
 
+def test_inject_forward_warm_cache_offset():
+    """The injected __call__ must pass a single KVCache (cache[0]) — not the
+    list — to create_attention_mask so the offset-aware make_mask path runs.
+
+    Regression for a codex R6 false positive that proposed passing the whole
+    cache list: mlx-lm's create_attention_mask gates on
+    ``hasattr(cache, "make_mask")``, which a list lacks, so the list form would
+    silently drop the warm-cache offset. Here we prefill a real KVCache with a
+    prompt, then continue with more tokens, and require the warm continuation to
+    match the equivalent slice of a single full-length forward (offset correct).
+    """
+    from mlx_lm.models.cache import KVCache
+
+    from vllm_mlx.spec_decode.mtp.hy3_inject import inject_hy3_mtp_support
+
+    model = _build_tiny_hy3_model()
+    assert inject_hy3_mtp_support(model, allow_random_init=True) is True
+
+    full_ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    # (a) one full-length forward, no cache.
+    full_out, _ = model(full_ids, return_hidden=True)
+    mx.eval(full_out)
+
+    # (b) prefill first 4 tokens into a warm cache, then continue with 2 more.
+    cache = [KVCache() for _ in range(len(model.model.layers))]
+    _ = model(full_ids[:, :4], cache=cache, return_hidden=True)
+    cont_out, _ = model(full_ids[:, 4:], cache=cache, return_hidden=True)
+    mx.eval(cont_out)
+
+    # The warm continuation's logits for positions 4..5 must match the full
+    # forward's positions 4..5 — only true if the attention offset is applied
+    # (i.e. cache[0].make_mask ran). A dropped offset would misalign attention.
+    assert cont_out.shape == (1, 2, 128)
+    assert bool(mx.allclose(cont_out, full_out[:, 4:, :], atol=1e-4).item()), (
+        "warm-cache continuation diverged from full forward — attention offset "
+        "was not applied (mask must receive cache[0], not the list)"
+    )
+
+
 def test_validate_false_before_inject():
     """A vanilla HY3 model has none of the MTP surfaces."""
     from vllm_mlx.spec_decode.mtp.hy3_inject import validate_hy3_mtp_support
