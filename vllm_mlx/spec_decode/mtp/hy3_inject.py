@@ -181,9 +181,16 @@ def inject_hy3_mtp_support(
 
     args = inner.args
     num_mtp_layers = _resolve_num_mtp_layers(inner, model)
-    if num_mtp_layers < 1:
+    if num_mtp_layers != 1:
+        # HY3 ships a single-layer (DeepSeek-V3-style) MTP head. detect may class
+        # num_nextn_predict_layers >= 2 as the (unimplemented) TREE variant, but
+        # build_hy3_mtp_module raises for != 1, so a num != 1 config would crash
+        # boot. Fail-closed to False here (codex R4 BLOCKING #1) — the runtime
+        # simply runs without MTP rather than aborting.
         logger.info(
-            "[mtp.inject.hy3] config has no num_nextn_predict_layers >= 1; skipping."
+            "[mtp.inject.hy3] num_nextn_predict_layers=%d (need exactly 1); "
+            "HY3 MTP unsupported for this config, skipping.",
+            num_mtp_layers,
         )
         return False
 
@@ -203,162 +210,178 @@ def inject_hy3_mtp_support(
         )
         return False
 
-    # --- Step 1: Build the HY3 MTP head. ---
-    from .hy3_head import build_hy3_mtp_module
+    # Steps 1-3 (build head, quantize, load sidecar) run under one guard:
+    # a truncated / unreadable / malformed sidecar — or any build error —
+    # must honor this function's False-on-refusal contract rather than let
+    # an exception abort server boot (codex R4 BLOCKING #2).
+    try:
+        # --- Step 1: Build the HY3 MTP head. ---
+        from .hy3_head import build_hy3_mtp_module
 
-    mtp = build_hy3_mtp_module(args, num_mtp_layers)
-    logger.info(
-        "[mtp.inject.hy3] Built HY3 MTP head (%d layer(s), hidden_size=%d).",
-        num_mtp_layers,
-        getattr(args, "hidden_size", -1),
-    )
-
-    # --- Step 2: Quantize to match base (4-bit Linear; 8-bit router.gate). ---
-    quant_info = _detect_base_quantization(inner)
-
-    # Resolve the DEFAULT sidecar BEFORE quantizing the head: HY3's base has no
-    # baked-in head, so a missing sidecar defaults to the published repo — but
-    # ONLY when the base quantization matches what that sidecar was extracted
-    # at (codex BLOCKING #3; a mismatch would load shape-incompatible tensors),
-    # and at a pinned revision (codex BLOCKING #1). An explicit sidecar bypasses
-    # both gates (the operator vouches for the pairing).
-    sidecar_revision = None
-    if mtp_sidecar is None and not allow_random_init:
-        if quant_info != DEFAULT_HY3_MTP_SIDECAR_BASE_QUANT:
-            logger.warning(
-                "[mtp.inject.hy3] base quantization %s != default sidecar's %s; "
-                "the auto-resolved %s would load shape-incompatible tensors. "
-                "Pass an explicit mtp_sidecar extracted for this base.",
-                quant_info,
-                DEFAULT_HY3_MTP_SIDECAR_BASE_QUANT,
-                DEFAULT_HY3_MTP_SIDECAR,
-            )
-            return False
-        mtp_sidecar = DEFAULT_HY3_MTP_SIDECAR
-        sidecar_revision = DEFAULT_HY3_MTP_SIDECAR_REVISION
+        mtp = build_hy3_mtp_module(args, num_mtp_layers)
         logger.info(
-            "[mtp.inject.hy3] no explicit sidecar; defaulting to %s@%s",
-            DEFAULT_HY3_MTP_SIDECAR,
-            sidecar_revision[:12],
+            "[mtp.inject.hy3] Built HY3 MTP head (%d layer(s), hidden_size=%d).",
+            num_mtp_layers,
+            getattr(args, "hidden_size", -1),
         )
-    if quant_info is not None:
 
-        def _class_predicate(path: str, module) -> Any:
-            # Only touch modules that actually support quantization (Linear /
-            # Embedding / SwitchLinear expose ``to_quantized``); never norms.
-            # Router gate keeps its own bits (8) but the SAME group_size as the
-            # base — extract_hy3_mtp.py quantizes the router with the base's
-            # group_size, so hard-coding 64 here would reject an explicit
-            # sidecar built for a non-gs64 base (codex R2 BLOCKING #2). Mirrors
-            # hy_v3.Model.quant_predicate + the default nn.quantize gate.
-            if not hasattr(module, "to_quantized"):
+        # --- Step 2: Quantize to match base (4-bit Linear; 8-bit router.gate). ---
+        quant_info = _detect_base_quantization(inner)
+
+        # Resolve the DEFAULT sidecar BEFORE quantizing the head: HY3's base has no
+        # baked-in head, so a missing sidecar defaults to the published repo — but
+        # ONLY when the base quantization matches what that sidecar was extracted
+        # at (codex BLOCKING #3; a mismatch would load shape-incompatible tensors),
+        # and at a pinned revision (codex BLOCKING #1). An explicit sidecar bypasses
+        # both gates (the operator vouches for the pairing).
+        sidecar_revision = None
+        if mtp_sidecar is None and not allow_random_init:
+            if quant_info != DEFAULT_HY3_MTP_SIDECAR_BASE_QUANT:
+                logger.warning(
+                    "[mtp.inject.hy3] base quantization %s != default sidecar's %s; "
+                    "the auto-resolved %s would load shape-incompatible tensors. "
+                    "Pass an explicit mtp_sidecar extracted for this base.",
+                    quant_info,
+                    DEFAULT_HY3_MTP_SIDECAR_BASE_QUANT,
+                    DEFAULT_HY3_MTP_SIDECAR,
+                )
                 return False
-            if path.endswith("mlp.router.gate"):
-                return {"group_size": quant_info["group_size"], "bits": 8}
-            return True
-
-        nn.quantize(
-            mtp,
-            group_size=quant_info["group_size"],
-            bits=quant_info["bits"],
-            class_predicate=_class_predicate,
-        )
-        logger.info(
-            "[mtp.inject.hy3] Quantized MTP head: %d-bit gs=%d (router.gate 8-bit)",
-            quant_info["bits"],
-            quant_info["group_size"],
-        )
-
-    # --- Step 3: Load sidecar weights with strict coverage check. ---
-    if mtp_sidecar is not None:
-        weights_file = _resolve_sidecar_file(mtp_sidecar, revision=sidecar_revision)
-        if weights_file is None:
-            logger.warning(
-                "[mtp.inject.hy3] sidecar %r could not be resolved; skipping.",
-                mtp_sidecar,
+            mtp_sidecar = DEFAULT_HY3_MTP_SIDECAR
+            sidecar_revision = DEFAULT_HY3_MTP_SIDECAR_REVISION
+            logger.info(
+                "[mtp.inject.hy3] no explicit sidecar; defaulting to %s@%s",
+                DEFAULT_HY3_MTP_SIDECAR,
+                sidecar_revision[:12],
             )
-            return False
-        raw = mx.load(str(weights_file))
-        mtp_weights = {
-            (k.removeprefix("mtp.") if k.startswith("mtp.") else k): v
-            for k, v in raw.items()
-        }
-        from mlx.utils import tree_flatten
+        if quant_info is not None:
 
-        expected_keys = {k for k, _ in tree_flatten(mtp.parameters())}
-        loaded_keys = set(mtp_weights.keys())
-        missing = expected_keys - loaded_keys
-        if missing:
-            logger.warning(
-                "[mtp.inject.hy3] sidecar %s missing %d required tensor(s); "
-                "refusing partial-random head. Missing (first 8): %s",
+            def _class_predicate(path: str, module) -> Any:
+                # Only touch modules that actually support quantization (Linear /
+                # Embedding / SwitchLinear expose ``to_quantized``); never norms.
+                # Router gate keeps its own bits (8) but the SAME group_size as the
+                # base — extract_hy3_mtp.py quantizes the router with the base's
+                # group_size, so hard-coding 64 here would reject an explicit
+                # sidecar built for a non-gs64 base (codex R2 BLOCKING #2). Mirrors
+                # hy_v3.Model.quant_predicate + the default nn.quantize gate.
+                if not hasattr(module, "to_quantized"):
+                    return False
+                if path.endswith("mlp.router.gate"):
+                    return {"group_size": quant_info["group_size"], "bits": 8}
+                return True
+
+            nn.quantize(
+                mtp,
+                group_size=quant_info["group_size"],
+                bits=quant_info["bits"],
+                class_predicate=_class_predicate,
+            )
+            logger.info(
+                "[mtp.inject.hy3] Quantized MTP head: %d-bit gs=%d (router.gate 8-bit)",
+                quant_info["bits"],
+                quant_info["group_size"],
+            )
+
+        # --- Step 3: Load sidecar weights with strict coverage check. ---
+        if mtp_sidecar is not None:
+            weights_file = _resolve_sidecar_file(mtp_sidecar, revision=sidecar_revision)
+            if weights_file is None:
+                logger.warning(
+                    "[mtp.inject.hy3] sidecar %r could not be resolved; skipping.",
+                    mtp_sidecar,
+                )
+                return False
+            raw = mx.load(str(weights_file))
+            mtp_weights = {
+                (k.removeprefix("mtp.") if k.startswith("mtp.") else k): v
+                for k, v in raw.items()
+            }
+            from mlx.utils import tree_flatten
+
+            expected_keys = {k for k, _ in tree_flatten(mtp.parameters())}
+            loaded_keys = set(mtp_weights.keys())
+            missing = expected_keys - loaded_keys
+            if missing:
+                logger.warning(
+                    "[mtp.inject.hy3] sidecar %s missing %d required tensor(s); "
+                    "refusing partial-random head. Missing (first 8): %s",
+                    weights_file.name,
+                    len(missing),
+                    sorted(missing)[:8],
+                )
+                return False
+
+            # Shape / dtype-category guard (codex BLOCKING): the key-name coverage
+            # above does NOT catch a sidecar quantized for a different base (e.g.
+            # 8-bit packed tensors landing on a 4-bit head), which would either
+            # error opaquely in load_weights or corrupt inference. A quant mismatch
+            # shows up as (a) a packed-shape mismatch and/or (b) a floating-vs-
+            # integer dtype-category flip (packed quant weights are uint32; the
+            # freshly-initialised template's unquantized tensors are floating).
+            #
+            # We deliberately do NOT require exact floating dtype equality: the
+            # real sidecar carries bf16 unquantized tensors (RMSNorm weights,
+            # biases) while the template initialises them in fp32, and
+            # ``load_weights`` casts float->float losslessly-in-kind. Comparing the
+            # raw dtype here (as an earlier revision did) rejected a perfectly
+            # valid bf16 sidecar. So compare the dtype *category* (floating vs
+            # integer/packed), not the exact float width.
+            def _kind(dt: Any) -> str:
+                return "float" if mx.issubdtype(dt, mx.floating) else "int"
+
+            expected = {
+                k: (v.shape, v.dtype) for k, v in tree_flatten(mtp.parameters())
+            }
+            bad = [
+                (
+                    k,
+                    (tuple(expected[k][0]), str(expected[k][1])),
+                    (tuple(mtp_weights[k].shape), str(mtp_weights[k].dtype)),
+                )
+                for k in expected_keys
+                if tuple(mtp_weights[k].shape) != tuple(expected[k][0])
+                or _kind(mtp_weights[k].dtype) != _kind(expected[k][1])
+            ]
+            if bad:
+                logger.warning(
+                    "[mtp.inject.hy3] sidecar %s has %d shape/dtype-mismatched "
+                    "tensor(s) (likely a quantization mismatch vs the base). "
+                    "First (key, expected(shape,dtype-kind), got(shape,dtype)): %s. "
+                    "Refusing to load. Use a sidecar extracted for this base quant.",
+                    weights_file.name,
+                    len(bad),
+                    bad[0],
+                )
+                return False
+            mtp.load_weights(list(mtp_weights.items()), strict=False)
+            mx.eval(mtp.parameters())
+            extra = loaded_keys - expected_keys
+            logger.info(
+                "[mtp.inject.hy3] Loaded %d/%d MTP tensors from %s%s",
+                len(expected_keys),
+                len(expected_keys),
                 weights_file.name,
-                len(missing),
-                sorted(missing)[:8],
+                f" (+{len(extra)} extra ignored)" if extra else "",
             )
-            return False
-
-        # Shape / dtype-category guard (codex BLOCKING): the key-name coverage
-        # above does NOT catch a sidecar quantized for a different base (e.g.
-        # 8-bit packed tensors landing on a 4-bit head), which would either
-        # error opaquely in load_weights or corrupt inference. A quant mismatch
-        # shows up as (a) a packed-shape mismatch and/or (b) a floating-vs-
-        # integer dtype-category flip (packed quant weights are uint32; the
-        # freshly-initialised template's unquantized tensors are floating).
-        #
-        # We deliberately do NOT require exact floating dtype equality: the
-        # real sidecar carries bf16 unquantized tensors (RMSNorm weights,
-        # biases) while the template initialises them in fp32, and
-        # ``load_weights`` casts float->float losslessly-in-kind. Comparing the
-        # raw dtype here (as an earlier revision did) rejected a perfectly
-        # valid bf16 sidecar. So compare the dtype *category* (floating vs
-        # integer/packed), not the exact float width.
-        def _kind(dt: Any) -> str:
-            return "float" if mx.issubdtype(dt, mx.floating) else "int"
-
-        expected = {k: (v.shape, v.dtype) for k, v in tree_flatten(mtp.parameters())}
-        bad = [
-            (
-                k,
-                (tuple(expected[k][0]), str(expected[k][1])),
-                (tuple(mtp_weights[k].shape), str(mtp_weights[k].dtype)),
-            )
-            for k in expected_keys
-            if tuple(mtp_weights[k].shape) != tuple(expected[k][0])
-            or _kind(mtp_weights[k].dtype) != _kind(expected[k][1])
-        ]
-        if bad:
+        else:
+            if not allow_random_init:
+                logger.warning(
+                    "[mtp.inject.hy3] no mtp_sidecar and allow_random_init=False; "
+                    "refusing random-init head."
+                )
+                return False
+            mx.eval(mtp.parameters())
             logger.warning(
-                "[mtp.inject.hy3] sidecar %s has %d shape/dtype-mismatched "
-                "tensor(s) (likely a quantization mismatch vs the base). "
-                "First (key, expected(shape,dtype-kind), got(shape,dtype)): %s. "
-                "Refusing to load. Use a sidecar extracted for this base quant.",
-                weights_file.name,
-                len(bad),
-                bad[0],
+                "[mtp.inject.hy3] allow_random_init=True — RANDOM init head (test-only)."
             )
-            return False
-        mtp.load_weights(list(mtp_weights.items()), strict=False)
-        mx.eval(mtp.parameters())
-        extra = loaded_keys - expected_keys
-        logger.info(
-            "[mtp.inject.hy3] Loaded %d/%d MTP tensors from %s%s",
-            len(expected_keys),
-            len(expected_keys),
-            weights_file.name,
-            f" (+{len(extra)} extra ignored)" if extra else "",
-        )
-    else:
-        if not allow_random_init:
-            logger.warning(
-                "[mtp.inject.hy3] no mtp_sidecar and allow_random_init=False; "
-                "refusing random-init head."
-            )
-            return False
-        mx.eval(mtp.parameters())
+
+    except Exception as exc:  # noqa: BLE001 — fail-closed on ANY head/load error
         logger.warning(
-            "[mtp.inject.hy3] allow_random_init=True — RANDOM init head (test-only)."
+            "[mtp.inject.hy3] head build / sidecar load failed (%s: %s); "
+            "refusing MTP injection (model left unmodified).",
+            type(exc).__name__,
+            exc,
         )
+        return False
 
     # --- Step 4: Attach + monkey-patch the HY3 Model class. ---
     inner.mtp = mtp

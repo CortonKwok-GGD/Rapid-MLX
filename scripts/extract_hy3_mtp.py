@@ -126,6 +126,33 @@ def _quantize(w: mx.array, bits: int, gs: int):
     return q_w, q_s, q_b
 
 
+def _resolve_commit_sha(repo: str, revision: str | None) -> str:
+    """Pin ``revision`` (or HEAD when ``None``) to one immutable commit SHA.
+
+    Resolving up front — before any file download — guarantees the config,
+    index, and every shard come from the *same* commit, so a repo update mid-
+    extraction can never mix files from different revisions into a published
+    sidecar (codex R4 BLOCKING). A 40-char hex string is already immutable and
+    returned as-is; anything else (a branch/tag, or ``None``=HEAD) is resolved
+    via the Hub API.
+    """
+    if (
+        revision
+        and len(revision) == 40
+        and all(c in "0123456789abcdef" for c in revision.lower())
+    ):
+        return revision
+    from huggingface_hub import HfApi
+
+    sha = HfApi().repo_info(repo, revision=revision).sha
+    if not sha:
+        raise RuntimeError(
+            f"could not resolve a commit SHA for {repo}@{revision or 'HEAD'}"
+        )
+    logger.info("Resolved %s@%s -> %s", repo, revision or "HEAD", sha)
+    return sha
+
+
 def main() -> int:
     import argparse
 
@@ -158,7 +185,14 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    base_cfg = _base_config(args.base_repo, args.base_rev)
+    # Pin both repos to one immutable commit SHA BEFORE any download so config,
+    # index, and shards all come from a single reproducible snapshot (codex R4
+    # BLOCKING). --base-rev / --upstream-rev may be a SHA (used as-is), a
+    # branch/tag, or omitted (=HEAD, resolved now).
+    base_rev = _resolve_commit_sha(args.base_repo, args.base_rev)
+    upstream_rev = _resolve_commit_sha(args.upstream_repo, args.upstream_rev)
+
+    base_cfg = _base_config(args.base_repo, base_rev)
     mtp_layer = _resolve_mtp_layer(base_cfg, args.base_repo)
     num_experts = _resolve_num_experts(base_cfg)
     base_quant = _resolve_base_quant(base_cfg)
@@ -167,14 +201,14 @@ def main() -> int:
         "Base quant: %d-bit gs=%d (router.gate %d-bit)", q_bits, q_gs, ROUTER_GATE_BITS
     )
     prefix = f"model.layers.{mtp_layer}."
-    shards = _find_shards_for_layer(args.upstream_repo, mtp_layer, args.upstream_rev)
+    shards = _find_shards_for_layer(args.upstream_repo, mtp_layer, upstream_rev)
 
     # --- 1. Download only the shard(s) holding the MTP layer. ---
     raw_paths: list[Path] = []
     all_weights: dict[str, mx.array] = {}
     for shard in shards:
         logger.info("Downloading %s ...", shard)
-        p = Path(hf_hub_download(args.upstream_repo, shard, revision=args.upstream_rev))
+        p = Path(hf_hub_download(args.upstream_repo, shard, revision=upstream_rev))
         raw_paths.append(p)
         w = mx.load(str(p))
         for k, v in w.items():

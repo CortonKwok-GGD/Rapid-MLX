@@ -206,6 +206,14 @@ def test_inject_attaches_four_surfaces_random_init():
     mtp_logits = model.mtp_forward(hidden, ids, mtp_cache)
     mx.eval(mtp_logits)
     assert mtp_logits.shape == (1, 4, 128)
+    # Beyond shape (codex R4 NIT #4): the head must actually consume BOTH the
+    # embedding of next_token_ids AND the prev hidden state via eh_proj(concat)
+    # — a degenerate/constant head would emit identical logits at every
+    # position, and a NaN would slip through a shape-only check. Assert the
+    # output is finite and position-varying (the two token/hidden pairs differ,
+    # so their fused logits must too).
+    assert bool(mx.all(mx.isfinite(mtp_logits)).item())
+    assert not bool(mx.allclose(mtp_logits[:, 0, :], mtp_logits[:, 1, :]).item())
 
 
 def test_validate_false_before_inject():
@@ -351,6 +359,40 @@ def test_inject_refuses_integer_packed_wrong_kind(tmp_path):
     side_dir = tmp_path / "sidecar"
     side_dir.mkdir()
     mx.save_safetensors(str(side_dir / "model-mtp.safetensors"), weights)
+
+    model = _build_tiny_hy3_model()
+    assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is False
+    assert validate_hy3_mtp_support(model) is False
+
+
+def test_inject_refuses_multi_nextn_layer_config():
+    """A HY3 config advertising num_nextn_predict_layers=2 must fail-closed to
+    False (HY3's head builder only supports exactly 1 layer), NOT crash boot
+    with a builder ValueError (codex R4 BLOCKING #1)."""
+    from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        inject_hy3_mtp_support,
+        validate_hy3_mtp_support,
+    )
+
+    model = _build_tiny_hy3_model(num_nextn_predict_layers=2)
+    # Must return False cleanly (no exception) even with allow_random_init.
+    assert inject_hy3_mtp_support(model, allow_random_init=True) is False
+    assert validate_hy3_mtp_support(model) is False
+
+
+def test_inject_returns_false_on_corrupt_sidecar(tmp_path):
+    """A truncated / malformed sidecar file must be caught and turned into a
+    False return (this function's documented contract), NOT propagate an
+    exception that aborts server boot (codex R4 BLOCKING #2)."""
+    from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        inject_hy3_mtp_support,
+        validate_hy3_mtp_support,
+    )
+
+    side_dir = tmp_path / "sidecar"
+    side_dir.mkdir()
+    # Write bytes that are NOT a valid safetensors file.
+    (side_dir / "model-mtp.safetensors").write_bytes(b"not a real safetensors file")
 
     model = _build_tiny_hy3_model()
     assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is False
