@@ -70,8 +70,9 @@ def _base_config(base_repo: str) -> dict:
 def _resolve_mtp_layer(cfg: dict, base_repo: str) -> int:
     """The native MTP head lives at ``model.layers.<num_hidden_layers>.*``."""
     n = int(cfg["num_hidden_layers"])
-    logger.info("Base %s: num_hidden_layers=%d -> MTP head at layer %d",
-                base_repo, n, n)
+    logger.info(
+        "Base %s: num_hidden_layers=%d -> MTP head at layer %d", base_repo, n, n
+    )
     return n
 
 
@@ -91,9 +92,7 @@ def _find_shards_for_layer(upstream_repo: str, layer: int) -> list[str]:
     prefix = f"model.layers.{layer}."
     shards = sorted({fn for k, fn in weight_map.items() if k.startswith(prefix)})
     if not shards:
-        raise RuntimeError(
-            f"no shards hold {prefix}* in {upstream_repo} index"
-        )
+        raise RuntimeError(f"no shards hold {prefix}* in {upstream_repo} index")
     logger.info("Layer %d spans %d shard(s): %s", layer, len(shards), shards)
     return shards
 
@@ -110,12 +109,19 @@ def main() -> int:
     from huggingface_hub import hf_hub_download
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--base-repo", default=DEFAULT_BASE_REPO,
-                    help="4-bit MLX base checkpoint (defines quant + layer count).")
-    ap.add_argument("--upstream-repo", default=DEFAULT_UPSTREAM_REPO,
-                    help="Full-precision checkpoint that still carries the MTP head.")
-    ap.add_argument("--out", default=DEFAULT_OUT,
-                    help="Output path for model-mtp.safetensors.")
+    ap.add_argument(
+        "--base-repo",
+        default=DEFAULT_BASE_REPO,
+        help="4-bit MLX base checkpoint (defines quant + layer count).",
+    )
+    ap.add_argument(
+        "--upstream-repo",
+        default=DEFAULT_UPSTREAM_REPO,
+        help="Full-precision checkpoint that still carries the MTP head.",
+    )
+    ap.add_argument(
+        "--out", default=DEFAULT_OUT, help="Output path for model-mtp.safetensors."
+    )
     args = ap.parse_args()
 
     base_cfg = _base_config(args.base_repo)
@@ -157,7 +163,10 @@ def main() -> int:
 
     lp = "layers.0."
     # Layernorms + attention (incl q_norm/k_norm).
-    put(lp + "input_layernorm.weight", all_weights.pop(prefix + "input_layernorm.weight"))
+    put(
+        lp + "input_layernorm.weight",
+        all_weights.pop(prefix + "input_layernorm.weight"),
+    )
     put(
         lp + "post_attention_layernorm.weight",
         all_weights.pop(prefix + "post_attention_layernorm.weight"),
@@ -175,7 +184,10 @@ def main() -> int:
 
     # Router gate + expert bias (bias renamed to router.expert_bias to match
     # hy_v3.MoEGate, which holds ``expert_bias`` under the ``router`` module).
-    put(lp + "mlp.router.gate.weight", all_weights.pop(prefix + "mlp.router.gate.weight"))
+    put(
+        lp + "mlp.router.gate.weight",
+        all_weights.pop(prefix + "mlp.router.gate.weight"),
+    )
     put(
         lp + "mlp.router.expert_bias",
         all_weights.pop(prefix + "mlp.expert_bias"),
@@ -196,19 +208,26 @@ def main() -> int:
         ]
         missing = [k for k in expert_keys if k not in all_weights]
         if missing:
-            logger.error("Missing %d expert tensors for %s (first: %s)",
-                         len(missing), proj, missing[0])
+            logger.error(
+                "Missing %d expert tensors for %s (first: %s)",
+                len(missing),
+                proj,
+                missing[0],
+            )
             return 1
         stacked = mx.stack([all_weights.pop(k) for k in expert_keys])
         mx.eval(stacked)
         put(lp + f"mlp.switch_mlp.{proj}.weight", stacked)
-        logger.info("Stacked %d experts for %s -> %s",
-                    num_experts, proj, tuple(stacked.shape))
+        logger.info(
+            "Stacked %d experts for %s -> %s", num_experts, proj, tuple(stacked.shape)
+        )
 
     if all_weights:
-        logger.warning("UNCONSUMED layer-%d tensors (first 8): %s",
-                       mtp_layer,
-                       sorted(all_weights)[:8])
+        logger.warning(
+            "UNCONSUMED layer-%d tensors (first 8): %s",
+            mtp_layer,
+            sorted(all_weights)[:8],
+        )
 
     # --- 3. Quantize to match the base checkpoint. ---
     # Norms (1-D) + expert_bias stay FP. eh_proj / attn proj / switch_mlp /
@@ -238,8 +257,9 @@ def main() -> int:
 
     # --- 5. Spot-checks. ---
     total_bytes = sum(v.nbytes for v in quantized.values())
-    logger.info("Sidecar size on disk: %.1f MB (%d tensors)",
-                total_bytes / 1e6, len(quantized))
+    logger.info(
+        "Sidecar size on disk: %.1f MB (%d tensors)", total_bytes / 1e6, len(quantized)
+    )
     smw = quantized.get(lp + "mlp.switch_mlp.gate_proj.weight")
     smw_s = quantized.get(lp + "mlp.switch_mlp.gate_proj.scales")
     smw_b = quantized.get(lp + "mlp.switch_mlp.gate_proj.biases")
@@ -253,9 +273,11 @@ def main() -> int:
     )
     rg = quantized.get(lp + "mlp.router.gate.weight")
     rg_s = quantized.get(lp + "mlp.router.gate.scales")
-    logger.info("spot-check router.gate: weight.shape=%s scales.shape=%s (8-bit)",
-                tuple(rg.shape) if rg is not None else None,
-                tuple(rg_s.shape) if rg_s is not None else None)
+    logger.info(
+        "spot-check router.gate: weight.shape=%s scales.shape=%s (8-bit)",
+        tuple(rg.shape) if rg is not None else None,
+        tuple(rg_s.shape) if rg_s is not None else None,
+    )
 
     # --- 6. Disk hygiene: delete raw shards (both symlink + blob target). ---
     for p in raw_paths:

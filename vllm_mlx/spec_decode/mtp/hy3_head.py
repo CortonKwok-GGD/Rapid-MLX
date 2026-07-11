@@ -60,9 +60,7 @@ def build_hy3_mtp_module(args: Any, num_layers: int):
     if num_layers != 1:
         # HY3 ships exactly one next-n layer. Guard so a future >1 config
         # doesn't silently under-run.
-        raise ValueError(
-            f"HY3 MTP supports exactly 1 next-n layer; got {num_layers}"
-        )
+        raise ValueError(f"HY3 MTP supports exactly 1 next-n layer; got {num_layers}")
 
     fkdr = int(getattr(args, "first_k_dense_replace", 1))
     # Force the MoE branch: DecoderLayer picks MoE iff layer_idx >= fkdr.
@@ -79,7 +77,9 @@ def build_hy3_mtp_module(args: Any, num_layers: int):
                 mod_args.hidden_size * 2, mod_args.hidden_size, bias=False
             )
             # Single HY3 DecoderLayer on the MoE branch.
-            self.layers = [DecoderLayer(mod_args, moe_layer_idx) for _ in range(n_layers)]
+            self.layers = [
+                DecoderLayer(mod_args, moe_layer_idx) for _ in range(n_layers)
+            ]
             self.norm = nn.RMSNorm(mod_args.hidden_size, eps=mod_args.rms_norm_eps)
 
         def __call__(

@@ -93,8 +93,9 @@ def _resolve_sidecar_file(mtp_sidecar: str | Path) -> Path | None:
         local = snapshot_download(repo_id=str(mtp_sidecar))
         return _find_mtp_weights_file(Path(local))
     except Exception as exc:  # pragma: no cover — network failure path
-        logger.warning("[mtp.inject.hy3] could not resolve sidecar %r: %s",
-                       mtp_sidecar, exc)
+        logger.warning(
+            "[mtp.inject.hy3] could not resolve sidecar %r: %s", mtp_sidecar, exc
+        )
         return None
 
 
@@ -177,6 +178,7 @@ def inject_hy3_mtp_support(
     # --- Step 2: Quantize to match base (4-bit Linear; 8-bit router.gate). ---
     quant_info = _detect_base_quantization(inner)
     if quant_info is not None:
+
         def _class_predicate(path: str, module) -> Any:
             # Only touch modules that actually support quantization (Linear /
             # Embedding / SwitchLinear expose ``to_quantized``); never norms.

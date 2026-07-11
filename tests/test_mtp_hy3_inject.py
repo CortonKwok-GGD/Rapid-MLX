@@ -341,9 +341,7 @@ def test_dispatch_inject_routes_and_attaches():
     )
 
     model = _build_tiny_hy3_model()
-    assert (
-        dispatch_mtp_inject(model, "hy_v3", allow_random_init=True) is True
-    )
+    assert dispatch_mtp_inject(model, "hy_v3", allow_random_init=True) is True
     assert dispatch_mtp_validate(model, "hy_v3") is True
 
 
