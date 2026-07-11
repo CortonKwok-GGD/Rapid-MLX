@@ -26,6 +26,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from vllm_mlx.spec_decode.mtp.detect import _safe_int
+
 logger = logging.getLogger(__name__)
 
 # The 4-bit HY3 MLX checkpoint (mlx-community/Hy3-preview-4bit) STRIPS the
@@ -151,7 +153,12 @@ def _resolve_num_mtp_layers(inner: Any, model: Any) -> int:
     """
     args = inner.args
     for key in _HY3_MTP_LAYER_KEYS:
-        n = int(getattr(args, key, 0) or 0)
+        # Guarded parse (codex R9): a hand-edited config shipping a
+        # non-numeric ``num_nextn_predict_layers`` (e.g. ``"unknown"``)
+        # must degrade to "no MTP" rather than raise and abort server
+        # boot. ``detect._safe_int`` is the same fail-closed coercion the
+        # detection side uses, so inject and detect never disagree.
+        n = _safe_int(getattr(args, key, None), 0)
         if n >= 1:
             return n
     # Fall back to a wrapper text_config dict (defensive; HY3 has no wrapper).
@@ -159,7 +166,7 @@ def _resolve_num_mtp_layers(inner: Any, model: Any) -> int:
     text_config = getattr(outer_args, "text_config", None) or {}
     if isinstance(text_config, dict):
         for key in _HY3_MTP_LAYER_KEYS:
-            n = int(text_config.get(key, 0) or 0)
+            n = _safe_int(text_config.get(key), 0)
             if n >= 1:
                 return n
     return 0
