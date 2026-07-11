@@ -430,32 +430,59 @@ def test_inject_refuses_integer_packed_wrong_kind(tmp_path):
 
 def test_inject_refuses_same_shape_wrong_integer_dtype(tmp_path):
     """Tighter dtype guard (codex R8 BLOCKING #1): the check requires EXACT
-    dtype equality unless BOTH sides are floating. A same-shape tensor whose
-    dtype is a *different* non-float type than expected — e.g. a signed int32 or
-    a bool where a floating (or packed uint32) parameter is expected — must be
-    refused, not waved through by a coarse float-vs-int category test."""
+    dtype equality unless BOTH sides are floating.
+
+    This targets the branch the tightening actually ADDED. The coarse
+    float-vs-int-category predecessor already rejected a non-float tensor in a
+    float slot, so a bool-where-float substitution proves nothing (codex R10
+    BLOCKING: that test passed even against the loose guard). The distinguishing
+    case is *two different non-float dtypes*: a quantized head expects a packed
+    ``uint32`` parameter, and a same-shape signed ``int32`` sidecar tensor —
+    which the coarse guard waved through (both "int") — must now be refused."""
+    import mlx.nn as nn
     from mlx.utils import tree_flatten
 
     from vllm_mlx.spec_decode.mtp.hy3_head import build_hy3_mtp_module
     from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        _detect_base_quantization,
         inject_hy3_mtp_support,
         validate_hy3_mtp_support,
     )
 
+    bits, gs = 4, 32
+
+    def _q_pred(path, module):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if path.endswith("mlp.router.gate"):
+            return {"group_size": gs, "bits": 8}
+        return True
+
+    # Quantize the base so inject detects a quant spec and EXPECTS a packed
+    # uint32 head — the only way a non-float parameter is the expected dtype.
+    model = _build_tiny_hy3_model()
+    nn.quantize(model.model, group_size=gs, bits=bits, class_predicate=_q_pred)
+    assert _detect_base_quantization(_resolve_inner(model)) == {
+        "bits": bits,
+        "group_size": gs,
+    }
+
+    # Build + quantize a head the same way inject does, then corrupt ONE packed
+    # uint32 tensor into a same-shape int32 (a *different* non-float dtype).
     args = _tiny_hy3_args()
-    template = build_hy3_mtp_module(args, 1)
-    weights = dict(tree_flatten(template.parameters()))
-    for k in list(weights):
-        mx.eval(weights[k])
-    # bool where a float weight is expected: same shape, not floating -> refuse.
-    shape = weights["eh_proj.weight"].shape
-    weights["eh_proj.weight"] = mx.zeros(shape, dtype=mx.bool_)
-    mx.eval(weights["eh_proj.weight"])
+    head = build_hy3_mtp_module(args, 1)
+    nn.quantize(head, group_size=gs, bits=bits, class_predicate=_q_pred)
+    packed = dict(tree_flatten(head.parameters()))
+    for k in list(packed):
+        mx.eval(packed[k])
+    uint32_key = next(k for k, v in packed.items() if v.dtype == mx.uint32)
+    packed[uint32_key] = mx.zeros(packed[uint32_key].shape, dtype=mx.int32)
+    mx.eval(packed[uint32_key])
     side_dir = tmp_path / "sidecar"
     side_dir.mkdir()
-    mx.save_safetensors(str(side_dir / "model-mtp.safetensors"), weights)
+    mx.save_safetensors(str(side_dir / "model-mtp.safetensors"), packed)
 
-    model = _build_tiny_hy3_model()
+    # int32-where-uint32-expected: same shape, both non-float, dtype differs.
     assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is False
     assert validate_hy3_mtp_support(model) is False
 
