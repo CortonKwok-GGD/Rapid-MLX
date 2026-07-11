@@ -356,3 +356,60 @@ def test_default_sidecar_repo_constant():
     from vllm_mlx.spec_decode.mtp import hy3_inject
 
     assert hy3_inject.DEFAULT_HY3_MTP_SIDECAR == "mlx-community/Hy3-preview-MTP-4bit"
+
+
+# ---------------------------------------------------------------------------
+# 8. Codex-hardening regressions (PR #1094 review)
+# ---------------------------------------------------------------------------
+
+
+def test_inject_resolver_reads_mtp_num_hidden_layers_fallback():
+    """detect + inject must agree on the layer-count key set. A hy_v3 config
+    that only carries ``mtp_num_hidden_layers`` (the hand-converted alias)
+    must be resolvable by the inject resolver too — otherwise detection deems
+    it eligible but inject refuses (codex BLOCKING #2)."""
+    from vllm_mlx.spec_decode.mtp import MTPEligibility, detect_mtp_eligibility
+    from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        inject_hy3_mtp_support,
+        validate_hy3_mtp_support,
+    )
+
+    # Detection accepts the fallback key.
+    cfg = {"model_type": "hy_v3", "mtp_num_hidden_layers": 1}
+    assert detect_mtp_eligibility(cfg) is MTPEligibility.CHAIN
+
+    # Inject must accept a model whose args carry ONLY the fallback key.
+    model = _build_tiny_hy3_model(num_nextn_predict_layers=0)
+    model.args.mtp_num_hidden_layers = 1  # hand-converted alias on the args
+    assert inject_hy3_mtp_support(model, allow_random_init=True) is True
+    assert validate_hy3_mtp_support(model) is True
+
+
+def test_default_sidecar_pinned_revision_constant():
+    """The default sidecar carries an immutable pinned revision (codex
+    BLOCKING #1) — never resolves a mutable HEAD in production."""
+    from vllm_mlx.spec_decode.mtp import hy3_inject
+
+    rev = hy3_inject.DEFAULT_HY3_MTP_SIDECAR_REVISION
+    assert isinstance(rev, str) and len(rev) == 40  # full commit SHA
+    assert all(c in "0123456789abcdef" for c in rev)
+
+
+def test_default_sidecar_refused_on_quant_mismatch(monkeypatch):
+    """The default (4-bit gs64) sidecar is refused when the base is a
+    different quant (codex BLOCKING #3) — it would load shape-incompatible
+    tensors. An explicit sidecar bypasses the gate."""
+    from vllm_mlx.spec_decode.mtp import hy3_inject
+
+    model = _build_tiny_hy3_model()
+
+    # Pretend the base is 8-bit (not the default sidecar's 4-bit).
+    monkeypatch.setattr(
+        hy3_inject,
+        "_detect_base_quantization",
+        lambda inner: {"bits": 8, "group_size": 64},
+    )
+    # No explicit sidecar → default path → quant gate must refuse.
+    ok = hy3_inject.inject_hy3_mtp_support(model)
+    assert ok is False
+    assert hy3_inject.validate_hy3_mtp_support(model) is False

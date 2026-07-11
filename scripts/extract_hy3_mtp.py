@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
 import mlx.core as mx
@@ -53,10 +52,27 @@ DEFAULT_BASE_REPO = "mlx-community/Hy3-preview-4bit"
 DEFAULT_UPSTREAM_REPO = "tencent/Hy3-preview"
 DEFAULT_OUT = "./hy3-mtp-sidecar/model-mtp.safetensors"
 
-# 4-bit / group_size 64 affine for every Linear; 8-bit for the router gate.
-Q_BITS = 4
-Q_GS = 64
-ROUTER_BITS = 8
+# Router-gate override bits: HY3 quantizes ``mlp.router.gate`` at 8-bit while
+# the rest of the layer uses the base's default bits (both group_size from the
+# base). Read the actual bit-widths from the base ``quantization`` block so a
+# differently-quantized base produces a matching sidecar (codex BLOCKING #4).
+ROUTER_GATE_BITS = 8
+
+
+def _resolve_base_quant(cfg: dict) -> dict:
+    """Read {bits, group_size} from the base checkpoint's ``quantization`` block.
+
+    Rejects a base with no quantization metadata rather than silently emitting
+    a 4-bit sidecar for it (codex BLOCKING #4).
+    """
+    q = cfg.get("quantization")
+    if not isinstance(q, dict) or "bits" not in q or "group_size" not in q:
+        raise ValueError(
+            "base config.json has no top-level quantization {bits, group_size}; "
+            "cannot derive matching sidecar quant. Pass a quantized MLX base "
+            "(e.g. mlx-community/Hy3-preview-4bit)."
+        )
+    return {"bits": int(q["bits"]), "group_size": int(q["group_size"])}
 
 
 def _base_config(base_repo: str) -> dict:
@@ -127,6 +143,11 @@ def main() -> int:
     base_cfg = _base_config(args.base_repo)
     mtp_layer = _resolve_mtp_layer(base_cfg, args.base_repo)
     num_experts = _resolve_num_experts(base_cfg)
+    base_quant = _resolve_base_quant(base_cfg)
+    q_bits, q_gs = base_quant["bits"], base_quant["group_size"]
+    logger.info(
+        "Base quant: %d-bit gs=%d (router.gate %d-bit)", q_bits, q_gs, ROUTER_GATE_BITS
+    )
     prefix = f"model.layers.{mtp_layer}."
     shards = _find_shards_for_layer(args.upstream_repo, mtp_layer)
 
@@ -243,8 +264,8 @@ def main() -> int:
         if not k.endswith(".weight"):
             quantized[k] = v
             continue
-        bits = ROUTER_BITS if k.endswith("mlp.router.gate.weight") else Q_BITS
-        q_w, q_s, q_b = _quantize(v, bits, Q_GS)
+        bits = ROUTER_GATE_BITS if k.endswith("mlp.router.gate.weight") else q_bits
+        q_w, q_s, q_b = _quantize(v, bits, q_gs)
         quantized[k] = q_w
         quantized[k.replace(".weight", ".scales")] = q_s
         quantized[k.replace(".weight", ".biases")] = q_b
@@ -279,20 +300,22 @@ def main() -> int:
         tuple(rg_s.shape) if rg_s is not None else None,
     )
 
-    # --- 6. Disk hygiene: delete raw shards (both symlink + blob target). ---
-    for p in raw_paths:
-        try:
-            real = os.path.realpath(p)
-            if os.path.exists(real):
-                os.remove(real)
-                logger.info("Deleted blob %s", real)
-            if os.path.islink(p) or os.path.exists(p):
-                os.remove(p)
-                logger.info("Deleted cache entry %s", p)
-        except FileNotFoundError:
-            pass
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Could not delete %s: %s", p, exc)
+    # --- 6. Disk hygiene hint (codex BLOCKING #5). ---
+    # NEVER unlink the content-addressed HF cache blobs directly: they are
+    # shared by ref-count across snapshots, and removing one leaves dangling
+    # symlinks in every OTHER snapshot that points at it. The downloaded
+    # shards are large; point the operator at the safe, ref-count-aware
+    # deletion path instead of corrupting the cache here.
+    if raw_paths:
+        logger.info(
+            "Downloaded %d upstream shard(s) into the shared HF cache. To "
+            "reclaim that space safely (ref-count aware), run:\n"
+            "    huggingface-cli delete-cache\n"
+            "and select the %s revision. (This script does not unlink shared "
+            "cache blobs — doing so would dangle other snapshots' symlinks.)",
+            len(raw_paths),
+            args.upstream_repo,
+        )
 
     logger.info("Done. Sidecar ready at %s", out)
     return 0

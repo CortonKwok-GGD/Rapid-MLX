@@ -36,6 +36,17 @@ logger = logging.getLogger(__name__)
 # this sidecar by default so a bare
 # ``--speculative-config '{"method":"mtp"}'`` boot works with no extra flag.
 DEFAULT_HY3_MTP_SIDECAR = "mlx-community/Hy3-preview-MTP-4bit"
+# Pin an immutable commit so a silently re-pushed sidecar can never land
+# weights into a production boot (codex BLOCKING #1). Bump deliberately
+# alongside a re-extract. Only the DEFAULT repo is pinned; an operator-
+# supplied ``mtp_sidecar`` (path or repo) is used verbatim.
+DEFAULT_HY3_MTP_SIDECAR_REVISION = "dfc35f7d4d1facdfb9bf607908fca569dcb1ab87"
+# The default sidecar is extracted at exactly this quantization. Auto-
+# resolving it onto a base with a different quant would load packed
+# tensors with incompatible shapes (codex BLOCKING #3), so the default
+# path is gated on the base matching this spec. An explicit sidecar
+# bypasses the gate (the operator vouches for the pairing).
+DEFAULT_HY3_MTP_SIDECAR_BASE_QUANT = {"bits": 4, "group_size": 64}
 
 
 def _resolve_inner_model(model: Any) -> Any:
@@ -79,7 +90,9 @@ def _find_mtp_weights_file(sidecar_dir: Path) -> Path | None:
     return None
 
 
-def _resolve_sidecar_file(mtp_sidecar: str | Path) -> Path | None:
+def _resolve_sidecar_file(
+    mtp_sidecar: str | Path, revision: str | None = None
+) -> Path | None:
     if mtp_sidecar is None:
         return None
     path = Path(mtp_sidecar)
@@ -90,7 +103,7 @@ def _resolve_sidecar_file(mtp_sidecar: str | Path) -> Path | None:
     try:
         from huggingface_hub import snapshot_download
 
-        local = snapshot_download(repo_id=str(mtp_sidecar))
+        local = snapshot_download(repo_id=str(mtp_sidecar), revision=revision)
         return _find_mtp_weights_file(Path(local))
     except Exception as exc:  # pragma: no cover — network failure path
         logger.warning(
@@ -99,18 +112,36 @@ def _resolve_sidecar_file(mtp_sidecar: str | Path) -> Path | None:
         return None
 
 
+# The two config keys that carry HY3's next-n layer count, most-specific
+# first. Must stay in lock-step with ``detect._mtp_num_hidden_layers``'s
+# per-family key list for ``hy_v3`` — otherwise a config detection deems
+# eligible could be refused here (codex BLOCKING #2). HY3 ships
+# ``num_nextn_predict_layers`` (DeepSeek-V3 convention); the
+# ``mtp_num_hidden_layers`` alias is accepted as a hand-converted fallback.
+_HY3_MTP_LAYER_KEYS = ("num_nextn_predict_layers", "mtp_num_hidden_layers")
+
+
 def _resolve_num_mtp_layers(inner: Any, model: Any) -> int:
-    """HY3 config uses ``num_nextn_predict_layers`` (not ``mtp_num_hidden_layers``)."""
+    """Resolve HY3's next-n layer count from the model args / wrapper config.
+
+    Reads the same key set as ``detect._mtp_num_hidden_layers`` for
+    ``model_type == "hy_v3"`` so detection and injection never disagree on
+    eligibility.
+    """
     args = inner.args
-    n = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
-    if n >= 1:
-        return n
+    for key in _HY3_MTP_LAYER_KEYS:
+        n = int(getattr(args, key, 0) or 0)
+        if n >= 1:
+            return n
     # Fall back to a wrapper text_config dict (defensive; HY3 has no wrapper).
     outer_args = getattr(model, "args", None)
     text_config = getattr(outer_args, "text_config", None) or {}
     if isinstance(text_config, dict):
-        n = int(text_config.get("num_nextn_predict_layers", 0) or 0)
-    return n
+        for key in _HY3_MTP_LAYER_KEYS:
+            n = int(text_config.get(key, 0) or 0)
+            if n >= 1:
+                return n
+    return 0
 
 
 def inject_hy3_mtp_support(
@@ -140,15 +171,6 @@ def inject_hy3_mtp_support(
     import mlx.core as mx
     import mlx.nn as nn
 
-    # HY3's base checkpoint has no baked-in MTP head — always resolve a sidecar
-    # (default to the published repo) unless the caller opted into random init.
-    if mtp_sidecar is None and not allow_random_init:
-        mtp_sidecar = DEFAULT_HY3_MTP_SIDECAR
-        logger.info(
-            "[mtp.inject.hy3] no explicit sidecar; defaulting to %s",
-            DEFAULT_HY3_MTP_SIDECAR,
-        )
-
     inner = _resolve_inner_model(model)
     if inner is None:
         logger.warning(
@@ -177,6 +199,32 @@ def inject_hy3_mtp_support(
 
     # --- Step 2: Quantize to match base (4-bit Linear; 8-bit router.gate). ---
     quant_info = _detect_base_quantization(inner)
+
+    # Resolve the DEFAULT sidecar BEFORE quantizing the head: HY3's base has no
+    # baked-in head, so a missing sidecar defaults to the published repo — but
+    # ONLY when the base quantization matches what that sidecar was extracted
+    # at (codex BLOCKING #3; a mismatch would load shape-incompatible tensors),
+    # and at a pinned revision (codex BLOCKING #1). An explicit sidecar bypasses
+    # both gates (the operator vouches for the pairing).
+    sidecar_revision = None
+    if mtp_sidecar is None and not allow_random_init:
+        if quant_info != DEFAULT_HY3_MTP_SIDECAR_BASE_QUANT:
+            logger.warning(
+                "[mtp.inject.hy3] base quantization %s != default sidecar's %s; "
+                "the auto-resolved %s would load shape-incompatible tensors. "
+                "Pass an explicit mtp_sidecar extracted for this base.",
+                quant_info,
+                DEFAULT_HY3_MTP_SIDECAR_BASE_QUANT,
+                DEFAULT_HY3_MTP_SIDECAR,
+            )
+            return False
+        mtp_sidecar = DEFAULT_HY3_MTP_SIDECAR
+        sidecar_revision = DEFAULT_HY3_MTP_SIDECAR_REVISION
+        logger.info(
+            "[mtp.inject.hy3] no explicit sidecar; defaulting to %s@%s",
+            DEFAULT_HY3_MTP_SIDECAR,
+            sidecar_revision[:12],
+        )
     if quant_info is not None:
 
         def _class_predicate(path: str, module) -> Any:
@@ -204,7 +252,7 @@ def inject_hy3_mtp_support(
 
     # --- Step 3: Load sidecar weights with strict coverage check. ---
     if mtp_sidecar is not None:
-        weights_file = _resolve_sidecar_file(mtp_sidecar)
+        weights_file = _resolve_sidecar_file(mtp_sidecar, revision=sidecar_revision)
         if weights_file is None:
             logger.warning(
                 "[mtp.inject.hy3] sidecar %r could not be resolved; skipping.",
@@ -228,6 +276,27 @@ def inject_hy3_mtp_support(
                 weights_file.name,
                 len(missing),
                 sorted(missing)[:8],
+            )
+            return False
+        # Shape/dtype guard (codex BLOCKING #3): the key-name coverage above
+        # does NOT catch a sidecar quantized for a different base (e.g. 8-bit
+        # packed tensors landing on a 4-bit head), which would either error
+        # opaquely in load_weights or corrupt inference. Reject up-front with
+        # an actionable message.
+        expected_shapes = {k: v.shape for k, v in tree_flatten(mtp.parameters())}
+        bad = [
+            (k, tuple(expected_shapes[k]), tuple(mtp_weights[k].shape))
+            for k in expected_keys
+            if tuple(mtp_weights[k].shape) != tuple(expected_shapes[k])
+        ]
+        if bad:
+            logger.warning(
+                "[mtp.inject.hy3] sidecar %s has %d shape-mismatched tensor(s) "
+                "(likely a quantization mismatch vs the base). First: %s. "
+                "Refusing to load. Use a sidecar extracted for this base quant.",
+                weights_file.name,
+                len(bad),
+                bad[0],
             )
             return False
         mtp.load_weights(list(mtp_weights.items()), strict=False)
