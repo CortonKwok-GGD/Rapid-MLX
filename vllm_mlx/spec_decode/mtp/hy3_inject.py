@@ -187,6 +187,22 @@ def inject_hy3_mtp_support(
         )
         return False
 
+    # Pipeline-parallel guard (codex R2 BLOCKING #3). The injected ``__call__``
+    # below inlines the single-node backbone loop over ``backbone.layers`` and
+    # has no distributed send/recv. Under pipeline parallelism the backbone
+    # holds only its ``pipeline_layers`` shard and iterating ``layers`` would
+    # call absent/non-local layers. Refuse rather than silently mis-run. HY3
+    # serves single-node in rapid-mlx today, so this only fail-closes a config
+    # the runtime does not support.
+    backbone = getattr(inner, "model", None)
+    if int(getattr(backbone, "pipeline_size", 1) or 1) > 1:
+        logger.warning(
+            "[mtp.inject.hy3] pipeline_size=%s > 1; MTP injection does not "
+            "support pipeline-parallel HY3. Refusing.",
+            getattr(backbone, "pipeline_size", None),
+        )
+        return False
+
     # --- Step 1: Build the HY3 MTP head. ---
     from .hy3_head import build_hy3_mtp_module
 
@@ -230,12 +246,15 @@ def inject_hy3_mtp_support(
         def _class_predicate(path: str, module) -> Any:
             # Only touch modules that actually support quantization (Linear /
             # Embedding / SwitchLinear expose ``to_quantized``); never norms.
-            # 8-bit for the MoE router gate; 4-bit for the rest. Mirrors
+            # Router gate keeps its own bits (8) but the SAME group_size as the
+            # base — extract_hy3_mtp.py quantizes the router with the base's
+            # group_size, so hard-coding 64 here would reject an explicit
+            # sidecar built for a non-gs64 base (codex R2 BLOCKING #2). Mirrors
             # hy_v3.Model.quant_predicate + the default nn.quantize gate.
             if not hasattr(module, "to_quantized"):
                 return False
             if path.endswith("mlp.router.gate"):
-                return {"group_size": 64, "bits": 8}
+                return {"group_size": quant_info["group_size"], "bits": 8}
             return True
 
         nn.quantize(
@@ -283,16 +302,22 @@ def inject_hy3_mtp_support(
         # packed tensors landing on a 4-bit head), which would either error
         # opaquely in load_weights or corrupt inference. Reject up-front with
         # an actionable message.
-        expected_shapes = {k: v.shape for k, v in tree_flatten(mtp.parameters())}
+        expected = {k: (v.shape, v.dtype) for k, v in tree_flatten(mtp.parameters())}
         bad = [
-            (k, tuple(expected_shapes[k]), tuple(mtp_weights[k].shape))
+            (
+                k,
+                (tuple(expected[k][0]), str(expected[k][1])),
+                (tuple(mtp_weights[k].shape), str(mtp_weights[k].dtype)),
+            )
             for k in expected_keys
-            if tuple(mtp_weights[k].shape) != tuple(expected_shapes[k])
+            if tuple(mtp_weights[k].shape) != tuple(expected[k][0])
+            or mtp_weights[k].dtype != expected[k][1]
         ]
         if bad:
             logger.warning(
-                "[mtp.inject.hy3] sidecar %s has %d shape-mismatched tensor(s) "
-                "(likely a quantization mismatch vs the base). First: %s. "
+                "[mtp.inject.hy3] sidecar %s has %d shape/dtype-mismatched "
+                "tensor(s) (likely a quantization mismatch vs the base). "
+                "First (key, expected(shape,dtype), got(shape,dtype)): %s. "
                 "Refusing to load. Use a sidecar extracted for this base quant.",
                 weights_file.name,
                 len(bad),

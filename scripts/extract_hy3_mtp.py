@@ -26,7 +26,10 @@ Usage:
         --upstream-repo tencent/Hy3-preview \
         --out ./hy3-mtp-sidecar/model-mtp.safetensors
 
-Disk hygiene: deletes the downloaded raw shards from the HF cache on exit.
+Provenance: `--base-rev` / `--upstream-rev` pin immutable commit SHAs so
+config, index, and shards all resolve from one reproducible snapshot. The
+downloaded shards stay in the shared HF cache; reclaim that space with
+`huggingface-cli delete-cache` (never unlink the shared blobs by hand).
 """
 
 from __future__ import annotations
@@ -75,11 +78,11 @@ def _resolve_base_quant(cfg: dict) -> dict:
     return {"bits": int(q["bits"]), "group_size": int(q["group_size"])}
 
 
-def _base_config(base_repo: str) -> dict:
-    """Fetch (and cache) the base checkpoint's ``config.json``."""
+def _base_config(base_repo: str, revision: str | None) -> dict:
+    """Fetch (and cache) the base checkpoint's ``config.json`` at ``revision``."""
     from huggingface_hub import hf_hub_download
 
-    cfg_path = hf_hub_download(base_repo, "config.json")
+    cfg_path = hf_hub_download(base_repo, "config.json", revision=revision)
     return json.loads(Path(cfg_path).read_text())
 
 
@@ -99,11 +102,15 @@ def _resolve_num_experts(cfg: dict) -> int:
     raise KeyError("could not find expert count in base config.json")
 
 
-def _find_shards_for_layer(upstream_repo: str, layer: int) -> list[str]:
+def _find_shards_for_layer(
+    upstream_repo: str, layer: int, revision: str | None
+) -> list[str]:
     """Return the shard filenames that hold ``model.layers.<layer>.*``."""
     from huggingface_hub import hf_hub_download
 
-    idx_path = hf_hub_download(upstream_repo, "model.safetensors.index.json")
+    idx_path = hf_hub_download(
+        upstream_repo, "model.safetensors.index.json", revision=revision
+    )
     weight_map = json.loads(Path(idx_path).read_text())["weight_map"]
     prefix = f"model.layers.{layer}."
     shards = sorted({fn for k, fn in weight_map.items() if k.startswith(prefix)})
@@ -149,14 +156,14 @@ def main() -> int:
         "Base quant: %d-bit gs=%d (router.gate %d-bit)", q_bits, q_gs, ROUTER_GATE_BITS
     )
     prefix = f"model.layers.{mtp_layer}."
-    shards = _find_shards_for_layer(args.upstream_repo, mtp_layer)
+    shards = _find_shards_for_layer(args.upstream_repo, mtp_layer, args.upstream_rev)
 
     # --- 1. Download only the shard(s) holding the MTP layer. ---
     raw_paths: list[Path] = []
     all_weights: dict[str, mx.array] = {}
     for shard in shards:
         logger.info("Downloading %s ...", shard)
-        p = Path(hf_hub_download(args.upstream_repo, shard))
+        p = Path(hf_hub_download(args.upstream_repo, shard, revision=args.upstream_rev))
         raw_paths.append(p)
         w = mx.load(str(p))
         for k, v in w.items():
