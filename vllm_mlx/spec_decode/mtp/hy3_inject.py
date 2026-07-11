@@ -95,6 +95,27 @@ def _resolve_sidecar_file(
 ) -> Path | None:
     if mtp_sidecar is None:
         return None
+    # Integrity guard (codex R5 BLOCKING #1): when a revision is pinned (the
+    # default-sidecar path), resolve the identifier EXCLUSIVELY as an HF repo at
+    # that immutable commit. Otherwise a local directory in the server's cwd
+    # that happens to be named like the repo id (e.g.
+    # ``mlx-community/Hy3-preview-MTP-4bit/``) would shadow the pinned repo and
+    # silently defeat the revision integrity guarantee. An explicit operator-
+    # supplied sidecar carries no revision, so local paths still resolve there.
+    if revision is not None:
+        try:
+            from huggingface_hub import snapshot_download
+
+            local = snapshot_download(repo_id=str(mtp_sidecar), revision=revision)
+            return _find_mtp_weights_file(Path(local))
+        except Exception as exc:  # pragma: no cover — network failure path
+            logger.warning(
+                "[mtp.inject.hy3] could not resolve pinned sidecar %r@%s: %s",
+                mtp_sidecar,
+                revision,
+                exc,
+            )
+            return None
     path = Path(mtp_sidecar)
     if path.is_file():
         return path

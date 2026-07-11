@@ -78,6 +78,12 @@ def _build_tiny_hy3_model(**overrides):
     return Model(_tiny_hy3_args(**overrides))
 
 
+def _resolve_inner(model):
+    from vllm_mlx.spec_decode.mtp.hy3_inject import _resolve_inner_model
+
+    return _resolve_inner_model(model)
+
+
 # ---------------------------------------------------------------------------
 # 1. Detection — num_nextn_predict_layers vs mtp_num_hidden_layers
 # ---------------------------------------------------------------------------
@@ -206,14 +212,27 @@ def test_inject_attaches_four_surfaces_random_init():
     mtp_logits = model.mtp_forward(hidden, ids, mtp_cache)
     mx.eval(mtp_logits)
     assert mtp_logits.shape == (1, 4, 128)
-    # Beyond shape (codex R4 NIT #4): the head must actually consume BOTH the
-    # embedding of next_token_ids AND the prev hidden state via eh_proj(concat)
-    # — a degenerate/constant head would emit identical logits at every
-    # position, and a NaN would slip through a shape-only check. Assert the
-    # output is finite and position-varying (the two token/hidden pairs differ,
-    # so their fused logits must too).
     assert bool(mx.all(mx.isfinite(mtp_logits)).item())
-    assert not bool(mx.allclose(mtp_logits[:, 0, :], mtp_logits[:, 1, :]).item())
+
+    # Prove the head consumes BOTH next_token_ids AND the prev hidden state via
+    # eh_proj(concat([enorm(embed(ids)), hnorm(hidden)])) — codex R5 BLOCKING
+    # #2. Vary ONLY ids (hidden fixed) then ONLY hidden (ids fixed); each
+    # perturbation must move the logits. A prior single-forward "both differ"
+    # check would pass even if one input were ignored, so perturb them
+    # independently with a fresh cache each time.
+    ids_b = mx.array([[5, 6, 7, 8]])
+    logits_ids_perturbed = model.mtp_forward(hidden, ids_b, model.make_mtp_cache())
+    mx.eval(logits_ids_perturbed)
+    assert not bool(mx.allclose(logits_ids_perturbed, mtp_logits).item()), (
+        "changing next_token_ids did not change MTP logits — ids input ignored"
+    )
+
+    hidden_b = hidden + 1.0
+    logits_hidden_perturbed = model.mtp_forward(hidden_b, ids, model.make_mtp_cache())
+    mx.eval(logits_hidden_perturbed)
+    assert not bool(mx.allclose(logits_hidden_perturbed, mtp_logits).item()), (
+        "changing the hidden state did not change MTP logits — hidden input ignored"
+    )
 
 
 def test_validate_false_before_inject():
@@ -352,9 +371,14 @@ def test_inject_refuses_integer_packed_wrong_kind(tmp_path):
     weights = dict(tree_flatten(template.parameters()))
     for k in list(weights):
         mx.eval(weights[k])
-    # Corrupt one float tensor into a packed-integer of a different shape,
-    # simulating a wrong-quant sidecar. Must be caught by the guard.
-    weights["eh_proj.weight"] = mx.zeros((4, 2), dtype=mx.uint32)
+    # Flip one float tensor to a packed-integer (uint32) while KEEPING its exact
+    # expected shape, so ONLY the dtype-category guard can reject it — if shape
+    # also differed, the shape check would pass the test even with the dtype
+    # guard removed (codex R5 BLOCKING #3). This isolates the dtype-category
+    # branch: a packed sidecar landing on an unquantized/differently-quantized
+    # head shows up as int-where-float-expected.
+    expected_shape = weights["eh_proj.weight"].shape
+    weights["eh_proj.weight"] = mx.zeros(expected_shape, dtype=mx.uint32)
     mx.eval(weights["eh_proj.weight"])
     side_dir = tmp_path / "sidecar"
     side_dir.mkdir()
@@ -363,6 +387,66 @@ def test_inject_refuses_integer_packed_wrong_kind(tmp_path):
     model = _build_tiny_hy3_model()
     assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is False
     assert validate_hy3_mtp_support(model) is False
+
+
+def test_inject_quantized_base_packed_sidecar_round_trip(tmp_path):
+    """Exercise the PRODUCTION packed path (codex R5 NIT): quantize the base
+    model so inject detects a quant spec and quantizes the head, build a sidecar
+    whose tensors are the head's quantized (packed uint32) params, then inject +
+    run mtp_forward. Every other sidecar-loading test uses an unquantized tiny
+    model, so this is the only coverage of the nn.quantize layout + packed load.
+    """
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.hy3_head import build_hy3_mtp_module
+    from vllm_mlx.spec_decode.mtp.hy3_inject import (
+        _detect_base_quantization,
+        inject_hy3_mtp_support,
+        validate_hy3_mtp_support,
+    )
+
+    bits, gs = 4, 32  # smallest tiny-model quantizable dim is 32 (experts)
+
+    # Quantize the BASE model so inject's _detect_base_quantization returns a
+    # spec and the head is quantized to match.
+    model = _build_tiny_hy3_model()
+
+    def _q_pred(path, module):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if path.endswith("mlp.router.gate"):
+            return {"group_size": gs, "bits": 8}
+        return True
+
+    nn.quantize(model.model, group_size=gs, bits=bits, class_predicate=_q_pred)
+    detected = _detect_base_quantization(_resolve_inner(model))
+    assert detected == {"bits": bits, "group_size": gs}
+
+    # Build + quantize a head the SAME way inject does, then dump its (packed)
+    # params as the sidecar so load_weights sees real uint32 packed tensors.
+    args = _tiny_hy3_args()
+    head = build_hy3_mtp_module(args, 1)
+    nn.quantize(head, group_size=gs, bits=bits, class_predicate=_q_pred)
+    packed = dict(tree_flatten(head.parameters()))
+    for k in list(packed):
+        mx.eval(packed[k])
+    assert any(v.dtype == mx.uint32 for v in packed.values()), (
+        "expected packed uint32 tensors in a quantized head"
+    )
+    side_dir = tmp_path / "sidecar"
+    side_dir.mkdir()
+    mx.save_safetensors(str(side_dir / "model-mtp.safetensors"), packed)
+
+    assert inject_hy3_mtp_support(model, mtp_sidecar=str(side_dir)) is True
+    assert validate_hy3_mtp_support(model) is True
+
+    ids = mx.array([[1, 2, 3, 4]])
+    _, hidden = model(ids, return_hidden=True)
+    logits = model.mtp_forward(hidden, ids, model.make_mtp_cache())
+    mx.eval(logits)
+    assert logits.shape == (1, 4, 128)
+    assert bool(mx.all(mx.isfinite(logits)).item())
 
 
 def test_inject_refuses_multi_nextn_layer_config():
