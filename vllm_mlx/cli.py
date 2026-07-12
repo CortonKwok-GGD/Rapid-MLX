@@ -1928,8 +1928,14 @@ def _normalize_speculative_config_or_exit(args):
             # but didn't pin a draft depth. K=1 chain-of-1 carries draft
             # overhead with no net speedup; default to K=3 (the EV auto-K
             # controller's intended default) so MTP actually accelerates.
-            # An explicit ``num_speculative_tokens`` always wins (branch
-            # above), so passing e.g. num_speculative_tokens=2 still holds.
+            #
+            # Only two draft-depth sources exist for the mtp method and
+            # neither is set here: (a) ``num_speculative_tokens`` in the JSON
+            # is handled by the branch above; (b) the legacy ``--mtp-max-k``
+            # flag CANNOT co-occur with ``--speculative-config`` — the
+            # mutual-exclusion guard (`_legacy_speculative_fields` lists
+            # ``mtp_max_k``) exits with code 2 before we reach this branch.
+            # So K=3 here never overwrites a user-pinned depth.
             args.mtp_max_k = 3
         if config.disable_auto_k is not None:
             args.mtp_disable_auto_k = config.disable_auto_k
@@ -6565,15 +6571,23 @@ def _parse_args_with_share_passthrough(
     representative argv orderings (see tests/test_share_cli.py) — the crux
     being that ``share`` must not corrupt ``model`` or the passthrough list.
     """
-    # The peek parse only reads ``command`` — the subparser action sets it
-    # regardless of any downstream positional/optional ambiguity, so a
-    # tolerant ``parse_known_args`` is safe purely to route here.
-    peeked, _ = parser.parse_known_args(raw_argv)
-    if getattr(peeked, "command", None) == "share" and "--" in raw_argv:
+    # Detect the subcommand with a side-effect-free lightweight probe rather
+    # than a full ``parser.parse_known_args`` — the latter would run every
+    # recognized type converter and custom argparse action a second time on
+    # normal invocations. The probe knows ONLY the subcommand positional, so
+    # no serve/bench converters fire. It is safe because the top-level parser
+    # has no value-taking global options ahead of the subcommand (only the
+    # valueless ``--version``/``-V``/``-h``), so the first positional token is
+    # unambiguously the command.
+    _probe = argparse.ArgumentParser(add_help=False)
+    _probe.add_argument("command", nargs="?", default=None)
+    probed, _ = _probe.parse_known_args(raw_argv)
+    if probed.command == "share" and "--" in raw_argv:
         sep = raw_argv.index("--")
         head_argv, passthrough_argv = raw_argv[:sep], raw_argv[sep + 1 :]
         # Strict parse of the head so typos in share's OWN flags still
-        # error; the denylist in share.cli then vets the passthrough.
+        # error; the denylist in share.cli then vets the passthrough. This is
+        # the single authoritative parse of share's own arguments.
         args = parser.parse_args(head_argv)
         args._passthrough = passthrough_argv
     else:

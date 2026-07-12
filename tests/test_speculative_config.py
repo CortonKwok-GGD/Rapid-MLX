@@ -316,6 +316,29 @@ def test_speculative_config_mtp_explicit_tokens_win_over_force_default() -> None
     assert args.mtp_max_k == 2
 
 
+def test_speculative_config_rejects_explicit_max_k_flag_combo(capsys) -> None:
+    """The ``--force-spec-decode`` K=3 default can never overwrite a
+    user-pinned ``--mtp-max-k`` because ``--mtp-max-k`` and
+    ``--speculative-config`` are mutually exclusive: the legacy-alias guard
+    (`_legacy_speculative_fields` lists ``mtp_max_k``) exits with code 2
+    before the mtp branch runs. This documents that the codex-flagged
+    "explicit depth silently overridden by 3" scenario is unreachable."""
+    import pytest
+
+    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp"}',
+        force_spec_decode=True,
+        mtp_max_k=5,  # explicit --mtp-max-k alongside --speculative-config
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _normalize_speculative_config_or_exit(args)
+    assert exc_info.value.code == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
 def test_speculative_config_parse_none_cleanly_disables(monkeypatch) -> None:
     from vllm_mlx.cli import _normalize_speculative_config_or_exit
     from vllm_mlx.spec_decode import config as config_mod
