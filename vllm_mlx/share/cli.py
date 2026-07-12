@@ -530,6 +530,46 @@ def share_command(args: argparse.Namespace) -> None:
         extra_serve_args.append("--rate-limit")
         extra_serve_args.append(str(args.rate_limit))
 
+    # Systematic serve-flag passthrough. ``cli.main`` collects any flag
+    # ``share`` does not define itself (via ``parse_known_args``) into
+    # ``args._passthrough`` and we forward it verbatim to the spawned
+    # ``rapid-mlx serve``. This means every serve flag — ``--force-spec-decode``
+    # / ``--speculative-config`` (spec-decode is off by default; the user
+    # opts in by passing them), KV-cache tuning, sampling defaults, etc. —
+    # works over a share tunnel without share re-declaring each one.
+    #
+    # A denylist blocks flags share MUST own for its security / lifecycle
+    # model. ``--host`` is the load-bearing one: share pins 127.0.0.1 so the
+    # bearer-gated port is reachable only through the frp tunnel; a
+    # forwarded ``--host 0.0.0.0`` would re-expose it to the whole LAN. The
+    # rest (``--api-key`` bearer minting, ``--port`` / ``--listen-fd`` /
+    # ``--log-level`` process + binding control) are set by share itself;
+    # forwarding a duplicate would either leak the key or fight share's own
+    # value. Reject with a clear message instead of silently dropping.
+    passthrough = list(getattr(args, "_passthrough", None) or [])
+    if passthrough:
+        denied = {
+            "--host": (
+                "share always binds 127.0.0.1 so the bearer-gated port is "
+                "reachable only through the tunnel; --host would re-expose "
+                "it on your LAN"
+            ),
+            "--api-key": "share mints its own single-use bearer key",
+            "--port": "use `rapid-mlx share --port` instead",
+            "--listen-fd": "share owns the serve process lifecycle",
+            "--log-level": "share sets the serve log level",
+        }
+        for token in passthrough:
+            flag = token.split("=", 1)[0]
+            if flag in denied:
+                print(
+                    f"share: {flag} cannot be forwarded to serve — "
+                    f"{denied[flag]}.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        extra_serve_args.extend(passthrough)
+
     api_key = secrets.token_hex(24)
     # Port parsing is lazy on purpose: validating RAPID_MLX_SHARE_PORT at
     # parser-build time crashes ``rapid-mlx models`` (and every other

@@ -288,6 +288,69 @@ def test_spawn_serve_passes_loopback_host():
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
 
 
+def test_share_forwards_passthrough_flags_to_serve():
+    """Unrecognized flags (collected by ``cli.main`` parse_known_args into
+    ``args._passthrough``) are forwarded verbatim to the spawned serve, so
+    e.g. ``--force-spec-decode`` / ``--speculative-config`` work over a
+    share tunnel even though share doesn't declare them itself."""
+    serve_proc = MagicMock()
+    serve_proc.poll.return_value = None
+    tunnel = _fake_tunnel()
+    passthrough = [
+        "--force-spec-decode",
+        "--speculative-config",
+        '{"method":"mtp"}',
+    ]
+    with (
+        patch.object(share_cli, "_spawn_serve", return_value=serve_proc) as spawn,
+        patch.object(share_cli, "_wait_for_healthz", return_value=True),
+        patch.object(share_cli, "_verify_auth_gate", return_value=True),
+        patch.object(share_cli.ws_tunnel, "TunnelClient", return_value=tunnel),
+        patch.object(share_cli.ws_tunnel, "wait_for_public_url", return_value=True),
+        patch.object(share_cli, "_pick_port", return_value=18765),
+        patch.object(
+            share_cli, "_resolve_served_model_name", return_value="qwen3.5-4b-4bit"
+        ),
+        patch("time.sleep", side_effect=_ctrl_c_in_monitor_loop()),
+    ):
+        share_cli.share_command(_make_args(_passthrough=passthrough))
+
+    extra = spawn.call_args.kwargs["extra_args"]
+    # Forwarded verbatim.
+    assert "--force-spec-decode" in extra
+    assert "--speculative-config" in extra
+    assert '{"method":"mtp"}' in extra
+    # Share's own forwarded flags are still present alongside the passthrough.
+    assert "--no-thinking" in extra
+
+
+@pytest.mark.parametrize(
+    "denied",
+    [
+        ["--host", "0.0.0.0"],
+        ["--host=0.0.0.0"],
+        ["--api-key", "leaked-secret"],
+        ["--port", "9999"],
+        ["--listen-fd", "7"],
+        ["--log-level", "DEBUG"],
+    ],
+)
+def test_share_rejects_denied_passthrough_flags(denied):
+    """Flags share MUST own for its security / lifecycle model are rejected
+    (exit 2) rather than forwarded. The load-bearing case is ``--host``: a
+    forwarded ``--host 0.0.0.0`` would re-expose the bearer-gated serve
+    port on the LAN, defeating the tunnel-only design. Rejection happens
+    before serve is ever spawned."""
+    with (
+        patch.object(share_cli, "_maybe_confirm_download"),
+        patch.object(share_cli, "_spawn_serve") as spawn,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        share_cli.share_command(_make_args(_passthrough=denied))
+    assert exc_info.value.code == 2
+    spawn.assert_not_called()
+
+
 def test_spawn_serve_passes_api_key_via_env_not_argv():
     """The bearer key must travel via env (RAPID_MLX_API_KEY) and never
     appear in argv where ``ps`` / shell history would leak it."""

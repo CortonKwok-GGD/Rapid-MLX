@@ -1923,6 +1923,14 @@ def _normalize_speculative_config_or_exit(args):
         args.mtp_sidecar = config.model
         if config.num_speculative_tokens is not None:
             args.mtp_max_k = config.num_speculative_tokens
+        elif getattr(args, "force_spec_decode", False):
+            # User explicitly opted into spec-decode via --force-spec-decode
+            # but didn't pin a draft depth. K=1 chain-of-1 carries draft
+            # overhead with no net speedup; default to K=3 (the EV auto-K
+            # controller's intended default) so MTP actually accelerates.
+            # An explicit ``num_speculative_tokens`` always wins (branch
+            # above), so passing e.g. num_speculative_tokens=2 still holds.
+            args.mtp_max_k = 3
         if config.disable_auto_k is not None:
             args.mtp_disable_auto_k = config.disable_auto_k
     elif config.method == "suffix":
@@ -8032,7 +8040,20 @@ Examples:
     else:
         argcomplete.autocomplete(parser)
 
-    args = parser.parse_args()
+    # ``parse_known_args`` instead of ``parse_args`` so the ``share``
+    # subcommand can forward unrecognized flags verbatim to the
+    # ``rapid-mlx serve`` it spawns (systematic serve-flag passthrough:
+    # every serve flag — spec-decode, KV-cache tuning, sampling defaults —
+    # works over a share tunnel without share re-declaring each one). For
+    # EVERY other subcommand we preserve the original strict behavior:
+    # unknown args are a hard error, exactly as ``parse_args`` raised.
+    args, _unknown_args = parser.parse_known_args()
+    if getattr(args, "command", None) == "share":
+        args._passthrough = _unknown_args
+    else:
+        if _unknown_args:
+            parser.error(f"unrecognized arguments: {' '.join(_unknown_args)}")
+        args._passthrough = []
 
     # First-run consent prompt — fires at most once per machine, only on
     # interactive subcommands when stdin is a tty. Safe no-op otherwise.

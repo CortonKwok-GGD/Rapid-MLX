@@ -282,6 +282,40 @@ def test_speculative_config_mtp_without_token_count_keeps_legacy_one_token() -> 
     assert args.mtp_disable_auto_k is False
 
 
+def test_speculative_config_mtp_force_spec_decode_defaults_k_three() -> None:
+    """When the user opts into spec-decode via ``--force-spec-decode`` but
+    doesn't pin ``num_speculative_tokens``, MTP defaults to K=3 (auto-K
+    controller's intended default) instead of the K=1 chain-of-1 that
+    carries draft overhead with no net speedup."""
+    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp"}', force_spec_decode=True
+    )
+
+    _normalize_speculative_config_or_exit(args)
+
+    assert args.spec_decode == "mtp"
+    assert args.mtp_max_k == 3
+    assert args.mtp_disable_auto_k is False
+
+
+def test_speculative_config_mtp_explicit_tokens_win_over_force_default() -> None:
+    """An explicit ``num_speculative_tokens`` always wins, even under
+    ``--force-spec-decode`` — the K=3 default only fills the unset case."""
+    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp","num_speculative_tokens":2}',
+        force_spec_decode=True,
+    )
+
+    _normalize_speculative_config_or_exit(args)
+
+    assert args.spec_decode == "mtp"
+    assert args.mtp_max_k == 2
+
+
 def test_speculative_config_parse_none_cleanly_disables(monkeypatch) -> None:
     from vllm_mlx.cli import _normalize_speculative_config_or_exit
     from vllm_mlx.spec_decode import config as config_mod
