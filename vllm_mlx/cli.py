@@ -6544,6 +6544,44 @@ def telemetry_command(args) -> None:
     sys.exit(1)
 
 
+def _parse_args_with_share_passthrough(
+    parser: argparse.ArgumentParser, raw_argv: list[str]
+) -> argparse.Namespace:
+    """Parse ``raw_argv`` with the fully-registered top-level ``parser``,
+    applying ``share``'s ``--`` end-of-options passthrough split.
+
+    ``rapid-mlx share <model> -- <serve flags…>`` forwards everything after
+    the literal ``--`` verbatim to the ``rapid-mlx serve`` that ``share``
+    spawns (stored on ``args._passthrough``). Splitting on ``--`` up front is
+    what keeps a value-taking serve flag such as
+    ``--speculative-config '{"method":"mtp"}'`` from having its JSON value
+    swallowed by share's required ``model`` positional — the passthrough
+    tokens never reach share's parser, so option/value grouping is preserved
+    exactly as typed. Every other subcommand (and ``share`` with no ``--``)
+    keeps argparse's native behavior, including hard errors on unrecognized
+    flags and native ``--`` end-of-options handling.
+
+    Factored out of ``main`` so tests can drive the real parser + split with
+    representative argv orderings (see tests/test_share_cli.py) — the crux
+    being that ``share`` must not corrupt ``model`` or the passthrough list.
+    """
+    # The peek parse only reads ``command`` — the subparser action sets it
+    # regardless of any downstream positional/optional ambiguity, so a
+    # tolerant ``parse_known_args`` is safe purely to route here.
+    peeked, _ = parser.parse_known_args(raw_argv)
+    if getattr(peeked, "command", None) == "share" and "--" in raw_argv:
+        sep = raw_argv.index("--")
+        head_argv, passthrough_argv = raw_argv[:sep], raw_argv[sep + 1 :]
+        # Strict parse of the head so typos in share's OWN flags still
+        # error; the denylist in share.cli then vets the passthrough.
+        args = parser.parse_args(head_argv)
+        args._passthrough = passthrough_argv
+    else:
+        args = parser.parse_args(raw_argv)
+        args._passthrough = []
+    return args
+
+
 def main():
     from importlib.metadata import version as pkg_version
 
@@ -8040,20 +8078,9 @@ Examples:
     else:
         argcomplete.autocomplete(parser)
 
-    # ``parse_known_args`` instead of ``parse_args`` so the ``share``
-    # subcommand can forward unrecognized flags verbatim to the
-    # ``rapid-mlx serve`` it spawns (systematic serve-flag passthrough:
-    # every serve flag — spec-decode, KV-cache tuning, sampling defaults —
-    # works over a share tunnel without share re-declaring each one). For
-    # EVERY other subcommand we preserve the original strict behavior:
-    # unknown args are a hard error, exactly as ``parse_args`` raised.
-    args, _unknown_args = parser.parse_known_args()
-    if getattr(args, "command", None) == "share":
-        args._passthrough = _unknown_args
-    else:
-        if _unknown_args:
-            parser.error(f"unrecognized arguments: {' '.join(_unknown_args)}")
-        args._passthrough = []
+    # Systematic serve-flag passthrough for ``share`` via the standard ``--``
+    # end-of-options separator — see ``_parse_args_with_share_passthrough``.
+    args = _parse_args_with_share_passthrough(parser, sys.argv[1:])
 
     # First-run consent prompt — fires at most once per machine, only on
     # interactive subcommands when stdin is a tty. Safe no-op otherwise.

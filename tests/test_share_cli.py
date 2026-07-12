@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vllm_mlx import cli as top_cli
 from vllm_mlx.share import cli as share_cli
 
 
@@ -288,65 +289,108 @@ def test_spawn_serve_passes_loopback_host():
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
 
 
-def test_share_forwards_passthrough_flags_to_serve():
-    """Unrecognized flags (collected by ``cli.main`` parse_known_args into
-    ``args._passthrough``) are forwarded verbatim to the spawned serve, so
-    e.g. ``--force-spec-decode`` / ``--speculative-config`` work over a
-    share tunnel even though share doesn't declare them itself."""
-    serve_proc = MagicMock()
-    serve_proc.poll.return_value = None
-    tunnel = _fake_tunnel()
-    passthrough = [
+def _real_top_parser() -> argparse.ArgumentParser:
+    """Build a top-level parser whose ``share`` subcommand is registered
+    through the SAME ``share_cli.register`` path ``cli.main`` uses, so these
+    tests exercise the real subparser (required ``model`` positional
+    included) and the real ``--`` passthrough split — not a hand-rolled
+    stand-in that could paper over the parser-layer bugs."""
+    parser = argparse.ArgumentParser(prog="rapid-mlx")
+    subparsers = parser.add_subparsers(dest="command")
+    share_cli.register(subparsers)
+    return parser
+
+
+def _drive_share_from_argv(argv, *, extra_patches=()):
+    """Parse ``argv`` through the real top-level parser + the real
+    ``cli._parse_args_with_share_passthrough`` split, then run
+    ``share_command`` with its lifecycle mocked and return
+    ``(args, spawned_serve_extra_args)``.
+
+    Driving from raw argv — rather than injecting a pre-built
+    ``_passthrough`` — is the whole point: it's the only way these tests can
+    catch a parser-layer regression that corrupts ``model`` or the
+    option/value grouping of the passthrough (codex review finding: a test
+    that hand-injects ``_passthrough`` stays green even when the parser
+    swallows the JSON value into share's ``model`` positional)."""
+    args = top_cli._parse_args_with_share_passthrough(_real_top_parser(), list(argv))
+    captured = _drive_share_capture(args, extra_patches=extra_patches)
+    return args, captured
+
+
+def test_share_forwards_passthrough_flags_after_double_dash():
+    """End-to-end: ``rapid-mlx share MODEL -- <serve flags>`` forwards every
+    token after ``--`` verbatim to the spawned serve, with option/value
+    grouping intact, so ``--force-spec-decode`` / ``--speculative-config``
+    work over a share tunnel even though share doesn't declare them."""
+    argv = [
+        "share",
+        "hy3-preview-4bit",
+        "--",
         "--force-spec-decode",
         "--speculative-config",
         '{"method":"mtp"}',
     ]
-    with (
-        patch.object(share_cli, "_spawn_serve", return_value=serve_proc) as spawn,
-        patch.object(share_cli, "_wait_for_healthz", return_value=True),
-        patch.object(share_cli, "_verify_auth_gate", return_value=True),
-        patch.object(share_cli.ws_tunnel, "TunnelClient", return_value=tunnel),
-        patch.object(share_cli.ws_tunnel, "wait_for_public_url", return_value=True),
-        patch.object(share_cli, "_pick_port", return_value=18765),
-        patch.object(
-            share_cli, "_resolve_served_model_name", return_value="qwen3.5-4b-4bit"
-        ),
-        patch("time.sleep", side_effect=_ctrl_c_in_monitor_loop()),
-    ):
-        share_cli.share_command(_make_args(_passthrough=passthrough))
+    args, extra = _drive_share_from_argv(argv)
 
-    extra = spawn.call_args.kwargs["extra_args"]
-    # Forwarded verbatim.
+    # The ``model`` positional must NOT swallow the JSON value of the
+    # passthrough flag — the exact corruption a bare parse_known_args had.
+    assert args.model == "hy3-preview-4bit"
+    assert args._passthrough == [
+        "--force-spec-decode",
+        "--speculative-config",
+        '{"method":"mtp"}',
+    ]
+    # Forwarded verbatim into the serve argv, option+value pairing preserved.
     assert "--force-spec-decode" in extra
-    assert "--speculative-config" in extra
-    assert '{"method":"mtp"}' in extra
-    # Share's own forwarded flags are still present alongside the passthrough.
+    sc = extra.index("--speculative-config")
+    assert extra[sc + 1] == '{"method":"mtp"}'
+    # Share's own forwarded flags still present alongside the passthrough.
     assert "--no-thinking" in extra
 
 
+def test_share_unknown_flag_without_double_dash_is_a_hard_error():
+    """Passthrough REQUIRES the ``--`` separator. A serve flag written
+    without it is a normal argparse error (not silently forwarded, not
+    swallowed) — this is what removes the model-positional value-steal
+    ambiguity for good and makes the passthrough grammar unambiguous."""
+    argv = ["share", "hy3-preview-4bit", "--force-spec-decode"]
+    with pytest.raises(SystemExit):
+        top_cli._parse_args_with_share_passthrough(_real_top_parser(), argv)
+
+
 @pytest.mark.parametrize(
-    "denied",
+    "denied_tokens",
     [
         ["--host", "0.0.0.0"],
         ["--host=0.0.0.0"],
+        # argparse keeps allow_abbrev=True on the serve child, so an
+        # abbreviation of a denied flag would resolve to the full flag and
+        # bypass a name-only denylist — the LAN-reexposure the review flagged.
+        ["--hos=0.0.0.0"],
+        ["--ho", "0.0.0.0"],
         ["--api-key", "leaked-secret"],
+        ["--api", "leaked-secret"],
         ["--port", "9999"],
         ["--listen-fd", "7"],
         ["--log-level", "DEBUG"],
     ],
 )
-def test_share_rejects_denied_passthrough_flags(denied):
+def test_share_rejects_denied_passthrough_flags_incl_abbreviations(denied_tokens):
     """Flags share MUST own for its security / lifecycle model are rejected
-    (exit 2) rather than forwarded. The load-bearing case is ``--host``: a
-    forwarded ``--host 0.0.0.0`` would re-expose the bearer-gated serve
-    port on the LAN, defeating the tunnel-only design. Rejection happens
-    before serve is ever spawned."""
+    (exit 2) rather than forwarded — including every unambiguous abbreviation
+    of them. The load-bearing case is ``--host`` (and ``--hos`` / ``--ho``):
+    a forwarded ``--host 0.0.0.0`` re-exposes the bearer-gated serve port on
+    the LAN, defeating the tunnel-only design. Rejection is driven from real
+    argv and happens before serve is ever spawned."""
+    argv = ["share", "hy3-preview-4bit", "--", *denied_tokens]
+    args = top_cli._parse_args_with_share_passthrough(_real_top_parser(), argv)
     with (
         patch.object(share_cli, "_maybe_confirm_download"),
         patch.object(share_cli, "_spawn_serve") as spawn,
         pytest.raises(SystemExit) as exc_info,
     ):
-        share_cli.share_command(_make_args(_passthrough=denied))
+        share_cli.share_command(args)
     assert exc_info.value.code == 2
     spawn.assert_not_called()
 

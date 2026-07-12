@@ -530,13 +530,16 @@ def share_command(args: argparse.Namespace) -> None:
         extra_serve_args.append("--rate-limit")
         extra_serve_args.append(str(args.rate_limit))
 
-    # Systematic serve-flag passthrough. ``cli.main`` collects any flag
-    # ``share`` does not define itself (via ``parse_known_args``) into
-    # ``args._passthrough`` and we forward it verbatim to the spawned
+    # Systematic serve-flag passthrough. ``cli.main`` splits the CLI on the
+    # standard ``--`` end-of-options separator and hands everything after it
+    # to us verbatim in ``args._passthrough``; we forward it to the spawned
     # ``rapid-mlx serve``. This means every serve flag — ``--force-spec-decode``
     # / ``--speculative-config`` (spec-decode is off by default; the user
     # opts in by passing them), KV-cache tuning, sampling defaults, etc. —
-    # works over a share tunnel without share re-declaring each one.
+    # works over a share tunnel without share re-declaring each one, and
+    # value-taking flags keep their arguments (``--`` is why the JSON of
+    # ``--speculative-config '{...}'`` is no longer swallowed by share's
+    # ``model`` positional).
     #
     # A denylist blocks flags share MUST own for its security / lifecycle
     # model. ``--host`` is the load-bearing one: share pins 127.0.0.1 so the
@@ -561,10 +564,23 @@ def share_command(args: argparse.Namespace) -> None:
         }
         for token in passthrough:
             flag = token.split("=", 1)[0]
-            if flag in denied:
+            # Match the canonical spelling AND any prefix of it. serve's
+            # parser keeps argparse's default ``allow_abbrev=True``, so an
+            # abbreviation like ``--hos`` / ``--hos=0.0.0.0`` resolves to
+            # ``--host`` on the child and would re-expose the port. Reject
+            # every unambiguous abbreviation of a denied flag, not just its
+            # full spelling, or the denylist is trivially bypassed. (Bare
+            # ``--`` — len 2 — is a literal separator, never an option.)
+            if not (flag.startswith("--") and len(flag) > 2):
+                continue
+            hit = next(
+                (d for d in denied if d == flag or d.startswith(flag)),
+                None,
+            )
+            if hit is not None:
                 print(
                     f"share: {flag} cannot be forwarded to serve — "
-                    f"{denied[flag]}.",
+                    f"{denied[hit]}.",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -817,6 +833,20 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "Start rapid-mlx serve and open a public Cloudflare-fronted "
             "URL on rapidmlx.com so you can use the model from a different "
             "device — or share it with a friend. Press Ctrl-C to stop."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "serve-flag passthrough:\n"
+            "  Anything after a literal `--` is forwarded verbatim to the\n"
+            "  `rapid-mlx serve` that share spawns, so every serve flag works\n"
+            "  over the tunnel without share re-declaring it. Spec-decode is\n"
+            "  off by default; opt in per share like this:\n"
+            "\n"
+            "    rapid-mlx share hy3-preview-4bit -- \\\n"
+            "        --force-spec-decode --speculative-config '{\"method\":\"mtp\"}'\n"
+            "\n"
+            "  (`--host` / `--api-key` / `--port` / `--listen-fd` /\n"
+            "  `--log-level` are owned by share and rejected if forwarded.)"
         ),
     )
     p.add_argument(
