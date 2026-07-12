@@ -6591,17 +6591,26 @@ def _parse_args_with_share_passthrough(
         # Strict probe: does the head fully resolve to a ``share`` command
         # with a model? A STRICT ``parse_args`` (not ``parse_known_args``)
         # means an incomplete head (``share`` alone, i.e. ``share -- MODEL``)
-        # or a typo'd share flag makes the probe exit — in which case this
-        # ``--`` is NOT a passthrough separator and we fall through to native
-        # parsing. stderr is muted so the probe's would-be usage error never
-        # reaches the user (the fall-through re-parses and either succeeds or
-        # emits the real error itself).
+        # or a typo'd share flag makes the probe exit with a NON-ZERO code — in
+        # which case this ``--`` is NOT a passthrough separator and we fall
+        # through to native parsing. stderr is muted so the probe's would-be
+        # usage error never reaches the user (the fall-through re-parses and
+        # either succeeds or emits the real error itself).
+        #
+        # A ZERO exit is different: the probe already ran a terminal argparse
+        # *action* — ``--help`` / ``--version`` printed to stdout and called
+        # ``parser.exit(0)``. Swallowing that would make the fall-through parse
+        # print the SAME message a second time, so re-raise instead: the text
+        # prints exactly once and the process exits cleanly.
         probed = None
         with contextlib.redirect_stderr(io.StringIO()):
             try:
                 probed = parser.parse_args(head_argv)
-            except SystemExit:
-                probed = None
+            except SystemExit as exc:
+                if exc.code not in (None, 0):
+                    probed = None
+                else:
+                    raise
         if (
             probed is not None
             and getattr(probed, "command", None) == "share"

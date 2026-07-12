@@ -415,6 +415,27 @@ def test_share_rejects_denied_passthrough_flags_incl_abbreviations(denied_tokens
     spawn.assert_not_called()
 
 
+@pytest.mark.parametrize("action_flag", ["--help", "-h"])
+def test_double_dash_probe_does_not_double_print_help(action_flag, capsys):
+    """``rapid-mlx --help --`` must print help EXACTLY once and exit 0.
+
+    Regression guard for the codex finding that the ``--`` passthrough probe
+    swallowed the ``SystemExit(0)`` raised by argparse's terminal help/version
+    *action*: the probe ran ``parse_args(head)`` (printing help to stdout),
+    caught the exit, then fell through to the native parse which printed the
+    SAME help a second time. The probe now re-raises a zero exit so the action
+    fires once. stderr-only muting in the probe is why this bug was invisible —
+    help goes to stdout."""
+    parser = _real_top_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        top_cli._parse_args_with_share_passthrough(parser, [action_flag, "--"])
+    # Zero exit propagates (help/version are a successful terminal action).
+    assert exc_info.value.code in (None, 0)
+    out = capsys.readouterr().out
+    # ``usage:`` is argparse's help banner header — exactly one, not two.
+    assert out.count("usage:") == 1, f"help printed {out.count('usage:')}×, want 1"
+
+
 def test_spawn_serve_passes_api_key_via_env_not_argv():
     """The bearer key must travel via env (RAPID_MLX_API_KEY) and never
     appear in argv where ``ps`` / shell history would leak it."""
