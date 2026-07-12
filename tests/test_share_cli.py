@@ -455,6 +455,65 @@ def test_double_dash_probe_does_not_double_print_help(argv, capsys):
     assert out.count("usage:") == 1, f"help printed {out.count('usage:')}×, want 1"
 
 
+def test_main_routes_share_passthrough_to_spawned_serve(monkeypatch):
+    """End-to-end through ``cli.main`` (not the helper in isolation): a real
+    ``rapid-mlx share MODEL -- <serve flags>`` argv, parsed by ``main``'s own
+    ``sys.argv`` handling, must reach the spawned serve with the passthrough
+    forwarded verbatim. Guards the codex finding that the unit tests call
+    ``_parse_args_with_share_passthrough`` directly and so would stay green if
+    ``main`` ever stopped routing CLI args through it."""
+    monkeypatch.setenv("RAPID_MLX_TELEMETRY", "0")
+    monkeypatch.setattr(
+        top_cli.sys,
+        "argv",
+        [
+            "rapid-mlx",
+            "share",
+            "hy3-preview-4bit",
+            "--",
+            "--force-spec-decode",
+            "--speculative-config",
+            '{"method":"mtp"}',
+        ],
+    )
+
+    serve_proc = MagicMock()
+    serve_proc.poll.return_value = None
+    tunnel = _fake_tunnel()
+    captured: list[str] = []
+
+    def fake_spawn(*, alias, port, api_key, log_path, extra_args):  # noqa: ARG001
+        captured.extend(extra_args)
+        return serve_proc
+
+    patches = [
+        patch.object(share_cli, "_spawn_serve", side_effect=fake_spawn),
+        patch.object(share_cli, "_wait_for_healthz", return_value=True),
+        patch.object(share_cli, "_verify_auth_gate", return_value=True),
+        patch.object(share_cli.ws_tunnel, "TunnelClient", return_value=tunnel),
+        patch.object(share_cli.ws_tunnel, "wait_for_public_url", return_value=True),
+        patch.object(share_cli, "_pick_port", return_value=18765),
+        patch.object(share_cli, "_maybe_confirm_download"),
+        patch.object(
+            share_cli, "_resolve_served_model_name", return_value="hy3-preview-4bit"
+        ),
+        patch("time.sleep", side_effect=_ctrl_c_in_monitor_loop()),
+    ]
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        # ``main`` may exit 0 via share's Ctrl-C-keeps-zero path; tolerate it.
+        with contextlib.suppress(SystemExit):
+            top_cli.main()
+
+    # The serve child receives the verbatim passthrough (option+value pairing
+    # intact) alongside share's own forwarded flags — proving main → helper →
+    # share_command → _spawn_serve is wired end to end.
+    assert "--force-spec-decode" in captured
+    sc = captured.index("--speculative-config")
+    assert captured[sc + 1] == '{"method":"mtp"}'
+
+
 def test_non_share_positional_value_share_skips_probe_no_double_convert():
     """A non-``share`` invocation must NOT trigger the passthrough probe even
     when a POSITIONAL VALUE happens to equal ``"share"`` — the probe is gated on
