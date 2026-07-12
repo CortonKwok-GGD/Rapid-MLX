@@ -6571,28 +6571,55 @@ def _parse_args_with_share_passthrough(
     representative argv orderings (see tests/test_share_cli.py) — the crux
     being that ``share`` must not corrupt ``model`` or the passthrough list.
     """
-    # Detect the subcommand with a side-effect-free lightweight probe rather
-    # than a full ``parser.parse_known_args`` — the latter would run every
-    # recognized type converter and custom argparse action a second time on
-    # normal invocations. The probe knows ONLY the subcommand positional, so
-    # no serve/bench converters fire. It is safe because the top-level parser
-    # has no value-taking global options ahead of the subcommand (only the
-    # valueless ``--version``/``-V``/``-h``), so the first positional token is
-    # unambiguously the command.
-    _probe = argparse.ArgumentParser(add_help=False)
-    _probe.add_argument("command", nargs="?", default=None)
-    probed, _ = _probe.parse_known_args(raw_argv)
-    if probed.command == "share" and "--" in raw_argv:
+    # A ``--`` is only the passthrough separator when it comes AFTER a
+    # COMPLETE ``share <model>`` head. A ``--`` positioned BEFORE the model
+    # (``share -- MODEL``) or before the subcommand (``-- share MODEL``) is
+    # argparse's native end-of-options marker and must keep its native
+    # meaning — splitting there would strip the required positional and break
+    # those valid forms. So we only split when the tokens to the left of the
+    # first ``--`` STRICTLY parse as ``share`` WITH a model.
+    #
+    # ``normal`` invocations (no ``--`` at all — the overwhelming majority)
+    # skip this block entirely and hit the single ``parse_args`` below, so no
+    # converter/action runs twice on the common path.
+    if "--" in raw_argv:
+        import contextlib
+        import io
+
         sep = raw_argv.index("--")
         head_argv, passthrough_argv = raw_argv[:sep], raw_argv[sep + 1 :]
-        # Strict parse of the head so typos in share's OWN flags still
-        # error; the denylist in share.cli then vets the passthrough. This is
-        # the single authoritative parse of share's own arguments.
-        args = parser.parse_args(head_argv)
-        args._passthrough = passthrough_argv
-    else:
-        args = parser.parse_args(raw_argv)
-        args._passthrough = []
+        # Strict probe: does the head fully resolve to a ``share`` command
+        # with a model? A STRICT ``parse_args`` (not ``parse_known_args``)
+        # means an incomplete head (``share`` alone, i.e. ``share -- MODEL``)
+        # or a typo'd share flag makes the probe exit — in which case this
+        # ``--`` is NOT a passthrough separator and we fall through to native
+        # parsing. stderr is muted so the probe's would-be usage error never
+        # reaches the user (the fall-through re-parses and either succeeds or
+        # emits the real error itself).
+        probed = None
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                probed = parser.parse_args(head_argv)
+            except SystemExit:
+                probed = None
+        if (
+            probed is not None
+            and getattr(probed, "command", None) == "share"
+            and getattr(probed, "model", None) is not None
+        ):
+            # Head is a complete share command; the tokens after ``--`` are
+            # verbatim serve-flag passthrough. ``probed`` already holds share's
+            # authoritative parsed args (model + share flags); the denylist in
+            # share.cli then vets the passthrough.
+            probed._passthrough = passthrough_argv
+            return probed
+
+    # Everything else — non-share commands, ``share`` with no passthrough
+    # ``--``, and the ``share -- MODEL`` / ``-- share MODEL`` native forms —
+    # keeps argparse's native behavior, including native ``--`` handling and
+    # hard errors on unrecognized flags.
+    args = parser.parse_args(raw_argv)
+    args._passthrough = []
     return args
 
 

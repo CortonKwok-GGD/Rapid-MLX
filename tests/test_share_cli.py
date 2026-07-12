@@ -349,6 +349,26 @@ def test_share_forwards_passthrough_flags_after_double_dash():
     assert "--no-thinking" in extra
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["share", "--", "hy3-preview-4bit"],  # -- before the model
+        ["--", "share", "hy3-preview-4bit"],  # -- before the subcommand
+    ],
+)
+def test_share_native_double_dash_before_model_is_not_passthrough(argv):
+    """A ``--`` that precedes the model (or the subcommand) is argparse's
+    native end-of-options marker, NOT the passthrough separator: the model
+    still parses and there is no passthrough. Regression guard for the codex
+    finding that splitting at the first ``--`` unconditionally broke these
+    previously-valid forms by stripping the required positional."""
+    parser = _real_top_parser()
+    args = top_cli._parse_args_with_share_passthrough(parser, argv)
+    assert args.command == "share"
+    assert args.model == "hy3-preview-4bit"
+    assert args._passthrough == []
+
+
 def test_share_unknown_flag_without_double_dash_is_a_hard_error():
     """Passthrough REQUIRES the ``--`` separator. A serve flag written
     without it is a normal argparse error (not silently forwarded, not
