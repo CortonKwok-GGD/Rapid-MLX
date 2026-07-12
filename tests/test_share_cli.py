@@ -436,6 +436,43 @@ def test_double_dash_probe_does_not_double_print_help(action_flag, capsys):
     assert out.count("usage:") == 1, f"help printed {out.count('usage:')}×, want 1"
 
 
+def test_non_share_double_dash_skips_probe_no_double_convert():
+    """A ``--`` in a non-``share`` invocation must NOT trigger the passthrough
+    probe: ``share`` isn't the command token, so ``--`` keeps its native
+    meaning and the head is parsed exactly ONCE. Guards the codex nit that the
+    unconditional probe re-parsed the full head for every ``--``-bearing
+    command, running argparse type converters / custom actions a second time.
+
+    Proven the faithful way — a sibling subcommand whose option uses a spy
+    type converter: with the guard, the converter fires once; without it, the
+    probe would parse the head and run it twice."""
+    parser = _real_top_parser()  # registers the real ``share`` subcommand
+    subparsers = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    calls = {"n": 0}
+
+    def _spy_int(raw):
+        calls["n"] += 1
+        return int(raw)
+
+    diag = subparsers.add_parser("diag")
+    diag.add_argument("--n", type=_spy_int)
+    diag.add_argument("rest", nargs="*")  # absorbs tokens after native ``--``
+
+    # ``share`` is absent from the head (``["diag", "--n", "5"]``) → probe is
+    # skipped; native parse runs the converter on "5" exactly once and ``--``
+    # keeps its native meaning (end-of-options; "x" lands in ``rest``).
+    args = top_cli._parse_args_with_share_passthrough(
+        parser, ["diag", "--n", "5", "--", "x"]
+    )
+    assert args.command == "diag"
+    assert args.n == 5
+    assert args.rest == ["x"]
+    assert args._passthrough == []
+    assert calls["n"] == 1, f"converter ran {calls['n']}×, want 1 (probe skipped)"
+
+
 def test_spawn_serve_passes_api_key_via_env_not_argv():
     """The bearer key must travel via env (RAPID_MLX_API_KEY) and never
     appear in argv where ``ps`` / shell history would leak it."""

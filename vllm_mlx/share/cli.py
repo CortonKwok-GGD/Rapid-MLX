@@ -579,8 +579,7 @@ def share_command(args: argparse.Namespace) -> None:
             )
             if hit is not None:
                 print(
-                    f"share: {flag} cannot be forwarded to serve — "
-                    f"{denied[hit]}.",
+                    f"share: {flag} cannot be forwarded to serve — {denied[hit]}.",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -843,7 +842,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  off by default; opt in per share like this:\n"
             "\n"
             "    rapid-mlx share hy3-preview-4bit -- \\\n"
-            "        --force-spec-decode --speculative-config '{\"method\":\"mtp\"}'\n"
+            '        --force-spec-decode --speculative-config \'{"method":"mtp"}\'\n'
             "\n"
             "  (`--host` / `--api-key` / `--port` / `--listen-fd` /\n"
             "  `--log-level` are owned by share and rejected if forwarded.)"
