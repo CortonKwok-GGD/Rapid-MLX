@@ -6589,14 +6589,20 @@ def _parse_args_with_share_passthrough(
         sep = raw_argv.index("--")
         head_argv, passthrough_argv = raw_argv[:sep], raw_argv[sep + 1 :]
         # Cheap gate before the probe: the passthrough split only ever applies
-        # to ``share``, and ``share`` must appear as a literal token in the head
-        # to be the command. If it doesn't (any other subcommand, or ``-- share
-        # MODEL`` where the head is empty), this ``--`` is argparse's native
-        # end-of-options marker — skip the probe so non-share invocations aren't
-        # parsed twice (which would run argparse type converters / custom
-        # actions a second time), and fall straight through to the single
-        # native parse below.
-        if "share" in head_argv:
+        # to ``share``, so only probe when ``share`` is the SELECTED subcommand.
+        # The selected subcommand is the first non-option token in the head —
+        # the top-level parser's only pre-subcommand options (``--version`` /
+        # ``-V`` / ``-h`` / ``--no-telemetry``) are all valueless, so no earlier
+        # token can be an option *value* masquerading as the command. Checking
+        # the command token structurally (rather than ``"share" in head_argv``)
+        # excludes a positional value that merely equals "share" — e.g. a model
+        # named "share" after another subcommand (``serve share …``) — so NO
+        # non-share invocation is ever parsed twice (which would rerun argparse
+        # type converters / custom actions). A ``--`` before the command
+        # (``-- share MODEL``, empty head → ``cmd_token is None``) also skips the
+        # probe and keeps argparse's native end-of-options meaning.
+        cmd_token = next((t for t in head_argv if not t.startswith("-")), None)
+        if cmd_token == "share":
             # Strict probe: does the head fully resolve to a ``share`` command
             # with a model? A STRICT ``parse_args`` (not ``parse_known_args``)
             # means an incomplete head (``share`` alone, i.e. ``share -- MODEL``)

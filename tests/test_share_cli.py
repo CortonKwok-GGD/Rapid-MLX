@@ -415,9 +415,24 @@ def test_share_rejects_denied_passthrough_flags_incl_abbreviations(denied_tokens
     spawn.assert_not_called()
 
 
-@pytest.mark.parametrize("action_flag", ["--help", "-h"])
-def test_double_dash_probe_does_not_double_print_help(action_flag, capsys):
-    """``rapid-mlx --help --`` must print help EXACTLY once and exit 0.
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Share head → the probe RUNS (``cmd_token == "share"``) and the share
+        # subparser's ``--help`` raises ``SystemExit(0)`` mid-probe. This is the
+        # case that actually exercises the zero-exit re-raise: without it the
+        # fall-through native parse would print share's help a SECOND time.
+        ["share", "hy3-preview-4bit", "--help", "--"],
+        ["share", "hy3-preview-4bit", "-h", "--"],
+        # Top-level head with no command token → probe is skipped; the native
+        # parse prints top-level help once. Kept so both the probe path and the
+        # skip path are covered.
+        ["--help", "--"],
+        ["-h", "--"],
+    ],
+)
+def test_double_dash_probe_does_not_double_print_help(argv, capsys):
+    """``… --help --`` must print help EXACTLY once and exit 0.
 
     Regression guard for the codex finding that the ``--`` passthrough probe
     swallowed the ``SystemExit(0)`` raised by argparse's terminal help/version
@@ -425,10 +440,14 @@ def test_double_dash_probe_does_not_double_print_help(action_flag, capsys):
     caught the exit, then fell through to the native parse which printed the
     SAME help a second time. The probe now re-raises a zero exit so the action
     fires once. stderr-only muting in the probe is why this bug was invisible —
-    help goes to stdout."""
+    help goes to stdout.
+
+    The share-head cases are load-bearing: a top-level ``--help`` skips the
+    probe entirely (no command token), so only a complete share head drives the
+    probe into the re-raise branch under test."""
     parser = _real_top_parser()
     with pytest.raises(SystemExit) as exc_info:
-        top_cli._parse_args_with_share_passthrough(parser, [action_flag, "--"])
+        top_cli._parse_args_with_share_passthrough(parser, argv)
     # Zero exit propagates (help/version are a successful terminal action).
     assert exc_info.value.code in (None, 0)
     out = capsys.readouterr().out
@@ -436,16 +455,17 @@ def test_double_dash_probe_does_not_double_print_help(action_flag, capsys):
     assert out.count("usage:") == 1, f"help printed {out.count('usage:')}×, want 1"
 
 
-def test_non_share_double_dash_skips_probe_no_double_convert():
-    """A ``--`` in a non-``share`` invocation must NOT trigger the passthrough
-    probe: ``share`` isn't the command token, so ``--`` keeps its native
-    meaning and the head is parsed exactly ONCE. Guards the codex nit that the
-    unconditional probe re-parsed the full head for every ``--``-bearing
-    command, running argparse type converters / custom actions a second time.
+def test_non_share_positional_value_share_skips_probe_no_double_convert():
+    """A non-``share`` invocation must NOT trigger the passthrough probe even
+    when a POSITIONAL VALUE happens to equal ``"share"`` — the probe is gated on
+    the structurally-selected command token (first non-option token), not on
+    ``"share"`` merely appearing somewhere in the head. Guards the codex finding
+    that a substring/``in`` check re-parsed such invocations twice, rerunning
+    argparse type converters / custom actions.
 
-    Proven the faithful way — a sibling subcommand whose option uses a spy
-    type converter: with the guard, the converter fires once; without it, the
-    probe would parse the head and run it twice."""
+    Proven the faithful way — a sibling subcommand with a spy type converter and
+    a model positional set to ``"share"``: the converter must fire exactly once
+    (probe skipped); a double parse would run it twice."""
     parser = _real_top_parser()  # registers the real ``share`` subcommand
     subparsers = next(
         a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
@@ -457,16 +477,17 @@ def test_non_share_double_dash_skips_probe_no_double_convert():
         return int(raw)
 
     diag = subparsers.add_parser("diag")
+    diag.add_argument("model")  # positional value is literally "share" below
     diag.add_argument("--n", type=_spy_int)
     diag.add_argument("rest", nargs="*")  # absorbs tokens after native ``--``
 
-    # ``share`` is absent from the head (``["diag", "--n", "5"]``) → probe is
-    # skipped; native parse runs the converter on "5" exactly once and ``--``
-    # keeps its native meaning (end-of-options; "x" lands in ``rest``).
+    # Command token is ``diag`` (first non-option token); the ``"share"`` here is
+    # only diag's model value → probe skipped, converter runs on "5" once.
     args = top_cli._parse_args_with_share_passthrough(
-        parser, ["diag", "--n", "5", "--", "x"]
+        parser, ["diag", "share", "--n", "5", "--", "x"]
     )
     assert args.command == "diag"
+    assert args.model == "share"
     assert args.n == 5
     assert args.rest == ["x"]
     assert args._passthrough == []
