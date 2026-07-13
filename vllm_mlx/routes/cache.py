@@ -159,7 +159,21 @@ class _dest_lock:
                 _export_dest_locks[self._key] = entry
             entry.refs += 1
             self._entry = entry
-        await entry.lock.acquire()
+        try:
+            await entry.lock.acquire()
+        except BaseException:
+            # #1100 codex round 5 (#3): a cancellation (or any error) while
+            # awaiting the lock happens AFTER refs was bumped but BEFORE
+            # ``__aexit__`` can run — the ``async with`` never entered its body,
+            # so ``__aexit__`` won't fire and the ref would leak permanently
+            # (a canceled waiter on every request would grow the registry
+            # unboundedly). Undo the ref here and evict if we were the last.
+            async with _export_locks_guard:
+                entry.refs -= 1
+                if entry.refs <= 0 and not entry.lock.locked():
+                    _export_dest_locks.pop(self._key, None)
+            self._entry = None
+            raise
         return entry.lock
 
     async def __aexit__(self, *exc: object) -> None:
@@ -191,17 +205,30 @@ class _dest_lock:
 #
 # ``flock`` is POSIX-only and advisory (both parties must opt in — they do,
 # it's the same code path). On a filesystem without working ``flock`` (some
-# network mounts) the call may raise; we degrade to the process-local lock
-# only (best-effort) rather than fail the request, logging once so an operator
-# on a shared mount knows cross-process exclusion isn't active.
+# network mounts) the acquire raises.
+#
+# #1100 codex round 5 (#2): a flock failure used to merely log and PROCEED,
+# which on an unsupported SHARED filesystem let two instances concurrently
+# corrupt the fixed ``.new``/``.old`` staging. Since the process-local
+# ``_dest_lock`` already fully serializes a SINGLE instance, the flock matters
+# ONLY for the multi-instance shared-FS case — exactly where silently
+# proceeding is unsafe. So the caller now FAILS the transaction (503) when the
+# flock can't be acquired, UNLESS the operator explicitly opts out via
+# ``RAPID_MLX_CACHE_ALLOW_UNSAFE_SHARED_FS=1`` (a documented escape hatch for a
+# deployment that KNOWS it runs a single instance on a flock-less mount). The
+# lock exposes ``degraded`` so the handler can decide.
+_ALLOW_UNSAFE_SHARED_FS_ENV = "RAPID_MLX_CACHE_ALLOW_UNSAFE_SHARED_FS"
+
+
 class _InterProcessLock:
     """Advisory cross-process exclusive lock on ``<path>.txlock`` via flock.
 
     Async-friendly: the (potentially blocking) ``flock`` acquire runs in a
     worker thread so the event loop isn't stalled while contending with
-    another process. Best-effort: if ``fcntl``/``flock`` is unavailable or
-    the filesystem rejects it, ``__aenter__`` returns having acquired
-    nothing and logs once — the process-local ``asyncio.Lock`` still holds.
+    another process. If ``fcntl``/``flock`` is unavailable or the filesystem
+    rejects it, ``__aenter__`` sets ``self.degraded = True`` (and acquires
+    nothing) so the caller can fail the transaction rather than proceed
+    without cross-process exclusion (#1100 codex round 5 #2).
     """
 
     _degraded_logged = False
@@ -211,6 +238,7 @@ class _InterProcessLock:
         # would be swept into the export blob / counted against max_bytes.
         self._lock_path = str(target).rstrip(os.sep) + ".txlock"
         self._fd: int | None = None
+        self.degraded: bool = False
 
     async def __aenter__(self) -> _InterProcessLock:
         try:
@@ -222,11 +250,9 @@ class _InterProcessLock:
                 # parent doesn't exist yet on a first export, ``os.open`` of
                 # ``sub/snap.txlock`` would raise ENOENT — the old code caught
                 # that as "flock unavailable" and SILENTLY disabled cross-
-                # process exclusion while competing processes still shared the
-                # fixed ``.new``/``.old`` staging paths. Ensuring the parent
-                # exists makes the lock reliably acquirable for real nested
-                # paths; a genuine flock-unsupported filesystem still degrades
-                # gracefully below.
+                # process exclusion. Ensuring the parent exists makes the lock
+                # reliably acquirable for real nested paths; a genuine
+                # flock-unsupported filesystem still surfaces below.
                 parent = os.path.dirname(self._lock_path)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
@@ -241,15 +267,17 @@ class _InterProcessLock:
             self._fd = await anyio.to_thread.run_sync(_acquire)
         except (ImportError, OSError) as exc:
             self._fd = None
+            self.degraded = True
             if not _InterProcessLock._degraded_logged:
                 _InterProcessLock._degraded_logged = True
                 logger.warning(
                     "cache: cross-process export lock unavailable (%s: %s); "
-                    "falling back to in-process serialization only — safe for "
-                    "a single instance, but two instances sharing this "
-                    "destination could race staging dirs",
+                    "cross-process exclusion is NOT active — the transaction "
+                    "will be rejected unless %s=1 is set (single-instance "
+                    "escape hatch)",
                     type(exc).__name__,
                     exc,
+                    _ALLOW_UNSAFE_SHARED_FS_ENV,
                 )
         return self
 
@@ -268,6 +296,24 @@ class _InterProcessLock:
                 os.close(fd)
 
         await anyio.to_thread.run_sync(_release)
+
+
+def _reject_if_ipc_lock_degraded(iplock: _InterProcessLock) -> None:
+    """Raise 503 if the inter-process lock degraded and the operator has not
+    opted into unsafe shared-FS operation (#1100 codex round 5 #2)."""
+    if not iplock.degraded:
+        return
+    if os.environ.get(_ALLOW_UNSAFE_SHARED_FS_ENV) == "1":
+        return
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "cross-process cache lock unavailable on this filesystem; refusing "
+            "to proceed without exclusion (set "
+            f"{_ALLOW_UNSAFE_SHARED_FS_ENV}=1 to override on a single-instance "
+            "deployment)"
+        ),
+    )
 
 
 class ExportRequest(BaseModel):
@@ -516,9 +562,8 @@ _IMPORT_CRITICAL_NAMES = (MANIFEST_FILENAME, "index.json")
 def _has_committed_index(d: Path) -> bool:
     """True if ``d`` holds a readable ``index.json`` with >=1 declared entry.
 
-    Cheap validity check used before deleting a staging dir — mirrors the
-    ``_has_valid_index`` recovery gate inside
-    ``MemoryAwarePrefixCache.load_from_disk`` (a zero-entry index is
+    Cheap validity check — mirrors the ``_has_valid_index`` recovery gate
+    inside ``MemoryAwarePrefixCache.load_from_disk`` (a zero-entry index is
     degenerate and treated as no snapshot).
     """
     p = d / "index.json"
@@ -529,6 +574,21 @@ def _has_committed_index(d: Path) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(obj, dict) and bool(obj.get("entries"))
+
+
+def _is_importable_snapshot(d: Path) -> bool:
+    """True if ``d`` is a snapshot a peer could actually IMPORT — a valid
+    ``index.json`` (>=1 entry) AND a ``manifest.json``.
+
+    #1100 codex round 5 (#5): ``save_to_disk``'s ``.new`` staging dir has a
+    valid index but NO manifest (the route writes ``manifest.json`` only AFTER
+    the atomic rename publishes the blob). So a ``.new`` that survived a failed
+    save is index-valid yet NON-importable. Recovering it over a complete
+    ``.old`` (a previously-published snapshot that DOES carry a manifest) would
+    replace an importable snapshot with a broken one and then delete ``.old``.
+    Recovery must therefore only promote a FULLY importable candidate.
+    """
+    return _has_committed_index(d) and (d / MANIFEST_FILENAME).is_file()
 
 
 def _sweep_staging_dirs(destination: Path) -> None:
@@ -542,31 +602,39 @@ def _sweep_staging_dirs(destination: Path) -> None:
 
     #1100 codex round 4 (#1): BUT if the save failed mid-swap, ``<dest>`` can
     be MISSING while the last valid snapshot sits in ``.old`` (dest was already
-    renamed away) or a fully-written-but-unpublished snapshot sits in ``.new``.
-    Blindly deleting both would destroy the only recoverable copy — the exact
-    data loss ``load_from_disk``'s crash recovery exists to prevent. So: if
-    ``<dest>`` lacks a valid committed index, RESTORE one from a staging sibling
-    first (prefer ``.new`` — newer, fully written — then ``.old``, matching
-    ``load_from_disk``'s recovery order), and only THEN remove leftovers. When
-    ``<dest>`` already holds a valid snapshot, both siblings are safe to drop.
-    Best-effort: failures are operator-log concerns.
+    renamed away). Blindly deleting both would destroy the only recoverable
+    copy — the exact data loss ``load_from_disk``'s crash recovery exists to
+    prevent. So if ``<dest>`` isn't itself importable, RESTORE an importable
+    snapshot from a staging sibling before removing leftovers.
+
+    #1100 codex round 5 (#5): the candidate must be a FULLY IMPORTABLE snapshot
+    (valid index AND a ``manifest.json``), and we prefer ``.old`` over ``.new``.
+    ``.new`` is ``save_to_disk``'s raw staging — it has a valid index but the
+    route writes ``manifest.json`` only AFTER the atomic publish, so a failed
+    save's ``.new`` is manifest-LESS and non-importable. ``.old`` is the prior
+    PUBLISHED snapshot (index + manifest). Promoting a manifest-less ``.new``
+    over a complete ``.old`` (then deleting ``.old``) would replace a good
+    snapshot with a broken one. Preferring ``.old`` and gating on
+    ``_is_importable_snapshot`` avoids that. Best-effort: failures are logs.
     """
     base = str(destination).rstrip(os.sep)
     new_dir = Path(base + ".new")
     old_dir = Path(base + ".old")
 
-    # Recover a snapshot into ``destination`` if it's missing/invalid and a
-    # sibling holds a valid one. Never overwrite a valid published dest.
-    if not _has_committed_index(destination):
-        for cand in (new_dir, old_dir):
-            if _has_committed_index(cand):
+    # Recover an importable snapshot into ``destination`` if it isn't itself
+    # importable. Prefer ``.old`` (published: index + manifest) over ``.new``
+    # (raw staging: index only). Never overwrite an importable published dest.
+    if not _is_importable_snapshot(destination):
+        for cand in (old_dir, new_dir):
+            if _is_importable_snapshot(cand):
                 try:
                     if destination.exists():
                         shutil.rmtree(destination, ignore_errors=True)
                     os.rename(cand, destination)
                     logger.warning(
-                        "cache/export: recovered a valid snapshot from %s → %s "
-                        "after a failed save (staging would otherwise be swept)",
+                        "cache/export: recovered an importable snapshot from "
+                        "%s → %s after a failed save (staging would otherwise "
+                        "be swept)",
                         cand,
                         destination,
                     )
@@ -782,7 +850,12 @@ async def export_cache(req: ExportRequest):
     # paths. Order matters: take the process-local lock FIRST (cheap, always
     # works), then the filesystem lock — so a single instance's queued requests
     # never each block a worker thread on ``flock`` acquisition.
-    async with _dest_lock(destination), _InterProcessLock(destination):
+    async with _dest_lock(destination), _InterProcessLock(destination) as _iplock:
+        # #1100 codex round 5 (#2): if the cross-process lock couldn't be
+        # acquired (flock-less shared FS), refuse rather than risk two
+        # instances corrupting the shared staging dirs — unless the operator
+        # opted into single-instance-unsafe mode.
+        _reject_if_ipc_lock_degraded(_iplock)
         # Snapshot to disk. Routed through the mlx-step worker thread inside
         # the engine (that's where the KV arrays are materializable). Returns
         # True if at least one entry committed; False for an empty / no-op
@@ -969,20 +1042,59 @@ async def import_cache(req: ImportRequest):
     """
     source = _resolve_or_400(req.source)
 
-    # #1100 codex round 4 (#4): hold the SAME per-destination transaction lock
-    # export uses, keyed on the resolved source path, from the manifest read
-    # through completion of the engine load. Without it, a concurrent export
-    # to this same path could swap ``index.json`` in the window between our
-    # manifest validation and the load — so we'd validate model_id/protocol
-    # against manifest A but hydrate the KV blob of manifest B. Reusing the
-    # export registry makes export-vs-import on one path mutually exclusive
-    # (distinct paths still run concurrently). The blocking filesystem read +
-    # the step-thread load both run via ``anyio.to_thread.run_sync`` /
-    # ``_read_manifest_or_http``, so the async lock is held across true awaits,
-    # never a CPU-bound spin.
-    async with _dest_lock(source), _InterProcessLock(source):
+    # #1100 codex round 5 (#1/#4): run the checks that need NEITHER the lock nor
+    # the engine FIRST — before acquiring ``_InterProcessLock`` (which creates
+    # ``<source>.txlock`` + parent dirs). This means:
+    #   * a MISSING source 404s WITHOUT creating any lockfile / parent dir
+    #     (round-4 #4's parent-creation would otherwise let a stream of unique
+    #     nonexistent import sources consume unbounded dirs/inodes), and
+    #   * a caller-side ``expected_model_id`` / protocol mismatch returns 409
+    #     even when no engine is loaded — the documented contract. The round-4
+    #     restructure moved ``_engine_or_503()`` ahead of the 409 gate, so a
+    #     mismatch wrongly 503'd on an engine-less server.
+    manifest = _read_manifest_or_http(source)
+
+    if manifest.protocol_version != req.expected_protocol_version:
+        raise HTTPException(
+            status_code=409,
+            detail=str(
+                ManifestMismatchError(
+                    "protocol_version",
+                    req.expected_protocol_version,
+                    manifest.protocol_version,
+                )
+            ),
+        )
+
+    # Caller-side identity assertion — independent of the loaded engine, so it
+    # must gate BEFORE ``_engine_or_503`` (a mismatch is 409, not 503).
+    if req.expected_model_id is not None and manifest.model_id != req.expected_model_id:
+        raise HTTPException(
+            status_code=409,
+            detail=str(
+                ManifestMismatchError(
+                    "model_id", req.expected_model_id, manifest.model_id
+                )
+            ),
+        )
+
+    # Now hold the SAME per-destination transaction lock export uses, keyed on
+    # the resolved source path, from a RE-READ of the manifest through
+    # completion of the engine load (#1100 codex round 4 #4). Without it a
+    # concurrent export to this same path could swap ``index.json`` in the
+    # window between validation and load — so we'd validate model_id/protocol
+    # against manifest A but hydrate the KV blob of manifest B. The manifest is
+    # re-read inside the lock so the identity/protocol facts we gate the LOAD on
+    # reflect the blob actually on disk under the lock, not the pre-lock read.
+    async with _dest_lock(source), _InterProcessLock(source) as _iplock:
+        # #1100 codex round 5 (#2): refuse to import without cross-process
+        # exclusion on a shared FS (a concurrent export could swap the blob
+        # mid-load) unless the operator opted into single-instance-unsafe mode.
+        _reject_if_ipc_lock_degraded(_iplock)
         manifest = _read_manifest_or_http(source)
 
+        # Re-check protocol under the lock (a concurrent export could have
+        # swapped in a differently-versioned blob after the pre-lock read).
         if manifest.protocol_version != req.expected_protocol_version:
             raise HTTPException(
                 status_code=409,
@@ -995,8 +1107,8 @@ async def import_cache(req: ImportRequest):
                 ),
             )
 
-        # Resolve the loaded engine BEFORE the identity gate so we can derive
-        # its model id the SAME way the manifest builder does (#1100
+        # Resolve the loaded engine BEFORE the SERVER-identity gate so we can
+        # derive its model id the SAME way the manifest builder does (#1100
         # BLOCKING-2). The gate previously read ``get_config().model_name``,
         # which is empty for an embedded / unit-test engine that never
         # populated ServerConfig — but ``build_manifest_from_engine_state``
@@ -1011,12 +1123,12 @@ async def import_cache(req: ImportRequest):
         # does not match the model THIS server loaded. KV cache is model-
         # specific (layer/head/dim geometry, quant layout) — loading another
         # model's blob corrupts inference or crashes the fetch. The caller's
-        # ``expected_model_id`` below is an ADDITIONAL, caller-side assertion;
-        # omitting it must NOT disable server-side identity checking. The 409
-        # detail names NEITHER the manifest's nor the server's model id — a
-        # bearer-token holder shouldn't be able to probe what this server runs
-        # by diffing mismatch messages; the caller can read its own manifest
-        # (or GET /v1/cache/info) to see the id it shipped.
+        # ``expected_model_id`` (already checked above) is an ADDITIONAL,
+        # caller-side assertion; omitting it must NOT disable server-side
+        # identity checking. The 409 detail names NEITHER the manifest's nor the
+        # server's model id — a bearer-token holder shouldn't be able to probe
+        # what this server runs by diffing mismatch messages; the caller can
+        # read its own manifest (or GET /v1/cache/info) to see the id it shipped.
         server_model_id = resolve_engine_model_id(engine)
         if server_model_id:
             if manifest.model_id != server_model_id:
@@ -1054,6 +1166,9 @@ async def import_cache(req: ImportRequest):
                     ),
                 )
 
+        # Re-check the caller-side ``expected_model_id`` against the RE-READ
+        # manifest (a concurrent export could have swapped the blob's model_id
+        # after the pre-lock check). Cheap and keeps the load honest.
         if (
             req.expected_model_id is not None
             and manifest.model_id != req.expected_model_id

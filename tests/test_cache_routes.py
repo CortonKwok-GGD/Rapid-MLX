@@ -1520,7 +1520,12 @@ def test_import_missing_source_does_not_leak_lock_entry(cache_client):
     """#1100 codex round 4 (#5): a missing-source import 404s, and its lock
     entry must NOT linger in the registry afterward (the round-3 version
     inserted an entry for every path, so 404-spamming unique paths grew the
-    dict unboundedly)."""
+    dict unboundedly).
+
+    #1100 codex round 5 (#1): the 404 must also fire BEFORE
+    ``_InterProcessLock`` runs, so no ``<source>.txlock`` file (nor its parent
+    dirs) gets created on disk — otherwise a stream of unique nonexistent
+    import sources would consume unbounded inodes."""
     import vllm_mlx.routes.cache as cache_mod
 
     cache_client.cfg.engine = cache_client.FakeEngine(entries=0)
@@ -1533,13 +1538,19 @@ def test_import_missing_source_does_not_leak_lock_entry(cache_client):
     assert resp.status_code == 404, resp.text
     # No new permanent entry for the missing path.
     assert cache_mod._export_dest_locks == before
+    # And no lockfile artifact leaked onto disk for the missing source.
+    assert not (cache_client.sandbox / "no-such-export.txlock").exists()
+    assert not (cache_client.sandbox / "no-such-export").exists()
 
 
 def test_sweep_staging_dirs_recovers_old_snapshot(tmp_path):
     """#1100 codex round 4 (#1): if a save failed mid-swap leaving ``<dest>``
-    MISSING and the last valid snapshot in ``<dest>.old``, ``_sweep_staging_
-    dirs`` must RESTORE ``.old`` → ``<dest>`` before removing staging — not
-    blindly delete both (which would destroy the only recoverable copy)."""
+    MISSING and the last valid PUBLISHED snapshot in ``<dest>.old``,
+    ``_sweep_staging_dirs`` must RESTORE ``.old`` → ``<dest>`` before removing
+    staging — not blindly delete both (destroying the only recoverable copy).
+
+    #1100 codex round 5 (#5): a recoverable snapshot must be IMPORTABLE — index
+    AND manifest. ``.old`` is a prior PUBLISHED snapshot so it carries both."""
     from pathlib import Path as _Path
 
     from vllm_mlx.routes.cache import _sweep_staging_dirs
@@ -1548,20 +1559,49 @@ def test_sweep_staging_dirs_recovers_old_snapshot(tmp_path):
     old_dir = _Path(str(dest) + ".old")
     new_dir = _Path(str(dest) + ".new")
     # Simulate a save interrupted after ``dest → .old`` but before ``.new →
-    # dest``: dest is gone, .old holds the valid prior snapshot, .new holds a
-    # half-written (invalid) staging dir.
+    # dest``: dest is gone, .old holds the valid prior PUBLISHED snapshot
+    # (index + manifest), .new holds raw save_to_disk staging (index, NO
+    # manifest — the route writes it only after the atomic publish).
     old_dir.mkdir(parents=True)
     (old_dir / "index.json").write_text('{"version":3,"entries":[{"index":0}]}')
-    (old_dir / "entry_0.safetensors").write_text("data")
-    new_dir.mkdir(parents=True)  # invalid: no index.json
+    (old_dir / "entry_0.safetensors").write_text("published-data")
+    (old_dir / "manifest.json").write_text('{"protocol_version":"1"}')
+    new_dir.mkdir(parents=True)
+    (new_dir / "index.json").write_text('{"version":3,"entries":[{"index":0}]}')
+    (new_dir / "entry_0.safetensors").write_text("staging-only")  # no manifest
 
     _sweep_staging_dirs(dest)
 
-    # The valid .old snapshot was restored to dest; staging siblings are gone.
+    # The importable .old snapshot was restored to dest — NOT the manifest-less
+    # .new (which would be non-importable). Staging siblings are gone.
     assert dest.is_dir()
     assert (dest / "index.json").exists()
-    assert (dest / "entry_0.safetensors").exists()
+    assert (dest / "manifest.json").exists()
+    assert (dest / "entry_0.safetensors").read_text() == "published-data"
     assert not old_dir.exists()
+    assert not new_dir.exists()
+
+
+def test_sweep_staging_dirs_does_not_promote_manifestless_new(tmp_path):
+    """#1100 codex round 5 (#5): ``.new`` (raw save_to_disk staging — valid
+    index but NO manifest) must NOT be promoted over a complete ``.old``. If
+    ONLY a manifest-less ``.new`` exists (no ``.old``), it is non-importable
+    and must be swept, NOT published to ``<dest>`` (which would leave a broken,
+    non-importable snapshot a peer would 404 on)."""
+    from pathlib import Path as _Path
+
+    from vllm_mlx.routes.cache import _sweep_staging_dirs
+
+    dest = _Path(tmp_path / "snap")
+    new_dir = _Path(str(dest) + ".new")
+    new_dir.mkdir(parents=True)
+    (new_dir / "index.json").write_text('{"version":3,"entries":[{"index":0}]}')
+    (new_dir / "entry_0.safetensors").write_text("staging-only")  # no manifest
+
+    _sweep_staging_dirs(dest)
+
+    # Non-importable .new was swept, not promoted — dest stays absent.
+    assert not dest.exists()
     assert not new_dir.exists()
 
 

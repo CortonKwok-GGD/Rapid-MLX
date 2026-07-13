@@ -2817,6 +2817,20 @@ class MemoryAwarePrefixCache:
         # STAGED set (which starts empty). In merge mode they're evaluated
         # against the LIVE cache, preserving the pre-#1100 behavior byte
         # for byte.
+        #
+        # #1100 codex round 5 (#6, NIT — accepted tradeoff): stage-then-swap
+        # in replace mode holds BOTH the existing cache AND the fully-staged
+        # snapshot in memory until the swap, a transient ~2× peak for a
+        # multi-GB import. This is the DELIBERATE cost of the corruption-safety
+        # guarantee the round-2 BLOCKING-1 fix requires ("a corrupt/missing
+        # source leaves the existing cache intact"): we cannot clear the live
+        # cache until we've proven the ENTIRE new blob reads cleanly, and
+        # proving that means materializing it. The per-entry memory-cap check
+        # (``staged_memory + memory > self._max_memory``) still bounds the
+        # STAGED half at the configured cap, so the peak is cap + current, not
+        # unbounded. A streaming design that validated without retaining both
+        # bodies would forfeit the atomic all-or-nothing contract — not worth
+        # it for an offline import that runs far below steady-state decode.
         loaded = 0
         corrupt_skipped = 0
         duplicate_skipped = 0
