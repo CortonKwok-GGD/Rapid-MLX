@@ -38,6 +38,7 @@ enforced when ``--api-key`` is set, no new header is invented.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -95,6 +96,31 @@ router = APIRouter(
     tags=["cache"],
     dependencies=[Depends(verify_api_key)],
 )
+
+
+# #1100 codex round 3 (findings #2/#5): serialize the whole export
+# transaction (save → manifest → committed-size gate → publish/discard) PER
+# RESOLVED DESTINATION. Two concurrent exports to the same path could
+# otherwise interleave so one request writes a manifest for another's
+# snapshot, or the over-cap cleanup of one deletes the newer snapshot the
+# other just committed. A per-destination asyncio.Lock makes the destination
+# a single-writer resource. Keyed on the resolved absolute path string so
+# distinct destinations still run concurrently. (The engine already
+# serializes the KV materialization on its mlx-step thread; this guards the
+# route-side filesystem transaction around it.)
+_export_dest_locks: dict[str, asyncio.Lock] = {}
+_export_locks_guard = asyncio.Lock()
+
+
+async def _acquire_dest_lock(destination: Path) -> asyncio.Lock:
+    """Return (creating if needed) the per-destination export lock."""
+    key = str(destination)
+    async with _export_locks_guard:
+        lock = _export_dest_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _export_dest_locks[key] = lock
+        return lock
 
 
 class ExportRequest(BaseModel):
@@ -340,6 +366,31 @@ def _committed_dir_size(destination: Path) -> int:
 _IMPORT_CRITICAL_NAMES = (MANIFEST_FILENAME, "index.json")
 
 
+def _sweep_staging_dirs(destination: Path) -> None:
+    """Remove the ``.new``/``.old`` staging dirs a FAILED save may have left.
+
+    #1100 codex round 3 (#2): ``save_to_disk`` writes into ``<dest>.new`` and
+    only atomically renames it onto ``<dest>`` on success. A non-committing
+    save leaves those sibling staging dirs behind but does NOT touch the
+    published ``<dest>`` (which may hold a previously-valid snapshot). So on a
+    failed save we sweep ONLY the staging siblings — never ``destination``
+    itself — to avoid destroying a prior good snapshot the failure never
+    modified. Best-effort: a leftover staging dir is an operator-log concern.
+    """
+    base = str(destination).rstrip(os.sep)
+    for suffix in (".new", ".old"):
+        staging = Path(base + suffix)
+        if staging.exists():
+            try:
+                shutil.rmtree(staging, ignore_errors=True)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "cache/export: could not sweep staging dir %s: %s",
+                    staging,
+                    exc,
+                )
+
+
 class _ExportDiscardError(RuntimeError):
     """Raised when a rejected export blob could NOT be made non-importable.
 
@@ -521,105 +572,161 @@ async def export_cache(req: ExportRequest):
             ),
         )
 
-    # Snapshot to disk. Routed through the mlx-step worker thread inside the
-    # engine (that's where the KV arrays are materializable). Returns True if
-    # at least one entry committed; False for an empty / no-op cache — either
-    # way the manifest below records the outcome. Run in a threadpool so the
-    # asyncio loop isn't blocked by the (potentially multi-GB) write.
-    saved = await anyio.to_thread.run_sync(engine.save_cache_to_disk, str(destination))
-
-    # #1100 BLOCKING-3: a non-empty cache whose save committed NOTHING is a
-    # FAILURE, not an empty export. ``save_cache_to_disk`` returns False for
-    # a genuinely-empty cache (legit — 200 with zero counts) AND for a
-    # non-committing save of a non-empty cache (staging dir vanished, all
-    # entries dropped by the post-write verify, or the atomic rename never
-    # landed). Distinguished by the pre-write entry snapshot: if the cache
-    # HAD entries but nothing committed, surface a 500 (after cleaning up
-    # any partial blob) instead of returning 200 with stale live-ledger
-    # counters and no usable snapshot on disk.
-    if not saved and had_entries_before:
-        try:
-            _discard_export(destination)
-        except _ExportDiscardError as exc:
-            # Even the partial blob couldn't be made non-importable — surface
-            # it in the 500 so an operator knows a stray blob may remain.
-            logger.error("cache/export: %s", exc)
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "cache export failed to commit and the partial blob could "
-                    "not be discarded"
-                ),
-            ) from exc
-        logger.error(
-            "cache/export: save FAILED — cache had entries but nothing committed "
-            "to disk (destination=%s); partial blob discarded",
-            destination,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="cache export failed to commit any entry to disk",
+    # #1100 codex round 3 (#2/#5): serialize the ENTIRE save→manifest→size-
+    # gate→publish transaction per destination. Without this, two concurrent
+    # exports to the same path interleave: one writes a manifest describing
+    # the other's snapshot, or the over-cap cleanup of one deletes the newer
+    # snapshot the other just committed. The lock makes ``destination`` a
+    # single-writer resource; distinct destinations still run concurrently.
+    dest_lock = await _acquire_dest_lock(destination)
+    async with dest_lock:
+        # Snapshot to disk. Routed through the mlx-step worker thread inside
+        # the engine (that's where the KV arrays are materializable). Returns
+        # True if at least one entry committed; False for an empty / no-op
+        # cache. Run in a threadpool so the asyncio loop isn't blocked by the
+        # (potentially multi-GB) write.
+        saved = await anyio.to_thread.run_sync(
+            engine.save_cache_to_disk, str(destination)
         )
 
-    # Build the manifest from the COMMITTED on-disk index (#1100 BLOCKING-3),
-    # not the live ledger — ``cache_dir=destination`` makes the counters
-    # match what a peer will actually load.
-    manifest = build_manifest_from_engine_state(engine, cache_dir=destination)
-
-    # Write the manifest BEFORE the size gate so the committed-blob measure
-    # below includes manifest.json — it's part of what a peer imports, so it
-    # must count against the cap (#1100 BLOCKING-4).
-    write_manifest(destination, manifest)
-
-    # #1100 BLOCKING-2 + BLOCKING-4: precise post-write size enforcement
-    # against the ACTUAL committed on-disk footprint. The pre-write gate
-    # reads the live logical ledger, which (a) can undercount if the cache
-    # grows between that check and the snapshot the step thread takes, and
-    # (b) counts only logical ``memory_bytes`` — excluding tokens.bin,
-    # index.json, manifest.json, and safetensors serialization overhead.
-    # ``_committed_dir_size`` sums the real file sizes now on disk, so the
-    # cap is enforced against exactly what an importing peer will read.
-    # Over-cap → DISCARD the whole blob (manifest included) and 413.
-    committed_bytes = _committed_dir_size(destination)
-    if req.max_bytes is not None and committed_bytes > req.max_bytes:
-        try:
-            _discard_export(destination)
-        except _ExportDiscardError as exc:
-            # #1100 BLOCKING-5: a 413 MUST guarantee the blob is not
-            # importable. If we couldn't delete OR quarantine it, we can't
-            # honor that invariant — return 500 instead of a 413 that lies.
-            logger.error("cache/export: %s", exc)
+        # #1100 BLOCKING-3: a non-empty cache whose save committed NOTHING is a
+        # FAILURE, not an empty export. ``save_cache_to_disk`` returns False
+        # for a genuinely-empty cache (legit — 200 with zero counts) AND for a
+        # non-committing save of a non-empty cache (staging dir vanished, all
+        # entries dropped by the post-write verify, or the atomic rename never
+        # landed). Distinguished by the pre-write entry snapshot: if the cache
+        # HAD entries but nothing committed, surface a 500.
+        #
+        # #1100 codex round 3 (#2): the failing save uses ``save_to_disk``'s
+        # own ``.new``/``.old`` staging and does NOT touch the published
+        # destination unless its atomic rename succeeds — so on a
+        # non-committing save we DELIBERATELY do NOT ``_discard_export`` the
+        # destination (that would destroy a previously-valid snapshot that
+        # this failed save never modified). We only sweep the orphaned
+        # ``.new``/``.old`` staging dirs the failed save may have left.
+        if not saved and had_entries_before:
+            _sweep_staging_dirs(destination)
+            logger.error(
+                "cache/export: save FAILED — cache had entries but nothing "
+                "committed to disk (destination=%s); staging dirs swept, "
+                "any prior published snapshot left intact",
+                destination,
+            )
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "cache export exceeded max_bytes but the oversized blob "
-                    "could not be discarded"
-                ),
+                detail="cache export failed to commit any entry to disk",
+            )
+
+        # #1100 codex round 3 (#1): an EMPTY export (no entries committed) to a
+        # destination that already holds a STALE prior snapshot must not
+        # silently re-export the old entries. ``build_manifest_from_engine_
+        # state`` reads counts from the committed ``index.json`` — a leftover
+        # one would make an "empty" export report the old blob. Clear the
+        # destination's blob artifacts first so the manifest honestly reports
+        # 0/0 and no importable stale entry files remain. (Only reached when
+        # the save committed nothing AND the cache was legitimately empty.)
+        if not saved:
+            try:
+                _discard_export(destination)
+            except _ExportDiscardError as exc:
+                logger.error("cache/export: %s", exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "empty cache export could not clear a stale prior "
+                        "snapshot at the destination"
+                    ),
+                ) from exc
+
+        # Everything from here to publish is wrapped so that if manifest write
+        # or the size gate raises (e.g. ENOSPC after a multi-GB commit — codex
+        # round 3 #3), the just-committed blob is discarded before the error
+        # propagates, rather than orphaned to worsen disk exhaustion on retry.
+        try:
+            # Build the manifest from the COMMITTED on-disk index (#1100
+            # BLOCKING-3), not the live ledger — ``cache_dir=destination``
+            # makes the counters match what a peer will actually load.
+            manifest = build_manifest_from_engine_state(engine, cache_dir=destination)
+
+            # Write the manifest BEFORE the size gate so the committed-blob
+            # measure below includes manifest.json — it's part of what a peer
+            # imports, so it must count against the cap (#1100 BLOCKING-4).
+            write_manifest(destination, manifest)
+
+            # #1100 BLOCKING-2 + BLOCKING-4: precise post-write size
+            # enforcement against the ACTUAL committed on-disk footprint. The
+            # pre-write gate reads the live logical ledger, which (a) can
+            # undercount if the cache grows between that check and the snapshot
+            # the step thread takes, and (b) counts only logical
+            # ``memory_bytes`` — excluding tokens.bin, index.json,
+            # manifest.json, and safetensors serialization overhead.
+            # ``_committed_dir_size`` sums the real file sizes now on disk.
+            committed_bytes = _committed_dir_size(destination)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # Post-save processing failed (manifest write ENOSPC, etc.). Do NOT
+            # leave the just-committed blob orphaned on disk — discard it, then
+            # surface a 500. Discard is best-effort here (already in an error
+            # path); a quarantine failure is logged, not re-raised over the
+            # original fault.
+            logger.error(
+                "cache/export: post-save processing failed (destination=%s): "
+                "%s; discarding the just-committed blob",
+                destination,
+                exc,
+            )
+            try:
+                _discard_export(destination)
+            except _ExportDiscardError as discard_exc:
+                logger.error(
+                    "cache/export: could not discard blob after post-save failure: %s",
+                    discard_exc,
+                )
+            raise HTTPException(
+                status_code=500,
+                detail="cache export failed during manifest/size finalization",
             ) from exc
+
+        if req.max_bytes is not None and committed_bytes > req.max_bytes:
+            try:
+                _discard_export(destination)
+            except _ExportDiscardError as exc:
+                # #1100 BLOCKING-5: a 413 MUST guarantee the blob is not
+                # importable. If we couldn't delete OR quarantine it, we can't
+                # honor that invariant — 500 instead of a 413 that lies.
+                logger.error("cache/export: %s", exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "cache export exceeded max_bytes but the oversized "
+                        "blob could not be discarded"
+                    ),
+                ) from exc
+            logger.info(
+                "cache/export: post-write reject — committed on-disk %d B "
+                "exceeds max_bytes %d B; blob discarded (destination=%s)",
+                committed_bytes,
+                req.max_bytes,
+                destination,
+            )
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"cache footprint {committed_bytes} bytes exceeds max_bytes "
+                    f"{req.max_bytes}"
+                ),
+            )
+
         logger.info(
-            "cache/export: post-write reject — committed on-disk %d B exceeds "
-            "max_bytes %d B; blob discarded (destination=%s)",
+            "cache/export: wrote %d entries (%d logical B, %d on-disk B, "
+            "saved=%s) to destination=%s",
+            manifest.entries,
+            manifest.total_bytes,
             committed_bytes,
-            req.max_bytes,
+            saved,
             destination,
         )
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"cache footprint {committed_bytes} bytes exceeds max_bytes "
-                f"{req.max_bytes}"
-            ),
-        )
-
-    logger.info(
-        "cache/export: wrote %d entries (%d logical B, %d on-disk B, saved=%s) "
-        "to destination=%s",
-        manifest.entries,
-        manifest.total_bytes,
-        committed_bytes,
-        saved,
-        destination,
-    )
     return ExportResponse(
         protocol_version=PROTOCOL_VERSION,
         entries_exported=manifest.entries,
@@ -688,11 +795,37 @@ async def import_cache(req: ImportRequest):
     # by diffing mismatch messages; the caller can read its own manifest
     # (or GET /v1/cache/info) to see the id it shipped.
     server_model_id = resolve_engine_model_id(engine)
-    if server_model_id and manifest.model_id != server_model_id:
-        raise HTTPException(
-            status_code=409,
-            detail="manifest model_id does not match the loaded engine model",
-        )
+    if server_model_id:
+        if manifest.model_id != server_model_id:
+            raise HTTPException(
+                status_code=409,
+                detail="manifest model_id does not match the loaded engine model",
+            )
+    else:
+        # #1100 codex round 3 (#4): FAIL CLOSED when the loaded engine's model
+        # id cannot be resolved. The old ``if server_model_id and ...`` gate
+        # fell OPEN here — an id-less engine skipped the comparison and would
+        # accept ANY model's KV geometry, the exact corruption the gate
+        # exists to prevent. Now such an engine may import ONLY when the
+        # caller EXPLICITLY pins a matching ``expected_model_id`` (taking
+        # responsibility for the identity assertion the server can't make);
+        # otherwise reject. The 422 (not 409) distinguishes "server can't
+        # verify identity" from "identities mismatch".
+        if req.expected_model_id is None or manifest.model_id != req.expected_model_id:
+            logger.warning(
+                "cache/import: rejected — loaded engine model id is "
+                "unresolvable and caller did not pin a matching "
+                "expected_model_id (source=%s)",
+                source,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "cannot verify model identity: the loaded engine has no "
+                    "resolvable model id; supply expected_model_id matching "
+                    "the manifest to import explicitly"
+                ),
+            )
 
     if req.expected_model_id is not None and manifest.model_id != req.expected_model_id:
         raise HTTPException(

@@ -994,24 +994,32 @@ def test_import_gate_engine_config_match_allows_load(cache_client):
 
 
 def test_export_failed_save_of_nonempty_cache_returns_500(cache_client):
-    """#1100 BLOCKING-3: a non-empty cache whose save commits NOTHING is a
-    FAILURE (500), not an empty export (200). ``save_cache_to_disk`` returns
-    False for BOTH a genuinely-empty cache and a non-committing save; the
-    route distinguishes them by the pre-write entry snapshot. Here the cache
-    HAS entries but the save returns False → 500, and any partial blob is
-    cleaned up (nothing importable left on disk)."""
+    """#1100 BLOCKING-3 + codex round 3 (#2): a non-empty cache whose save
+    commits NOTHING is a FAILURE (500). A real failing ``save_to_disk`` uses
+    its own ``.new``/``.old`` staging and leaves the PUBLISHED destination
+    untouched — so the route must NOT ``_discard_export`` the destination
+    (that would destroy a previously-valid snapshot the failed save never
+    modified). It sweeps only the orphaned staging siblings. Here a prior
+    valid snapshot sits at the destination and the save fails leaving a
+    ``.new`` staging dir; the route 500s, sweeps ``.new``, and PRESERVES the
+    prior published snapshot."""
     from pathlib import Path as _Path
 
     engine = cache_client.FakeEngine(entries=5, current_memory=2048)
+    blob_dir = _Path(cache_client.sandbox) / "failed-save"
+    # A previously-valid published snapshot at the destination.
+    blob_dir.mkdir(parents=True, exist_ok=True)
+    (blob_dir / "index.json").write_text('{"version":3,"entries":[]}')
+    (blob_dir / "manifest.json").write_text('{"protocol_version":"1"}')
 
     def _save_commits_nothing(cache_dir, should_abort=None):
-        # Simulate a non-empty cache whose save committed nothing (staging
-        # dir vanished / all entries dropped by post-write verify). Leave a
-        # stray partial blob to prove the route cleans it up.
+        # Real failing save: writes into <dest>.new, never renames onto <dest>,
+        # then aborts — leaving the staging dir but not touching the published
+        # destination.
         engine.saved_to = cache_dir
-        d = _Path(cache_dir)
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "index.json").write_text("{}")  # partial junk
+        staging = _Path(str(cache_dir) + ".new")
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "index.json").write_text("{}")  # orphaned staging artifact
         return False  # nothing committed
 
     engine.save_cache_to_disk = _save_commits_nothing
@@ -1022,10 +1030,12 @@ def test_export_failed_save_of_nonempty_cache_returns_500(cache_client):
         headers=_auth(),
     )
     assert resp.status_code == 500, resp.text
-    # The partial blob was discarded — no importable index.json left behind.
-    blob_dir = _Path(cache_client.sandbox) / "failed-save"
-    assert not (blob_dir / "index.json").exists()
-    assert not (blob_dir / "manifest.json").exists()
+    # The prior published snapshot is PRESERVED (the failed save never touched
+    # it — discarding it would be data loss, codex round 3 #2).
+    assert (blob_dir / "index.json").exists()
+    assert (blob_dir / "manifest.json").exists()
+    # The orphaned staging dir was swept.
+    assert not _Path(str(blob_dir) + ".new").exists()
 
 
 def test_export_empty_cache_save_false_is_200_not_error(cache_client):
@@ -1042,6 +1052,212 @@ def test_export_empty_cache_save_false_is_200_not_error(cache_client):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["entries_exported"] == 0
+
+
+def test_export_empty_cache_clears_stale_prior_snapshot(cache_client):
+    """#1100 codex round 3 (#1): an EMPTY export to a destination that already
+    holds a STALE prior snapshot must NOT silently re-export the old entries.
+    ``build_manifest_from_engine_state`` reads counts from the committed
+    ``index.json`` — a leftover one would make an 'empty' export report the
+    old blob. The route clears the destination's blob artifacts first so the
+    manifest honestly reports 0/0 and no importable stale entry files remain."""
+    from pathlib import Path as _Path
+
+    blob_dir = _Path(cache_client.sandbox) / "stale-then-empty"
+    blob_dir.mkdir(parents=True, exist_ok=True)
+    # A stale prior snapshot: index.json claiming 7 entries + entry files.
+    stale_index = {
+        "version": 3,
+        "entries": [
+            {
+                "index": i,
+                "num_tokens": 4,
+                "memory_bytes": 100,
+                "cache_types": ["KVCache"],
+            }
+            for i in range(7)
+        ],
+    }
+    (blob_dir / "index.json").write_text(json.dumps(stale_index))
+    for i in range(7):
+        (blob_dir / f"entry_{i}.safetensors").write_text("x")
+        (blob_dir / f"entry_{i}_tokens.bin").write_text("x")
+    (blob_dir / "manifest.json").write_text('{"protocol_version":"1","entries":7}')
+
+    # Empty cache → save_cache_to_disk returns False (nothing to commit).
+    engine = cache_client.FakeEngine(entries=0, current_memory=0)
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "stale-then-empty"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Honest empty export — NOT the stale 7 entries.
+    assert body["entries_exported"] == 0
+    assert body["bytes_written"] == 0
+    # The stale entry files are gone (not importable).
+    assert not (blob_dir / "index.json").exists()
+    assert not (blob_dir / "entry_0.safetensors").exists()
+    # A fresh empty manifest was written.
+    assert (blob_dir / "manifest.json").is_file()
+    fresh = read_manifest(blob_dir)
+    assert fresh.entries == 0
+
+
+def test_export_manifest_write_failure_discards_committed_blob(
+    cache_client, monkeypatch
+):
+    """#1100 codex round 3 (#3): if post-save processing (manifest write /
+    size gate) raises after a multi-GB snapshot commits — e.g. ENOSPC — the
+    just-committed blob must be DISCARDED before the error propagates, not
+    orphaned to worsen disk exhaustion on retry."""
+    from pathlib import Path as _Path
+
+    import vllm_mlx.routes.cache as cache_mod
+
+    engine = cache_client.FakeEngine(entries=2, current_memory=100)
+
+    def _save_commits(cache_dir, should_abort=None):
+        engine.saved_to = cache_dir
+        d = _Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.json").write_text(
+            '{"version":3,"entries":[{"index":0,"num_tokens":4,'
+            '"memory_bytes":50,"cache_types":["KVCache"]}]}'
+        )
+        (d / "entry_0.safetensors").write_text("x")
+        (d / "entry_0_tokens.bin").write_text("x")
+        return True
+
+    engine.save_cache_to_disk = _save_commits
+    cache_client.cfg.engine = engine
+
+    # write_manifest raises (simulate ENOSPC after the snapshot committed).
+    def _boom_write(*a, **k):
+        raise OSError("simulated ENOSPC writing manifest")
+
+    monkeypatch.setattr(cache_mod, "write_manifest", _boom_write)
+
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "enospc"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 500, resp.text
+    # The committed blob was discarded — not orphaned.
+    blob_dir = _Path(cache_client.sandbox) / "enospc"
+    assert not (blob_dir / "index.json").exists()
+    assert not (blob_dir / "entry_0.safetensors").exists()
+
+
+def test_import_fails_closed_when_engine_model_id_unresolvable(cache_client):
+    """#1100 codex round 3 (#4): the model-identity gate must FAIL CLOSED when
+    the loaded engine's model id can't be resolved. An id-less engine used to
+    skip the comparison (fail open) and would accept ANY model's KV geometry.
+    Now such an engine is rejected (422) unless the caller explicitly pins a
+    matching ``expected_model_id``."""
+    cache_client.cfg.model_name = ""  # server singleton empty
+    _write_export_root(
+        cache_client.sandbox,
+        "idless",
+        Manifest(
+            protocol_version=PROTOCOL_VERSION, model_id="foreign/model", entries=3
+        ),
+    )
+    # Engine whose own config also has no resolvable id.
+    engine = cache_client.FakeEngine(entries=1, load_returns=3)
+    engine.config.model_name = None
+    engine.config.model_path = None
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "idless"},  # NO expected_model_id
+        headers=_auth(),
+    )
+    assert resp.status_code == 422, resp.text
+    assert engine.loaded_from is None  # load never ran
+
+    # With an explicit matching expected_model_id the caller takes
+    # responsibility — the import proceeds.
+    resp2 = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "idless", "expected_model_id": "foreign/model"},
+        headers=_auth(),
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert engine.loaded_from is not None
+
+
+@pytest.mark.asyncio
+async def test_export_concurrent_same_destination_serialized(cache_client):
+    """#1100 codex round 3 (#5): concurrent exports to the SAME destination
+    must be serialized so one request never writes a manifest for another's
+    snapshot or discards a newer one. Fire N concurrent exports at one
+    destination on a SINGLE event loop (exactly how uvicorn schedules them in
+    production — not raw OS threads) and assert (a) each returns a coherent
+    200, and (b) the per-destination lock actually serialized the critical
+    section (no two save→publish transactions overlapped)."""
+    import asyncio as _asyncio
+
+    # Instrument the save to detect overlap: the save runs in a threadpool
+    # (anyio.to_thread), so WITHOUT the per-destination lock multiple saves to
+    # the same destination would overlap (peak in-flight > 1). A short real
+    # sleep widens the window; a threading.Lock-guarded counter records the
+    # peak. With the route's per-destination lock, saves serialize → peak==1.
+    import threading
+    import time as _time
+
+    import httpx
+    from fastapi import FastAPI
+
+    import vllm_mlx.routes.cache as cache_mod
+    from vllm_mlx.routes.cache import router
+
+    engine = cache_client.FakeEngine(entries=3, current_memory=1024)
+    state = {"in_flight": 0, "peak": 0}
+    counter_lock = threading.Lock()
+
+    def _save(cache_dir, should_abort=None):
+        with counter_lock:
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+        _time.sleep(0.05)  # widen the overlap window
+        with counter_lock:
+            state["in_flight"] -= 1
+        engine.saved_to = cache_dir
+        return True
+
+    engine.save_cache_to_disk = _save
+    cache_client.cfg.engine = engine
+
+    # Reset the module-level per-destination lock registry so this loop owns
+    # freshly-created locks (asyncio.Lock binds to the loop that first awaits
+    # it; a lock cached from another test's loop would be foreign here).
+    cache_mod._export_dest_locks.clear()
+    cache_mod._export_locks_guard = _asyncio.Lock()
+
+    app = FastAPI()
+    app.include_router(router)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _do_export():
+            return await client.post(
+                "/v1/cache/export",
+                json={"destination": "shared"},
+                headers=_auth(),
+            )
+
+        responses = await _asyncio.gather(*[_do_export() for _ in range(6)])
+
+    for r in responses:
+        assert r.status_code == 200, r.text
+        assert r.json()["entries_exported"] == 3
+    # The per-destination lock serialized the save critical section — the
+    # in-flight save count never exceeded 1.
+    assert state["peak"] == 1, f"lock did not serialize; peak in-flight={state['peak']}"
 
 
 def test_export_discard_quarantines_when_delete_fails(cache_client, monkeypatch):
