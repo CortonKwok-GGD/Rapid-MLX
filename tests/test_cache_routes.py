@@ -112,6 +112,12 @@ class _FakeEngine:
         self.saved_to: str | None = None
         self.loaded_from: str | None = None
         self.load_replace: bool | None = None
+        # #1100 codex round 6 (#2): serializes save/load+outcome-read so the
+        # fake matches the real engine's single ``max_workers=1`` step-thread
+        # atomicity when the route drives it from concurrent to_thread handlers.
+        import threading as _threading
+
+        self._step_lock = _threading.Lock()
 
     def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
         self.saved_to = cache_dir
@@ -124,7 +130,53 @@ class _FakeEngine:
         # dedicated failure test.)
         if cache is not None:
             cache._last_save_outcome = "committed" if committed else "empty"
+        # #1100 codex round 6 (#2): the REAL ``save_to_disk`` always writes a
+        # committed ``index.json`` when it commits (>=1 entry), and the manifest
+        # builder now REQUIRES that index to be readable on a committed save
+        # (``require_committed_index=True``) — else it refuses to publish. Honor
+        # that post-condition here so the fake's committed saves produce an
+        # importable-shaped blob whose entry count + total memory MATCH the live
+        # ledger the tests set up (the manifest reads counts from this index,
+        # not the ledger). Emitted only on commit (empty saves write no index).
+        if committed:
+            n = self._entry_count()
+            total = int(getattr(cache, "_current_memory", 0)) if cache else 0
+            self._write_committed_index(cache_dir, entries=n, total_bytes=total)
         return committed
+
+    @staticmethod
+    def _write_committed_index(
+        cache_dir: str, entries: int = 1, total_bytes: int | None = None
+    ) -> None:
+        """Write a minimal valid committed ``index.json`` mirroring the real
+        ``save_to_disk`` post-condition. ``total_bytes`` is split evenly across
+        the entries' ``memory_bytes`` so the manifest's committed-index counts
+        match the live ledger the caller staged (any remainder lands on the
+        last entry). Defaults to 512 B/entry when ``total_bytes`` is omitted."""
+        import json as _json
+        import os as _os
+
+        entries = max(entries, 0)
+        if total_bytes is None:
+            per = [512] * entries
+        elif entries == 0:
+            per = []
+        else:
+            base = total_bytes // entries
+            per = [base] * entries
+            per[-1] += total_bytes - base * entries
+        _os.makedirs(cache_dir, exist_ok=True)
+        with open(_os.path.join(cache_dir, "index.json"), "w") as _fh:
+            _json.dump(
+                {
+                    "version": 3,
+                    "entries": [
+                        {"index": i, "num_tokens": 4, "memory_bytes": per[i]}
+                        for i in range(entries)
+                    ],
+                },
+                _fh,
+            )
 
     def _resolve_cache(self):
         """Resolve the prefix cache like the route's ``_prefix_cache`` does —
@@ -154,16 +206,28 @@ class _FakeEngine:
     def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
         """#1100 codex round 4 (#2): run the save stub then return the
         authoritative outcome as a value — mirrors the real engine wrapper that
-        captures the outcome in the SAME step-thread task as the save."""
+        captures the outcome in the SAME step-thread task as the save.
+
+        #1100 codex round 6 (#2): the REAL engine runs save+outcome-read inside
+        one task on the single ``max_workers=1`` mlx-step thread, so they are
+        atomic w.r.t. any OTHER save. The route calls this via
+        ``anyio.to_thread`` from concurrent handlers, so two exports would run
+        it on DIFFERENT pool threads and their shared-``_last_save_outcome``
+        reads could interleave (a "good" save's read seeing a concurrent "bad"
+        save's field write — exactly the cross-contamination this fake exists to
+        rule out). Serialize save+read under a per-engine lock so the fake has
+        the same single-writer atomicity the real step thread provides.
+        """
         from vllm_mlx.cache.protocol import SaveOutcome
 
-        self.save_cache_to_disk(cache_dir, should_abort=should_abort)
-        cache = self._resolve_cache()
-        outcome = (
-            getattr(cache, "_last_save_outcome", "empty")
-            if cache is not None
-            else "empty"
-        )
+        with self._step_lock:
+            self.save_cache_to_disk(cache_dir, should_abort=should_abort)
+            cache = self._resolve_cache()
+            outcome = (
+                getattr(cache, "_last_save_outcome", "empty")
+                if cache is not None
+                else "empty"
+            )
         return SaveOutcome(outcome=outcome)
 
     def load_cache_with_result(self, cache_dir: str, replace: bool = False):
@@ -171,11 +235,12 @@ class _FakeEngine:
         count + loaded bytes as a value (same step-thread capture semantics)."""
         from vllm_mlx.cache.protocol import LoadResult
 
-        entries = self.load_cache_from_disk(cache_dir, replace=replace)
-        cache = self._resolve_cache()
-        bytes_loaded = (
-            int(getattr(cache, "_last_load_bytes", 0)) if cache is not None else 0
-        )
+        with self._step_lock:
+            entries = self.load_cache_from_disk(cache_dir, replace=replace)
+            cache = self._resolve_cache()
+            bytes_loaded = (
+                int(getattr(cache, "_last_load_bytes", 0)) if cache is not None else 0
+            )
         return LoadResult(entries=entries, bytes_loaded=bytes_loaded)
 
     def _entry_count(self) -> int:
@@ -224,6 +289,15 @@ class _NestedFakeEngine(_FakeEngine):
         committed = bool(cache and len(cache._entries))
         if cache is not None:
             cache._last_save_outcome = "committed" if committed else "empty"
+        # #1100 codex round 6 (#2): honor the real committed-save post-condition
+        # (a readable index.json whose counts match the nested ledger) the
+        # manifest builder now requires.
+        if committed:
+            self._write_committed_index(
+                cache_dir,
+                entries=len(cache._entries),
+                total_bytes=int(getattr(cache, "_current_memory", 0)),
+            )
         return committed
 
 
@@ -1321,6 +1395,9 @@ async def test_export_concurrent_same_destination_serialized(cache_client):
         cache = engine.scheduler.memory_aware_cache
         if cache is not None:
             cache._last_save_outcome = "committed"
+        # #1100 codex round 6 (#2): write the committed index (3 entries /
+        # 1024 B, matching the ledger) the manifest builder now requires.
+        engine._write_committed_index(cache_dir, entries=3, total_bytes=1024)
         return True
 
     engine.save_cache_to_disk = _save
@@ -1356,14 +1433,27 @@ async def test_export_concurrent_same_destination_serialized(cache_client):
 
 @pytest.mark.asyncio
 async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
-    """#1100 codex round 4 (#4): the import handler holds the SAME
-    per-destination lock export uses, from manifest read through load, so a
-    concurrent export to the same path can't swap ``index.json`` between our
-    manifest validation and the load. Prove mutual exclusion: an in-flight
-    import and export to one path never overlap their critical sections."""
+    """#1100 codex round 4 (#4) + round 6 (#5): the import handler holds the
+    SAME per-destination lock export uses, from manifest read THROUGH load, so
+    a concurrent export to the same path can't swap ``index.json`` /
+    ``manifest.json`` between our manifest validation and the load.
+
+    Round-6 strengthening: the round-4 version only asserted that the two
+    instrumented save/load critical sections never OVERLAP (peak==1). That
+    passes even for a broken implementation that RELEASES the lock between
+    manifest validation and the load and re-takes it only around the load —
+    because save and load would still not overlap. To actually prove the lock
+    spans validate→load, the concurrent export here REPLACES the on-disk
+    manifest+index while the import is mid-flight, and the import's load records
+    the manifest ``model_id`` it observes ON DISK at load time. If the lock
+    truly covers validate→load, the load must see the ORIGINAL manifest the
+    import validated (``test-model``), never the export's swapped-in one — and
+    the export's manifest write must be serialized AFTER the import's load."""
     import asyncio as _asyncio
+    import json as _json
     import threading
     import time as _time
+    from pathlib import Path as _Path
 
     import httpx
     from fastapi import FastAPI
@@ -1371,11 +1461,12 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
     import vllm_mlx.routes.cache as cache_mod
     from vllm_mlx.routes.cache import router
 
-    # A shared path holding a valid manifest the import will read.
+    # A shared path holding a valid manifest the import will read+validate.
     manifest = Manifest(
         protocol_version=PROTOCOL_VERSION, model_id="test-model", entries=1
     )
     _write_export_root(cache_client.sandbox, "shared-io", manifest)
+    shared_dir = _Path(cache_client.sandbox) / "shared-io"
 
     engine = cache_client.FakeEngine(
         entries=1, current_memory=1024, load_returns=1, loaded_bytes=512
@@ -1384,13 +1475,40 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
     cache_client.cfg.model_name = "test-model"
 
     state = {"in_flight": 0, "peak": 0}
+    # Ordering witnesses: what model_id the LOAD saw on disk, and whether the
+    # export's manifest-swap landed before or after the load ran.
+    witness = {"load_saw_model_id": None, "manifest_swapped_before_load": None}
     counter_lock = threading.Lock()
 
-    def _instrumented(cache_dir, should_abort=None):
+    def _instrumented_save(cache_dir, should_abort=None):
+        # The export's save runs INSIDE the dest lock. Simulate the export
+        # publishing a DIFFERENT snapshot: swap the on-disk manifest+index to a
+        # foreign model_id. If the import's lock discipline is correct, this can
+        # only run once the import has fully released the lock (after its load).
         with counter_lock:
             state["in_flight"] += 1
             state["peak"] = max(state["peak"], state["in_flight"])
         _time.sleep(0.05)
+        # Publish the export's foreign manifest over the shared path, and a
+        # committed index.json (the real committed-save post-condition the
+        # manifest builder now requires — round 6 #2).
+        (shared_dir / "index.json").write_text(
+            _json.dumps(
+                {
+                    "version": 3,
+                    "entries": [{"index": 0, "num_tokens": 4, "memory_bytes": 512}],
+                }
+            )
+        )
+        (shared_dir / "manifest.json").write_text(
+            _json.dumps(
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "model_id": "EXPORT-swapped-model",
+                    "entries": 1,
+                }
+            )
+        )
         with counter_lock:
             state["in_flight"] -= 1
         cache = engine.scheduler.memory_aware_cache
@@ -1403,6 +1521,17 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
         with counter_lock:
             state["in_flight"] += 1
             state["peak"] = max(state["peak"], state["in_flight"])
+        # Read the manifest model_id the import is loading against, ON DISK,
+        # at LOAD time — this is the blob a correct lock guarantees is still the
+        # one the import validated, not one a concurrent export swapped in.
+        try:
+            on_disk = _json.loads((shared_dir / "manifest.json").read_text())
+            witness["load_saw_model_id"] = on_disk.get("model_id")
+            witness["manifest_swapped_before_load"] = (
+                on_disk.get("model_id") == "EXPORT-swapped-model"
+            )
+        except Exception:
+            witness["load_saw_model_id"] = "<read-failed>"
         _time.sleep(0.05)
         with counter_lock:
             state["in_flight"] -= 1
@@ -1411,7 +1540,7 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
             cache._last_load_bytes = 512
         return 1
 
-    engine.save_cache_to_disk = _instrumented
+    engine.save_cache_to_disk = _instrumented_save
     engine.load_cache_from_disk = _instrumented_load
     cache_client.cfg.engine = engine
 
@@ -1422,23 +1551,35 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
     app.include_router(router)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        export = client.post(
-            "/v1/cache/export", json={"destination": "shared-io"}, headers=_auth()
-        )
+        # Start the IMPORT first so it wins the lock and validates the ORIGINAL
+        # manifest; the concurrent export then contends for the same lock.
         importr = client.post(
             "/v1/cache/import",
             json={"source": "shared-io", "merge_strategy": "merge"},
             headers=_auth(),
         )
-        r_exp, r_imp = await _asyncio.gather(export, importr)
+        await _asyncio.sleep(0)  # let the import acquire the lock first
+        export = client.post(
+            "/v1/cache/export", json={"destination": "shared-io"}, headers=_auth()
+        )
+        r_imp, r_exp = await _asyncio.gather(importr, export)
 
-    assert r_exp.status_code == 200, r_exp.text
     assert r_imp.status_code == 200, r_imp.text
+    assert r_exp.status_code == 200, r_exp.text
     # Export's save and import's load share the destination lock → their
     # instrumented critical sections never overlapped.
     assert state["peak"] == 1, (
         f"import/export on one path overlapped; peak in-flight={state['peak']}"
     )
+    # Round-6 (#5): the load ran against the manifest the import VALIDATED — the
+    # export's manifest swap did NOT slip in before the load. If the lock were
+    # released between validate and load, the export could publish its foreign
+    # manifest and the load would observe ``EXPORT-swapped-model``.
+    assert witness["load_saw_model_id"] == "test-model", (
+        "import loaded against a manifest a concurrent export swapped in "
+        f"(TOCTOU): load saw model_id={witness['load_saw_model_id']!r}"
+    )
+    assert witness["manifest_swapped_before_load"] is False
 
 
 @pytest.mark.asyncio
@@ -1655,6 +1796,9 @@ async def test_export_outcome_isolated_across_concurrent_paths(cache_client):
             cache._last_save_outcome = "failed"
             return False
         cache._last_save_outcome = "committed"
+        # #1100 codex round 6 (#2): committed save writes a readable index.json
+        # (the manifest builder now requires it on a committed save).
+        engine._write_committed_index(cache_dir)
         return True
 
     engine.save_cache_to_disk = _save
@@ -1678,6 +1822,44 @@ async def test_export_outcome_isolated_across_concurrent_paths(cache_client):
     # Each handler reported its OWN outcome despite sharing the cache field.
     assert r_good.status_code == 200, r_good.text
     assert r_bad.status_code == 500, r_bad.text
+
+
+def test_export_committed_but_unreadable_index_500s_and_discards(cache_client):
+    """#1100 codex round 6 (#2): when a save reports ``"committed"`` but its
+    on-disk ``index.json`` is missing/torn, the manifest builder must NOT fall
+    back to the live ledger and publish a manifest for a non-importable
+    snapshot. The export 500s and the blob is discarded — never a 200 that
+    advertises entries a peer can't load."""
+    from pathlib import Path as _Path
+
+    engine = cache_client.FakeEngine(entries=3, current_memory=4096)
+
+    def _save_committed_torn_index(cache_dir, should_abort=None):
+        # Report a committed save but write a MALFORMED index.json (valid save
+        # would have written a well-formed one; simulate a torn commit).
+        engine.saved_to = cache_dir
+        d = _Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.json").write_text("{ this is not valid json")
+        (d / "entry_0.safetensors").write_text("x")
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "committed"
+        return True
+
+    engine.save_cache_to_disk = _save_committed_torn_index
+    cache_client.cfg.engine = engine
+
+    resp = cache_client.client.post(
+        "/v1/cache/export", json={"destination": "torn"}, headers=_auth()
+    )
+    assert resp.status_code == 500, resp.text
+    assert "unreadable" in resp.json()["detail"]
+    # The blob was discarded — no importable index/manifest left behind that
+    # would let a peer load a snapshot the save never validly committed.
+    torn = _Path(cache_client.sandbox) / "torn"
+    assert not (torn / "manifest.json").is_file()
+    assert not (torn / "index.json").is_file()
 
 
 def test_export_discard_quarantines_when_delete_fails(cache_client, monkeypatch):
@@ -2310,6 +2492,96 @@ def test_load_from_disk_repopulates_radix_index(tmp_path):
     # radix, not just the bisect fallback.
     assert len(dst._radix_index) == len(dst._entries) == 1
     assert src_key in dst._radix_index
+
+
+def test_load_from_disk_rolls_back_entry_on_radix_insert_failure(tmp_path, monkeypatch):
+    """#1100 codex round 6 (#4): if the radix insert FAILS while committing a
+    loaded entry, that entry must be rolled back out of ``_entries`` /
+    ``_sorted_keys`` / memory accounting — never left reported as loaded but
+    unreachable through the radix-backed lookup. A radix-present ``_entries``
+    entry absent from the radix is silently unreachable AND inflates the loaded
+    total; rolling it back keeps ``_entries`` and the radix in lockstep."""
+    import mlx.core as mx
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+    from vllm_mlx.runtime.radix_index import RadixPrefixIndex
+
+    src_cache, load_cfg = _build_cache_with_arrays_layer()
+    for entry in src_cache._entries.values():
+        for layer in entry.cache:
+            state = getattr(layer, "state", None)
+            if state is not None:
+                mx.eval(state)
+    target = str(tmp_path / "radix-fail-snap")
+    with mx.stream(mx.default_stream(mx.default_device())):
+        assert src_cache.save_to_disk(target) is True
+
+    radix = RadixPrefixIndex()
+
+    def _boom_insert(_key):
+        raise RuntimeError("radix insert blew up")
+
+    monkeypatch.setattr(radix, "insert", _boom_insert)
+
+    dst = MemoryAwarePrefixCache(model=object(), config=load_cfg, radix_index=radix)
+    with mx.stream(mx.default_stream(mx.default_device())):
+        loaded = dst.load_from_disk(target, replace=True)
+
+    # The only entry's radix insert failed → it was rolled back: nothing
+    # loaded, no orphaned ``_entries`` / ``_sorted_keys`` / memory, and the
+    # authoritative loaded-byte total is 0 (not the rolled-back entry's bytes).
+    assert loaded == 0
+    assert len(dst._entries) == 0
+    assert dst._sorted_keys == []
+    assert dst._current_memory == 0
+    assert dst._last_load_bytes == 0
+
+
+def test_load_from_disk_replace_aborts_on_insufficient_physical_headroom(
+    tmp_path, monkeypatch
+):
+    """#1100 codex round 6 (#3): replace mode holds the existing cache AND the
+    staged blob until the swap (~2× peak). If admitting the next staged entry
+    would blow past the physical-headroom budget, the replace ABORTS with the
+    existing cache intact — never OOM-ing the host mid-import."""
+    import mlx.core as mx
+
+    import vllm_mlx.memory_cache as mc
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    src_cache, load_cfg = _build_cache_with_arrays_layer()
+    for entry in src_cache._entries.values():
+        for layer in entry.cache:
+            state = getattr(layer, "state", None)
+            if state is not None:
+                mx.eval(state)
+    target = str(tmp_path / "headroom-snap")
+    with mx.stream(mx.default_stream(mx.default_device())):
+        assert src_cache.save_to_disk(target) is True
+
+    # A destination cache that already holds a (sentinel) live entry, so the
+    # replace has an existing cache to PRESERVE on abort.
+    dst = MemoryAwarePrefixCache(model=object(), config=load_cfg)
+    dst._entries[(1, 2, 3)] = object()
+    dst._sorted_keys = [(1, 2, 3)]
+    dst._current_memory = 999
+    before_entries = dict(dst._entries)
+
+    # Force a tiny-but-nonzero physical-headroom budget so ANY real staged
+    # entry exceeds it (100 B available → 75 B budget after the headroom
+    # fraction; a real KV entry is far larger). A 0 budget would DISABLE the
+    # check (psutil-missing fallback), so we use a small positive value.
+    monkeypatch.setattr(mc, "_get_available_memory", lambda: 100)
+
+    with mx.stream(mx.default_stream(mx.default_device())):
+        loaded = dst.load_from_disk(target, replace=True)
+
+    # Replace aborted: nothing loaded, existing cache fully preserved.
+    assert loaded == 0
+    assert dst._entries == before_entries
+    assert dst._sorted_keys == [(1, 2, 3)]
+    assert dst._current_memory == 999
+    assert dst._last_load_bytes == 0
 
 
 def test_http_export_import_roundtrip_end_to_end(monkeypatch, sandbox):

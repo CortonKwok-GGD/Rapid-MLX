@@ -44,6 +44,19 @@ _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
 
+# #1100 codex round 6 (#3): replace-mode stage-then-swap transiently holds BOTH
+# the existing live cache AND the fully-staged new blob until the atomic swap
+# (the DELIBERATE cost of the "corrupt source leaves existing cache intact"
+# guarantee — we can't clear the old cache until the whole new blob proves
+# readable). To keep that ~2× peak from OOM-ing a host already near its cache
+# limit, a replace import admits a staged entry only while
+# ``existing_live + staged_so_far + this_entry`` stays under this fraction of
+# CURRENTLY-AVAILABLE physical RAM (psutil). Exceeding it aborts the replace
+# gracefully — existing cache preserved, nothing loaded — rather than pushing
+# the process into swap / OOM-kill. The fraction leaves headroom for the model
+# weights, activations, and non-cache allocations already resident.
+_REPLACE_STAGING_PHYS_HEADROOM_FRACTION = 0.75
+
 # ---------------------------------------------------------------------------
 # Persist-format pinning (R10-D, Talia r10-R1)
 # ---------------------------------------------------------------------------
@@ -2818,19 +2831,23 @@ class MemoryAwarePrefixCache:
         # against the LIVE cache, preserving the pre-#1100 behavior byte
         # for byte.
         #
-        # #1100 codex round 5 (#6, NIT — accepted tradeoff): stage-then-swap
-        # in replace mode holds BOTH the existing cache AND the fully-staged
-        # snapshot in memory until the swap, a transient ~2× peak for a
-        # multi-GB import. This is the DELIBERATE cost of the corruption-safety
-        # guarantee the round-2 BLOCKING-1 fix requires ("a corrupt/missing
-        # source leaves the existing cache intact"): we cannot clear the live
-        # cache until we've proven the ENTIRE new blob reads cleanly, and
-        # proving that means materializing it. The per-entry memory-cap check
-        # (``staged_memory + memory > self._max_memory``) still bounds the
-        # STAGED half at the configured cap, so the peak is cap + current, not
-        # unbounded. A streaming design that validated without retaining both
-        # bodies would forfeit the atomic all-or-nothing contract — not worth
-        # it for an offline import that runs far below steady-state decode.
+        # #1100 codex round 5 (#6) → round 6 (#3): stage-then-swap in replace
+        # mode holds BOTH the existing cache AND the fully-staged snapshot in
+        # memory until the swap, a transient ~2× peak for a multi-GB import.
+        # This is the DELIBERATE cost of the corruption-safety guarantee the
+        # round-2 BLOCKING-1 fix requires ("a corrupt/missing source leaves the
+        # existing cache intact"): we cannot clear the live cache until we've
+        # proven the ENTIRE new blob reads cleanly, and proving that means
+        # materializing it. The per-entry LOGICAL-cap check (``staged_memory +
+        # memory > self._max_memory``) bounds the STAGED half at the configured
+        # cap; round 6 adds a PHYSICAL-headroom admission check
+        # (``_REPLACE_STAGING_PHYS_HEADROOM_FRACTION`` of available RAM, checked
+        # against ``existing + staged + entry`` below) so the ~2× peak can't
+        # OOM a host whose cache cap exceeds — or is already near — its free
+        # RAM: exceeding it aborts the replace with the existing cache intact. A
+        # streaming design that validated without retaining both bodies would
+        # forfeit the atomic all-or-nothing contract — not worth it for an
+        # offline import that runs far below steady-state decode.
         loaded = 0
         corrupt_skipped = 0
         duplicate_skipped = 0
@@ -2845,6 +2862,24 @@ class MemoryAwarePrefixCache:
         # replace mode from 0 (the staged blob stands alone).
         staged_memory = 0 if replace else self._current_memory
         replace_aborted = False
+
+        # #1100 codex round 6 (#3): replace mode holds the EXISTING cache in
+        # memory alongside the growing staged set until the swap. Snapshot its
+        # footprint and the available physical RAM ONCE up front so we can admit
+        # each staged entry only while both fit — bounding the transient ~2×
+        # peak against real host memory, not just the logical ``_max_memory``
+        # cap (a host can be configured with a cache cap larger than its free
+        # RAM, or already be near it). 0 available (psutil missing) disables the
+        # physical check and falls back to the logical cap alone, preserving
+        # prior behavior on hosts without psutil.
+        replace_existing_bytes = self._current_memory if replace else 0
+        phys_admission_budget = 0
+        if replace:
+            avail = _get_available_memory()
+            if avail > 0:
+                phys_admission_budget = int(
+                    avail * _REPLACE_STAGING_PHYS_HEADROOM_FRACTION
+                )
         for entry_meta in index.get("entries", []):
             i = entry_meta["index"]
             expected_num_tokens = entry_meta["num_tokens"]
@@ -2991,6 +3026,36 @@ class MemoryAwarePrefixCache:
                     )
                     break
 
+                # #1100 codex round 6 (#3): replace-mode PHYSICAL-headroom
+                # admission. The existing cache stays resident until the swap,
+                # so the co-resident cost is ``existing + staged_so_far +
+                # this_entry``. If that would blow past our safe fraction of
+                # currently-available RAM, ABORT the whole replace (existing
+                # cache preserved, nothing loaded) rather than push the host
+                # into swap / OOM-kill mid-import. This is a hard safety abort,
+                # not the soft logical-cap ``break`` above — a partial replace
+                # would silently drop entries, so we fail closed and keep the
+                # old cache. Skipped when psutil is unavailable (budget 0).
+                if phys_admission_budget > 0:
+                    co_resident = replace_existing_bytes + staged_memory + memory
+                    if co_resident > phys_admission_budget:
+                        logger.warning(
+                            "[cache_persist] replace ABORTED: staging entry %d "
+                            "would need %.0fMB co-resident (existing %.0fMB + "
+                            "staged %.0fMB + entry %.0fMB) — exceeds physical "
+                            "headroom budget %.0fMB (%.0f%% of available RAM); "
+                            "existing cache left intact, nothing loaded",
+                            i,
+                            co_resident / _BYTES_PER_MB,
+                            replace_existing_bytes / _BYTES_PER_MB,
+                            staged_memory / _BYTES_PER_MB,
+                            memory / _BYTES_PER_MB,
+                            phys_admission_budget / _BYTES_PER_MB,
+                            _REPLACE_STAGING_PHYS_HEADROOM_FRACTION * 100,
+                        )
+                        replace_aborted = True
+                        break
+
                 entry = _CacheEntry(
                     tokens=tokens_key,
                     cache=cache,
@@ -3047,6 +3112,10 @@ class MemoryAwarePrefixCache:
         # save_drift_drops / non_trimmable_skips) is inlined here so the
         # whole clear+install stays in one critical section.
         loaded_bytes = 0
+        # #1100 codex round 6 (#4): count entries dropped at commit because
+        # their radix insert failed, so the RETURNED loaded count (the staging
+        # tally ``loaded``) reflects only entries actually installed+reachable.
+        radix_rolled_back = 0
         with self._lock:
             if replace:
                 self._entries.clear()
@@ -3069,9 +3138,34 @@ class MemoryAwarePrefixCache:
                     len(staged),
                 )
             for tokens_key, entry in staged.items():
+                # #1100 codex round 6 (#1): commit each staged entry fully
+                # inside ``self._lock``, and treat a key that is ALREADY live
+                # as a replacement rather than a blind overwrite. All cache
+                # WRITERS (store / evict via ``step()``, and this load) run on
+                # the single mlx-step worker thread, so a live duplicate can
+                # arise here only in ``merge`` mode when the pre-lock dedup and
+                # this commit see different ledgers — but we still account for
+                # it correctly instead of leaking the replaced entry's bytes:
+                # subtract the old entry's memory and drop its (now-stale) radix
+                # membership before installing the new one, so ``_current_
+                # memory`` and ``_sorted_keys`` never double-count or duplicate.
+                existing = self._entries.get(tokens_key)
+                if existing is not None:
+                    self._current_memory -= existing.memory_bytes
+                    idx = bisect.bisect_left(self._sorted_keys, tokens_key)
+                    if (
+                        idx < len(self._sorted_keys)
+                        and self._sorted_keys[idx] == tokens_key
+                    ):
+                        self._sorted_keys.pop(idx)
+                    if self._radix_index is not None:
+                        try:
+                            self._radix_index.remove(tokens_key)
+                        except Exception:  # pragma: no cover — defensive
+                            pass
+
                 self._entries[tokens_key] = entry
                 self._current_memory += entry.memory_bytes
-                loaded_bytes += entry.memory_bytes
                 bisect.insort(self._sorted_keys, tokens_key)
                 # #1100 codex round 4 (#3): keep the radix lookup index in sync
                 # with ``_entries``. The replace path clears the radix above and
@@ -3080,15 +3174,37 @@ class MemoryAwarePrefixCache:
                 # imported entry (the bisect path would still find them, but the
                 # radix is the primary lookup when wired). Mirrors ``store()``'s
                 # in-lock radix insert; skips silently in ``hash`` mode.
+                #
+                # #1100 codex round 6 (#4): if the radix insert FAILS, roll the
+                # entry back out of ``_entries`` / ``_sorted_keys`` / accounting
+                # so it is NEVER reported as loaded-but-unreachable. A radix-
+                # backed fetch is the primary lookup path when wired, so an
+                # entry present in ``_entries`` but absent from the radix would
+                # be silently unreachable while inflating the loaded-byte total.
+                # Rolling it back keeps ``_entries`` and the radix in lockstep
+                # and makes ``loaded_bytes`` count only reachable entries.
                 if self._radix_index is not None:
                     try:
                         self._radix_index.insert(tokens_key)
                     except Exception as exc:  # pragma: no cover — defensive
+                        self._entries.pop(tokens_key, None)
+                        self._current_memory -= entry.memory_bytes
+                        idx = bisect.bisect_left(self._sorted_keys, tokens_key)
+                        if (
+                            idx < len(self._sorted_keys)
+                            and self._sorted_keys[idx] == tokens_key
+                        ):
+                            self._sorted_keys.pop(idx)
+                        radix_rolled_back += 1
                         logger.warning(
-                            "[radix] insert failed for %d tokens during load: %s",
+                            "[radix] insert failed for %d tokens during load — "
+                            "entry rolled back (not counted as loaded): %s",
                             len(tokens_key),
                             exc,
                         )
+                        continue
+
+                loaded_bytes += entry.memory_bytes
 
             self._stats.entry_count = len(self._entries)
             self._stats.current_memory_bytes = self._current_memory
@@ -3109,11 +3225,18 @@ class MemoryAwarePrefixCache:
         # concurrent store/evict on the step thread could skew the delta.
         self._last_load_bytes = loaded_bytes
 
+        # #1100 codex round 6 (#4): entries whose radix insert failed were
+        # rolled back out of the cache — they must NOT count toward the loaded
+        # total the caller (and the import route's ``entries_loaded``) sees.
+        loaded -= radix_rolled_back
+
         dt = _time.monotonic() - t0
         summary = (
             f"[cache_persist] LOADED {loaded} entries from {cache_dir} "
             f"in {dt:.1f}s ({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
         )
+        if radix_rolled_back:
+            summary += f", {radix_rolled_back} rolled back on radix-insert failure"
         if duplicate_skipped:
             summary += (
                 f", {duplicate_skipped} skipped as duplicates of in-memory entries"

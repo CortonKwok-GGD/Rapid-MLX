@@ -95,6 +95,23 @@ class MalformedManifestError(ValueError):
     """
 
 
+class CommittedIndexUnreadableError(RuntimeError):
+    """Raised when a COMMITTED export's ``index.json`` can't be read back.
+
+    #1100 codex round 6 (#2): ``build_manifest_from_engine_state`` normally
+    reads the entry/byte counts from the committed on-disk ``index.json`` and
+    falls back to the live cache ledger only when there is NO index (a
+    legitimately empty export / disabled cache, both 0/0). But that fallback
+    also fired on an index that EXISTS yet is unreadable or malformed — so a
+    save that reported ``"committed"`` but left a torn index would publish a
+    manifest describing the (nonzero) live ledger for a snapshot no peer can
+    import. When the caller asserts the save committed
+    (``require_committed_index=True``), a ``None`` committed read is therefore
+    an ERROR, not an empty-export signal: the export route catches this and
+    discards the blob instead of publishing a lying manifest.
+    """
+
+
 class ManifestMismatchError(ValueError):
     """Raised when a manifest doesn't match caller expectations.
 
@@ -364,7 +381,9 @@ def resolve_engine_model_id(engine: Any) -> str:
 
 
 def build_manifest_from_engine_state(
-    engine: Any, cache_dir: str | Path | None = None
+    engine: Any,
+    cache_dir: str | Path | None = None,
+    require_committed_index: bool = False,
 ) -> Manifest:
     """Build a :class:`Manifest` describing the engine's current cache blob.
 
@@ -403,6 +422,15 @@ def build_manifest_from_engine_state(
     ``cache_dir`` is the export root just written by ``save_to_disk``.
     Omitting it (the pre-#1100 call shape) keeps the live-ledger behavior
     — still correct for callers that only want the config knobs.
+
+    ``require_committed_index`` (#1100 codex round 6 #2): when the caller
+    KNOWS the preceding save committed (>=1 entry atomically published), pass
+    ``True`` so a missing/unreadable ``index.json`` raises
+    :class:`CommittedIndexUnreadableError` instead of silently falling back to
+    the live ledger. The live-ledger fallback is only correct for the genuine
+    no-index cases (empty export / disabled cache); on a committed save a
+    ``None`` committed read means a TORN index, and publishing the live
+    ledger's nonzero counts would advertise a snapshot no peer can import.
     """
     # Model id — prefer the server singleton (what the operator typed), fall
     # back to the engine's own config for unit-test / embedded engines. The
@@ -449,6 +477,18 @@ def build_manifest_from_engine_state(
     committed = (
         _read_committed_cache_counts(cache_dir) if cache_dir is not None else None
     )
+    if committed is None and require_committed_index:
+        # #1100 codex round 6 (#2): the caller asserts a save just COMMITTED
+        # (>=1 entry atomically published), so a readable ``index.json`` MUST
+        # exist at ``cache_dir``. A ``None`` here means the index is missing or
+        # torn/malformed — do NOT silently fall back to the live ledger and
+        # publish a manifest for a snapshot no peer can import. Fail loudly so
+        # the export route discards the blob and 500s.
+        raise CommittedIndexUnreadableError(
+            "committed export index.json is missing or unreadable at the "
+            "destination — refusing to publish a manifest for a non-importable "
+            "snapshot"
+        )
     if committed is not None:
         entries, total_bytes = committed
     else:

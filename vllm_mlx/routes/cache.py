@@ -53,6 +53,7 @@ from pydantic import BaseModel, Field
 from ..cache.protocol import (
     MANIFEST_FILENAME,
     PROTOCOL_VERSION,
+    CommittedIndexUnreadableError,
     InvalidExportPathError,  # noqa: F401 — re-exported for _resolve_or_400 callers
     MalformedManifestError,  # noqa: F401 — used via _read_manifest_or_http
     ManifestMismatchError,
@@ -929,7 +930,20 @@ async def export_cache(req: ExportRequest):
             # Build the manifest from the COMMITTED on-disk index (#1100
             # BLOCKING-3), not the live ledger — ``cache_dir=destination``
             # makes the counters match what a peer will actually load.
-            manifest = build_manifest_from_engine_state(engine, cache_dir=destination)
+            #
+            # #1100 codex round 6 (#2): when the save reported ``"committed"``
+            # (>=1 entry atomically published), a readable committed
+            # ``index.json`` MUST exist — pass ``require_committed_index=True``
+            # so a torn/unreadable index raises ``CommittedIndexUnreadableError``
+            # (caught below → discard + 500) instead of silently falling back to
+            # the live ledger and publishing a manifest for a non-importable
+            # snapshot. An EMPTY export legitimately has no index (0 entries),
+            # so we require it only on the committed path.
+            manifest = build_manifest_from_engine_state(
+                engine,
+                cache_dir=destination,
+                require_committed_index=(save_outcome == "committed"),
+            )
 
             # Write the manifest BEFORE the size gate so the committed-blob
             # measure below includes manifest.json — it's part of what a peer
@@ -947,6 +961,29 @@ async def export_cache(req: ExportRequest):
             committed_bytes = _committed_dir_size(destination)
         except HTTPException:
             raise
+        except CommittedIndexUnreadableError as exc:
+            # #1100 codex round 6 (#2): the save said "committed" but its
+            # ``index.json`` is missing/torn — the snapshot is NOT importable.
+            # Discard the blob and 500 rather than publish a manifest that lies
+            # about a non-loadable export.
+            logger.error(
+                "cache/export: committed save left an unreadable index "
+                "(destination=%s): %s; discarding the blob",
+                destination,
+                exc,
+            )
+            try:
+                _discard_export(destination)
+            except _ExportDiscardError as discard_exc:
+                logger.error(
+                    "cache/export: could not discard blob after unreadable "
+                    "committed index: %s",
+                    discard_exc,
+                )
+            raise HTTPException(
+                status_code=500,
+                detail="cache export committed but its on-disk index was unreadable",
+            ) from exc
         except Exception as exc:
             # Post-save processing failed (manifest write ENOSPC, etc.). Do NOT
             # leave the just-committed blob orphaned on disk — discard it, then
