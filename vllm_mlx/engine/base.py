@@ -99,6 +99,28 @@ class GenerationOutput:
     matched_stop: str | None = None
 
 
+def _callable_accepts_kwarg(func: Any, name: str, inspect_mod: Any) -> bool:
+    """True iff ``func`` can be called with keyword ``name``.
+
+    #1100 codex round 10 (#5): used to pick the call shape for a possibly-legacy
+    override BEFORE invoking it, so a ``TypeError`` from inside the method body
+    is never mistaken for a signature mismatch (which would re-invoke and
+    duplicate partial mutations). Accepts the kwarg when it is a named parameter
+    OR the signature has ``**kwargs``. Falls back to ``True`` (assume the modern
+    signature) if the signature can't be introspected — a genuine legacy
+    one-arg override still raises ``TypeError`` in that rare case, but no
+    double-invocation path exists to mask it.
+    """
+    try:
+        sig = inspect_mod.signature(func)
+    except (ValueError, TypeError):  # pragma: no cover — builtins / C funcs
+        return True
+    params = sig.parameters
+    if name in params:
+        return True
+    return any(p.kind == inspect_mod.Parameter.VAR_KEYWORD for p in params.values())
+
+
 class BaseEngine(ABC):
     """
     Abstract base class for inference engines.
@@ -318,15 +340,29 @@ class BaseEngine(ABC):
         if saved:
             return SaveOutcome(outcome="committed")
         # Not committed — distinguish a genuine empty no-op from a failed save
-        # by asking the cache how many entries it holds. A nonzero count means
-        # the save had work to do and dropped it: that's a failure, not empty.
-        entry_count = 0
+        # by asking the cache how many entries it holds.
+        #
+        # #1100 codex round 7 (#2) → round 10 (#4): FAIL CLOSED when the entry
+        # count is UNAVAILABLE. ``get_cache_stats`` returns ``None`` on the
+        # BaseEngine default (and can be malformed on an odd subclass); the
+        # round-7 version treated that as ``entry_count = 0`` → ``"empty"``,
+        # which reports a FAILED non-empty save as a successful empty export (the
+        # route then publishes an empty manifest instead of 500ing). ``"empty"``
+        # must be reserved for an EXPLICIT authoritative zero; anything we can't
+        # read authoritatively is ``"failed"`` — the safe direction (a false
+        # "failed" only 500s a genuinely-empty export; a false "empty" ships a
+        # lie).
         try:
             stats = self.get_cache_stats()
-            if stats is not None:
-                entry_count = int(stats.get("entry_count", 0) or 0)
         except Exception:  # pragma: no cover — defensive against odd stats shapes
-            entry_count = 0
+            stats = None
+        if not isinstance(stats, dict) or "entry_count" not in stats:
+            # No authoritative count → cannot prove emptiness → fail closed.
+            return SaveOutcome(outcome="failed")
+        try:
+            entry_count = int(stats.get("entry_count") or 0)
+        except (TypeError, ValueError):  # non-numeric entry_count → unauthoritative
+            return SaveOutcome(outcome="failed")
         return SaveOutcome(outcome="failed" if entry_count > 0 else "empty")
 
     def load_cache_with_result(self, cache_dir: str, replace: bool = False):
@@ -337,29 +373,40 @@ class BaseEngine(ABC):
         to ``load_cache_from_disk`` and reports 0 loaded bytes (the count is
         authoritative; bytes are best-effort for engines that don't override).
 
-        #1100 codex round 9 (#4): ``replace`` was added to
-        ``load_cache_from_disk`` for #476. A pre-existing engine that overrides
-        only the OLD one-arg ``load_cache_from_disk(self, cache_dir)`` would
-        ``TypeError`` on the ``replace=`` keyword — even for the default merge
-        path it never asked to change. Preserve the old call shape when
-        ``replace`` is False (the historical default), and only pass the keyword
-        when a replace was actually requested; if that raises ``TypeError`` the
-        engine genuinely can't do a replace, which we surface rather than
-        silently degrade to a merge.
+        #1100 codex round 9 (#4) → round 10 (#5): ``replace`` was added to
+        ``load_cache_from_disk`` for #476. A pre-existing engine overriding only
+        the OLD one-arg ``load_cache_from_disk(self, cache_dir)`` would
+        ``TypeError`` on the ``replace=`` keyword. Round 9 caught that TypeError
+        and retried — but a ``TypeError`` raised from INSIDE the method body
+        (not a signature mismatch) would then be re-invoked, DUPLICATING partial
+        mutations and masking the real fault. Round 10: decide signature
+        compatibility by INTROSPECTION (``inspect.signature``) BEFORE the call,
+        so we never re-invoke on a body error. If the callee accepts ``replace``
+        (or ``**kwargs``), pass it; otherwise call one-arg and — if the caller
+        asked for a replace the callee can't honor — fail loudly rather than
+        silently merge.
         """
+        import inspect
+
         from ..cache.protocol import LoadResult
 
-        if replace:
-            entries = self.load_cache_from_disk(cache_dir, replace=True)
+        accepts_replace = _callable_accepts_kwarg(
+            self.load_cache_from_disk, "replace", inspect
+        )
+        if accepts_replace:
+            entries = self.load_cache_from_disk(cache_dir, replace=replace)
         else:
-            # Back-compat: call with the historical one-arg signature so a
-            # subclass predating the ``replace`` parameter still works.
-            try:
-                entries = self.load_cache_from_disk(cache_dir)
-            except TypeError:
-                # A subclass whose signature REQUIRES replace= (unlikely but
-                # possible) — fall back to the explicit keyword.
-                entries = self.load_cache_from_disk(cache_dir, replace=False)
+            if replace:
+                # The callee predates ``replace`` and cannot do an atomic
+                # clear-inside-load. Surface that instead of silently degrading
+                # a requested replace into a merge (which would leave stale
+                # entries the caller expected gone).
+                raise TypeError(
+                    f"{type(self).__name__}.load_cache_from_disk does not "
+                    "support replace=True (one-arg legacy signature); cannot "
+                    "honor merge_strategy='replace'"
+                )
+            entries = self.load_cache_from_disk(cache_dir)
         return LoadResult(entries=entries, bytes_loaded=0)
 
     def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:

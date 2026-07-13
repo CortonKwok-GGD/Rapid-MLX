@@ -3049,15 +3049,42 @@ def test_base_engine_save_outcome_default_distinguishes_failed_from_empty():
     empty = _MinimalEngine(save_returns=False, entry_count=0)
     assert empty.save_cache_with_outcome("/tmp/whatever").outcome == "empty"
 
+    # #1100 codex round 10 (#4): a subclass that overrides save_cache_to_disk
+    # but NOT get_cache_stats (inheriting the None default) must FAIL CLOSED on
+    # a False save — reporting "failed", not "empty" (an unauthoritative count
+    # cannot prove emptiness, and a false "empty" ships a lying export).
+    class _NoStatsEngine(BaseEngine):
+        locals().update(_abstract_stubs)
+
+        def save_cache_to_disk(self, cache_dir, should_abort=None):
+            return False  # non-committing save, stats unavailable
+
+        # get_cache_stats NOT overridden → BaseEngine default returns None.
+
+    assert _NoStatsEngine().save_cache_with_outcome("/tmp/x").outcome == "failed"
+
+    # A malformed stats shape (missing entry_count / non-numeric) is also
+    # unauthoritative → "failed".
+    class _BadStatsEngine(BaseEngine):
+        locals().update(_abstract_stubs)
+
+        def save_cache_to_disk(self, cache_dir, should_abort=None):
+            return False
+
+        def get_cache_stats(self):
+            return {"entry_count": "not-a-number"}
+
+    assert _BadStatsEngine().save_cache_with_outcome("/tmp/x").outcome == "failed"
+
 
 def test_base_engine_load_result_default_tolerates_old_one_arg_signature():
-    """#1100 codex round 9 (#4): the ``load_cache_with_result`` default must not
-    break a pre-existing engine that overrides only the OLD one-arg
-    ``load_cache_from_disk(self, cache_dir)`` (pre-#476, before ``replace`` was
-    added). For the default MERGE path (``replace=False``) it must call with the
-    historical one-arg shape, not pass ``replace=`` and TypeError. A replace
-    request DOES pass the keyword (an engine that can't replace should surface
-    that, not silently degrade)."""
+    """#1100 codex round 9 (#4) → round 10 (#5): the ``load_cache_with_result``
+    default must not break a pre-existing engine that overrides only the OLD
+    one-arg ``load_cache_from_disk(self, cache_dir)`` (pre-#476), AND must decide
+    the call shape by INTROSPECTION rather than catching ``TypeError`` — so a
+    ``TypeError`` raised from INSIDE the method body is never mistaken for a
+    signature mismatch and re-invoked (which would duplicate partial
+    mutations)."""
     from vllm_mlx.engine.base import BaseEngine
 
     _stubs = {
@@ -3080,6 +3107,10 @@ def test_base_engine_load_result_default_tolerates_old_one_arg_signature():
     assert res.entries == 7
     assert e.calls == [("one-arg", "/tmp/x")]
 
+    # A legacy one-arg engine CANNOT honor a replace — surface it, don't degrade.
+    with pytest.raises(TypeError):
+        _OldMergeEngine().load_cache_with_result("/tmp/x", replace=True)
+
     # A new-style engine accepting replace= still gets the keyword on replace.
     class _NewEngine(BaseEngine):
         locals().update(_stubs)
@@ -3094,6 +3125,35 @@ def test_base_engine_load_result_default_tolerates_old_one_arg_signature():
     n = _NewEngine()
     assert n.load_cache_with_result("/tmp/x", replace=True).entries == 3
     assert n.saw_replace is True
+
+    # #1100 codex round 10 (#5): a TypeError raised from the method BODY (not a
+    # signature mismatch) must propagate ONCE — never be swallowed and the load
+    # re-invoked (which the old ``except TypeError`` retry would have done,
+    # duplicating partial mutations). Introspection sees a compatible signature,
+    # so the body error is surfaced as-is and the method runs exactly once.
+    class _BodyRaisesEngine(BaseEngine):
+        locals().update(_stubs)
+
+        def __init__(self):
+            self.invocations = 0
+
+        def load_cache_from_disk(self, cache_dir, replace: bool = False):
+            self.invocations += 1
+            raise TypeError("boom from inside the body, not a signature mismatch")
+
+    b = _BodyRaisesEngine()
+    with pytest.raises(TypeError, match="boom from inside the body"):
+        b.load_cache_with_result("/tmp/x", replace=False)
+    assert b.invocations == 1  # called EXACTLY once — no double-invocation
+
+    # A ``**kwargs`` signature is also recognized as replace-capable.
+    class _KwargsEngine(BaseEngine):
+        locals().update(_stubs)
+
+        def load_cache_from_disk(self, cache_dir, **kwargs):
+            return 1 if kwargs.get("replace") else 2
+
+    assert _KwargsEngine().load_cache_with_result("/tmp/x", replace=True).entries == 1
 
 
 def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_path):
