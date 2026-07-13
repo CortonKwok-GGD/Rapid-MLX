@@ -1174,34 +1174,41 @@ async def import_cache(req: ImportRequest):
                     detail=("manifest model_id does not match the loaded engine model"),
                 )
         else:
-            # #1100 codex round 3 (#4): FAIL CLOSED when the loaded engine's
-            # model id cannot be resolved. The old ``if server_model_id and
-            # ...`` gate fell OPEN here — an id-less engine skipped the
-            # comparison and would accept ANY model's KV geometry, the exact
-            # corruption the gate exists to prevent. Now such an engine may
-            # import ONLY when the caller EXPLICITLY pins a matching
-            # ``expected_model_id`` (taking responsibility for the identity
-            # assertion the server can't make); otherwise reject. The 422 (not
-            # 409) distinguishes "server can't verify identity" from
-            # "identities mismatch".
-            if (
-                req.expected_model_id is None
-                or manifest.model_id != req.expected_model_id
-            ):
-                logger.warning(
-                    "cache/import: rejected — loaded engine model id is "
-                    "unresolvable and caller did not pin a matching "
-                    "expected_model_id (source=%s)",
-                    source,
-                )
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "cannot verify model identity: the loaded engine has no "
-                        "resolvable model id; supply expected_model_id matching "
-                        "the manifest to import explicitly"
-                    ),
-                )
+            # #1100 codex round 3 (#4) → round 7 (#1): FAIL CLOSED — HARD —
+            # when the loaded engine's model id cannot be resolved. The KV blob
+            # is model-specific (layer/head/dim geometry, quant layout); loading
+            # a foreign one corrupts inference or crashes the fetch, so the
+            # server MUST positively confirm the blob matches the model it
+            # actually loaded before importing.
+            #
+            # The round-3 fix let an id-less engine import if the caller pinned
+            # ``expected_model_id == manifest.model_id`` — but BOTH of those are
+            # CALLER-CONTROLLED and UNTRUSTED (the caller ships the manifest AND
+            # picks expected_model_id), so that check compares an attacker's
+            # value against the attacker's own manifest and proves NOTHING about
+            # the geometry of the model this server loaded. It reduced to "trust
+            # the caller", the exact hole the gate exists to close. There is no
+            # trusted server-side signal to compare against here, so we reject
+            # UNCONDITIONALLY. An operator who hits this must give the engine a
+            # resolvable model id (serve with a named model / populate
+            # ServerConfig.model_name) so the server can make the identity
+            # assertion itself. 422 = "server cannot verify identity" (distinct
+            # from the 409 "identities mismatch" above).
+            logger.warning(
+                "cache/import: rejected — loaded engine model id is "
+                "unresolvable; refusing to import a model-specific KV blob the "
+                "server cannot verify against its loaded model (source=%s)",
+                source,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "cannot verify model identity: the loaded engine has no "
+                    "resolvable model id, so the server cannot confirm this KV "
+                    "cache matches the loaded model; serve with a named model "
+                    "so the identity can be verified"
+                ),
+            )
 
         # Re-check the caller-side ``expected_model_id`` against the RE-READ
         # manifest (a concurrent export could have swapped the blob's model_id

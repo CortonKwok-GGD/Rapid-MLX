@@ -1318,11 +1318,19 @@ def test_export_manifest_write_failure_discards_committed_blob(
 
 
 def test_import_fails_closed_when_engine_model_id_unresolvable(cache_client):
-    """#1100 codex round 3 (#4): the model-identity gate must FAIL CLOSED when
-    the loaded engine's model id can't be resolved. An id-less engine used to
-    skip the comparison (fail open) and would accept ANY model's KV geometry.
-    Now such an engine is rejected (422) unless the caller explicitly pins a
-    matching ``expected_model_id``."""
+    """#1100 codex round 3 (#4) → round 7 (#1): the model-identity gate must
+    FAIL CLOSED — HARD — when the loaded engine's model id can't be resolved.
+
+    Round 3 rejected an id-less engine UNLESS the caller pinned a matching
+    ``expected_model_id``. Codex round 7 (#1) flagged that as still-open: BOTH
+    ``expected_model_id`` AND the manifest's ``model_id`` are caller-controlled
+    and untrusted, so comparing one against the other proves NOTHING about the
+    geometry of the model the server actually loaded — a caller can echo the
+    manifest id it shipped and slip an incompatible KV blob past the gate.
+    There is no trusted server-side signal to compare against when the engine
+    can't identify itself, so the import is now rejected UNCONDITIONALLY (422).
+    The remediation is operational: give the engine a resolvable model id.
+    """
     cache_client.cfg.model_name = ""  # server singleton empty
     _write_export_root(
         cache_client.sandbox,
@@ -1344,14 +1352,28 @@ def test_import_fails_closed_when_engine_model_id_unresolvable(cache_client):
     assert resp.status_code == 422, resp.text
     assert engine.loaded_from is None  # load never ran
 
-    # With an explicit matching expected_model_id the caller takes
-    # responsibility — the import proceeds.
+    # Round 7 (#1): echoing the manifest's own model_id via expected_model_id
+    # does NOT open the gate — both values are caller-controlled, so the server
+    # still has no trustworthy identity assertion. Reject unconditionally.
     resp2 = cache_client.client.post(
         "/v1/cache/import",
         json={"source": "idless", "expected_model_id": "foreign/model"},
         headers=_auth(),
     )
-    assert resp2.status_code == 200, resp2.text
+    assert resp2.status_code == 422, resp2.text
+    assert engine.loaded_from is None  # load still never ran
+
+    # The correct fix is operational: once the engine has a resolvable id that
+    # MATCHES the manifest, the server can make the identity assertion itself
+    # and the import proceeds. (Model id lives on ``engine.config.model_name``,
+    # read via ``resolve_engine_model_id`` when the server singleton is empty.)
+    engine.config.model_name = "foreign/model"
+    resp3 = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "idless"},
+        headers=_auth(),
+    )
+    assert resp3.status_code == 200, resp3.text
     assert engine.loaded_from is not None
 
 
@@ -1401,6 +1423,24 @@ async def test_export_concurrent_same_destination_serialized(cache_client):
         return True
 
     engine.save_cache_to_disk = _save
+
+    # #1100 codex round 7 (#5): the default ``_FakeEngine.save_cache_with_outcome``
+    # wraps save+outcome-read in ``self._step_lock`` to mimic the real single
+    # ``max_workers=1`` step thread. But that lock ALSO serializes concurrent
+    # exports — so this test would observe ``peak == 1`` even if the ROUTE's
+    # per-destination lock were deleted, i.e. it would prove nothing about the
+    # thing it exists to verify. Install an UNSYNCHRONIZED outcome wrapper on
+    # THIS engine (no ``_step_lock``) so the ONLY lock that can hold ``peak``
+    # at 1 is the route's per-destination lock we are actually testing.
+    def _unsync_save_with_outcome(cache_dir, should_abort=None):
+        from vllm_mlx.cache.protocol import SaveOutcome
+
+        engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
+        cache = engine.scheduler.memory_aware_cache
+        outcome = getattr(cache, "_last_save_outcome", "empty") if cache else "empty"
+        return SaveOutcome(outcome=outcome)
+
+    engine.save_cache_with_outcome = _unsync_save_with_outcome
     cache_client.cfg.engine = engine
 
     # Reset the module-level per-destination lock registry so this loop owns
@@ -2700,3 +2740,114 @@ def test_http_export_import_roundtrip_end_to_end(monkeypatch, sandbox):
         assert "ArraysCache" in layer_classes, layer_classes
     finally:
         reset_config()
+
+
+# ---------------------------------------------------------------------------
+# #1100 codex round 7 direct-unit regressions for the non-route fixes.
+# ---------------------------------------------------------------------------
+
+
+def test_base_engine_save_outcome_default_distinguishes_failed_from_empty():
+    """#1100 codex round 7 (#2): the ``BaseEngine.save_cache_with_outcome``
+    DEFAULT must NOT collapse every ``save_cache_to_disk() is False`` into
+    ``"empty"``. ``save_cache_to_disk`` returns ``False`` for BOTH a genuine
+    empty no-op AND a NON-empty cache that failed to commit anything, so a
+    subclass overriding only ``save_cache_to_disk`` (relying on the default
+    outcome wrapper) would otherwise report a FAILED export as a successful
+    empty snapshot — the route would then publish an empty manifest instead of
+    500ing. The default disambiguates via authoritative ``get_cache_stats``:
+    False + entries>0 → ``"failed"``; False + no entries → ``"empty"``.
+    """
+    from vllm_mlx.engine.base import BaseEngine
+
+    # Concretize every abstract member with an inert stub so the ABC can be
+    # instantiated; we only exercise the concrete ``save_cache_with_outcome``
+    # default (NOT overridden) driving ``save_cache_to_disk`` + ``get_cache_stats``.
+    _abstract_stubs = {
+        name: (lambda self, *a, **k: None) for name in BaseEngine.__abstractmethods__
+    }
+
+    class _MinimalEngine(BaseEngine):
+        """Overrides ONLY ``save_cache_to_disk`` (+ stats) — exactly the
+        subclass shape the default outcome wrapper must serve correctly."""
+
+        locals().update(_abstract_stubs)
+
+        def __init__(self, *, save_returns: bool, entry_count: int):
+            self._save_returns = save_returns
+            self._entry_count = entry_count
+
+        def get_cache_stats(self):
+            return {"entry_count": self._entry_count}
+
+        def save_cache_to_disk(self, cache_dir, should_abort=None):
+            return self._save_returns
+
+    # Committed save → "committed".
+    committed = _MinimalEngine(save_returns=True, entry_count=3)
+    assert committed.save_cache_with_outcome("/tmp/whatever").outcome == "committed"
+
+    # Non-empty cache that committed nothing → "failed" (the bug this closes:
+    # the old default returned "empty" here, hiding a failed export).
+    failed = _MinimalEngine(save_returns=False, entry_count=3)
+    assert failed.save_cache_with_outcome("/tmp/whatever").outcome == "failed"
+
+    # Genuinely empty cache, save is a legit no-op → "empty".
+    empty = _MinimalEngine(save_returns=False, entry_count=0)
+    assert empty.save_cache_with_outcome("/tmp/whatever").outcome == "empty"
+
+
+def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_path):
+    """#1100 codex round 7 (#3): ``_read_committed_cache_counts`` must FAIL
+    CLOSED over the WHOLE index. The old loop skipped malformed entries yet
+    returned ``len(entries_list)`` — counting entries it never validated — so a
+    partially-torn index could satisfy ``require_committed_index=True`` and then
+    CRASH the importer at ``entry_meta["index"]`` / ``["num_tokens"]``. Now ANY
+    malformed entry (non-dict, missing / wrong-typed / negative required field)
+    rejects the ENTIRE index (→ ``None``); a fully well-formed index returns the
+    ``(count, total_bytes)`` summed from per-entry ``memory_bytes``.
+    """
+    from vllm_mlx.cache.protocol import _read_committed_cache_counts
+
+    def _write_index(entries):
+        (tmp_path / "index.json").write_text(json.dumps({"entries": entries}))
+        return tmp_path
+
+    def _good(i):
+        return {"index": i, "num_tokens": 4, "memory_bytes": 100}
+
+    # Fully well-formed → (count, summed bytes).
+    _write_index([_good(0), _good(1)])
+    assert _read_committed_cache_counts(tmp_path) == (2, 200)
+
+    # A single malformed entry poisons the whole index (fail-closed → None):
+    malformed_cases = [
+        [_good(0), "not-a-dict"],  # non-dict entry
+        [_good(0), {"num_tokens": 4, "memory_bytes": 100}],  # missing index
+        [_good(0), {"index": 1, "memory_bytes": 100}],  # missing num_tokens
+        [
+            _good(0),
+            {"index": 1, "num_tokens": 4},
+        ],  # missing memory_bytes → 0? no: default 0 OK
+        [_good(0), {"index": -1, "num_tokens": 4, "memory_bytes": 100}],  # negative
+        [_good(0), {"index": True, "num_tokens": 4, "memory_bytes": 100}],  # bool≠int
+        [_good(0), {"index": "1", "num_tokens": 4, "memory_bytes": 100}],  # str
+        [_good(0), {"index": 1, "num_tokens": 4, "memory_bytes": -5}],  # neg bytes
+    ]
+    for entries in malformed_cases:
+        _write_index(entries)
+        # NOTE: memory_bytes defaults to 0 when absent, so the "missing
+        # memory_bytes" case is actually VALID — assert accordingly below.
+        result = _read_committed_cache_counts(tmp_path)
+        if entries[1] == {"index": 1, "num_tokens": 4}:
+            assert result == (2, 100), (
+                f"missing memory_bytes should default 0: {result}"
+            )
+        else:
+            assert result is None, (
+                f"malformed index not rejected: {entries!r} → {result!r}"
+            )
+
+    # No index.json at all → None (empty export).
+    (tmp_path / "index.json").unlink()
+    assert _read_committed_cache_counts(tmp_path) is None

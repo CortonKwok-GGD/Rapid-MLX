@@ -297,16 +297,37 @@ class BaseEngine(ABC):
         round 4 #2).
 
         Declared here (not behind a ``hasattr`` guard in the route — the #500
-        silent-skip shape) so the cache route can call it directly. The
-        default delegates to ``save_cache_to_disk`` and infers the outcome
-        from its bool; real engines override to compute the outcome IN the
-        step-thread task alongside the save (closing the cross-path race where
-        a cache-global outcome field is clobbered between op and read).
+        silent-skip shape) so the cache route can call it directly. Real
+        engines override to compute the outcome IN the step-thread task
+        alongside the save (closing the cross-path race where a cache-global
+        outcome field is clobbered between op and read).
+
+        #1100 codex round 7 (#2): the default must NOT map every ``False`` from
+        ``save_cache_to_disk`` to ``"empty"`` — that method also returns
+        ``False`` for a NON-empty cache that failed to commit any entry, so a
+        subclass overriding only ``save_cache_to_disk`` (not this method) would
+        report a FAILED export as a successful empty snapshot (the export route
+        then publishes an empty manifest instead of 500ing). Disambiguate via
+        authoritative cache state: ``True`` → ``"committed"``; ``False`` with a
+        cache that still reports entries → ``"failed"``; ``False`` with an empty
+        / absent cache → ``"empty"``.
         """
         from ..cache.protocol import SaveOutcome
 
         saved = self.save_cache_to_disk(cache_dir, should_abort=should_abort)
-        return SaveOutcome(outcome="committed" if saved else "empty")
+        if saved:
+            return SaveOutcome(outcome="committed")
+        # Not committed — distinguish a genuine empty no-op from a failed save
+        # by asking the cache how many entries it holds. A nonzero count means
+        # the save had work to do and dropped it: that's a failure, not empty.
+        entry_count = 0
+        try:
+            stats = self.get_cache_stats()
+            if stats is not None:
+                entry_count = int(stats.get("entry_count", 0) or 0)
+        except Exception:  # pragma: no cover — defensive against odd stats shapes
+            entry_count = 0
+        return SaveOutcome(outcome="failed" if entry_count > 0 else "empty")
 
     def load_cache_with_result(self, cache_dir: str, replace: bool = False):
         """Load the prefix cache and return a ``LoadResult`` (#1100 codex

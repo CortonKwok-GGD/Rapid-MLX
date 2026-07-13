@@ -312,10 +312,22 @@ def _read_committed_cache_counts(cache_dir: str | Path) -> tuple[int, int] | Non
     the total matches the bytes a peer can actually load, not the pre-
     verify ``total_memory_bytes`` snapshot.
 
-    Returns ``None`` when there is no readable committed index — an empty
-    export (``save_to_disk`` writes no ``index.json`` for 0 entries) or a
-    disabled prefix cache. The caller then falls back to the live ledger,
-    which correctly reports 0/0 for those cases.
+    Returns ``None`` when there is no readable, WELL-FORMED committed index —
+    an empty export (``save_to_disk`` writes no ``index.json`` for 0 entries),
+    a disabled prefix cache, OR a torn/malformed index. The caller uses the
+    ``None``/count distinction to decide fallback-vs-fail:
+    ``build_manifest_from_engine_state(require_committed_index=True)`` (a
+    committed save) treats ``None`` as an error and discards the export; the
+    live-ledger fallback (empty / disabled cache) correctly reports 0/0.
+
+    #1100 codex round 7 (#3): validation is FAIL-CLOSED over the WHOLE index —
+    if ANY entry is malformed (not a dict, or missing / wrong-typed / negative
+    ``index`` / ``num_tokens`` / ``memory_bytes``) the entire index is rejected
+    (``None``). The old loop ``continue``d past malformed entries yet returned
+    ``len(entries_list)`` — counting entries it hadn't validated — so a
+    partially-torn index could pass ``require_committed_index`` here and then
+    CRASH the importer at ``entry_meta["index"]`` / ``["num_tokens"]``. Every
+    counted entry must therefore carry exactly the fields the importer reads.
     """
     try:
         index_path = Path(cache_dir) / "index.json"
@@ -327,14 +339,31 @@ def _read_committed_cache_counts(cache_dir: str | Path) -> tuple[int, int] | Non
         entries_list = data.get("entries")
         if not isinstance(entries_list, list):
             return None
+
+        def _valid_nonneg_int(v: object) -> bool:
+            # Reject bool (a JSON true/false is an int subclass) and negatives;
+            # accept a whole-valued float (json may parse 5.0). ``index`` and
+            # ``num_tokens`` are indices/counts, so they must be nonneg ints.
+            if isinstance(v, bool):
+                return False
+            if isinstance(v, int):
+                return v >= 0
+            if isinstance(v, float):
+                return v >= 0 and v.is_integer()
+            return False
+
         total = 0
         for entry in entries_list:
             if not isinstance(entry, dict):
-                continue
+                return None
+            # Fields the importer (memory_cache.load_from_disk) dereferences.
+            if not _valid_nonneg_int(entry.get("index")):
+                return None
+            if not _valid_nonneg_int(entry.get("num_tokens")):
+                return None
             mb = entry.get("memory_bytes", 0)
-            # Reject bool (JSON true/false) even though it's an int subclass.
-            if isinstance(mb, bool) or not isinstance(mb, (int, float)):
-                continue
+            if isinstance(mb, bool) or not isinstance(mb, (int, float)) or mb < 0:
+                return None
             total += int(mb)
         return len(entries_list), total
     except Exception:  # pragma: no cover — defensive against a torn index

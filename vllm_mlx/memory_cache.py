@@ -2863,16 +2863,19 @@ class MemoryAwarePrefixCache:
         staged_memory = 0 if replace else self._current_memory
         replace_aborted = False
 
-        # #1100 codex round 6 (#3): replace mode holds the EXISTING cache in
-        # memory alongside the growing staged set until the swap. Snapshot its
-        # footprint and the available physical RAM ONCE up front so we can admit
-        # each staged entry only while both fit — bounding the transient ~2×
-        # peak against real host memory, not just the logical ``_max_memory``
-        # cap (a host can be configured with a cache cap larger than its free
-        # RAM, or already be near it). 0 available (psutil missing) disables the
-        # physical check and falls back to the logical cap alone, preserving
-        # prior behavior on hosts without psutil.
-        replace_existing_bytes = self._current_memory if replace else 0
+        # #1100 codex round 6 (#3) → round 7 (#4): replace mode holds the
+        # EXISTING cache in memory alongside the growing staged set until the
+        # swap, so the NEW allocation the import adds is the STAGED blob. We
+        # admit each staged entry only while that INCREMENTAL staged allocation
+        # (``staged_so_far + this_entry``) fits within a safe fraction of
+        # currently-available physical RAM. Round-7 fix: do NOT add the existing
+        # cache to the left side — ``psutil.virtual_memory().available`` ALREADY
+        # excludes the resident existing cache (it's live process memory), so
+        # adding ``replace_existing_bytes`` double-counted it and wrongly
+        # rejected safe replacements on memory-constrained hosts. The budget is
+        # the headroom for NEW allocations; the staged blob is exactly that new
+        # allocation. 0 available (psutil missing) disables the check and falls
+        # back to the logical ``_max_memory`` cap alone.
         phys_admission_budget = 0
         if replace:
             avail = _get_available_memory()
@@ -3026,28 +3029,32 @@ class MemoryAwarePrefixCache:
                     )
                     break
 
-                # #1100 codex round 6 (#3): replace-mode PHYSICAL-headroom
-                # admission. The existing cache stays resident until the swap,
-                # so the co-resident cost is ``existing + staged_so_far +
-                # this_entry``. If that would blow past our safe fraction of
-                # currently-available RAM, ABORT the whole replace (existing
-                # cache preserved, nothing loaded) rather than push the host
-                # into swap / OOM-kill mid-import. This is a hard safety abort,
-                # not the soft logical-cap ``break`` above — a partial replace
-                # would silently drop entries, so we fail closed and keep the
-                # old cache. Skipped when psutil is unavailable (budget 0).
+                # #1100 codex round 6 (#3) → round 7 (#4): replace-mode
+                # PHYSICAL-headroom admission. The existing cache stays resident
+                # until the swap, so the NEW allocation this import adds is the
+                # STAGED blob (``staged_so_far + this_entry``). Available RAM
+                # already excludes the resident existing cache, so we compare
+                # ONLY that incremental staged allocation against the headroom
+                # budget — NOT ``existing + staged`` (which double-counted the
+                # already-resident existing cache and wrongly rejected safe
+                # replacements). If the incremental allocation would blow past
+                # the budget, ABORT the whole replace (existing cache preserved,
+                # nothing loaded) rather than push the host into swap / OOM-kill.
+                # A hard safety abort, not the soft logical-cap ``break`` above —
+                # a partial replace would silently drop entries. Skipped when
+                # psutil is unavailable (budget 0).
                 if phys_admission_budget > 0:
-                    co_resident = replace_existing_bytes + staged_memory + memory
-                    if co_resident > phys_admission_budget:
+                    incremental_staged = staged_memory + memory
+                    if incremental_staged > phys_admission_budget:
                         logger.warning(
                             "[cache_persist] replace ABORTED: staging entry %d "
-                            "would need %.0fMB co-resident (existing %.0fMB + "
-                            "staged %.0fMB + entry %.0fMB) — exceeds physical "
-                            "headroom budget %.0fMB (%.0f%% of available RAM); "
-                            "existing cache left intact, nothing loaded",
+                            "needs %.0fMB new staged allocation (staged %.0fMB + "
+                            "entry %.0fMB) — exceeds physical headroom budget "
+                            "%.0fMB (%.0f%% of available RAM, existing cache "
+                            "already resident); existing cache left intact, "
+                            "nothing loaded",
                             i,
-                            co_resident / _BYTES_PER_MB,
-                            replace_existing_bytes / _BYTES_PER_MB,
+                            incremental_staged / _BYTES_PER_MB,
                             staged_memory / _BYTES_PER_MB,
                             memory / _BYTES_PER_MB,
                             phys_admission_budget / _BYTES_PER_MB,
