@@ -39,6 +39,7 @@ enforced when ``--api-key`` is set, no new header is invented.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -98,29 +99,82 @@ router = APIRouter(
 )
 
 
-# #1100 codex round 3 (findings #2/#5): serialize the whole export
-# transaction (save → manifest → committed-size gate → publish/discard) PER
-# RESOLVED DESTINATION. Two concurrent exports to the same path could
-# otherwise interleave so one request writes a manifest for another's
-# snapshot, or the over-cap cleanup of one deletes the newer snapshot the
-# other just committed. A per-destination asyncio.Lock makes the destination
-# a single-writer resource. Keyed on the resolved absolute path string so
-# distinct destinations still run concurrently. (The engine already
-# serializes the KV materialization on its mlx-step thread; this guards the
+# #1100 codex round 3 (findings #2/#5): serialize the whole export/import
+# transaction (save → manifest → committed-size gate → publish/discard, or
+# manifest-read → load) PER RESOLVED DESTINATION. Two concurrent operations on
+# the same path could otherwise interleave so one writes a manifest for
+# another's snapshot, or an import loads a blob a concurrent export swapped
+# after the manifest validated. A per-destination asyncio.Lock makes the path
+# a single-writer resource; distinct paths still run concurrently. (The engine
+# already serializes KV materialization on its mlx-step thread; this guards the
 # route-side filesystem transaction around it.)
-_export_dest_locks: dict[str, asyncio.Lock] = {}
+#
+# #1100 codex round 4 (#5): the lock registry is REFERENCE-COUNTED so it can't
+# grow without bound. The round-3 version cached an ``asyncio.Lock`` per
+# caller-selected path FOREVER — every unique path (including a missing-source
+# import that 404s) left a permanent dict entry, an unbounded-memory footgun
+# under adversarial or high-cardinality path use. Now each entry tracks how
+# many holders/waiters reference it and is EVICTED when the last one releases,
+# so the registry only ever holds locks for paths with a transaction in flight.
+_export_dest_locks: dict[str, _RefCountedLock] = {}
 _export_locks_guard = asyncio.Lock()
 
 
-async def _acquire_dest_lock(destination: Path) -> asyncio.Lock:
-    """Return (creating if needed) the per-destination export lock."""
-    key = str(destination)
-    async with _export_locks_guard:
-        lock = _export_dest_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _export_dest_locks[key] = lock
-        return lock
+class _RefCountedLock:
+    """An ``asyncio.Lock`` plus a reference count for registry eviction."""
+
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0
+
+
+class _dest_lock:
+    """Async context manager: acquire the per-destination lock for ``key``,
+    reference-counted so the registry entry is evicted when idle (#1100 codex
+    round 4 #5).
+
+    Usage::
+
+        async with _dest_lock(path), _InterProcessLock(path):
+            ...
+
+    The ref count is bumped under ``_export_locks_guard`` on entry (so a
+    concurrent waiter keeps the entry alive) and decremented on exit; the entry
+    is removed only when it drops to 0 AND the lock is not held.
+    """
+
+    __slots__ = ("_key", "_entry")
+
+    def __init__(self, key: Path | str) -> None:
+        self._key = str(key)
+        self._entry: _RefCountedLock | None = None
+
+    async def __aenter__(self) -> asyncio.Lock:
+        async with _export_locks_guard:
+            entry = _export_dest_locks.get(self._key)
+            if entry is None:
+                entry = _RefCountedLock()
+                _export_dest_locks[self._key] = entry
+            entry.refs += 1
+            self._entry = entry
+        await entry.lock.acquire()
+        return entry.lock
+
+    async def __aexit__(self, *exc: object) -> None:
+        entry = self._entry
+        self._entry = None
+        if entry is None:  # pragma: no cover — defensive
+            return
+        entry.lock.release()
+        async with _export_locks_guard:
+            entry.refs -= 1
+            # Evict only when no other holder/waiter references this key AND
+            # the lock is free — avoids removing an entry another coroutine is
+            # about to acquire (it holds its own ref, so refs>0 protects it).
+            if entry.refs <= 0 and not entry.lock.locked():
+                _export_dest_locks.pop(self._key, None)
 
 
 # #1100 codex round 4 (#5): the per-destination ``asyncio.Lock`` above is
@@ -163,6 +217,19 @@ class _InterProcessLock:
             import fcntl
 
             def _acquire() -> int:
+                # #1100 codex round 4 (#4): create the lockfile's parent dir
+                # FIRST. For a NESTED destination (e.g. ``sub/snap``) whose
+                # parent doesn't exist yet on a first export, ``os.open`` of
+                # ``sub/snap.txlock`` would raise ENOENT — the old code caught
+                # that as "flock unavailable" and SILENTLY disabled cross-
+                # process exclusion while competing processes still shared the
+                # fixed ``.new``/``.old`` staging paths. Ensuring the parent
+                # exists makes the lock reliably acquirable for real nested
+                # paths; a genuine flock-unsupported filesystem still degrades
+                # gracefully below.
+                parent = os.path.dirname(self._lock_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -446,20 +513,72 @@ def _committed_dir_size(destination: Path) -> int:
 _IMPORT_CRITICAL_NAMES = (MANIFEST_FILENAME, "index.json")
 
 
+def _has_committed_index(d: Path) -> bool:
+    """True if ``d`` holds a readable ``index.json`` with >=1 declared entry.
+
+    Cheap validity check used before deleting a staging dir — mirrors the
+    ``_has_valid_index`` recovery gate inside
+    ``MemoryAwarePrefixCache.load_from_disk`` (a zero-entry index is
+    degenerate and treated as no snapshot).
+    """
+    p = d / "index.json"
+    if not p.is_file():
+        return False
+    try:
+        obj = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(obj, dict) and bool(obj.get("entries"))
+
+
 def _sweep_staging_dirs(destination: Path) -> None:
-    """Remove the ``.new``/``.old`` staging dirs a FAILED save may have left.
+    """Clean up staging dirs a FAILED save left, WITHOUT destroying a
+    recoverable snapshot.
 
     #1100 codex round 3 (#2): ``save_to_disk`` writes into ``<dest>.new`` and
-    only atomically renames it onto ``<dest>`` on success. A non-committing
-    save leaves those sibling staging dirs behind but does NOT touch the
-    published ``<dest>`` (which may hold a previously-valid snapshot). So on a
-    failed save we sweep ONLY the staging siblings — never ``destination``
-    itself — to avoid destroying a prior good snapshot the failure never
-    modified. Best-effort: a leftover staging dir is an operator-log concern.
+    commits via a 3-step swap (``dest → .old``, ``.new → dest``, ``rm .old``).
+    A non-committing save usually leaves ``<dest>`` untouched and only orphans
+    the staging siblings — so we sweep those.
+
+    #1100 codex round 4 (#1): BUT if the save failed mid-swap, ``<dest>`` can
+    be MISSING while the last valid snapshot sits in ``.old`` (dest was already
+    renamed away) or a fully-written-but-unpublished snapshot sits in ``.new``.
+    Blindly deleting both would destroy the only recoverable copy — the exact
+    data loss ``load_from_disk``'s crash recovery exists to prevent. So: if
+    ``<dest>`` lacks a valid committed index, RESTORE one from a staging sibling
+    first (prefer ``.new`` — newer, fully written — then ``.old``, matching
+    ``load_from_disk``'s recovery order), and only THEN remove leftovers. When
+    ``<dest>`` already holds a valid snapshot, both siblings are safe to drop.
+    Best-effort: failures are operator-log concerns.
     """
     base = str(destination).rstrip(os.sep)
-    for suffix in (".new", ".old"):
-        staging = Path(base + suffix)
+    new_dir = Path(base + ".new")
+    old_dir = Path(base + ".old")
+
+    # Recover a snapshot into ``destination`` if it's missing/invalid and a
+    # sibling holds a valid one. Never overwrite a valid published dest.
+    if not _has_committed_index(destination):
+        for cand in (new_dir, old_dir):
+            if _has_committed_index(cand):
+                try:
+                    if destination.exists():
+                        shutil.rmtree(destination, ignore_errors=True)
+                    os.rename(cand, destination)
+                    logger.warning(
+                        "cache/export: recovered a valid snapshot from %s → %s "
+                        "after a failed save (staging would otherwise be swept)",
+                        cand,
+                        destination,
+                    )
+                    break
+                except OSError as exc:  # pragma: no cover — defensive
+                    logger.error(
+                        "cache/export: could not recover snapshot from %s: %s",
+                        cand,
+                        exc,
+                    )
+
+    for staging in (new_dir, old_dir):
         if staging.exists():
             try:
                 shutil.rmtree(staging, ignore_errors=True)
@@ -663,29 +782,29 @@ async def export_cache(req: ExportRequest):
     # paths. Order matters: take the process-local lock FIRST (cheap, always
     # works), then the filesystem lock — so a single instance's queued requests
     # never each block a worker thread on ``flock`` acquisition.
-    dest_lock = await _acquire_dest_lock(destination)
-    async with dest_lock, _InterProcessLock(destination):
+    async with _dest_lock(destination), _InterProcessLock(destination):
         # Snapshot to disk. Routed through the mlx-step worker thread inside
         # the engine (that's where the KV arrays are materializable). Returns
         # True if at least one entry committed; False for an empty / no-op
         # cache. Run in a threadpool so the asyncio loop isn't blocked by the
         # (potentially multi-GB) write.
-        saved = await anyio.to_thread.run_sync(
-            engine.save_cache_to_disk, str(destination)
-        )
-
-        # #1100 codex round 4 (#1): read the AUTHORITATIVE outcome the save
-        # op recorded INSIDE the step thread — no racy pre-write snapshot.
-        #   "committed" → >=1 entry landed + published (saved is True)
+        # #1100 codex round 4 (#1/#2): get the AUTHORITATIVE save outcome as a
+        # RETURN VALUE computed in the SAME step-thread task as the save — not
+        # by reading a cache-global ``_last_save_outcome`` field on the asyncio
+        # thread, which a concurrent export to ANOTHER destination (distinct
+        # lock) could overwrite in the gap between op and read. Outcome ∈:
+        #   "committed" → >=1 entry landed + atomically published
         #   "empty"     → the cache genuinely held 0 entries (legit no-op)
         #   "failed"    → had entries but nothing committed (staging vanished,
         #                 post-write verify dropped all, rename never landed)
-        # ``getattr`` default keeps the handler robust if the cache couldn't
-        # be resolved (embedded engines): fall back to inferring from the
-        # bool — True→committed, False→empty (there was no cache to fail).
-        save_outcome = getattr(
-            cache, "_last_save_outcome", "committed" if saved else "empty"
+        # ``save_cache_with_outcome`` is declared on ``BaseEngine`` (route-layer
+        # contract) so every real engine has it — no ``hasattr`` guard (the
+        # #500 silent-skip shape the route-contract test forbids).
+        outcome_obj = await anyio.to_thread.run_sync(
+            engine.save_cache_with_outcome, str(destination)
         )
+        save_outcome = outcome_obj.outcome
+        saved = save_outcome == "committed"
 
         # A non-empty cache whose save committed NOTHING is a FAILURE, not an
         # empty export (#1100 BLOCKING-3). #1100 codex round 3 (#2): the
@@ -861,8 +980,7 @@ async def import_cache(req: ImportRequest):
     # the step-thread load both run via ``anyio.to_thread.run_sync`` /
     # ``_read_manifest_or_http``, so the async lock is held across true awaits,
     # never a CPU-bound spin.
-    dest_lock = await _acquire_dest_lock(source)
-    async with dest_lock, _InterProcessLock(source):
+    async with _dest_lock(source), _InterProcessLock(source):
         manifest = _read_manifest_or_http(source)
 
         if manifest.protocol_version != req.expected_protocol_version:
@@ -969,26 +1087,22 @@ async def import_cache(req: ImportRequest):
         # are skipped).
         cache = _prefix_cache(engine)
 
-        # Hydrate from disk. Routed through the mlx-step worker thread so the
-        # loaded arrays are tagged with the right generation_stream. ``replace``
-        # is passed positionally to fit ``anyio.to_thread.run_sync``'s *args.
-        entries_loaded = await anyio.to_thread.run_sync(
-            engine.load_cache_from_disk, str(source), replace
+        # Hydrate from disk. #1100 codex round 4 (#2/#3): the entries count AND
+        # the loaded-byte total are computed in the SAME step-thread task and
+        # returned as ONE ``LoadResult`` — the byte total is summed under the
+        # cache lock over the entries THIS load installed (0 for an empty load
+        # or an aborted replace). Returning it as a value (rather than reading
+        # a cache-global ``_last_load_bytes`` field on the asyncio thread)
+        # closes the cross-path race where a concurrent load to another
+        # destination could clobber the field between op and read. ``replace``
+        # is positional to fit ``anyio.to_thread.run_sync``'s *args.
+        # ``load_cache_with_result`` is a ``BaseEngine`` route-layer-contract
+        # method — present on every real engine, so no ``hasattr`` guard.
+        load_result = await anyio.to_thread.run_sync(
+            engine.load_cache_with_result, str(source), replace
         )
-
-    # #1100 codex round 4 (#3): the loaded byte total is now computed INSIDE
-    # ``load_from_disk`` (under its lock, summed over the entries this call
-    # actually installed) and recorded on the cache as ``_last_load_bytes``.
-    # We read that authoritative value instead of diffing ``_current_memory``
-    # before/after on the asyncio thread, where a concurrent store/evict on
-    # the step thread could skew the delta (and where a merge/replace/aborted
-    # path each needed different snapshot arithmetic). It is already 0 for an
-    # empty load, an aborted replace, or a resolvable-but-untouched cache.
-    # ``getattr`` default 0 keeps the handler robust for engine shapes whose
-    # cache we can't resolve (bytes_loaded is best-effort, not a gate).
-    bytes_loaded = (
-        int(getattr(cache, "_last_load_bytes", 0)) if cache is not None else 0
-    )
+        entries_loaded = load_result.entries
+        bytes_loaded = load_result.bytes_loaded
 
     entries_skipped = max(0, manifest.entries - entries_loaded)
     logger.info(

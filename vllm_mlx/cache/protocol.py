@@ -33,6 +33,40 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = "1"
 MANIFEST_FILENAME = "manifest.json"
 
+
+@dataclass(frozen=True)
+class SaveOutcome:
+    """Operation-specific result of one cache save (#1100 codex round 4 #2).
+
+    Returned DIRECTLY from the engine save call so the export route never
+    reads a cache-global ``_last_save_outcome`` field that a concurrent
+    save to ANOTHER destination (distinct per-destination lock) could
+    overwrite between the op and the read.
+
+    ``outcome`` is one of:
+      * ``"empty"``     — the cache held 0 entries (a legit no-op export)
+      * ``"committed"`` — >=1 entry committed + atomically published
+      * ``"failed"``    — the cache had entries but nothing committed
+    """
+
+    outcome: str
+
+
+@dataclass(frozen=True)
+class LoadResult:
+    """Operation-specific result of one cache load (#1100 codex round 4 #2).
+
+    ``entries`` is the count loaded; ``bytes_loaded`` is the exact KV byte
+    total this load installed (0 on an empty load or an aborted replace).
+    Returned directly from the engine load call so the import route never
+    reads a cache-global ``_last_load_bytes`` field a concurrent load to
+    another path could clobber.
+    """
+
+    entries: int
+    bytes_loaded: int
+
+
 # Default sandbox root for export/import paths. Overridable via the
 # ``RAPID_MLX_CACHE_EXPORT_DIR`` env var. All caller-supplied paths must
 # resolve inside this directory after symlink expansion — otherwise a

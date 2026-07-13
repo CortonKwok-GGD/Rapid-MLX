@@ -292,6 +292,43 @@ class BaseEngine(ABC):
         """Get cache statistics. Override in subclasses."""
         return None
 
+    def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
+        """Save the prefix cache and return a ``SaveOutcome`` (#1100 codex
+        round 4 #2).
+
+        Declared here (not behind a ``hasattr`` guard in the route — the #500
+        silent-skip shape) so the cache route can call it directly. The
+        default delegates to ``save_cache_to_disk`` and infers the outcome
+        from its bool; real engines override to compute the outcome IN the
+        step-thread task alongside the save (closing the cross-path race where
+        a cache-global outcome field is clobbered between op and read).
+        """
+        from ..cache.protocol import SaveOutcome
+
+        saved = self.save_cache_to_disk(cache_dir, should_abort=should_abort)
+        return SaveOutcome(outcome="committed" if saved else "empty")
+
+    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+        """Load the prefix cache and return a ``LoadResult`` (#1100 codex
+        round 4 #2).
+
+        Same rationale as ``save_cache_with_outcome``. The default delegates
+        to ``load_cache_from_disk`` and reports 0 loaded bytes (the count is
+        authoritative; bytes are best-effort for engines that don't override).
+        """
+        from ..cache.protocol import LoadResult
+
+        entries = self.load_cache_from_disk(cache_dir, replace=replace)
+        return LoadResult(entries=entries, bytes_loaded=0)
+
+    def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
+        """Persist the prefix cache. Override in subclasses that have one."""
+        return False
+
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+        """Hydrate the prefix cache. Override in subclasses that have one."""
+        return 0
+
     async def abort_request(self, request_id: str) -> bool:
         """Abort an active or queued request when the engine supports it."""
         return False

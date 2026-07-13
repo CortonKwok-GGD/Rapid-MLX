@@ -2723,6 +2723,26 @@ class BatchedEngine(BaseEngine):
             return self._engine.load_cache_from_disk(cache_dir, replace=replace)
         return 0
 
+    def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
+        """Forward to the inner engine's outcome-returning save (#1100 codex
+        round 4 #2). Returns a ``SaveOutcome`` computed on the step thread."""
+        if self._engine:
+            return self._engine.save_cache_with_outcome(
+                cache_dir, should_abort=should_abort
+            )
+        from ..cache.protocol import SaveOutcome
+
+        return SaveOutcome(outcome="empty")
+
+    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+        """Forward to the inner engine's result-returning load (#1100 codex
+        round 4 #2). Returns a ``LoadResult`` computed on the step thread."""
+        if self._engine:
+            return self._engine.load_cache_with_result(cache_dir, replace=replace)
+        from ..cache.protocol import LoadResult
+
+        return LoadResult(entries=0, bytes_loaded=0)
+
     # ------------------------------------------------------------------
     # Guided generation (JSON schema constrained decoding via outlines)
     # ------------------------------------------------------------------

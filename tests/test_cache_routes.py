@@ -151,6 +151,33 @@ class _FakeEngine:
             cache._last_load_bytes = self._loaded_bytes if self._load_returns else 0
         return self._load_returns
 
+    def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
+        """#1100 codex round 4 (#2): run the save stub then return the
+        authoritative outcome as a value — mirrors the real engine wrapper that
+        captures the outcome in the SAME step-thread task as the save."""
+        from vllm_mlx.cache.protocol import SaveOutcome
+
+        self.save_cache_to_disk(cache_dir, should_abort=should_abort)
+        cache = self._resolve_cache()
+        outcome = (
+            getattr(cache, "_last_save_outcome", "empty")
+            if cache is not None
+            else "empty"
+        )
+        return SaveOutcome(outcome=outcome)
+
+    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+        """#1100 codex round 4 (#2): run the load stub then return the entries
+        count + loaded bytes as a value (same step-thread capture semantics)."""
+        from vllm_mlx.cache.protocol import LoadResult
+
+        entries = self.load_cache_from_disk(cache_dir, replace=replace)
+        cache = self._resolve_cache()
+        bytes_loaded = (
+            int(getattr(cache, "_last_load_bytes", 0)) if cache is not None else 0
+        )
+        return LoadResult(entries=entries, bytes_loaded=bytes_loaded)
+
     def _entry_count(self) -> int:
         cache = self.scheduler.memory_aware_cache
         return len(cache._entries) if cache is not None else 0
@@ -1424,11 +1451,15 @@ async def test_interprocess_lock_serializes_and_uses_sibling_path(tmp_path):
 
     from vllm_mlx.routes.cache import _InterProcessLock
 
+    # #1100 codex round 4 (#4): the parent dir does NOT exist yet — the lock
+    # must create it, not silently degrade to no-exclusion on ENOENT.
     dest = tmp_path / "sub" / "snap"
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    assert not dest.parent.exists()
 
     lock_a = _InterProcessLock(dest)
     async with lock_a:
+        # The lock actually acquired an fd (not the degraded None path).
+        assert lock_a._fd is not None, "flock degraded on a nested path (ENOENT)"
         # The lockfile is a sibling of ``dest``, not a child under it.
         sibling = tmp_path / "sub" / "snap.txlock"
         assert sibling.exists()
@@ -1446,6 +1477,167 @@ async def test_interprocess_lock_serializes_and_uses_sibling_path(tmp_path):
     # Once A releases, B acquires promptly.
     await _asyncio.wait_for(acquire_b, timeout=2.0)
     await lock_b.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_dest_lock_registry_evicts_idle_entries():
+    """#1100 codex round 4 (#5): the per-destination lock registry is
+    reference-counted — an entry is evicted once the last holder releases it,
+    so a stream of unique paths can't grow it without bound. A concurrent
+    waiter keeps the entry alive; it disappears only when fully idle."""
+    import asyncio as _asyncio
+
+    import vllm_mlx.routes.cache as cache_mod
+    from vllm_mlx.routes.cache import _dest_lock
+
+    cache_mod._export_dest_locks.clear()
+    cache_mod._export_locks_guard = _asyncio.Lock()
+
+    # A single acquire+release leaves the registry empty (idle → evicted).
+    async with _dest_lock("path-a"):
+        assert "path-a" in cache_mod._export_dest_locks
+        assert cache_mod._export_dest_locks["path-a"].refs == 1
+    assert "path-a" not in cache_mod._export_dest_locks
+
+    # Overlapping holders keep the entry until the LAST releases.
+    started = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def _hold():
+        async with _dest_lock("path-b"):
+            started.set()
+            await release.wait()
+
+    holder = _asyncio.ensure_future(_hold())
+    await started.wait()
+    assert cache_mod._export_dest_locks["path-b"].refs == 1
+    release.set()
+    await holder
+    assert "path-b" not in cache_mod._export_dest_locks
+
+
+def test_import_missing_source_does_not_leak_lock_entry(cache_client):
+    """#1100 codex round 4 (#5): a missing-source import 404s, and its lock
+    entry must NOT linger in the registry afterward (the round-3 version
+    inserted an entry for every path, so 404-spamming unique paths grew the
+    dict unboundedly)."""
+    import vllm_mlx.routes.cache as cache_mod
+
+    cache_client.cfg.engine = cache_client.FakeEngine(entries=0)
+    before = dict(cache_mod._export_dest_locks)
+    resp = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "no-such-export", "merge_strategy": "merge"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 404, resp.text
+    # No new permanent entry for the missing path.
+    assert cache_mod._export_dest_locks == before
+
+
+def test_sweep_staging_dirs_recovers_old_snapshot(tmp_path):
+    """#1100 codex round 4 (#1): if a save failed mid-swap leaving ``<dest>``
+    MISSING and the last valid snapshot in ``<dest>.old``, ``_sweep_staging_
+    dirs`` must RESTORE ``.old`` → ``<dest>`` before removing staging — not
+    blindly delete both (which would destroy the only recoverable copy)."""
+    from pathlib import Path as _Path
+
+    from vllm_mlx.routes.cache import _sweep_staging_dirs
+
+    dest = _Path(tmp_path / "snap")
+    old_dir = _Path(str(dest) + ".old")
+    new_dir = _Path(str(dest) + ".new")
+    # Simulate a save interrupted after ``dest → .old`` but before ``.new →
+    # dest``: dest is gone, .old holds the valid prior snapshot, .new holds a
+    # half-written (invalid) staging dir.
+    old_dir.mkdir(parents=True)
+    (old_dir / "index.json").write_text('{"version":3,"entries":[{"index":0}]}')
+    (old_dir / "entry_0.safetensors").write_text("data")
+    new_dir.mkdir(parents=True)  # invalid: no index.json
+
+    _sweep_staging_dirs(dest)
+
+    # The valid .old snapshot was restored to dest; staging siblings are gone.
+    assert dest.is_dir()
+    assert (dest / "index.json").exists()
+    assert (dest / "entry_0.safetensors").exists()
+    assert not old_dir.exists()
+    assert not new_dir.exists()
+
+
+def test_sweep_staging_dirs_preserves_valid_published_dest(tmp_path):
+    """#1100 codex round 4 (#1) complement: when ``<dest>`` already holds a
+    valid published snapshot, ``_sweep_staging_dirs`` leaves it untouched and
+    only removes the orphaned staging siblings."""
+    from pathlib import Path as _Path
+
+    from vllm_mlx.routes.cache import _sweep_staging_dirs
+
+    dest = _Path(tmp_path / "snap")
+    dest.mkdir(parents=True)
+    (dest / "index.json").write_text('{"version":3,"entries":[{"index":0}]}')
+    (dest / "entry_0.safetensors").write_text("published")
+    new_dir = _Path(str(dest) + ".new")
+    new_dir.mkdir(parents=True)
+    (new_dir / "index.json").write_text("{}")  # orphan staging
+
+    _sweep_staging_dirs(dest)
+
+    assert (dest / "entry_0.safetensors").read_text() == "published"
+    assert not new_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_export_outcome_isolated_across_concurrent_paths(cache_client):
+    """#1100 codex round 4 (#2): the save outcome is returned as a VALUE from
+    the step-thread op, not read from a cache-global field on the asyncio
+    thread — so two concurrent exports to DIFFERENT paths (distinct locks,
+    same underlying cache) can't cross-contaminate each other's classification.
+    One path's save legitimately commits; another's legitimately fails; each
+    handler must report ITS OWN outcome."""
+    import asyncio as _asyncio
+
+    import httpx
+    from fastapi import FastAPI
+
+    import vllm_mlx.routes.cache as cache_mod
+    from vllm_mlx.routes.cache import router
+
+    engine = cache_client.FakeEngine(entries=3, current_memory=1024)
+
+    # The save's outcome depends on the destination: 'committed' for "good",
+    # 'failed' for "bad". Both mutate the SAME shared cache field; the route
+    # must NOT read that field (it reads the returned value instead).
+    def _save(cache_dir, should_abort=None):
+        engine.saved_to = cache_dir
+        cache = engine.scheduler.memory_aware_cache
+        if str(cache_dir).endswith("bad"):
+            cache._last_save_outcome = "failed"
+            return False
+        cache._last_save_outcome = "committed"
+        return True
+
+    engine.save_cache_to_disk = _save
+    cache_client.cfg.engine = engine
+
+    cache_mod._export_dest_locks.clear()
+    cache_mod._export_locks_guard = _asyncio.Lock()
+
+    app = FastAPI()
+    app.include_router(router)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        good = client.post(
+            "/v1/cache/export", json={"destination": "good"}, headers=_auth()
+        )
+        bad = client.post(
+            "/v1/cache/export", json={"destination": "bad"}, headers=_auth()
+        )
+        r_good, r_bad = await _asyncio.gather(good, bad)
+
+    # Each handler reported its OWN outcome despite sharing the cache field.
+    assert r_good.status_code == 200, r_good.text
+    assert r_bad.status_code == 500, r_bad.text
 
 
 def test_export_discard_quarantines_when_delete_fails(cache_client, monkeypatch):
@@ -2042,6 +2234,44 @@ def test_real_cache_roundtrip_survives_arrays_layer(tmp_path):
     assert "KVCache" in layer_classes, layer_classes
 
 
+def test_load_from_disk_repopulates_radix_index(tmp_path):
+    """#1100 codex round 4 (#3): a load must insert the loaded keys into the
+    radix lookup index, not just ``_entries``/``_sorted_keys``. The round-4
+    atomic-swap clears the radix (replace) / leaves it stale (merge) and the
+    round-4 bug installed entries WITHOUT re-inserting them into the radix —
+    so a radix-backed fetch would MISS every imported entry. Uses the real
+    save/load path (real MLX arrays) into a radix-WIRED destination cache."""
+    import mlx.core as mx
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+    from vllm_mlx.runtime.radix_index import RadixPrefixIndex
+
+    # Real 1-entry snapshot on disk (KVCache + ArraysCache, real arrays).
+    src_cache, load_cfg = _build_cache_with_arrays_layer()
+    for entry in src_cache._entries.values():
+        for layer in entry.cache:
+            state = getattr(layer, "state", None)
+            if state is not None:
+                mx.eval(state)
+    target = str(tmp_path / "radix-snap")
+    with mx.stream(mx.default_stream(mx.default_device())):
+        assert src_cache.save_to_disk(target) is True
+    (src_key,) = src_cache._entries.keys()
+
+    # Destination cache WITH a radix index, replace-import the snapshot.
+    dst = MemoryAwarePrefixCache(
+        model=object(), config=load_cfg, radix_index=RadixPrefixIndex()
+    )
+    with mx.stream(mx.default_stream(mx.default_device())):
+        loaded = dst.load_from_disk(target, replace=True)
+
+    assert loaded == 1
+    # The radix index mirrors ``_entries`` — the imported key is findable via
+    # radix, not just the bisect fallback.
+    assert len(dst._radix_index) == len(dst._entries) == 1
+    assert src_key in dst._radix_index
+
+
 def test_http_export_import_roundtrip_end_to_end(monkeypatch, sandbox):
     """Full HTTP round-trip against the REAL engine cache primitives.
 
@@ -2105,6 +2335,22 @@ def test_http_export_import_roundtrip_end_to_end(monkeypatch, sandbox):
             # load_from_disk path (compat gate included). ``replace`` forwards
             # to the real clear-inside-load contract (#1100 BLOCKING-4).
             return _on_default_stream(dst_cache.load_from_disk, cache_dir, replace)
+
+        def save_cache_with_outcome(self, cache_dir, should_abort=None):
+            # #1100 codex round 4 (#2): run the real save + capture the
+            # authoritative outcome the SAME way the real engine wrapper does.
+            from vllm_mlx.cache.protocol import SaveOutcome
+
+            self.save_cache_to_disk(cache_dir, should_abort=should_abort)
+            return SaveOutcome(outcome=src_cache._last_save_outcome)
+
+        def load_cache_with_result(self, cache_dir, replace=False):
+            from vllm_mlx.cache.protocol import LoadResult
+
+            entries = self.load_cache_from_disk(cache_dir, replace=replace)
+            return LoadResult(
+                entries=entries, bytes_loaded=int(dst_cache._last_load_bytes)
+            )
 
     cfg = reset_config()
     cfg.api_key = "test-secret"

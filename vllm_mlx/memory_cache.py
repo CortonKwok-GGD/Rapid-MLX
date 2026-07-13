@@ -3059,6 +3059,22 @@ class MemoryAwarePrefixCache:
                 self._current_memory += entry.memory_bytes
                 loaded_bytes += entry.memory_bytes
                 bisect.insort(self._sorted_keys, tokens_key)
+                # #1100 codex round 4 (#3): keep the radix lookup index in sync
+                # with ``_entries``. The replace path clears the radix above and
+                # the merge path never touched it — either way the staged keys
+                # must be inserted or a radix-backed fetch would MISS every
+                # imported entry (the bisect path would still find them, but the
+                # radix is the primary lookup when wired). Mirrors ``store()``'s
+                # in-lock radix insert; skips silently in ``hash`` mode.
+                if self._radix_index is not None:
+                    try:
+                        self._radix_index.insert(tokens_key)
+                    except Exception as exc:  # pragma: no cover — defensive
+                        logger.warning(
+                            "[radix] insert failed for %d tokens during load: %s",
+                            len(tokens_key),
+                            exc,
+                        )
 
             self._stats.entry_count = len(self._entries)
             self._stats.current_memory_bytes = self._current_memory

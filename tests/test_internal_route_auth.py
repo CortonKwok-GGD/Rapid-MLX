@@ -240,6 +240,17 @@ def _empty_prefix_cache_engine():
     engine.config = SimpleNamespace(model_name="test-model", model_path=None)
     engine.save_cache_to_disk = MagicMock(return_value=False)
     engine.load_cache_from_disk = MagicMock(return_value=0)
+    # #1100 codex round 4 (#2): the route prefers the outcome/result-returning
+    # engine methods. A bare MagicMock would auto-return a MagicMock whose
+    # ``.entries`` breaks arithmetic — pin real result objects (empty snapshot).
+    from vllm_mlx.cache.protocol import LoadResult, SaveOutcome
+
+    engine.save_cache_with_outcome = MagicMock(
+        return_value=SaveOutcome(outcome="empty")
+    )
+    engine.load_cache_with_result = MagicMock(
+        return_value=LoadResult(entries=0, bytes_loaded=0)
+    )
     return engine
 
 
