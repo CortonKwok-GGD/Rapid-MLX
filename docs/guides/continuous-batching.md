@@ -1,8 +1,7 @@
 # Continuous Batching
 
 Continuous batching enables higher throughput when serving multiple concurrent
-users. It is **on by default** — the `--continuous-batching` flag is accepted
-for back-compat but is a no-op.
+users and is always enabled.
 
 ## Default Behaviour
 
