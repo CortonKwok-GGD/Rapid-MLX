@@ -54,6 +54,7 @@ from ..cache.protocol import (
     MANIFEST_FILENAME,
     PROTOCOL_VERSION,
     CommittedIndexUnreadableError,
+    EngineNotReadyError,
     InvalidExportPathError,  # noqa: F401 — re-exported for _resolve_or_400 callers
     MalformedManifestError,  # noqa: F401 — used via _read_manifest_or_http
     ManifestMismatchError,
@@ -874,9 +875,19 @@ async def export_cache(req: ExportRequest):
         # ``save_cache_with_outcome`` is declared on ``BaseEngine`` (route-layer
         # contract) so every real engine has it — no ``hasattr`` guard (the
         # #500 silent-skip shape the route-contract test forbids).
-        outcome_obj = await anyio.to_thread.run_sync(
-            engine.save_cache_with_outcome, str(destination)
-        )
+        # #1100 codex round 8 (#4): a BatchedEngine whose INNER engine hasn't
+        # started raises ``EngineNotReadyError`` here rather than masking as an
+        # empty snapshot — map it to the same 503 an absent outer engine gets so
+        # "engine not loaded" is one consistent signal.
+        try:
+            outcome_obj = await anyio.to_thread.run_sync(
+                engine.save_cache_with_outcome, str(destination)
+            )
+        except EngineNotReadyError as exc:
+            logger.warning("cache/export: engine not ready — %s", exc)
+            raise HTTPException(
+                status_code=503, detail=_ENGINE_NOT_LOADED_DETAIL
+            ) from exc
         save_outcome = outcome_obj.outcome
         saved = save_outcome == "committed"
 
@@ -1257,9 +1268,17 @@ async def import_cache(req: ImportRequest):
         # is positional to fit ``anyio.to_thread.run_sync``'s *args.
         # ``load_cache_with_result`` is a ``BaseEngine`` route-layer-contract
         # method — present on every real engine, so no ``hasattr`` guard.
-        load_result = await anyio.to_thread.run_sync(
-            engine.load_cache_with_result, str(source), replace
-        )
+        # #1100 codex round 8 (#4): absent inner engine → ``EngineNotReadyError``
+        # → 503 (not a 200 reporting a zero-entry "success").
+        try:
+            load_result = await anyio.to_thread.run_sync(
+                engine.load_cache_with_result, str(source), replace
+            )
+        except EngineNotReadyError as exc:
+            logger.warning("cache/import: engine not ready — %s", exc)
+            raise HTTPException(
+                status_code=503, detail=_ENGINE_NOT_LOADED_DETAIL
+            ) from exc
         entries_loaded = load_result.entries
         bytes_loaded = load_result.bytes_loaded
 

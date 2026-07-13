@@ -2806,6 +2806,31 @@ class MemoryAwarePrefixCache:
         else:
             expected_save_uuid = None
 
+        # #1100 codex round 8 (#1): validate the FULL entries schema BEFORE the
+        # staging loop dereferences ``entry_meta["index"]`` / ``["num_tokens"]``.
+        # The loop below indexes those keys raw; a malformed / torn / hand-
+        # crafted index (non-dict entry, missing or wrong-typed required field)
+        # would otherwise raise ``TypeError``/``KeyError`` mid-load instead of
+        # safely rejecting the snapshot — and in replace mode that raise could
+        # land AFTER the live cache was cleared. Reuse the SAME fail-closed
+        # validator the export/manifest side uses (``protocol.validate_committed_
+        # index_data``) so import and export agree on what "loadable" means.
+        # Refuse the whole load on any violation, leaving the live cache intact
+        # (we have not cleared anything yet).
+        from .cache.protocol import validate_committed_index_data
+
+        _idx_ok, _idx_reason, _idx_count, _idx_total = validate_committed_index_data(
+            index
+        )
+        if not _idx_ok:
+            logger.warning(
+                "[cache_persist] refusing load — malformed index at %s: %s; "
+                "existing cache left intact",
+                index_path,
+                _idx_reason,
+            )
+            return 0
+
         # BLOCKING-1 (#1100 codex round 2): STAGE-then-SWAP for the
         # "replace" merge strategy. The round-1 fix cleared the live cache
         # here — AFTER index.json validated but BEFORE any entry blob was
@@ -3124,7 +3149,24 @@ class MemoryAwarePrefixCache:
         # tally ``loaded``) reflects only entries actually installed+reachable.
         radix_rolled_back = 0
         with self._lock:
+            # #1100 codex round 8 (#2): replace mode clears the live cache
+            # BEFORE installing the staged set. Round 6 (#4) rolled back only
+            # the ONE entry whose radix insert failed — but by then the previous
+            # cache was already gone, so a mid-commit radix failure left a
+            # PARTIAL cache and permanently destroyed the prior one while still
+            # returning a "successful" load. Snapshot the prior cache structures
+            # here so a commit failure can RESTORE the whole prior state (true
+            # all-or-nothing replace). Shallow copies of the containers are
+            # enough — the ``_CacheEntry`` values are immutable snapshots and the
+            # staged install below only rebinds keys, never mutates old entries.
+            replace_snapshot = None
             if replace:
+                replace_snapshot = (
+                    dict(self._entries),
+                    list(self._sorted_keys),
+                    self._current_memory,
+                    self._stats,
+                )
                 self._entries.clear()
                 self._sorted_keys.clear()
                 if self._radix_index is not None:
@@ -3194,6 +3236,48 @@ class MemoryAwarePrefixCache:
                     try:
                         self._radix_index.insert(tokens_key)
                     except Exception as exc:  # pragma: no cover — defensive
+                        # #1100 codex round 8 (#2): in REPLACE mode a radix
+                        # failure here is fatal to the atomicity contract — the
+                        # prior cache was already cleared, so we cannot leave a
+                        # partial cache and claim success. RESTORE the whole
+                        # prior state from the snapshot and abort the load (0
+                        # loaded, existing cache intact), matching the staging-
+                        # phase corruption-abort guarantee. In MERGE mode there
+                        # was no clear, so the round-6 single-entry rollback is
+                        # correct: drop just this unreachable entry, keep the
+                        # rest of the live cache.
+                        if replace and replace_snapshot is not None:
+                            (
+                                _snap_entries,
+                                _snap_sorted,
+                                _snap_mem,
+                                _snap_stats,
+                            ) = replace_snapshot
+                            self._entries.clear()
+                            self._entries.update(_snap_entries)
+                            self._sorted_keys[:] = _snap_sorted
+                            self._current_memory = _snap_mem
+                            self._stats = _snap_stats
+                            if self._radix_index is not None:
+                                try:
+                                    self._radix_index.clear()
+                                    for _k in self._entries:
+                                        self._radix_index.insert(_k)
+                                except Exception as rexc:  # pragma: no cover
+                                    logger.error(
+                                        "[radix] restore after replace abort "
+                                        "failed: %s",
+                                        rexc,
+                                    )
+                            self._last_load_bytes = 0
+                            logger.error(
+                                "[cache_persist] replace ABORTED: radix insert "
+                                "failed mid-commit (%s) — prior cache restored "
+                                "(%d entries), nothing loaded",
+                                exc,
+                                len(self._entries),
+                            )
+                            return 0
                         self._entries.pop(tokens_key, None)
                         self._current_memory -= entry.memory_bytes
                         idx = bisect.bisect_left(self._sorted_keys, tokens_key)

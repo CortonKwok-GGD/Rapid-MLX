@@ -1473,22 +1473,29 @@ async def test_export_concurrent_same_destination_serialized(cache_client):
 
 @pytest.mark.asyncio
 async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
-    """#1100 codex round 4 (#4) + round 6 (#5): the import handler holds the
-    SAME per-destination lock export uses, from manifest read THROUGH load, so
-    a concurrent export to the same path can't swap ``index.json`` /
+    """#1100 codex round 4 (#4) + round 6 (#5) + round 8 (#5): the import handler
+    holds the SAME per-destination lock export uses, from manifest read THROUGH
+    load, so a concurrent export to the same path can't swap ``index.json`` /
     ``manifest.json`` between our manifest validation and the load.
 
-    Round-6 strengthening: the round-4 version only asserted that the two
-    instrumented save/load critical sections never OVERLAP (peak==1). That
-    passes even for a broken implementation that RELEASES the lock between
-    manifest validation and the load and re-takes it only around the load —
-    because save and load would still not overlap. To actually prove the lock
-    spans validate→load, the concurrent export here REPLACES the on-disk
-    manifest+index while the import is mid-flight, and the import's load records
-    the manifest ``model_id`` it observes ON DISK at load time. If the lock
-    truly covers validate→load, the load must see the ORIGINAL manifest the
-    import validated (``test-model``), never the export's swapped-in one — and
-    the export's manifest write must be serialized AFTER the import's load."""
+    Round-8 strengthening (codex #5): the round-6 version relied on
+    ``asyncio.sleep(0)`` to order import-before-export and on overlapping
+    ``time.sleep`` windows for contention — neither DETERMINISTICALLY put the
+    export's swap into the validate->load gap, so an implementation that
+    released and immediately re-took the lock in that gap could still pass. This
+    version drives the ordering with explicit events:
+
+      1. ``read_manifest`` is wrapped so the import's validation call fires
+         ``import_validated`` — the import has validated the ORIGINAL manifest
+         and (if correct) still holds the lock.
+      2. The export coroutine waits for ``import_validated`` before issuing its
+         request, so it contends for the lock strictly AFTER the import
+         validated — precisely in the validate->load gap.
+      3. The import's load signals ``export_may_run`` and gives the export a
+         bounded window to attempt its swap. If the lock spans validate->load
+         the export stays BLOCKED and the load still observes ``test-model``; if
+         the lock were dropped in the gap the swap lands and the load observes
+         ``EXPORT-swapped-model`` — failing the assertion."""
     import asyncio as _asyncio
     import json as _json
     import threading
@@ -1520,15 +1527,31 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
     witness = {"load_saw_model_id": None, "manifest_swapped_before_load": None}
     counter_lock = threading.Lock()
 
+    # #1100 codex round 8 (#5): cross-thread coordination. The save/load run on
+    # anyio worker threads and the route handlers on the loop; threading.Event
+    # is safe to set from the loop and wait on from a worker.
+    import_validated = threading.Event()
+    export_may_run = threading.Event()
+
+    # Wrap read_manifest so the import's validation of the ORIGINAL manifest
+    # fires ``import_validated`` (the export waits on this before contending, so
+    # it lands strictly in the validate->load gap).
+    _orig_read_manifest = cache_mod.read_manifest
+
+    def _wrapped_read_manifest(cache_dir):
+        m = _orig_read_manifest(cache_dir)
+        if getattr(m, "model_id", None) == "test-model":
+            import_validated.set()
+        return m
+
     def _instrumented_save(cache_dir, should_abort=None):
-        # The export's save runs INSIDE the dest lock. Simulate the export
-        # publishing a DIFFERENT snapshot: swap the on-disk manifest+index to a
-        # foreign model_id. If the import's lock discipline is correct, this can
-        # only run once the import has fully released the lock (after its load).
+        # The export's save runs INSIDE the dest lock. Publish a FOREIGN
+        # snapshot: swap the on-disk manifest+index to a foreign model_id. If
+        # the import's lock discipline is correct, this can only run once the
+        # import has fully released the lock (after its load).
         with counter_lock:
             state["in_flight"] += 1
             state["peak"] = max(state["peak"], state["in_flight"])
-        _time.sleep(0.05)
         # Publish the export's foreign manifest over the shared path, and a
         # committed index.json (the real committed-save post-condition the
         # manifest builder now requires — round 6 #2).
@@ -1561,9 +1584,15 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
         with counter_lock:
             state["in_flight"] += 1
             state["peak"] = max(state["peak"], state["in_flight"])
-        # Read the manifest model_id the import is loading against, ON DISK,
-        # at LOAD time — this is the blob a correct lock guarantees is still the
-        # one the import validated, not one a concurrent export swapped in.
+        # We are now in the validate->load gap, holding the dest lock (if the
+        # implementation is correct). Release the export to attempt its swap and
+        # give it a real window to try. A correct lock keeps the export blocked,
+        # so the swap never lands before we read the manifest below.
+        export_may_run.set()
+        _time.sleep(0.15)
+        # Read the manifest model_id the import is loading against, ON DISK, at
+        # LOAD time — the blob a correct lock guarantees is still the one the
+        # import validated, not one a concurrent export swapped in.
         try:
             on_disk = _json.loads((shared_dir / "manifest.json").read_text())
             witness["load_saw_model_id"] = on_disk.get("model_id")
@@ -1572,7 +1601,6 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
             )
         except Exception:
             witness["load_saw_model_id"] = "<read-failed>"
-        _time.sleep(0.05)
         with counter_lock:
             state["in_flight"] -= 1
         cache = engine.scheduler.memory_aware_cache
@@ -1583,6 +1611,7 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
     engine.save_cache_to_disk = _instrumented_save
     engine.load_cache_from_disk = _instrumented_load
     cache_client.cfg.engine = engine
+    cache_mod.read_manifest = _wrapped_read_manifest
 
     cache_mod._export_dest_locks.clear()
     cache_mod._export_locks_guard = _asyncio.Lock()
@@ -1590,19 +1619,36 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
     app = FastAPI()
     app.include_router(router)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Start the IMPORT first so it wins the lock and validates the ORIGINAL
-        # manifest; the concurrent export then contends for the same lock.
-        importr = client.post(
-            "/v1/cache/import",
-            json={"source": "shared-io", "merge_strategy": "merge"},
-            headers=_auth(),
-        )
-        await _asyncio.sleep(0)  # let the import acquire the lock first
-        export = client.post(
-            "/v1/cache/export", json={"destination": "shared-io"}, headers=_auth()
-        )
-        r_imp, r_exp = await _asyncio.gather(importr, export)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            # Start the IMPORT; it wins the lock and validates the ORIGINAL
+            # manifest (firing ``import_validated``).
+            importr = _asyncio.ensure_future(
+                client.post(
+                    "/v1/cache/import",
+                    json={"source": "shared-io", "merge_strategy": "merge"},
+                    headers=_auth(),
+                )
+            )
+
+            async def _export_after_import_validates():
+                # Contend ONLY after the import validated, so the export lands
+                # strictly in the validate->load gap. Poll the threading.Event
+                # off the loop without blocking it.
+                while not import_validated.is_set():
+                    await _asyncio.sleep(0.005)
+                return await client.post(
+                    "/v1/cache/export",
+                    json={"destination": "shared-io"},
+                    headers=_auth(),
+                )
+
+            exportr = _asyncio.ensure_future(_export_after_import_validates())
+            r_imp, r_exp = await _asyncio.gather(importr, exportr)
+    finally:
+        cache_mod.read_manifest = _orig_read_manifest
 
     assert r_imp.status_code == 200, r_imp.text
     assert r_exp.status_code == 200, r_exp.text
@@ -1611,15 +1657,18 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
     assert state["peak"] == 1, (
         f"import/export on one path overlapped; peak in-flight={state['peak']}"
     )
-    # Round-6 (#5): the load ran against the manifest the import VALIDATED — the
-    # export's manifest swap did NOT slip in before the load. If the lock were
-    # released between validate and load, the export could publish its foreign
-    # manifest and the load would observe ``EXPORT-swapped-model``.
+    # The export was released to run DURING the import's validate->load gap, yet
+    # the load still observed the ORIGINAL manifest — proving the lock spanned
+    # validate->load (a release-and-reacquire in the gap would let the swap land
+    # and the load would see EXPORT-swapped-model).
     assert witness["load_saw_model_id"] == "test-model", (
         "import loaded against a manifest a concurrent export swapped in "
         f"(TOCTOU): load saw model_id={witness['load_saw_model_id']!r}"
     )
     assert witness["manifest_swapped_before_load"] is False
+    # export_may_run must have been set (the load ran) — sanity that the
+    # coordination fired rather than the test silently no-op'ing.
+    assert export_may_run.is_set()
 
 
 @pytest.mark.asyncio
@@ -2534,6 +2583,50 @@ def test_load_from_disk_repopulates_radix_index(tmp_path):
     assert src_key in dst._radix_index
 
 
+def test_load_from_disk_refuses_malformed_index_without_crashing(tmp_path):
+    """#1100 codex round 8 (#1): the IMPORT path (``load_from_disk``) reads
+    ``entry_meta["index"]`` / ``["num_tokens"]`` raw in its staging loop. A
+    malformed / torn / hand-crafted index (non-dict entry, missing or wrong-
+    typed required field, wrong version) must be REJECTED up front — returning 0
+    with the live cache intact — not raise ``TypeError``/``KeyError`` mid-load
+    (which in replace mode could land after the cache was already cleared). The
+    importer applies the SAME validator the export/manifest side uses."""
+    import json as _json
+
+    import mlx.core as mx
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    _src, load_cfg = _build_cache_with_arrays_layer()
+
+    def _run_case(index_obj):
+        d = tmp_path / "malformed"
+        d.mkdir(exist_ok=True)
+        (d / "index.json").write_text(_json.dumps(index_obj))
+        dst = MemoryAwarePrefixCache(model=object(), config=load_cfg)
+        # Seed a prior entry so we can prove replace leaves it intact.
+        prior_key = (7, 8, 9)
+        dst._entries[prior_key] = SimpleNamespace(memory_bytes=55, cache=[])
+        dst._sorted_keys = [prior_key]
+        dst._current_memory = 55
+        with mx.stream(mx.default_stream(mx.default_device())):
+            loaded = dst.load_from_disk(str(d), replace=True)
+        # No crash, nothing loaded, prior cache preserved (replace never
+        # reached the clear because the index was refused up front).
+        assert loaded == 0
+        assert dst._entries == {prior_key: dst._entries[prior_key]}
+        assert dst._current_memory == 55
+
+    # A grab-bag of malformed indices the raw deref would have crashed on:
+    _run_case({"version": 3, "entries": [{"num_tokens": 4}]})  # missing index
+    _run_case({"version": 3, "entries": [{"index": 0}]})  # missing num_tokens
+    _run_case({"version": 3, "entries": ["not-a-dict"]})  # non-dict entry
+    _run_case({"version": 3, "entries": [{"index": "x", "num_tokens": 4}]})  # str index
+    _run_case(
+        {"version": 99, "entries": [{"index": 0, "num_tokens": 4}]}
+    )  # bad version
+
+
 def test_load_from_disk_rolls_back_entry_on_radix_insert_failure(tmp_path, monkeypatch):
     """#1100 codex round 6 (#4): if the radix insert FAILS while committing a
     loaded entry, that entry must be rolled back out of ``_entries`` /
@@ -2574,6 +2667,69 @@ def test_load_from_disk_rolls_back_entry_on_radix_insert_failure(tmp_path, monke
     assert len(dst._entries) == 0
     assert dst._sorted_keys == []
     assert dst._current_memory == 0
+    assert dst._last_load_bytes == 0
+
+
+def test_load_from_disk_replace_restores_prior_cache_on_radix_failure(
+    tmp_path, monkeypatch
+):
+    """#1100 codex round 8 (#2): replace mode clears the live cache BEFORE
+    installing the staged set. Round 6 (#4) rolled back only the ONE entry whose
+    radix insert failed — but by then the PRIOR cache was already destroyed, so a
+    mid-commit radix failure left a partial cache and permanently lost the prior
+    one while still returning a "successful" load. The fix snapshots the prior
+    cache and RESTORES it wholesale on any radix failure (true all-or-nothing
+    replace). This test seeds a real prior entry, forces the staged entry's radix
+    insert to blow up, and asserts the prior cache is intact (not wiped) and 0
+    loaded — the replace was atomic."""
+    import mlx.core as mx
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+    from vllm_mlx.runtime.radix_index import RadixPrefixIndex
+
+    src_cache, load_cfg = _build_cache_with_arrays_layer()
+    for entry in src_cache._entries.values():
+        for layer in entry.cache:
+            state = getattr(layer, "state", None)
+            if state is not None:
+                mx.eval(state)
+    target = str(tmp_path / "replace-restore-snap")
+    with mx.stream(mx.default_stream(mx.default_device())):
+        assert src_cache.save_to_disk(target) is True
+
+    radix = RadixPrefixIndex()
+
+    # A destination cache holding a REAL prior entry (with a valid radix
+    # membership), so a botched replace has something concrete to lose.
+    dst = MemoryAwarePrefixCache(model=object(), config=load_cfg, radix_index=radix)
+    prior_key = (11, 22, 33)
+    prior_entry = SimpleNamespace(memory_bytes=777, cache=[])
+    dst._entries[prior_key] = prior_entry
+    dst._sorted_keys = [prior_key]
+    dst._current_memory = 777
+    radix.insert(prior_key)
+
+    # Now make the NEXT radix insert (the staged entry, during commit) fail —
+    # AFTER the prior cache was cleared.
+    _orig_insert = radix.insert
+
+    def _boom_on_new(_key):
+        if _key == prior_key:
+            return _orig_insert(_key)  # allow the restore-path re-insert
+        raise RuntimeError("radix insert blew up on staged entry")
+
+    monkeypatch.setattr(radix, "insert", _boom_on_new)
+
+    with mx.stream(mx.default_stream(mx.default_device())):
+        loaded = dst.load_from_disk(target, replace=True)
+
+    # Atomic replace: the staged entry's radix failure restored the PRIOR cache
+    # wholesale — nothing loaded, prior entry + accounting intact, prior radix
+    # membership rebuilt.
+    assert loaded == 0
+    assert dst._entries == {prior_key: prior_entry}
+    assert dst._sorted_keys == [prior_key]
+    assert dst._current_memory == 777
     assert dst._last_load_bytes == 0
 
 
@@ -2809,8 +2965,10 @@ def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_pat
     """
     from vllm_mlx.cache.protocol import _read_committed_cache_counts
 
-    def _write_index(entries):
-        (tmp_path / "index.json").write_text(json.dumps({"entries": entries}))
+    def _write_index(entries, version=3):
+        (tmp_path / "index.json").write_text(
+            json.dumps({"version": version, "entries": entries})
+        )
         return tmp_path
 
     def _good(i):
@@ -2820,15 +2978,23 @@ def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_pat
     _write_index([_good(0), _good(1)])
     assert _read_committed_cache_counts(tmp_path) == (2, 200)
 
+    # #1100 codex round 8 (#3): wrong index-format version is refused even when
+    # every entry is well-formed — a manifest must never be published for a
+    # snapshot whose on-disk format a peer's importer would reject.
+    _write_index([_good(0)], version=1)  # below min (legacy pre-#198)
+    assert _read_committed_cache_counts(tmp_path) is None
+    _write_index([_good(0)], version=99)  # above max (future format)
+    assert _read_committed_cache_counts(tmp_path) is None
+    _write_index([_good(0)], version="3")  # non-int version
+    assert _read_committed_cache_counts(tmp_path) is None
+
     # A single malformed entry poisons the whole index (fail-closed → None):
+    _missing_mb = {"index": 1, "num_tokens": 4}  # memory_bytes defaults to 0 → VALID
     malformed_cases = [
         [_good(0), "not-a-dict"],  # non-dict entry
         [_good(0), {"num_tokens": 4, "memory_bytes": 100}],  # missing index
         [_good(0), {"index": 1, "memory_bytes": 100}],  # missing num_tokens
-        [
-            _good(0),
-            {"index": 1, "num_tokens": 4},
-        ],  # missing memory_bytes → 0? no: default 0 OK
+        [_good(0), _missing_mb],  # missing memory_bytes → default 0 (VALID)
         [_good(0), {"index": -1, "num_tokens": 4, "memory_bytes": 100}],  # negative
         [_good(0), {"index": True, "num_tokens": 4, "memory_bytes": 100}],  # bool≠int
         [_good(0), {"index": "1", "num_tokens": 4, "memory_bytes": 100}],  # str
@@ -2836,10 +3002,9 @@ def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_pat
     ]
     for entries in malformed_cases:
         _write_index(entries)
-        # NOTE: memory_bytes defaults to 0 when absent, so the "missing
-        # memory_bytes" case is actually VALID — assert accordingly below.
         result = _read_committed_cache_counts(tmp_path)
-        if entries[1] == {"index": 1, "num_tokens": 4}:
+        if entries[1] is _missing_mb:
+            # memory_bytes absent defaults to 0 → this index is well-formed.
             assert result == (2, 100), (
                 f"missing memory_bytes should default 0: {result}"
             )
@@ -2851,3 +3016,64 @@ def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_pat
     # No index.json at all → None (empty export).
     (tmp_path / "index.json").unlink()
     assert _read_committed_cache_counts(tmp_path) is None
+
+
+def test_batched_engine_cache_ops_raise_when_inner_engine_absent():
+    """#1100 codex round 8 (#4): a ``BatchedEngine`` whose inner engine hasn't
+    started (``_engine is None``) must raise ``EngineNotReadyError`` from the
+    export/import outcome forwarders — NOT mask it as a successful empty save /
+    zero-entry load (which made export/import return 200 instead of the
+    advertised 503 "engine not loaded"). The bare ``save_cache_to_disk`` keeps
+    its no-op-False for lifespan persistence, where "no engine, nothing to
+    persist" is legitimate."""
+    from vllm_mlx.cache.protocol import EngineNotReadyError
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    engine = BatchedEngine("fake-model")
+    assert engine._engine is None  # not started — the finding's condition
+
+    with pytest.raises(EngineNotReadyError):
+        engine.save_cache_with_outcome("/tmp/whatever")
+    with pytest.raises(EngineNotReadyError):
+        engine.load_cache_with_result("/tmp/whatever")
+
+    # The bare persistence methods stay quiet no-ops (lifespan startup/shutdown
+    # persistence must not crash when there's no engine to persist).
+    assert engine.save_cache_to_disk("/tmp/whatever") is False
+    assert engine.load_cache_from_disk("/tmp/whatever") == 0
+
+
+def test_export_import_503_when_inner_engine_not_ready(cache_client):
+    """#1100 codex round 8 (#4): the cache route maps ``EngineNotReadyError``
+    (raised when a non-None engine's inner engine hasn't started) to the SAME
+    503 an absent engine gets — so "engine not loaded" is one consistent signal
+    whether the OUTER engine is None or its INNER engine is down."""
+    from vllm_mlx.cache.protocol import EngineNotReadyError
+
+    class _NotReadyEngine(cache_client.FakeEngine):
+        def save_cache_with_outcome(self, cache_dir, should_abort=None):
+            raise EngineNotReadyError("inner engine not loaded")
+
+        def load_cache_with_result(self, cache_dir, replace: bool = False):
+            raise EngineNotReadyError("inner engine not loaded")
+
+    engine = _NotReadyEngine(entries=1, current_memory=1024)
+    engine.config.model_name = "test-model"
+    cache_client.cfg.model_name = "test-model"
+    cache_client.cfg.engine = engine
+
+    exp = cache_client.client.post(
+        "/v1/cache/export", json={"destination": "nr"}, headers=_auth()
+    )
+    assert exp.status_code == 503, exp.text
+
+    # Import needs a manifest to reach the load call; write a matching one.
+    _write_export_root(
+        cache_client.sandbox,
+        "nr-src",
+        Manifest(protocol_version=PROTOCOL_VERSION, model_id="test-model", entries=1),
+    )
+    imp = cache_client.client.post(
+        "/v1/cache/import", json={"source": "nr-src"}, headers=_auth()
+    )
+    assert imp.status_code == 503, imp.text

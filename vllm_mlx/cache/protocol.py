@@ -112,6 +112,22 @@ class CommittedIndexUnreadableError(RuntimeError):
     """
 
 
+class EngineNotReadyError(RuntimeError):
+    """Raised by a cache op when the engine exists but isn't fully loaded.
+
+    #1100 codex round 8 (#4): the route's ``_engine_or_503`` only checks
+    ``get_config().engine is None``. But a ``BatchedEngine`` can be installed
+    (non-None) while its INNER engine (``_engine``) is still absent — model not
+    yet started, or torn down. Its cache forwards previously masked that state
+    as a successful EMPTY save / ZERO load (``SaveOutcome("empty")`` /
+    ``LoadResult(0, 0)``), so export/import returned 200 instead of the
+    advertised 503 "engine not loaded". The forwarders now raise this instead;
+    the cache route catches it and maps to the same 503 an absent engine gets,
+    so "engine not loaded" is one consistent signal whether the outer engine is
+    None OR its inner engine hasn't come up.
+    """
+
+
 class ManifestMismatchError(ValueError):
     """Raised when a manifest doesn't match caller expectations.
 
@@ -294,6 +310,93 @@ def _rapid_mlx_version() -> str:
         return ""
 
 
+# On-disk prefix-cache ``index.json`` schema window this build understands.
+# Mirrors ``memory_cache._TOKENS_FORMAT_VERSION_IN_INDEX`` (kept here rather
+# than imported to avoid a protocol→memory_cache import cycle — memory_cache
+# imports THIS module). v2 = legacy int-array tokens.bin (no save_uuid);
+# v3 = magic-prefixed tokens.bin with save_uuid. Anything outside [min, max]
+# is refused (older = missing metadata; newer = format we can't decode).
+_COMMITTED_INDEX_MIN_VERSION = 2
+_COMMITTED_INDEX_MAX_VERSION = 3
+
+
+def _valid_nonneg_int(v: object) -> bool:
+    """True iff ``v`` is a nonnegative integer value.
+
+    Rejects ``bool`` (a JSON ``true``/``false`` is an ``int`` subclass) and
+    negatives; accepts a whole-valued ``float`` (json may parse ``5.0``).
+    ``index`` / ``num_tokens`` are indices/counts the importer dereferences,
+    so they MUST be nonnegative ints.
+    """
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return v >= 0
+    if isinstance(v, float):
+        return v >= 0 and v.is_integer()
+    return False
+
+
+def validate_committed_index_data(
+    data: object,
+) -> tuple[bool, str, int, int]:
+    """Validate a parsed ``index.json`` mapping FAIL-CLOSED over the whole file.
+
+    Single source of truth for "is this committed cache index safe to trust?"
+    Used by BOTH the export/manifest side (``_read_committed_cache_counts`` →
+    ``build_manifest_from_engine_state(require_committed_index=True)``) and the
+    IMPORT side (``memory_cache.load_from_disk`` gate) so the two can't drift on
+    what counts as a well-formed index — the exact drift codex round 8 (#1/#3)
+    flagged (export published a manifest for an index the importer then crashed
+    on at ``entry_meta["index"]``).
+
+    Checks, in order:
+
+    * ``data`` is a dict.
+    * ``version`` (default 1) is within [``_COMMITTED_INDEX_MIN_VERSION``,
+      ``_COMMITTED_INDEX_MAX_VERSION``] — a wrong-version index is refused, not
+      silently parsed against a format we don't know (round 8 #3).
+    * ``entries`` is a list.
+    * EVERY entry is a dict carrying nonneg-int ``index`` + ``num_tokens`` and a
+      nonneg (int|float) ``memory_bytes`` (defaulting to 0 when absent). One
+      malformed entry rejects the WHOLE index — no partial trust.
+
+    Returns ``(ok, reason, entries_count, total_bytes)``. On failure ``ok`` is
+    ``False`` and ``reason`` names the first problem (for a single structured
+    WARN); ``entries_count``/``total_bytes`` are 0. On success the count is
+    ``len(entries)`` and total is the summed per-entry ``memory_bytes``.
+    """
+    if not isinstance(data, dict):
+        return False, "index.json is not a JSON object", 0, 0
+    version = data.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        return False, f"index version has non-int type {type(version).__name__}", 0, 0
+    if not (_COMMITTED_INDEX_MIN_VERSION <= version <= _COMMITTED_INDEX_MAX_VERSION):
+        return (
+            False,
+            f"index version {version} outside supported "
+            f"[{_COMMITTED_INDEX_MIN_VERSION}, {_COMMITTED_INDEX_MAX_VERSION}]",
+            0,
+            0,
+        )
+    entries_list = data.get("entries")
+    if not isinstance(entries_list, list):
+        return False, "index 'entries' is not a list", 0, 0
+    total = 0
+    for pos, entry in enumerate(entries_list):
+        if not isinstance(entry, dict):
+            return False, f"entry {pos} is not an object", 0, 0
+        if not _valid_nonneg_int(entry.get("index")):
+            return False, f"entry {pos} has invalid 'index'", 0, 0
+        if not _valid_nonneg_int(entry.get("num_tokens")):
+            return False, f"entry {pos} has invalid 'num_tokens'", 0, 0
+        mb = entry.get("memory_bytes", 0)
+        if isinstance(mb, bool) or not isinstance(mb, (int, float)) or mb < 0:
+            return False, f"entry {pos} has invalid 'memory_bytes'", 0, 0
+        total += int(mb)
+    return True, "", len(entries_list), total
+
+
 def _read_committed_cache_counts(cache_dir: str | Path) -> tuple[int, int] | None:
     """Read ``(entries, total_bytes)`` from the committed ``index.json``.
 
@@ -320,52 +423,28 @@ def _read_committed_cache_counts(cache_dir: str | Path) -> tuple[int, int] | Non
     committed save) treats ``None`` as an error and discards the export; the
     live-ledger fallback (empty / disabled cache) correctly reports 0/0.
 
-    #1100 codex round 7 (#3): validation is FAIL-CLOSED over the WHOLE index —
-    if ANY entry is malformed (not a dict, or missing / wrong-typed / negative
-    ``index`` / ``num_tokens`` / ``memory_bytes``) the entire index is rejected
-    (``None``). The old loop ``continue``d past malformed entries yet returned
-    ``len(entries_list)`` — counting entries it hadn't validated — so a
+    #1100 codex round 7 (#3) → round 8 (#3): validation is FAIL-CLOSED over the
+    WHOLE index via the shared ``validate_committed_index_data`` — one malformed
+    entry (not a dict, missing / wrong-typed / negative ``index`` /
+    ``num_tokens`` / ``memory_bytes``) OR a wrong ``version`` rejects the entire
+    index (``None``). The old loop ``continue``d past malformed entries yet
+    returned ``len(entries_list)`` — counting entries it hadn't validated — so a
     partially-torn index could pass ``require_committed_index`` here and then
-    CRASH the importer at ``entry_meta["index"]`` / ``["num_tokens"]``. Every
-    counted entry must therefore carry exactly the fields the importer reads.
+    CRASH the importer at ``entry_meta["index"]`` / ``["num_tokens"]``. Round 8
+    adds the version gate so a manifest is never published for a snapshot whose
+    on-disk format a peer's importer would refuse. The importer
+    (``memory_cache.load_from_disk``) applies the SAME validator so export and
+    import agree byte-for-byte on what "loadable" means.
     """
     try:
         index_path = Path(cache_dir) / "index.json"
         if not index_path.is_file():
             return None
         data = json.loads(index_path.read_text())
-        if not isinstance(data, dict):
+        ok, _reason, count, total = validate_committed_index_data(data)
+        if not ok:
             return None
-        entries_list = data.get("entries")
-        if not isinstance(entries_list, list):
-            return None
-
-        def _valid_nonneg_int(v: object) -> bool:
-            # Reject bool (a JSON true/false is an int subclass) and negatives;
-            # accept a whole-valued float (json may parse 5.0). ``index`` and
-            # ``num_tokens`` are indices/counts, so they must be nonneg ints.
-            if isinstance(v, bool):
-                return False
-            if isinstance(v, int):
-                return v >= 0
-            if isinstance(v, float):
-                return v >= 0 and v.is_integer()
-            return False
-
-        total = 0
-        for entry in entries_list:
-            if not isinstance(entry, dict):
-                return None
-            # Fields the importer (memory_cache.load_from_disk) dereferences.
-            if not _valid_nonneg_int(entry.get("index")):
-                return None
-            if not _valid_nonneg_int(entry.get("num_tokens")):
-                return None
-            mb = entry.get("memory_bytes", 0)
-            if isinstance(mb, bool) or not isinstance(mb, (int, float)) or mb < 0:
-                return None
-            total += int(mb)
-        return len(entries_list), total
+        return count, total
     except Exception:  # pragma: no cover — defensive against a torn index
         return None
 

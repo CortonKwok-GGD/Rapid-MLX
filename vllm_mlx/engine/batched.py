@@ -2725,23 +2725,38 @@ class BatchedEngine(BaseEngine):
 
     def save_cache_with_outcome(self, cache_dir: str, should_abort=None):
         """Forward to the inner engine's outcome-returning save (#1100 codex
-        round 4 #2). Returns a ``SaveOutcome`` computed on the step thread."""
+        round 4 #2). Returns a ``SaveOutcome`` computed on the step thread.
+
+        #1100 codex round 8 (#4): if the inner engine is absent (model not
+        started / torn down) this is NOT an empty snapshot — it's an
+        engine-not-loaded condition. Raise ``EngineNotReadyError`` so the cache
+        route surfaces the advertised 503 instead of a 200 that publishes a
+        lying empty manifest. (The bare ``save_cache_to_disk`` keeps its
+        no-op-False for lifespan persistence, where "no engine, nothing to
+        persist" is legitimate — only the export/import outcome path must fail
+        loudly.)
+        """
         if self._engine:
             return self._engine.save_cache_with_outcome(
                 cache_dir, should_abort=should_abort
             )
-        from ..cache.protocol import SaveOutcome
+        from ..cache.protocol import EngineNotReadyError
 
-        return SaveOutcome(outcome="empty")
+        raise EngineNotReadyError("cannot export cache: inner engine is not loaded")
 
     def load_cache_with_result(self, cache_dir: str, replace: bool = False):
         """Forward to the inner engine's result-returning load (#1100 codex
-        round 4 #2). Returns a ``LoadResult`` computed on the step thread."""
+        round 4 #2). Returns a ``LoadResult`` computed on the step thread.
+
+        #1100 codex round 8 (#4): absent inner engine → raise
+        ``EngineNotReadyError`` (→ route 503) rather than reporting a
+        successful zero-entry load, matching ``save_cache_with_outcome``.
+        """
         if self._engine:
             return self._engine.load_cache_with_result(cache_dir, replace=replace)
-        from ..cache.protocol import LoadResult
+        from ..cache.protocol import EngineNotReadyError
 
-        return LoadResult(entries=0, bytes_loaded=0)
+        raise EngineNotReadyError("cannot import cache: inner engine is not loaded")
 
     # ------------------------------------------------------------------
     # Guided generation (JSON schema constrained decoding via outlines)
