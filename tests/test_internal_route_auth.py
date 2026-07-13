@@ -350,6 +350,11 @@ def test_cache_import_200_body_does_not_leak_operator_path(
     build, _ = client_factory
     client = build(api_key=None)
     get_config().engine = _empty_prefix_cache_engine()
+    # The server must run the SAME model the manifest was exported from, or
+    # the #1100 BLOCKING-1 unconditional gate 409s before we can inspect a
+    # 200 body. Align the server model id with the manifest's so this leak-
+    # shape test reaches the happy path it's meant to guard.
+    get_config().model_name = "secret-org-model-12b-8bit"
     client.app.include_router(cache_router)
 
     r = client.post("/v1/cache/import", json={"source": str(tmp_path)})

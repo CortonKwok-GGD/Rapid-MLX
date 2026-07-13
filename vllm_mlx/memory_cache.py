@@ -2580,8 +2580,23 @@ class MemoryAwarePrefixCache:
             )
         return saved > 0 and rename_committed
 
-    def load_from_disk(self, cache_dir: str) -> int:
+    def load_from_disk(self, cache_dir: str, replace: bool = False) -> int:
         """Load cache entries from disk.
+
+        ``replace=True`` implements the export/import "replace" merge
+        strategy (#476) as an ATOMIC clear-then-load on this thread: the
+        in-memory cache is emptied via :meth:`clear` only AFTER the
+        on-disk ``index.json`` has been read and validated (every index-
+        level failure below returns 0 *without* clearing, so a missing/
+        corrupt/version-mismatched source leaves the existing cache
+        intact). The clear happens right before the per-entry load loop,
+        inside this single method — so no other caller can ``store`` into
+        the cache in the gap between clear and load (the route layer used
+        to ``clear()`` on the asyncio thread and ``load`` on the mlx-step
+        thread, leaving a window where a concurrent request repopulated
+        the "replaced" cache — codex #1100 BLOCKING-4). ``replace=False``
+        (default) preserves the pre-existing merge-into-current behavior
+        used by radix persistence and the offline CLI.
 
         Recovers from a save interrupted between the two directory
         renames in :meth:`save_to_disk`:
@@ -2732,6 +2747,26 @@ class MemoryAwarePrefixCache:
             expected_save_uuid = raw_uuid
         else:
             expected_save_uuid = None
+
+        # BLOCKING-4 (#1100): atomic clear for the "replace" merge strategy.
+        # We reach here only after index.json was read + structurally
+        # validated (every failure path above returned 0 without touching
+        # the live cache), so clearing now cannot destroy the existing
+        # cache on a missing/corrupt/version-mismatched source. Doing it
+        # here — on the same mlx-step thread that runs the load loop below
+        # — closes the clear/load race the route layer had when it cleared
+        # on the asyncio thread. Per-entry corruption past this point is
+        # already handled by the skip counters (a valid index whose
+        # every entry file is unreadable yields an empty cache, which is
+        # the honest outcome of "replace with a blob that has no loadable
+        # entries").
+        if replace:
+            self.clear()
+            logger.info(
+                "[cache_persist] replace: cleared in-memory cache before load "
+                "(index validated, %d entries declared)",
+                len(index.get("entries", [])),
+            )
 
         loaded = 0
         corrupt_skipped = 0

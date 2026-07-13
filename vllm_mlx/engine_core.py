@@ -1291,14 +1291,22 @@ class EngineCore:
             self.scheduler.save_cache_to_disk, cache_dir, should_abort=should_abort
         )
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
         """Load prefix cache from disk.
 
         Loading also goes through the worker thread so the loaded arrays
         end up tagged with the generation_stream that subsequent fetches
         will run on.
+
+        ``replace=True`` (export/import "replace" strategy, #476) is
+        forwarded down to ``MemoryAwarePrefixCache.load_from_disk`` so the
+        cache clear happens atomically ON THIS worker thread, after the
+        on-disk index is validated — never on the asyncio loop thread
+        where a concurrent request could repopulate it mid-swap.
         """
-        return self._run_on_step_thread(self.scheduler.load_cache_from_disk, cache_dir)
+        return self._run_on_step_thread(
+            self.scheduler.load_cache_from_disk, cache_dir, replace=replace
+        )
 
     def _release_model(self) -> None:
         """Release model ownership."""
@@ -1445,6 +1453,6 @@ class AsyncEngineCore:
         """Save prefix cache to disk."""
         return self.engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
         """Load prefix cache from disk."""
-        return self.engine.load_cache_from_disk(cache_dir)
+        return self.engine.load_cache_from_disk(cache_dir, replace=replace)

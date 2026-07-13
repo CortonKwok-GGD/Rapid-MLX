@@ -2711,10 +2711,16 @@ class BatchedEngine(BaseEngine):
             return self._engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
         return False
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
-        """Load prefix cache from disk. Returns number of entries loaded."""
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+        """Load prefix cache from disk. Returns number of entries loaded.
+
+        ``replace=True`` (export/import "replace" strategy, #476) forwards
+        to the underlying engine so the cache clear runs atomically on the
+        mlx-step thread after index validation — see
+        ``EngineCore.load_cache_from_disk``.
+        """
         if self._engine:
-            return self._engine.load_cache_from_disk(cache_dir)
+            return self._engine.load_cache_from_disk(cache_dir, replace=replace)
         return 0
 
     # ------------------------------------------------------------------

@@ -243,7 +243,56 @@ def _rapid_mlx_version() -> str:
         return ""
 
 
-def build_manifest_from_engine_state(engine: Any) -> Manifest:
+def _read_committed_cache_counts(cache_dir: str | Path) -> tuple[int, int] | None:
+    """Read ``(entries, total_bytes)`` from the committed ``index.json``.
+
+    BLOCKING-3 (#1100): the manifest counters must reflect what
+    ``save_to_disk`` actually committed to disk, NOT the live in-memory
+    ledger (``len(cache._entries)`` / ``cache._current_memory``). The live
+    ledger drifts from the snapshot when the cache mutates in the window
+    between the save and this manifest build (a concurrent store, or an
+    entry ``save_to_disk`` dropped in its post-write self-verify pass) —
+    producing a manifest whose ``entries``/``total_bytes`` disagree with
+    the on-disk index a peer will actually load.
+
+    Reads the per-entry ``memory_bytes`` the save loop wrote into each
+    ``index["entries"][i]`` and sums them (this is the post-verify entry
+    list — entries whose files vanished mid-save are already filtered), so
+    the total matches the bytes a peer can actually load, not the pre-
+    verify ``total_memory_bytes`` snapshot.
+
+    Returns ``None`` when there is no readable committed index — an empty
+    export (``save_to_disk`` writes no ``index.json`` for 0 entries) or a
+    disabled prefix cache. The caller then falls back to the live ledger,
+    which correctly reports 0/0 for those cases.
+    """
+    try:
+        index_path = Path(cache_dir) / "index.json"
+        if not index_path.is_file():
+            return None
+        data = json.loads(index_path.read_text())
+        if not isinstance(data, dict):
+            return None
+        entries_list = data.get("entries")
+        if not isinstance(entries_list, list):
+            return None
+        total = 0
+        for entry in entries_list:
+            if not isinstance(entry, dict):
+                continue
+            mb = entry.get("memory_bytes", 0)
+            # Reject bool (JSON true/false) even though it's an int subclass.
+            if isinstance(mb, bool) or not isinstance(mb, (int, float)):
+                continue
+            total += int(mb)
+        return len(entries_list), total
+    except Exception:  # pragma: no cover — defensive against a torn index
+        return None
+
+
+def build_manifest_from_engine_state(
+    engine: Any, cache_dir: str | Path | None = None
+) -> Manifest:
     """Build a :class:`Manifest` describing the engine's current cache blob.
 
     Reads the model id + cache-config knobs (quantization / paged / turbo-
@@ -268,9 +317,19 @@ def build_manifest_from_engine_state(engine: Any) -> Manifest:
     * ``index_format_version`` — the engine's on-disk prefix-cache index
       format (``memory_cache._TOKENS_FORMAT_VERSION_IN_INDEX``), NOT the
       manifest protocol version (see module docstring).
-    * ``entries`` / ``total_bytes`` — the live prefix-cache ledger
-      (``len(cache._entries)`` / ``cache._current_memory``); 0 when the
-      prefix cache is disabled or empty.
+    * ``entries`` / ``total_bytes`` — when ``cache_dir`` is given, read
+      from the COMMITTED ``index.json`` at that export root (the source of
+      truth a peer will load), via ``_read_committed_cache_counts``. Falls
+      back to the live prefix-cache ledger (``len(cache._entries)`` /
+      ``cache._current_memory``) only when there's no committed index —
+      an empty export or a disabled prefix cache, both of which the live
+      ledger reports as 0/0. Deriving from the committed index (not the
+      live ledger) is BLOCKING-3 (#1100): the ledger drifts from the
+      snapshot if the cache mutates between save and manifest-build.
+
+    ``cache_dir`` is the export root just written by ``save_to_disk``.
+    Omitting it (the pre-#1100 call shape) keeps the live-ledger behavior
+    — still correct for callers that only want the config knobs.
     """
     # Model id — prefer the server singleton (what the operator typed), fall
     # back to the engine's own config for unit-test / embedded engines.
@@ -319,28 +378,38 @@ def build_manifest_from_engine_state(engine: Any) -> Manifest:
     except Exception:  # pragma: no cover — memory_cache import guard
         index_format_version = 0
 
-    # Live prefix-cache ledger. ``memory_aware_cache`` is None when the
-    # prefix cache is disabled (--disable-prefix-cache) — export an empty
-    # snapshot rather than raising. ``entries`` and ``total_bytes`` are read
-    # in SEPARATE try/excepts so a fault reading one (a partially-torn cache)
-    # doesn't zero the other — the coupled block previously discarded a good
-    # entry count when only the memory read raised.
+    # entries / total_bytes — prefer the COMMITTED on-disk index (#1100
+    # BLOCKING-3). When ``cache_dir`` points at a just-written export root,
+    # read the counts the save loop actually committed; only fall back to
+    # the live ledger when there's no readable index (empty export /
+    # disabled cache, both correctly 0/0 on the live path).
     entries = 0
     total_bytes = 0
-    prefix_cache = (
-        getattr(scheduler, "memory_aware_cache", None)
-        if scheduler is not None
-        else None
+    committed = (
+        _read_committed_cache_counts(cache_dir) if cache_dir is not None else None
     )
-    if prefix_cache is not None:
-        try:
-            entries = len(prefix_cache._entries)  # noqa: SLF001 — ledger read
-        except Exception:  # pragma: no cover — defensive against a partial cache
-            entries = 0
-        try:
-            total_bytes = int(prefix_cache._current_memory)  # noqa: SLF001
-        except Exception:  # pragma: no cover — defensive against a partial cache
-            total_bytes = 0
+    if committed is not None:
+        entries, total_bytes = committed
+    else:
+        # Live prefix-cache ledger fallback. ``memory_aware_cache`` is None
+        # when the prefix cache is disabled (--disable-prefix-cache) —
+        # export an empty snapshot rather than raising. ``entries`` and
+        # ``total_bytes`` are read in SEPARATE try/excepts so a fault
+        # reading one (a partially-torn cache) doesn't zero the other.
+        prefix_cache = (
+            getattr(scheduler, "memory_aware_cache", None)
+            if scheduler is not None
+            else None
+        )
+        if prefix_cache is not None:
+            try:
+                entries = len(prefix_cache._entries)  # noqa: SLF001 — ledger read
+            except Exception:  # pragma: no cover — defensive against partial cache
+                entries = 0
+            try:
+                total_bytes = int(prefix_cache._current_memory)  # noqa: SLF001
+            except Exception:  # pragma: no cover — defensive against partial cache
+                total_bytes = 0
 
     return Manifest(
         protocol_version=PROTOCOL_VERSION,

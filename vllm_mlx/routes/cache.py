@@ -39,6 +39,8 @@ enforced when ``--api-key`` is set, no new header is invented.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -47,12 +49,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..cache.protocol import (
+    MANIFEST_FILENAME,
     PROTOCOL_VERSION,
     InvalidExportPathError,  # noqa: F401 — re-exported for _resolve_or_400 callers
     MalformedManifestError,  # noqa: F401 — used via _read_manifest_or_http
     ManifestMismatchError,
     ManifestNotFoundError,  # noqa: F401 — used via _read_manifest_or_http
     build_manifest_from_engine_state,
+    default_export_root,
     read_manifest,
     resolve_cache_dir,
     write_manifest,
@@ -108,11 +112,13 @@ class ExportRequest(BaseModel):
         default=None,
         ge=1,
         description=(
-            "Optional cap on the exported blob size. Checked BEFORE any "
-            "write: if the prefix cache's current in-memory footprint "
-            "(``_current_memory``) exceeds this, the export is rejected "
-            "with 413 and nothing is written. MVP is all-or-nothing — no "
-            "partial-entry eviction to fit under the cap."
+            "Optional cap on the exported blob size, enforced with 413 in "
+            "TWO stages: a cheap pre-write check against the live in-memory "
+            "footprint (rejects before touching disk), AND a precise post-"
+            "write check against the committed on-disk size (catches cache "
+            "growth that raced the snapshot — the over-cap blob is then "
+            "discarded from disk). MVP is all-or-nothing — no partial-entry "
+            "eviction to fit under the cap."
         ),
     )
 
@@ -137,9 +143,12 @@ class ImportRequest(BaseModel):
     expected_model_id: str | None = Field(
         default=None,
         description=(
-            "If set, manifest.model_id must match exactly. Mismatch → 409. "
-            "Omit to skip the model-identity check (importer accepts any "
-            "model — only use when you're sure the engine matches)."
+            "Optional ADDITIONAL caller-side assertion on manifest.model_id "
+            "(exact match; mismatch → 409). NOTE: the server ALWAYS rejects a "
+            "manifest whose model_id differs from the model it loaded — "
+            "omitting this does NOT disable identity checking, it only skips "
+            "the extra caller-side assertion. Set it to pin a specific model "
+            "id independently of the server's loaded model."
         ),
     )
     merge_strategy: Literal["replace", "merge"] = Field(
@@ -147,8 +156,10 @@ class ImportRequest(BaseModel):
         description=(
             "'merge' keeps existing entries and adds new ones (token-tuple "
             "key collisions resolved by the engine's ``store``). 'replace' "
-            "calls ``MemoryAwarePrefixCache.clear()`` before loading so the "
-            "imported blob is the only thing in the cache."
+            "clears the in-memory cache ATOMICALLY inside the step-thread "
+            "load — only after the source index is validated — so the "
+            "imported blob is the only thing in the cache, and a corrupt/"
+            "missing source leaves the existing cache intact."
         ),
     )
 
@@ -268,14 +279,57 @@ def _prefix_cache(engine):
     return _resolve_memory_aware_cache(engine)
 
 
+def _discard_export(destination: Path) -> None:
+    """Delete a just-written export blob after a post-write reject (#1100
+    BLOCKING-2: max_bytes race).
+
+    ``save_to_disk`` commits the blob (index.json + entry_* files) into
+    ``destination`` via an atomic rename before the route can enforce the
+    exact committed size. When the committed footprint exceeds ``max_bytes``
+    we must not leave the over-cap blob on disk for a peer to import.
+
+    A dedicated export sub-directory is removed wholesale. When
+    ``destination`` IS the sandbox root itself (the ``destination=None``
+    export shape), only the known ``save_to_disk`` artifacts are unlinked —
+    the root directory and anything else in it are preserved. Best-effort:
+    a leftover file is logged, never raised (the 413 is the caller-facing
+    outcome; a stray file is an operator-log concern, not a client error).
+    """
+    try:
+        root = default_export_root()
+        if destination != root:
+            shutil.rmtree(destination, ignore_errors=True)
+            return
+        # destination is the sandbox root — unlink only the blob artifacts.
+        for name in os.listdir(destination):
+            is_blob = name in ("index.json", MANIFEST_FILENAME) or (
+                name.startswith("entry_")
+                and (name.endswith(".safetensors") or name.endswith("_tokens.bin"))
+            )
+            if is_blob:
+                try:
+                    (destination / name).unlink()
+                except OSError:  # pragma: no cover — racing unlink
+                    pass
+    except Exception as exc:  # pragma: no cover — cleanup is best-effort
+        logger.warning(
+            "cache/export: cleanup after max_bytes reject failed (destination=%s): %s",
+            destination,
+            exc,
+        )
+
+
 @router.post("/export", response_model=ExportResponse)
 async def export_cache(req: ExportRequest):
     """Export the engine's KV prefix cache to disk under the sandbox root.
 
     Flow: resolve the destination against the path whitelist (403 on
-    escape) → require a loaded engine (503) → enforce ``max_bytes`` from the
-    cheap in-memory footprint BEFORE writing (413) → snapshot via
-    ``EngineCore.save_cache_to_disk`` → write ``manifest.json`` alongside.
+    escape) → require a loaded engine (503) → pre-write ``max_bytes`` gate
+    on the cheap in-memory footprint (413) → snapshot via
+    ``EngineCore.save_cache_to_disk`` → build the manifest from the
+    committed on-disk index → post-write ``max_bytes`` gate on the exact
+    committed size, discarding the blob if the cache raced over the cap
+    (413) → write ``manifest.json`` alongside.
 
     An empty prefix cache (disabled or 0 entries) is a valid export: it
     returns 200 with ``entries_exported=0`` and still writes a manifest so
@@ -319,7 +373,35 @@ async def export_cache(req: ExportRequest):
     # asyncio loop isn't blocked by the (potentially multi-GB) write.
     saved = await anyio.to_thread.run_sync(engine.save_cache_to_disk, str(destination))
 
-    manifest = build_manifest_from_engine_state(engine)
+    # Build the manifest from the COMMITTED on-disk index (#1100 BLOCKING-3),
+    # not the live ledger — ``cache_dir=destination`` makes the counters
+    # match what a peer will actually load.
+    manifest = build_manifest_from_engine_state(engine, cache_dir=destination)
+
+    # #1100 BLOCKING-2: precise post-write size enforcement. The pre-write
+    # gate above reads the live ledger, which can undercount if the cache
+    # grows between that check and the snapshot the step thread takes. Now
+    # that the blob is committed, ``manifest.total_bytes`` is its exact
+    # on-disk footprint — enforce ``max_bytes`` against it and DISCARD the
+    # over-cap blob so an importing peer never sees an export larger than
+    # the accepted cap.
+    if req.max_bytes is not None and manifest.total_bytes > req.max_bytes:
+        _discard_export(destination)
+        logger.info(
+            "cache/export: post-write reject — committed %d B exceeds max_bytes "
+            "%d B; blob discarded (destination=%s)",
+            manifest.total_bytes,
+            req.max_bytes,
+            destination,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"cache footprint {manifest.total_bytes} bytes exceeds max_bytes "
+                f"{req.max_bytes}"
+            ),
+        )
+
     write_manifest(destination, manifest)
 
     logger.info(
@@ -346,10 +428,12 @@ async def import_cache(req: ImportRequest):
     """Import a peer instance's export into the local engine.
 
     Flow: resolve the source under the sandbox (403 on escape) → read the
-    manifest (404 missing / 400 malformed) → reject protocol-version or
-    model-id mismatch (409) → require a loaded engine (503) → optionally
-    clear the in-memory cache (``merge_strategy="replace"``) → hydrate via
-    ``EngineCore.load_cache_from_disk``.
+    manifest (404 missing / 400 malformed) → reject a protocol-version
+    mismatch, a manifest model_id that differs from the loaded model
+    (unconditional), or a caller ``expected_model_id`` mismatch (409) →
+    require a loaded engine (503) → hydrate via
+    ``EngineCore.load_cache_from_disk`` (``merge_strategy="replace"`` clears
+    the cache atomically inside that step-thread load).
 
     ``entries_skipped`` is ``manifest.entries - entries_loaded`` floored at
     0: the loader drops entries that fail per-entry validation (truncated
@@ -372,6 +456,27 @@ async def import_cache(req: ImportRequest):
             ),
         )
 
+    # #1100 BLOCKING-1: unconditionally reject a manifest whose model_id
+    # does not match the model THIS server loaded. KV cache is model-
+    # specific (layer/head/dim geometry, quant layout) — loading another
+    # model's blob corrupts inference or crashes the fetch. The caller's
+    # ``expected_model_id`` below is an ADDITIONAL, caller-side assertion;
+    # omitting it must NOT disable server-side identity checking. The 409
+    # detail names NEITHER the manifest's nor the server's model id — a
+    # bearer-token holder shouldn't be able to probe what this server runs
+    # by diffing mismatch messages; the caller can read its own manifest
+    # (or GET /v1/cache/info) to see the id it shipped.
+    server_model_id = ""
+    try:
+        server_model_id = get_config().model_name or ""
+    except Exception:  # pragma: no cover — config singleton import guard
+        server_model_id = ""
+    if server_model_id and manifest.model_id != server_model_id:
+        raise HTTPException(
+            status_code=409,
+            detail="manifest model_id does not match the loaded engine model",
+        )
+
     if req.expected_model_id is not None and manifest.model_id != req.expected_model_id:
         raise HTTPException(
             status_code=409,
@@ -384,34 +489,47 @@ async def import_cache(req: ImportRequest):
 
     engine = _engine_or_503()
 
-    # merge_strategy="replace" — drop the current in-memory prefix cache so
-    # the imported blob is the ONLY thing present. ``MemoryAwarePrefixCache
-    # .clear()`` is the smallest correct primitive: it empties ``_entries`` /
-    # ``_sorted_keys`` / the radix index and zeroes ``_current_memory`` while
-    # carrying the monotonic Prometheus counters over (load_skipped /
-    # save_drift_drops) — exactly what a "replace the contents" reset wants.
-    # We deliberately do NOT call ``scheduler.deep_reset()``: that also tears
-    # down the BatchGenerator and paged manager, which would abort in-flight
-    # requests — far heavier than clearing the prefix cache.
-    if req.merge_strategy == "replace":
-        cache = _prefix_cache(engine)
-        if cache is not None:
-            cache.clear()
-            logger.info("cache/import: cleared in-memory prefix cache (replace)")
+    # merge_strategy="replace": the in-memory cache is cleared ATOMICALLY
+    # inside the step-thread load — ``engine.load_cache_from_disk(...,
+    # replace=True)`` forwards to ``MemoryAwarePrefixCache.load_from_disk``,
+    # which clears only AFTER index.json is read + validated, on the same
+    # mlx-step thread that runs the entry-load loop. #1100 BLOCKING-4: the
+    # old code cleared here on the ASYNCIO thread before the step-thread
+    # load, so (a) a corrupt/missing source destroyed the existing cache
+    # before we knew loading would fail, and (b) a concurrent request could
+    # ``store`` into the cache in the gap between clear and load. Pushing the
+    # clear into the load call closes both. We still deliberately do NOT use
+    # ``scheduler.deep_reset()`` (it would abort in-flight requests). clear()
+    # carries the monotonic Prometheus counters over, so replace preserves
+    # load_skipped / save_drift_drops.
+    replace = req.merge_strategy == "replace"
 
-    # Hydrate from disk. Also routed through the mlx-step worker thread so
-    # the loaded arrays are tagged with the right generation_stream. Run in
-    # a threadpool for the same reason as export.
+    # #1100 BLOCKING-5: report the bytes THIS import actually loaded, not the
+    # manifest's full ``total_bytes`` (which overstates when entries are
+    # skipped). Snapshot the cache footprint around the load: for "replace"
+    # the post-load footprint IS the loaded bytes (the cache was emptied
+    # first); for "merge" the positive delta is what got added.
+    cache = _prefix_cache(engine)
+    before_bytes = int(getattr(cache, "_current_memory", 0)) if cache is not None else 0
+
+    # Hydrate from disk. Routed through the mlx-step worker thread so the
+    # loaded arrays are tagged with the right generation_stream. ``replace``
+    # is passed positionally to fit ``anyio.to_thread.run_sync``'s *args.
     entries_loaded = await anyio.to_thread.run_sync(
-        engine.load_cache_from_disk, str(source)
+        engine.load_cache_from_disk, str(source), replace
     )
+
+    after_bytes = int(getattr(cache, "_current_memory", 0)) if cache is not None else 0
+    bytes_loaded = after_bytes if replace else max(0, after_bytes - before_bytes)
 
     entries_skipped = max(0, manifest.entries - entries_loaded)
     logger.info(
-        "cache/import: loaded %d/%d entries (skipped=%s, merge=%s) from source=%s",
+        "cache/import: loaded %d/%d entries (skipped=%s, %d B, merge=%s) "
+        "from source=%s",
         entries_loaded,
         manifest.entries,
         entries_skipped,
+        bytes_loaded,
         req.merge_strategy,
         source,
     )
@@ -419,7 +537,7 @@ async def import_cache(req: ImportRequest):
         protocol_version=PROTOCOL_VERSION,
         entries_loaded=entries_loaded,
         entries_skipped=entries_skipped,
-        bytes_loaded=manifest.total_bytes,
+        bytes_loaded=bytes_loaded,
     )
 
 

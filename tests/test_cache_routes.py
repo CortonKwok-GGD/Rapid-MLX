@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wire-level tests for the KV cache export/import HTTP API (#476 stub).
+"""Wire + engine-body tests for the KV cache export/import HTTP API (#476).
 
-The engine integration is the follow-up PR's job — these tests cover
-the protocol surface that the stub freezes: auth, path sandbox,
-manifest validation, and the explicit 501s on the engine-touching paths.
+Covers the full surface: auth, path sandbox, manifest validation, AND the
+engine-touching save/load bodies — including the production BatchedEngine
+nesting (scheduler at ``engine._engine.engine.scheduler``), the ArraysCache
+round-trip, and the #1100 hardening: the unconditional model-id gate,
+committed-size ``max_bytes`` enforcement with blob discard, the atomic
+``replace`` clear-inside-load, and precise ``bytes_loaded`` accounting.
 """
 
 from __future__ import annotations
@@ -73,6 +76,7 @@ class _FakeEngine:
         use_paged_cache: bool = False,
         kv_cache_turboquant: bool = False,
         load_returns: int = 0,
+        loaded_bytes: int = 0,
     ):
         cache = (
             _FakeCache(entries=entries, current_memory=current_memory)
@@ -89,15 +93,33 @@ class _FakeEngine:
         )
         self.config = SimpleNamespace(model_name="test-model", model_path=None)
         self._load_returns = load_returns
+        self._loaded_bytes = loaded_bytes
         self.saved_to: str | None = None
         self.loaded_from: str | None = None
+        self.load_replace: bool | None = None
 
     def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
         self.saved_to = cache_dir
         return bool(self.scheduler.memory_aware_cache and self._entry_count())
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    def _resolve_cache(self):
+        """Resolve the prefix cache like the route's ``_prefix_cache`` does —
+        overridden by ``_NestedFakeEngine`` for the nested BatchedEngine
+        shape (where ``self.scheduler`` was deleted)."""
+        return self.scheduler.memory_aware_cache
+
+    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
         self.loaded_from = cache_dir
+        self.load_replace = replace
+        cache = self._resolve_cache()
+        if cache is not None:
+            # New contract (#1100 BLOCKING-4): the "replace" clear happens
+            # INSIDE the load (atomic on the step thread), not in the route.
+            if replace:
+                cache.clear()
+            # Simulate the loaded footprint so the route's before/after byte
+            # accounting (#1100 BLOCKING-5) has a real delta to measure.
+            cache._current_memory += self._loaded_bytes
         return self._load_returns
 
     def _entry_count(self) -> int:
@@ -131,6 +153,11 @@ class _NestedFakeEngine(_FakeEngine):
     @property
     def _nested_scheduler(self):
         return self._engine.engine.scheduler
+
+    def _resolve_cache(self):
+        # Nested shape: the cache is only reachable through the
+        # AsyncEngineCore→EngineCore chain (self.scheduler was deleted).
+        return self._nested_scheduler.memory_aware_cache
 
     def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
         # Prod BatchedEngine forwards to the inner engine; the inner
@@ -755,7 +782,15 @@ def test_import_validated_request_returns_200(cache_client):
         total_bytes=4_096_000,
     )
     _write_export_root(cache_client.sandbox, "ready", manifest)
-    engine = cache_client.FakeEngine(entries=2, current_memory=99, load_returns=15)
+    # The server must be running the SAME model the manifest was exported
+    # from, else the #1100 BLOCKING-1 unconditional gate 409s before load.
+    cache_client.cfg.model_name = "qwen3.5-9b-4bit"
+    # ``loaded_bytes`` simulates the footprint the load hydrates; under
+    # "replace" the cache is cleared first so the post-load footprint IS the
+    # loaded bytes → the route reports bytes_loaded == loaded_bytes.
+    engine = cache_client.FakeEngine(
+        entries=2, current_memory=99, load_returns=15, loaded_bytes=4_096_000
+    )
     cache_client.cfg.engine = engine
     resp = cache_client.client.post(
         "/v1/cache/import",
@@ -771,6 +806,8 @@ def test_import_validated_request_returns_200(cache_client):
     assert body["protocol_version"] == PROTOCOL_VERSION
     assert body["entries_loaded"] == 15
     assert body["entries_skipped"] == 3  # 18 claimed − 15 loaded
+    # #1100 BLOCKING-5: bytes_loaded is the ACTUAL loaded footprint (replace
+    # cleared first, so post-load footprint == loaded), not manifest.total.
     assert body["bytes_loaded"] == 4_096_000
     # The engine's load actually ran, with the resolved source dir.
     assert engine.loaded_from is not None
@@ -816,6 +853,118 @@ def test_import_entries_skipped_floored_at_zero(cache_client):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["entries_skipped"] == 0
+
+
+def test_import_rejects_mismatched_model_without_expected_id(cache_client):
+    """#1100 BLOCKING-1: the unconditional model-id gate can NOT be bypassed
+    by omitting ``expected_model_id``. A manifest whose model_id differs from
+    the server's loaded model is rejected (409) even with no caller-side
+    expectation — loading another model's KV geometry would corrupt
+    inference. The load must not run, and the 409 must not leak the server's
+    model id."""
+    _write_export_root(
+        cache_client.sandbox,
+        "wrong-model",
+        Manifest(
+            protocol_version=PROTOCOL_VERSION,
+            model_id="some-other-model-70b",  # != server "test-model"
+            entries=5,
+        ),
+    )
+    engine = cache_client.FakeEngine(entries=3, current_memory=500, load_returns=5)
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "wrong-model"},  # NO expected_model_id — must still 409
+        headers=_auth(),
+    )
+    assert resp.status_code == 409, resp.text
+    # The gate fires before the engine is touched — load never ran.
+    assert engine.loaded_from is None
+    # 409 detail must not name either model id (server or manifest).
+    assert "test-model" not in resp.text
+    assert "some-other-model-70b" not in resp.text
+
+
+def test_load_from_disk_replace_preserves_cache_on_missing_source():
+    """#1100 BLOCKING-4: ``replace=True`` clears the cache ONLY after the
+    source index validates. A missing/unreadable source returns 0 WITHOUT
+    clearing — so a failed replace-import preserves the existing cache
+    instead of destroying it (the route used to clear before it knew the
+    load would fail)."""
+    import mlx.core as mx
+
+    src_cache, _ = _build_cache_with_arrays_layer()
+    # Materialize arrays on the main thread (see the roundtrip test's stream
+    # rationale) so touching them from the default-stream context is safe.
+    for entry in src_cache._entries.values():
+        for layer in entry.cache:
+            state = getattr(layer, "state", None)
+            if state is not None:
+                mx.eval(state)
+    before = len(src_cache._entries)
+    assert before > 0
+
+    with mx.stream(mx.default_stream(mx.default_device())):
+        loaded = src_cache.load_from_disk("/nonexistent/replace/source", replace=True)
+
+    assert loaded == 0
+    # NOT cleared — a failed replace leaves the existing cache intact.
+    assert len(src_cache._entries) == before
+
+
+def test_export_post_write_max_bytes_discards_oversized_blob(cache_client):
+    """#1100 BLOCKING-2 + BLOCKING-3: max_bytes is enforced against the
+    COMMITTED on-disk size (read from index.json), not just the pre-write
+    live ledger. A cache that grows between the pre-check and the snapshot
+    still can't produce an over-cap export — the oversized blob is discarded
+    from disk rather than left for a peer to import."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    engine = cache_client.FakeEngine(entries=1, current_memory=10, load_returns=0)
+
+    def _save_writes_big_index(cache_dir, should_abort=None):
+        # Pre-check saw a tiny live footprint (10 B ≤ cap); the committed
+        # index reports 5000 B (simulating cache growth racing the snapshot).
+        engine.saved_to = cache_dir
+        d = _Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.json").write_text(
+            _json.dumps(
+                {
+                    "version": 3,
+                    "total_memory_bytes": 5000,
+                    "entries": [
+                        {
+                            "index": 0,
+                            "num_tokens": 4,
+                            "memory_bytes": 5000,
+                            "cache_types": ["KVCache"],
+                        }
+                    ],
+                }
+            )
+        )
+        (d / "entry_0.safetensors").write_text("x")
+        (d / "entry_0_tokens.bin").write_text("x")
+        return True
+
+    engine.save_cache_to_disk = _save_writes_big_index
+    cache_client.cfg.engine = engine
+
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "grew", "max_bytes": 1000},  # committed 5000 > 1000
+        headers=_auth(),
+    )
+    assert resp.status_code == 413, resp.text
+    # The oversized blob was discarded — nothing left on disk for a peer.
+    blob_dir = _Path(cache_client.sandbox) / "grew"
+    assert not (blob_dir / "index.json").exists()
+    assert not (blob_dir / "entry_0.safetensors").exists()
+    # No manifest was written for the rejected export.
+    assert not (blob_dir / "manifest.json").exists()
 
 
 def test_import_engine_not_loaded_returns_503(cache_client):
@@ -1128,10 +1277,11 @@ def test_http_export_import_roundtrip_end_to_end(monkeypatch, sandbox):
         def save_cache_to_disk(self, cache_dir, should_abort=None):
             return _on_default_stream(src_cache.save_to_disk, cache_dir)
 
-        def load_cache_from_disk(self, cache_dir):
+        def load_cache_from_disk(self, cache_dir, replace=False):
             # Importer loads into the DESTINATION cache — the real
-            # load_from_disk path (compat gate included).
-            return _on_default_stream(dst_cache.load_from_disk, cache_dir)
+            # load_from_disk path (compat gate included). ``replace`` forwards
+            # to the real clear-inside-load contract (#1100 BLOCKING-4).
+            return _on_default_stream(dst_cache.load_from_disk, cache_dir, replace)
 
     cfg = reset_config()
     cfg.api_key = "test-secret"
