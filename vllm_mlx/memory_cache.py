@@ -1351,6 +1351,20 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
+        # #1100 codex round 4 (#1/#3): authoritative outcome of the LAST
+        # save_to_disk / load_from_disk call, recorded INSIDE the serialized
+        # step-thread op (not inferred from a racy pre/post snapshot the
+        # asyncio thread reads around it). The export/import routes read these
+        # so a concurrent store/evict that races the op can't be misattributed.
+        #   _last_save_outcome: "empty" (cache had 0 entries — legit no-op),
+        #     "committed" (>=1 entry committed), or "failed" (had entries but
+        #     nothing committed). Distinguishes an empty export from a failed
+        #     save without the route sampling len(cache) before the op.
+        #   _last_load_bytes: the exact KV byte total this load installed
+        #     (0 on an aborted replace / empty load), computed under _lock.
+        self._last_save_outcome: str = "empty"
+        self._last_load_bytes: int = 0
+
         # Guards _entries / _sorted_keys mutations against concurrent
         # fetch/store/evict from multiple threads (asyncio loop + mlx-step).
         self._lock = threading.Lock()
@@ -2017,10 +2031,21 @@ class MemoryAwarePrefixCache:
         import shutil
         import time as _time
 
+        # #1100 codex round 4 (#1): record the AUTHORITATIVE save outcome on
+        # the instance INSIDE this serialized step-thread op, so the export
+        # route can distinguish an empty no-op from a failed save WITHOUT
+        # sampling ``len(cache)`` on the asyncio thread before the op (a
+        # concurrent store/evict racing that snapshot mis-classified the
+        # result). "empty" here = the cache genuinely held 0 entries. Any
+        # ``return False`` AFTER this point means we had entries but couldn't
+        # commit them → "failed"; we default to that and flip to "committed"
+        # only on the successful final return.
         if not self._entries:
+            self._last_save_outcome = "empty"
             logger.info("[cache_persist] nothing to save (0 entries)")
             return False
 
+        self._last_save_outcome = "failed"
         t0 = _time.monotonic()
 
         try:
@@ -2578,7 +2603,12 @@ class MemoryAwarePrefixCache:
                 f"{saved}/{total_entries} entries written but rename "
                 f"did not complete; load_from_disk recovery required"
             )
-        return saved > 0 and rename_committed
+        committed = saved > 0 and rename_committed
+        # #1100 codex round 4 (#1): flip the outcome to "committed" only when
+        # at least one entry landed AND the atomic rename published it. A
+        # zero-commit / un-renamed result stays "failed" (set above).
+        self._last_save_outcome = "committed" if committed else "failed"
+        return committed
 
     def load_from_disk(self, cache_dir: str, replace: bool = False) -> int:
         """Load cache entries from disk.
@@ -2628,6 +2658,12 @@ class MemoryAwarePrefixCache:
         """
         import shutil
         import time as _time
+
+        # #1100 codex round 4 (#3): default the authoritative loaded-byte
+        # total to 0 up front so EVERY early return (missing index, JSON
+        # parse failure, aborted replace) leaves it correct — the import
+        # route reads this, never a before/after ``_current_memory`` diff.
+        self._last_load_bytes = 0
 
         # Strip trailing separators (see save_to_disk for rationale).
         cache_dir = cache_dir.rstrip(os.sep)
@@ -2968,7 +3004,12 @@ class MemoryAwarePrefixCache:
         # cache is preserved intact. We never clear before this point, so
         # there is nothing to roll back.
         if replace and replace_aborted:
-            self._stats.load_skipped += corrupt_skipped
+            with self._lock:
+                self._stats.load_skipped += corrupt_skipped
+            # #1100 codex round 4 (#3): nothing was installed — report 0
+            # loaded bytes authoritatively so the import route never
+            # attributes the PRESERVED existing cache to this load.
+            self._last_load_bytes = 0
             logger.warning(
                 "[cache_persist] replace ABORTED: source blob at %s has a "
                 "corrupt/missing entry (%d corrupt so far) — existing cache "
@@ -2978,33 +3019,65 @@ class MemoryAwarePrefixCache:
             )
             return 0
 
-        # Commit the staged entries. In replace mode we clear the live
-        # cache now — AFTER the whole blob staged cleanly — then swap the
-        # staged entries in. ``clear()`` carries the monotonic counters
-        # over (load_skipped / save_drift_drops). In merge mode there's
-        # nothing to clear; the staged set already excludes live duplicates.
-        if replace:
-            self.clear()
-            logger.info(
-                "[cache_persist] replace: cleared in-memory cache after full "
-                "staging (%d entries staged, index validated)",
-                len(staged),
-            )
-        for tokens_key, entry in staged.items():
-            self._entries[tokens_key] = entry
-            self._current_memory += entry.memory_bytes
-            bisect.insort(self._sorted_keys, tokens_key)
+        # Commit the staged entries as a SINGLE atomic bulk swap under
+        # ``self._lock`` (#1100 codex round 4 #2). In replace mode we clear
+        # the live cache and install the staged set WITHOUT releasing the
+        # lock in between — a concurrent reader (e.g. /v1/cache/info,
+        # /metrics on the asyncio thread) can never observe an empty or
+        # half-rebuilt cache. The old path called ``self.clear()`` (which
+        # takes+releases the lock) and then inserted entries lock-free,
+        # exposing exactly that window. In merge mode there's nothing to
+        # clear; the staged set already excludes live duplicates.
+        #
+        # ``clear()``'s monotonic-counter carry-over (load_skipped /
+        # save_drift_drops / non_trimmable_skips) is inlined here so the
+        # whole clear+install stays in one critical section.
+        loaded_bytes = 0
+        with self._lock:
+            if replace:
+                self._entries.clear()
+                self._sorted_keys.clear()
+                if self._radix_index is not None:
+                    try:
+                        self._radix_index.clear()
+                    except Exception as exc:  # pragma: no cover — defensive
+                        logger.warning(f"[radix] clear failed: {exc}")
+                self._current_memory = 0
+                self._stats = CacheStats(
+                    max_memory_bytes=self._max_memory,
+                    load_skipped=self._stats.load_skipped,
+                    save_drift_drops=self._stats.save_drift_drops,
+                    non_trimmable_skips=self._stats.non_trimmable_skips,
+                )
+                logger.info(
+                    "[cache_persist] replace: cleared in-memory cache after "
+                    "full staging (%d entries staged, index validated)",
+                    len(staged),
+                )
+            for tokens_key, entry in staged.items():
+                self._entries[tokens_key] = entry
+                self._current_memory += entry.memory_bytes
+                loaded_bytes += entry.memory_bytes
+                bisect.insort(self._sorted_keys, tokens_key)
 
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
-        # R10-D / R9-L4: surface the corrupt-skip count as a sticky
-        # cumulative counter so /metrics can graph "% of disk-load
-        # rejected per startup" without re-scraping logs. We only
-        # bump for CORRUPTION skips — duplicate and incompatible skips
-        # are benign (a deliberate config change or in-memory dedup)
-        # and would dilute the corruption signal an operator is
-        # actually looking for.
-        self._stats.load_skipped += corrupt_skipped
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
+            # R10-D / R9-L4: surface the corrupt-skip count as a sticky
+            # cumulative counter so /metrics can graph "% of disk-load
+            # rejected per startup" without re-scraping logs. We only
+            # bump for CORRUPTION skips — duplicate and incompatible skips
+            # are benign (a deliberate config change or in-memory dedup)
+            # and would dilute the corruption signal an operator is
+            # actually looking for. Kept inside the same critical section
+            # as the install so a scraper reads a consistent stats block.
+            self._stats.load_skipped += corrupt_skipped
+
+        # #1100 codex round 4 (#3): authoritative loaded-byte total, summed
+        # from the entries actually installed in THIS load (under the lock
+        # above). The import route reports this instead of diffing
+        # ``_current_memory`` before/after on the asyncio thread, where a
+        # concurrent store/evict on the step thread could skew the delta.
+        self._last_load_bytes = loaded_bytes
 
         dt = _time.monotonic() - t0
         summary = (

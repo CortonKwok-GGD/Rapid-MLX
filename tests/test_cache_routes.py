@@ -41,13 +41,23 @@ def sandbox(monkeypatch, tmp_path):
 class _FakeCache:
     """Minimal stand-in for ``MemoryAwarePrefixCache`` — just the ledger
     fields the routes read (``_entries`` / ``_current_memory``) plus a
-    ``clear()`` that the ``merge_strategy="replace"`` path calls."""
+    ``clear()`` that the ``merge_strategy="replace"`` path calls.
+
+    #1100 codex round 4: the routes no longer read a pre/post ``_current_
+    memory`` snapshot around the op — they read the AUTHORITATIVE outcome the
+    serialized op records on the cache: ``_last_save_outcome`` (empty /
+    committed / failed) and ``_last_load_bytes``. The fake engine's
+    save/load stubs below set these the same way the real op does.
+    """
 
     def __init__(self, entries: int = 0, current_memory: int = 0):
         # The routes read ``len(cache._entries)`` and ``cache._current_memory``.
         self._entries = {f"k{i}": i for i in range(entries)}
         self._current_memory = current_memory
         self.clear_calls = 0
+        # Mirror the real cache's authoritative op-outcome attributes.
+        self._last_save_outcome = "empty"
+        self._last_load_bytes = 0
 
     def clear(self) -> None:
         self.clear_calls += 1
@@ -56,8 +66,7 @@ class _FakeCache:
 
     def __len__(self) -> int:
         # Mirror ``MemoryAwarePrefixCache.__len__`` so the export route's
-        # ``len(cache) > 0`` pre-write entry snapshot (#1100 BLOCKING-3)
-        # exercises the SAME code path the real cache does.
+        # entry-count reads exercise the SAME code path the real cache does.
         return len(self._entries)
 
 
@@ -106,7 +115,16 @@ class _FakeEngine:
 
     def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
         self.saved_to = cache_dir
-        return bool(self.scheduler.memory_aware_cache and self._entry_count())
+        cache = self.scheduler.memory_aware_cache
+        committed = bool(cache and self._entry_count())
+        # #1100 codex round 4 (#1): record the authoritative outcome the same
+        # way the real ``save_to_disk`` does — empty cache is a legit no-op,
+        # a non-empty cache that commits >=1 entry is "committed". (The
+        # failed-save path is simulated by overriding this stub in the
+        # dedicated failure test.)
+        if cache is not None:
+            cache._last_save_outcome = "committed" if committed else "empty"
+        return committed
 
     def _resolve_cache(self):
         """Resolve the prefix cache like the route's ``_prefix_cache`` does —
@@ -123,9 +141,14 @@ class _FakeEngine:
             # INSIDE the load (atomic on the step thread), not in the route.
             if replace:
                 cache.clear()
-            # Simulate the loaded footprint so the route's before/after byte
-            # accounting (#1100 BLOCKING-5) has a real delta to measure.
+            # Simulate the loaded footprint. #1100 codex round 4 (#3): the
+            # route now reads the AUTHORITATIVE ``_last_load_bytes`` the op
+            # records (summed over installed entries), NOT a before/after
+            # ``_current_memory`` diff. Record it the same way the real
+            # ``load_from_disk`` does: the bytes this load installed, or 0
+            # when nothing loaded (aborted replace / empty source).
             cache._current_memory += self._loaded_bytes
+            cache._last_load_bytes = self._loaded_bytes if self._load_returns else 0
         return self._load_returns
 
     def _entry_count(self) -> int:
@@ -171,7 +194,10 @@ class _NestedFakeEngine(_FakeEngine):
         # the nested cache for the "did anything commit?" signal.
         self.saved_to = cache_dir
         cache = self._nested_scheduler.memory_aware_cache
-        return bool(cache and len(cache._entries))
+        committed = bool(cache and len(cache._entries))
+        if cache is not None:
+            cache._last_save_outcome = "committed" if committed else "empty"
+        return committed
 
 
 @pytest.fixture
@@ -1020,6 +1046,12 @@ def test_export_failed_save_of_nonempty_cache_returns_500(cache_client):
         staging = _Path(str(cache_dir) + ".new")
         staging.mkdir(parents=True, exist_ok=True)
         (staging / "index.json").write_text("{}")  # orphaned staging artifact
+        # #1100 codex round 4 (#1): the real ``save_to_disk`` records "failed"
+        # on the cache when a non-empty cache commits nothing. The route reads
+        # THIS (not a pre-write len snapshot) to classify the outcome.
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "failed"
         return False  # nothing committed
 
     engine.save_cache_to_disk = _save_commits_nothing
@@ -1036,6 +1068,35 @@ def test_export_failed_save_of_nonempty_cache_returns_500(cache_client):
     assert (blob_dir / "manifest.json").exists()
     # The orphaned staging dir was swept.
     assert not _Path(str(blob_dir) + ".new").exists()
+
+
+def test_export_classifies_failed_save_by_authoritative_outcome(cache_client):
+    """#1100 codex round 4 (#1): the export route classifies the save result by
+    the AUTHORITATIVE ``_last_save_outcome`` the op records, NOT by a pre-write
+    ``len(cache)`` snapshot that a racing store/evict could skew. Here the
+    op reports 'failed' (a non-empty cache that committed nothing) while the
+    route is given NO pre-write len discriminator at all — the classification
+    must come purely from the recorded outcome (→ 500 failed save), proving the
+    route no longer depends on the racy snapshot it used to sample."""
+    engine = cache_client.FakeEngine(entries=2, current_memory=999)
+
+    def _save_fails(cache_dir, should_abort=None):
+        # Authoritative outcome: had entries but committed nothing.
+        engine.saved_to = cache_dir
+        cache = engine.scheduler.memory_aware_cache
+        cache._last_save_outcome = "failed"
+        return False
+
+    engine.save_cache_to_disk = _save_fails
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "outcome-failed"},
+        headers=_auth(),
+    )
+    # Trusted the authoritative 'failed' outcome → 500.
+    assert resp.status_code == 500, resp.text
+    assert "commit" in resp.json()["detail"].lower()
 
 
 def test_export_empty_cache_save_false_is_200_not_error(cache_client):
@@ -1129,6 +1190,9 @@ def test_export_manifest_write_failure_discards_committed_blob(
         )
         (d / "entry_0.safetensors").write_text("x")
         (d / "entry_0_tokens.bin").write_text("x")
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "committed"
         return True
 
     engine.save_cache_to_disk = _save_commits
@@ -1227,6 +1291,9 @@ async def test_export_concurrent_same_destination_serialized(cache_client):
         with counter_lock:
             state["in_flight"] -= 1
         engine.saved_to = cache_dir
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "committed"
         return True
 
     engine.save_cache_to_disk = _save
@@ -1260,6 +1327,127 @@ async def test_export_concurrent_same_destination_serialized(cache_client):
     assert state["peak"] == 1, f"lock did not serialize; peak in-flight={state['peak']}"
 
 
+@pytest.mark.asyncio
+async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
+    """#1100 codex round 4 (#4): the import handler holds the SAME
+    per-destination lock export uses, from manifest read through load, so a
+    concurrent export to the same path can't swap ``index.json`` between our
+    manifest validation and the load. Prove mutual exclusion: an in-flight
+    import and export to one path never overlap their critical sections."""
+    import asyncio as _asyncio
+    import threading
+    import time as _time
+
+    import httpx
+    from fastapi import FastAPI
+
+    import vllm_mlx.routes.cache as cache_mod
+    from vllm_mlx.routes.cache import router
+
+    # A shared path holding a valid manifest the import will read.
+    manifest = Manifest(
+        protocol_version=PROTOCOL_VERSION, model_id="test-model", entries=1
+    )
+    _write_export_root(cache_client.sandbox, "shared-io", manifest)
+
+    engine = cache_client.FakeEngine(
+        entries=1, current_memory=1024, load_returns=1, loaded_bytes=512
+    )
+    engine.config.model_name = "test-model"
+    cache_client.cfg.model_name = "test-model"
+
+    state = {"in_flight": 0, "peak": 0}
+    counter_lock = threading.Lock()
+
+    def _instrumented(cache_dir, should_abort=None):
+        with counter_lock:
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+        _time.sleep(0.05)
+        with counter_lock:
+            state["in_flight"] -= 1
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "committed"
+            cache._last_load_bytes = 512
+        return True
+
+    def _instrumented_load(cache_dir, replace=False):
+        with counter_lock:
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+        _time.sleep(0.05)
+        with counter_lock:
+            state["in_flight"] -= 1
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_load_bytes = 512
+        return 1
+
+    engine.save_cache_to_disk = _instrumented
+    engine.load_cache_from_disk = _instrumented_load
+    cache_client.cfg.engine = engine
+
+    cache_mod._export_dest_locks.clear()
+    cache_mod._export_locks_guard = _asyncio.Lock()
+
+    app = FastAPI()
+    app.include_router(router)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        export = client.post(
+            "/v1/cache/export", json={"destination": "shared-io"}, headers=_auth()
+        )
+        importr = client.post(
+            "/v1/cache/import",
+            json={"source": "shared-io", "merge_strategy": "merge"},
+            headers=_auth(),
+        )
+        r_exp, r_imp = await _asyncio.gather(export, importr)
+
+    assert r_exp.status_code == 200, r_exp.text
+    assert r_imp.status_code == 200, r_imp.text
+    # Export's save and import's load share the destination lock → their
+    # instrumented critical sections never overlapped.
+    assert state["peak"] == 1, (
+        f"import/export on one path overlapped; peak in-flight={state['peak']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_interprocess_lock_serializes_and_uses_sibling_path(tmp_path):
+    """#1100 codex round 4 (#5): the cross-process ``flock`` (a) is held
+    exclusively — a second acquire blocks until the first releases — and (b)
+    lives on a ``.txlock`` SIBLING of the destination, never inside it (a child
+    would ride the export blob / count against max_bytes)."""
+    import asyncio as _asyncio
+
+    from vllm_mlx.routes.cache import _InterProcessLock
+
+    dest = tmp_path / "sub" / "snap"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_a = _InterProcessLock(dest)
+    async with lock_a:
+        # The lockfile is a sibling of ``dest``, not a child under it.
+        sibling = tmp_path / "sub" / "snap.txlock"
+        assert sibling.exists()
+        assert not (dest / "snap.txlock").exists()
+
+        # A second lock on the SAME dest must not acquire while A holds it.
+        # ``flock`` is per-open-file-description, so a second fd from THIS
+        # process still blocks on LOCK_EX — assert the acquire doesn't
+        # complete within a short window.
+        lock_b = _InterProcessLock(dest)
+        acquire_b = _asyncio.ensure_future(lock_b.__aenter__())
+        done, _pending = await _asyncio.wait({acquire_b}, timeout=0.3)
+        assert not done, "second flock acquired while the first was held"
+
+    # Once A releases, B acquires promptly.
+    await _asyncio.wait_for(acquire_b, timeout=2.0)
+    await lock_b.__aexit__(None, None, None)
+
+
 def test_export_discard_quarantines_when_delete_fails(cache_client, monkeypatch):
     """#1100 BLOCKING-5: if the oversized-blob cleanup can't DELETE the blob
     (permission / fs failure), it must QUARANTINE the import-critical files
@@ -1283,6 +1471,9 @@ def test_export_discard_quarantines_when_delete_fails(cache_client, monkeypatch)
         )
         (d / "entry_0.safetensors").write_text("x" * 5000)  # on-disk over cap
         (d / "entry_0_tokens.bin").write_text("x")
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "committed"
         return True
 
     engine.save_cache_to_disk = _save_writes_big_blob
@@ -1340,6 +1531,11 @@ def test_export_discard_500_when_neither_delete_nor_quarantine_works(
         )
         (d / "entry_0.safetensors").write_text("x" * 5000)
         (d / "entry_0_tokens.bin").write_text("x")
+        # #1100 codex round 4 (#1): committed save — record the authoritative
+        # outcome the route reads to route into the size-gate branch.
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "committed"
         return True
 
     engine.save_cache_to_disk = _save_writes_big_blob
@@ -1445,6 +1641,73 @@ def test_load_from_disk_replace_preserves_cache_on_corrupt_entry_blob(tmp_path):
     assert loaded == 0
     assert dst_cache._entries == before_entries
     assert dst_cache._current_memory == before_mem
+    # #1100 codex round 4 (#3): the authoritative loaded-byte total is 0 — the
+    # preserved existing footprint must NOT be reported as loaded by this call.
+    assert dst_cache._last_load_bytes == 0
+
+
+def test_load_from_disk_replace_records_authoritative_loaded_bytes(tmp_path):
+    """#1100 codex round 4 (#3): a COMMITTED replace records the exact KV byte
+    total it installed on ``_last_load_bytes`` (summed under the lock over the
+    entries it staged), so the import route reports the loaded footprint
+    without a racy before/after ``_current_memory`` diff. And (#2) the
+    clear+install is a single atomic swap — the post-load footprint equals the
+    recorded loaded bytes, never a half-rebuilt intermediate."""
+    import mlx.core as mx
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache, _CacheEntry
+
+    # 1. Build + save a real 1-entry snapshot (valid index + blobs).
+    src_cache, load_cfg = _build_cache_with_arrays_layer()
+    for entry in src_cache._entries.values():
+        for layer in entry.cache:
+            state = getattr(layer, "state", None)
+            if state is not None:
+                mx.eval(state)
+    target = str(tmp_path / "snap")
+    with mx.stream(mx.default_stream(mx.default_device())):
+        assert src_cache.save_to_disk(target) is True
+    # The source's save recorded a "committed" outcome (>=1 entry landed).
+    assert src_cache._last_save_outcome == "committed"
+
+    # 2. A populated destination cache does a replace-import of the snapshot.
+    dst_cache = MemoryAwarePrefixCache(model=object(), config=load_cfg)
+    dst_tokens = (90, 91, 92)
+    dst_kv = _second_kvcache()
+    entry = _CacheEntry.create(list(dst_tokens), dst_kv)
+    with dst_cache._lock:
+        dst_cache._entries[dst_tokens] = entry
+        dst_cache._current_memory += entry.memory_bytes
+    for layer in dst_kv:
+        state = getattr(layer, "state", None)
+        if state is not None:
+            mx.eval(state)
+
+    with mx.stream(mx.default_stream(mx.default_device())):
+        loaded = dst_cache.load_from_disk(target, replace=True)
+
+    # The pre-existing entry was replaced; the snapshot's single entry loaded.
+    assert loaded == 1
+    assert dst_tokens not in dst_cache._entries
+    # Authoritative loaded bytes == the installed footprint == post-load
+    # ``_current_memory`` (replace cleared first, so no residue skews it).
+    assert dst_cache._last_load_bytes > 0
+    assert dst_cache._last_load_bytes == dst_cache._current_memory
+
+
+def test_save_to_disk_records_empty_outcome_on_empty_cache(tmp_path):
+    """#1100 codex round 4 (#1): ``save_to_disk`` on a genuinely EMPTY cache
+    records ``_last_save_outcome == 'empty'`` (a legit no-op), distinct from a
+    ``'failed'`` save of a non-empty cache — so the export route can 200 an
+    empty export vs 500 a failed one WITHOUT sampling ``len(cache)`` before the
+    op (a racy pre-write snapshot)."""
+    _src, load_cfg = _build_cache_with_arrays_layer()
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    empty = MemoryAwarePrefixCache(model=object(), config=load_cfg)
+    assert len(empty) == 0
+    assert empty.save_to_disk(str(tmp_path / "empty-snap")) is False
+    assert empty._last_save_outcome == "empty"
 
 
 def _second_kvcache():
@@ -1503,6 +1766,11 @@ def test_export_post_write_max_bytes_discards_oversized_blob(cache_client):
         # gate missed.
         (d / "entry_0.safetensors").write_text("x" * 5000)
         (d / "entry_0_tokens.bin").write_text("x")
+        # #1100 codex round 4 (#1): committed save — the route reads this
+        # authoritative outcome to reach the post-write size gate.
+        cache = engine.scheduler.memory_aware_cache
+        if cache is not None:
+            cache._last_save_outcome = "committed"
         return True
 
     engine.save_cache_to_disk = _save_writes_big_blob

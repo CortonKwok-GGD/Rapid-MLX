@@ -123,6 +123,86 @@ async def _acquire_dest_lock(destination: Path) -> asyncio.Lock:
         return lock
 
 
+# #1100 codex round 4 (#5): the per-destination ``asyncio.Lock`` above is
+# process-local — it serializes concurrent requests WITHIN one rapid-mlx
+# instance but does nothing across SEPARATE instances that export/import to a
+# SHARED destination (an NFS / SMB mount two servers both point at). Those
+# processes collide on ``save_to_disk``'s fixed ``<dest>.new`` / ``<dest>.old``
+# staging paths: instance A's ``.new`` gets clobbered by instance B, or A's
+# atomic rename publishes B's half-written blob. An advisory whole-file
+# ``flock`` on a ``<dest>.txlock`` sibling makes the WHOLE transaction (stage →
+# publish → manifest) mutually exclusive across processes on the same host /
+# lock-aware filesystem. The lock is a plain O_CREAT file we never delete
+# (deleting it races the next acquirer); its bytes are meaningless.
+#
+# ``flock`` is POSIX-only and advisory (both parties must opt in — they do,
+# it's the same code path). On a filesystem without working ``flock`` (some
+# network mounts) the call may raise; we degrade to the process-local lock
+# only (best-effort) rather than fail the request, logging once so an operator
+# on a shared mount knows cross-process exclusion isn't active.
+class _InterProcessLock:
+    """Advisory cross-process exclusive lock on ``<path>.txlock`` via flock.
+
+    Async-friendly: the (potentially blocking) ``flock`` acquire runs in a
+    worker thread so the event loop isn't stalled while contending with
+    another process. Best-effort: if ``fcntl``/``flock`` is unavailable or
+    the filesystem rejects it, ``__aenter__`` returns having acquired
+    nothing and logs once — the process-local ``asyncio.Lock`` still holds.
+    """
+
+    _degraded_logged = False
+
+    def __init__(self, target: Path) -> None:
+        # Sibling of the destination, NOT a child — a child under ``<dest>``
+        # would be swept into the export blob / counted against max_bytes.
+        self._lock_path = str(target).rstrip(os.sep) + ".txlock"
+        self._fd: int | None = None
+
+    async def __aenter__(self) -> _InterProcessLock:
+        try:
+            import fcntl
+
+            def _acquire() -> int:
+                fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    os.close(fd)
+                    raise
+                return fd
+
+            self._fd = await anyio.to_thread.run_sync(_acquire)
+        except (ImportError, OSError) as exc:
+            self._fd = None
+            if not _InterProcessLock._degraded_logged:
+                _InterProcessLock._degraded_logged = True
+                logger.warning(
+                    "cache: cross-process export lock unavailable (%s: %s); "
+                    "falling back to in-process serialization only — safe for "
+                    "a single instance, but two instances sharing this "
+                    "destination could race staging dirs",
+                    type(exc).__name__,
+                    exc,
+                )
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+
+        def _release() -> None:
+            try:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+        await anyio.to_thread.run_sync(_release)
+
+
 class ExportRequest(BaseModel):
     """Request body for ``POST /v1/cache/export``."""
 
@@ -540,22 +620,20 @@ async def export_cache(req: ExportRequest):
     # lets us reject an over-cap export before touching the disk (the issue's
     # H-04 "never start a write you can't afford" concern).
     #
-    # #1100 BLOCKING-3: also snapshot whether the cache had ANY entries to
-    # save here, BEFORE the write. ``save_cache_to_disk`` returns False for
-    # BOTH a legitimately-empty cache (nothing to commit — 200 with zero
-    # counts) AND a genuine save FAILURE of a non-empty cache (rename never
-    # committed / all entries dropped by the post-write verify). We can't
-    # tell those apart from the boolean alone, so we remember the pre-write
-    # entry count as the discriminator: empty-before → False is legit;
-    # non-empty-before → False is a failed save.
+    # #1100 codex round 4 (#1): we no longer sample ``len(cache)`` here to
+    # tell an empty export from a failed save — that pre-write snapshot
+    # raced a concurrent store/evict on the step thread. Instead the
+    # serialized ``save_to_disk`` op records an AUTHORITATIVE tri-state
+    # outcome on the cache (``_last_save_outcome`` ∈ empty/committed/failed)
+    # that we read AFTER the future resolves (happens-after the write). The
+    # only pre-write value we still need is the live footprint for the CHEAP
+    # 413 pre-gate ("never start a write you can't afford", the issue's
+    # H-04 concern) — an over-cap approximation is fine because the precise
+    # post-write gate against the real committed on-disk size is the
+    # authority (#1100 BLOCKING-2/4).
     current_bytes = 0
-    had_entries_before = False
     if cache is not None:
         current_bytes = int(getattr(cache, "_current_memory", 0))
-        try:
-            had_entries_before = len(cache) > 0
-        except Exception:  # pragma: no cover — defensive against partial cache
-            had_entries_before = current_bytes > 0
     if req.max_bytes is not None and current_bytes > req.max_bytes:
         logger.info(
             "cache/export: rejected — cache footprint %d B exceeds max_bytes %d B "
@@ -572,14 +650,21 @@ async def export_cache(req: ExportRequest):
             ),
         )
 
-    # #1100 codex round 3 (#2/#5): serialize the ENTIRE save→manifest→size-
+    # #1100 codex round 3 (#2): serialize the ENTIRE save→manifest→size-
     # gate→publish transaction per destination. Without this, two concurrent
     # exports to the same path interleave: one writes a manifest describing
     # the other's snapshot, or the over-cap cleanup of one deletes the newer
     # snapshot the other just committed. The lock makes ``destination`` a
     # single-writer resource; distinct destinations still run concurrently.
+    #
+    # #1100 codex round 4 (#5): layer an advisory cross-PROCESS ``flock`` under
+    # the in-process lock so two SEPARATE rapid-mlx instances exporting to a
+    # SHARED destination can't collide on the fixed ``.new``/``.old`` staging
+    # paths. Order matters: take the process-local lock FIRST (cheap, always
+    # works), then the filesystem lock — so a single instance's queued requests
+    # never each block a worker thread on ``flock`` acquisition.
     dest_lock = await _acquire_dest_lock(destination)
-    async with dest_lock:
+    async with dest_lock, _InterProcessLock(destination):
         # Snapshot to disk. Routed through the mlx-step worker thread inside
         # the engine (that's where the KV arrays are materializable). Returns
         # True if at least one entry committed; False for an empty / no-op
@@ -589,22 +674,28 @@ async def export_cache(req: ExportRequest):
             engine.save_cache_to_disk, str(destination)
         )
 
-        # #1100 BLOCKING-3: a non-empty cache whose save committed NOTHING is a
-        # FAILURE, not an empty export. ``save_cache_to_disk`` returns False
-        # for a genuinely-empty cache (legit — 200 with zero counts) AND for a
-        # non-committing save of a non-empty cache (staging dir vanished, all
-        # entries dropped by the post-write verify, or the atomic rename never
-        # landed). Distinguished by the pre-write entry snapshot: if the cache
-        # HAD entries but nothing committed, surface a 500.
-        #
-        # #1100 codex round 3 (#2): the failing save uses ``save_to_disk``'s
-        # own ``.new``/``.old`` staging and does NOT touch the published
-        # destination unless its atomic rename succeeds — so on a
-        # non-committing save we DELIBERATELY do NOT ``_discard_export`` the
-        # destination (that would destroy a previously-valid snapshot that
-        # this failed save never modified). We only sweep the orphaned
-        # ``.new``/``.old`` staging dirs the failed save may have left.
-        if not saved and had_entries_before:
+        # #1100 codex round 4 (#1): read the AUTHORITATIVE outcome the save
+        # op recorded INSIDE the step thread — no racy pre-write snapshot.
+        #   "committed" → >=1 entry landed + published (saved is True)
+        #   "empty"     → the cache genuinely held 0 entries (legit no-op)
+        #   "failed"    → had entries but nothing committed (staging vanished,
+        #                 post-write verify dropped all, rename never landed)
+        # ``getattr`` default keeps the handler robust if the cache couldn't
+        # be resolved (embedded engines): fall back to inferring from the
+        # bool — True→committed, False→empty (there was no cache to fail).
+        save_outcome = getattr(
+            cache, "_last_save_outcome", "committed" if saved else "empty"
+        )
+
+        # A non-empty cache whose save committed NOTHING is a FAILURE, not an
+        # empty export (#1100 BLOCKING-3). #1100 codex round 3 (#2): the
+        # failing save uses ``save_to_disk``'s own ``.new``/``.old`` staging
+        # and does NOT touch the published destination unless its atomic
+        # rename succeeds — so on a non-committing save we DELIBERATELY do NOT
+        # ``_discard_export`` the destination (that would destroy a
+        # previously-valid snapshot this failed save never modified). We only
+        # sweep the orphaned ``.new``/``.old`` staging dirs it may have left.
+        if save_outcome == "failed":
             _sweep_staging_dirs(destination)
             logger.error(
                 "cache/export: save FAILED — cache had entries but nothing "
@@ -625,7 +716,7 @@ async def export_cache(req: ExportRequest):
         # destination's blob artifacts first so the manifest honestly reports
         # 0/0 and no importable stale entry files remain. (Only reached when
         # the save committed nothing AND the cache was legitimately empty.)
-        if not saved:
+        if save_outcome != "committed":
             try:
                 _discard_export(destination)
             except _ExportDiscardError as exc:
@@ -758,130 +849,146 @@ async def import_cache(req: ImportRequest):
     partial import from a clean one without re-reading the blob.
     """
     source = _resolve_or_400(req.source)
-    manifest = _read_manifest_or_http(source)
 
-    if manifest.protocol_version != req.expected_protocol_version:
-        raise HTTPException(
-            status_code=409,
-            detail=str(
-                ManifestMismatchError(
-                    "protocol_version",
-                    req.expected_protocol_version,
-                    manifest.protocol_version,
-                )
-            ),
-        )
+    # #1100 codex round 4 (#4): hold the SAME per-destination transaction lock
+    # export uses, keyed on the resolved source path, from the manifest read
+    # through completion of the engine load. Without it, a concurrent export
+    # to this same path could swap ``index.json`` in the window between our
+    # manifest validation and the load — so we'd validate model_id/protocol
+    # against manifest A but hydrate the KV blob of manifest B. Reusing the
+    # export registry makes export-vs-import on one path mutually exclusive
+    # (distinct paths still run concurrently). The blocking filesystem read +
+    # the step-thread load both run via ``anyio.to_thread.run_sync`` /
+    # ``_read_manifest_or_http``, so the async lock is held across true awaits,
+    # never a CPU-bound spin.
+    dest_lock = await _acquire_dest_lock(source)
+    async with dest_lock, _InterProcessLock(source):
+        manifest = _read_manifest_or_http(source)
 
-    # Resolve the loaded engine BEFORE the identity gate so we can derive
-    # its model id the SAME way the manifest builder does (#1100
-    # BLOCKING-2). The gate previously read ``get_config().model_name``,
-    # which is empty for an embedded / unit-test engine that never
-    # populated ServerConfig — but ``build_manifest_from_engine_state``
-    # falls back to ``engine.config.model_name`` (populated), so an
-    # embedded engine's manifest carried a real id while the gate compared
-    # against "" and skipped the check, letting it import ANOTHER model's
-    # KV state. ``resolve_engine_model_id`` is the shared source of truth
-    # both call sites use so they can't drift again.
-    engine = _engine_or_503()
-
-    # #1100 BLOCKING-1: unconditionally reject a manifest whose model_id
-    # does not match the model THIS server loaded. KV cache is model-
-    # specific (layer/head/dim geometry, quant layout) — loading another
-    # model's blob corrupts inference or crashes the fetch. The caller's
-    # ``expected_model_id`` below is an ADDITIONAL, caller-side assertion;
-    # omitting it must NOT disable server-side identity checking. The 409
-    # detail names NEITHER the manifest's nor the server's model id — a
-    # bearer-token holder shouldn't be able to probe what this server runs
-    # by diffing mismatch messages; the caller can read its own manifest
-    # (or GET /v1/cache/info) to see the id it shipped.
-    server_model_id = resolve_engine_model_id(engine)
-    if server_model_id:
-        if manifest.model_id != server_model_id:
+        if manifest.protocol_version != req.expected_protocol_version:
             raise HTTPException(
                 status_code=409,
-                detail="manifest model_id does not match the loaded engine model",
-            )
-    else:
-        # #1100 codex round 3 (#4): FAIL CLOSED when the loaded engine's model
-        # id cannot be resolved. The old ``if server_model_id and ...`` gate
-        # fell OPEN here — an id-less engine skipped the comparison and would
-        # accept ANY model's KV geometry, the exact corruption the gate
-        # exists to prevent. Now such an engine may import ONLY when the
-        # caller EXPLICITLY pins a matching ``expected_model_id`` (taking
-        # responsibility for the identity assertion the server can't make);
-        # otherwise reject. The 422 (not 409) distinguishes "server can't
-        # verify identity" from "identities mismatch".
-        if req.expected_model_id is None or manifest.model_id != req.expected_model_id:
-            logger.warning(
-                "cache/import: rejected — loaded engine model id is "
-                "unresolvable and caller did not pin a matching "
-                "expected_model_id (source=%s)",
-                source,
-            )
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "cannot verify model identity: the loaded engine has no "
-                    "resolvable model id; supply expected_model_id matching "
-                    "the manifest to import explicitly"
+                detail=str(
+                    ManifestMismatchError(
+                        "protocol_version",
+                        req.expected_protocol_version,
+                        manifest.protocol_version,
+                    )
                 ),
             )
 
-    if req.expected_model_id is not None and manifest.model_id != req.expected_model_id:
-        raise HTTPException(
-            status_code=409,
-            detail=str(
-                ManifestMismatchError(
-                    "model_id", req.expected_model_id, manifest.model_id
+        # Resolve the loaded engine BEFORE the identity gate so we can derive
+        # its model id the SAME way the manifest builder does (#1100
+        # BLOCKING-2). The gate previously read ``get_config().model_name``,
+        # which is empty for an embedded / unit-test engine that never
+        # populated ServerConfig — but ``build_manifest_from_engine_state``
+        # falls back to ``engine.config.model_name`` (populated), so an
+        # embedded engine's manifest carried a real id while the gate compared
+        # against "" and skipped the check, letting it import ANOTHER model's
+        # KV state. ``resolve_engine_model_id`` is the shared source of truth
+        # both call sites use so they can't drift again.
+        engine = _engine_or_503()
+
+        # #1100 BLOCKING-1: unconditionally reject a manifest whose model_id
+        # does not match the model THIS server loaded. KV cache is model-
+        # specific (layer/head/dim geometry, quant layout) — loading another
+        # model's blob corrupts inference or crashes the fetch. The caller's
+        # ``expected_model_id`` below is an ADDITIONAL, caller-side assertion;
+        # omitting it must NOT disable server-side identity checking. The 409
+        # detail names NEITHER the manifest's nor the server's model id — a
+        # bearer-token holder shouldn't be able to probe what this server runs
+        # by diffing mismatch messages; the caller can read its own manifest
+        # (or GET /v1/cache/info) to see the id it shipped.
+        server_model_id = resolve_engine_model_id(engine)
+        if server_model_id:
+            if manifest.model_id != server_model_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=("manifest model_id does not match the loaded engine model"),
                 )
-            ),
+        else:
+            # #1100 codex round 3 (#4): FAIL CLOSED when the loaded engine's
+            # model id cannot be resolved. The old ``if server_model_id and
+            # ...`` gate fell OPEN here — an id-less engine skipped the
+            # comparison and would accept ANY model's KV geometry, the exact
+            # corruption the gate exists to prevent. Now such an engine may
+            # import ONLY when the caller EXPLICITLY pins a matching
+            # ``expected_model_id`` (taking responsibility for the identity
+            # assertion the server can't make); otherwise reject. The 422 (not
+            # 409) distinguishes "server can't verify identity" from
+            # "identities mismatch".
+            if (
+                req.expected_model_id is None
+                or manifest.model_id != req.expected_model_id
+            ):
+                logger.warning(
+                    "cache/import: rejected — loaded engine model id is "
+                    "unresolvable and caller did not pin a matching "
+                    "expected_model_id (source=%s)",
+                    source,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "cannot verify model identity: the loaded engine has no "
+                        "resolvable model id; supply expected_model_id matching "
+                        "the manifest to import explicitly"
+                    ),
+                )
+
+        if (
+            req.expected_model_id is not None
+            and manifest.model_id != req.expected_model_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=str(
+                    ManifestMismatchError(
+                        "model_id", req.expected_model_id, manifest.model_id
+                    )
+                ),
+            )
+
+        # merge_strategy="replace": the in-memory cache is cleared ATOMICALLY
+        # inside the step-thread load — ``engine.load_cache_from_disk(...,
+        # replace=True)`` forwards to ``MemoryAwarePrefixCache.load_from_disk``,
+        # which clears only AFTER index.json is read + validated, on the same
+        # mlx-step thread that runs the entry-load loop. #1100 BLOCKING-4: the
+        # old code cleared here on the ASYNCIO thread before the step-thread
+        # load, so (a) a corrupt/missing source destroyed the existing cache
+        # before we knew loading would fail, and (b) a concurrent request could
+        # ``store`` into the cache in the gap between clear and load. Pushing
+        # the clear into the load call closes both. We still deliberately do
+        # NOT use ``scheduler.deep_reset()`` (it would abort in-flight
+        # requests). clear() carries the monotonic Prometheus counters over, so
+        # replace preserves load_skipped / save_drift_drops.
+        replace = req.merge_strategy == "replace"
+
+        # #1100 BLOCKING-5: report the bytes THIS import actually loaded, not
+        # the manifest's full ``total_bytes`` (which overstates when entries
+        # are skipped).
+        cache = _prefix_cache(engine)
+
+        # Hydrate from disk. Routed through the mlx-step worker thread so the
+        # loaded arrays are tagged with the right generation_stream. ``replace``
+        # is passed positionally to fit ``anyio.to_thread.run_sync``'s *args.
+        entries_loaded = await anyio.to_thread.run_sync(
+            engine.load_cache_from_disk, str(source), replace
         )
 
-    # merge_strategy="replace": the in-memory cache is cleared ATOMICALLY
-    # inside the step-thread load — ``engine.load_cache_from_disk(...,
-    # replace=True)`` forwards to ``MemoryAwarePrefixCache.load_from_disk``,
-    # which clears only AFTER index.json is read + validated, on the same
-    # mlx-step thread that runs the entry-load loop. #1100 BLOCKING-4: the
-    # old code cleared here on the ASYNCIO thread before the step-thread
-    # load, so (a) a corrupt/missing source destroyed the existing cache
-    # before we knew loading would fail, and (b) a concurrent request could
-    # ``store`` into the cache in the gap between clear and load. Pushing the
-    # clear into the load call closes both. We still deliberately do NOT use
-    # ``scheduler.deep_reset()`` (it would abort in-flight requests). clear()
-    # carries the monotonic Prometheus counters over, so replace preserves
-    # load_skipped / save_drift_drops.
-    replace = req.merge_strategy == "replace"
-
-    # #1100 BLOCKING-5: report the bytes THIS import actually loaded, not the
-    # manifest's full ``total_bytes`` (which overstates when entries are
-    # skipped). Snapshot the cache footprint around the load: for a committed
-    # "replace" the post-load footprint IS the loaded bytes (the cache was
-    # emptied first); for "merge" the positive delta is what got added.
-    cache = _prefix_cache(engine)
-    before_bytes = int(getattr(cache, "_current_memory", 0)) if cache is not None else 0
-
-    # Hydrate from disk. Routed through the mlx-step worker thread so the
-    # loaded arrays are tagged with the right generation_stream. ``replace``
-    # is passed positionally to fit ``anyio.to_thread.run_sync``'s *args.
-    entries_loaded = await anyio.to_thread.run_sync(
-        engine.load_cache_from_disk, str(source), replace
+    # #1100 codex round 4 (#3): the loaded byte total is now computed INSIDE
+    # ``load_from_disk`` (under its lock, summed over the entries this call
+    # actually installed) and recorded on the cache as ``_last_load_bytes``.
+    # We read that authoritative value instead of diffing ``_current_memory``
+    # before/after on the asyncio thread, where a concurrent store/evict on
+    # the step thread could skew the delta (and where a merge/replace/aborted
+    # path each needed different snapshot arithmetic). It is already 0 for an
+    # empty load, an aborted replace, or a resolvable-but-untouched cache.
+    # ``getattr`` default 0 keeps the handler robust for engine shapes whose
+    # cache we can't resolve (bytes_loaded is best-effort, not a gate).
+    bytes_loaded = (
+        int(getattr(cache, "_last_load_bytes", 0)) if cache is not None else 0
     )
-
-    after_bytes = int(getattr(cache, "_current_memory", 0)) if cache is not None else 0
-    if entries_loaded == 0:
-        # #1100 BLOCKING-1 interaction: a "replace" that ABORTED on a corrupt
-        # entry blob (stage-then-swap) returns 0 WITHOUT clearing, so
-        # ``after_bytes`` still reflects the PRESERVED existing cache — NOT
-        # anything this import loaded. Reporting ``after_bytes`` there would
-        # claim the untouched cache as loaded bytes. Nothing loaded → 0 bytes.
-        bytes_loaded = 0
-    elif replace:
-        # Committed replace: cache was cleared then filled with the staged
-        # set, so the post-load footprint is exactly the loaded bytes.
-        bytes_loaded = after_bytes
-    else:
-        # Merge: the positive delta over the pre-existing footprint.
-        bytes_loaded = max(0, after_bytes - before_bytes)
 
     entries_skipped = max(0, manifest.entries - entries_loaded)
     logger.info(
