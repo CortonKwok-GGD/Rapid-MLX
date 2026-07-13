@@ -1,22 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV cache export/import HTTP API — stub for issue #476.
+"""KV cache export/import HTTP API (issue #476).
 
 This module defines the wire surface (request/response shapes, auth,
-path-whitelist, manifest validation) that ``moc375``'s follow-up PR will
-fill in with the engine-level save/load body. Stub behavior:
+path-whitelist, manifest validation) AND the engine-level save/load body:
 
-* ``POST /v1/cache/export`` — validates request, resolves destination
-  under the sandbox, then returns **501 Not Implemented** with a link
-  to the tracking issue. Engine integration is the follow-up's job.
-* ``POST /v1/cache/import`` — validates request, resolves source under
-  the sandbox, reads + checks the manifest against caller expectations,
-  then returns **501 Not Implemented**. Mismatches surface as 409 so
-  the wire-level contract is exercised today.
-* ``GET /v1/cache/info`` — fully implemented: reads the manifest at a
-  whitelisted path and returns it. Lets a peer instance (or oai-mlx) GC
-  / inspect an export root without round-tripping a full import. H-12:
-  response carries ``protocol_version`` + ``manifest`` only — the
-  resolved sandbox root stays in the server log, never on the wire.
+* ``POST /v1/cache/export`` — validates the request, resolves the
+  destination under the sandbox, then calls ``EngineCore.save_cache_to_disk``
+  to snapshot the in-memory prefix cache and writes a ``manifest.json``
+  alongside it. Returns 200 with a byte/entry summary.
+* ``POST /v1/cache/import`` — validates the request, resolves the source
+  under the sandbox, reads + checks the manifest against caller
+  expectations (protocol_version / model_id mismatch → 409), then calls
+  ``EngineCore.load_cache_from_disk`` to hydrate the prefix cache. With
+  ``merge_strategy="replace"`` the in-memory cache is cleared first.
+* ``GET /v1/cache/info`` — reads the manifest at a whitelisted path and
+  returns it. Lets a peer instance (or oai-mlx) GC / inspect an export
+  root without round-tripping a full import. H-12: response carries
+  ``protocol_version`` + ``manifest`` only — the resolved sandbox root
+  stays in the server log, never on the wire.
+
+Both engine-touching handlers 503 when no model is loaded (``cfg.engine
+is None``), matching ``vllm_mlx.routes.health``'s ``clear_cache`` idiom.
+
+Quiesce (out of MVP): the issue's ``wait_for_quiesce_seconds`` — draining
+in-flight decode before snapshotting — is deliberately NOT implemented
+here. ``EngineCore.save_cache_to_disk`` already serializes on the mlx-step
+worker thread (that's why the KV arrays are materializable at all), so a
+snapshot taken while a request is mid-decode captures a consistent
+per-entry view; a torn cross-entry snapshot is possible only under
+concurrent store()/evict, which is acceptable for the MVP (the importer
+validates each entry independently and drops any that fail). A real
+quiesce controller is tracked in #476's follow-up list.
 
 Auth follows ``vllm_mlx.routes.health``'s ``router``: the bearer key is
 enforced when ``--api-key`` is set, no new header is invented.
@@ -28,35 +42,32 @@ import logging
 from pathlib import Path
 from typing import Literal
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..cache.protocol import (
     PROTOCOL_VERSION,
-    InvalidExportPathError,
-    MalformedManifestError,
+    InvalidExportPathError,  # noqa: F401 — re-exported for _resolve_or_400 callers
+    MalformedManifestError,  # noqa: F401 — used via _read_manifest_or_http
     ManifestMismatchError,
-    ManifestNotFoundError,
+    ManifestNotFoundError,  # noqa: F401 — used via _read_manifest_or_http
+    build_manifest_from_engine_state,
     read_manifest,
     resolve_cache_dir,
+    write_manifest,
 )
+from ..config import get_config
 from ..middleware.auth import verify_api_key
 
 logger = logging.getLogger(__name__)
 
-_NOT_IMPLEMENTED_MSG = "engine integration pending"
-
-# Don't echo resolved paths / manifest contents in the 501 response body.
-# Logs keep the validated values for the operator; the client only learns
-# the route is unimplemented. (Avoids leaking $HOME / cache-sandbox layout
-# to any caller — sibling concerns to F-180.)
-_NOT_IMPLEMENTED_DETAIL = {
-    "error": {
-        "message": _NOT_IMPLEMENTED_MSG,
-        "type": "not_implemented_error",
-        "code": None,
-    }
-}
+# H-02/H-12: the resolved sandbox path never rides the wire. On the
+# engine-touching paths we log the destination/source server-side and
+# return only caller-oriented counters. ``_ENGINE_NOT_LOADED_DETAIL``
+# keeps the same sanitized-envelope discipline the stub established for
+# its 403 body — no path, no manifest excerpt.
+_ENGINE_NOT_LOADED_DETAIL = "engine not loaded"
 
 # H-02: sandbox-escape 403 envelope. The underlying
 # ``InvalidExportPathError`` carries the caller-supplied path AND the
@@ -97,9 +108,11 @@ class ExportRequest(BaseModel):
         default=None,
         ge=1,
         description=(
-            "Optional cap on the exported blob size. Implementation may "
-            "stop adding entries once the total exceeds this; the engine "
-            "integration follow-up defines the precise eviction order."
+            "Optional cap on the exported blob size. Checked BEFORE any "
+            "write: if the prefix cache's current in-memory footprint "
+            "(``_current_memory``) exceeds this, the export is rejected "
+            "with 413 and nothing is written. MVP is all-or-nothing — no "
+            "partial-entry eviction to fit under the cap."
         ),
     )
 
@@ -133,11 +146,40 @@ class ImportRequest(BaseModel):
         default="merge",
         description=(
             "'merge' keeps existing entries and adds new ones (token-tuple "
-            "key collisions resolved by the engine). 'replace' clears the "
-            "in-memory cache before loading. Implementation lands with the "
-            "follow-up PR."
+            "key collisions resolved by the engine's ``store``). 'replace' "
+            "calls ``MemoryAwarePrefixCache.clear()`` before loading so the "
+            "imported blob is the only thing in the cache."
         ),
     )
+
+
+class ExportResponse(BaseModel):
+    """200 body for ``POST /v1/cache/export`` — caller-oriented summary.
+
+    H-02/H-12: NO resolved sandbox path is echoed. ``manifest_path`` is the
+    caller-relative filename (``manifest.json``), not the absolute on-disk
+    location — a peer that wrote to ``destination="session-a"`` already
+    knows where it asked to write; it does not need (and must not learn)
+    the operator's ``$HOME``-rooted expansion.
+    """
+
+    protocol_version: str
+    entries_exported: int
+    bytes_written: int
+    model_id: str
+    quantization: str
+    paged_cache: bool
+    turboquant_kv: bool
+    manifest_path: str
+
+
+class ImportResponse(BaseModel):
+    """200 body for ``POST /v1/cache/import`` — caller-oriented summary."""
+
+    protocol_version: str
+    entries_loaded: int
+    entries_skipped: int
+    bytes_loaded: int
 
 
 def _resolve_or_400(caller_path: str | None) -> Path:
@@ -191,35 +233,123 @@ def _read_manifest_or_http(root: Path):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/export", status_code=501)
+def _engine_or_503():
+    """Return the loaded engine or raise 503 (matches ``health.clear_cache``).
+
+    The engine-touching routes are meaningless before a model is loaded —
+    there is no prefix cache to snapshot / hydrate. Same 503 idiom the rest
+    of the cache-management surface uses so operators get one consistent
+    "engine not loaded" signal across ``/v1/cache/clear``, ``/v1/cache/stats``
+    and this pair.
+    """
+    engine = get_config().engine
+    if engine is None:
+        raise HTTPException(status_code=503, detail=_ENGINE_NOT_LOADED_DETAIL)
+    return engine
+
+
+def _prefix_cache(engine):
+    """The engine's in-memory ``MemoryAwarePrefixCache`` or ``None``.
+
+    ``None`` when the prefix cache is disabled (``--disable-prefix-cache``)
+    or the scheduler hasn't finished building it. Callers treat ``None`` as
+    "empty snapshot" (0 entries / 0 bytes) rather than an error — an export
+    of an empty cache is a valid no-op that still writes a manifest.
+    """
+    scheduler = getattr(engine, "scheduler", None)
+    if scheduler is None:
+        return None
+    return getattr(scheduler, "memory_aware_cache", None)
+
+
+@router.post("/export", response_model=ExportResponse)
 async def export_cache(req: ExportRequest):
     """Export the engine's KV prefix cache to disk under the sandbox root.
 
-    **Status: stub (issue #476).** This handler validates the request,
-    resolves the destination against the path whitelist, and would call
-    ``EngineCore.save_cache_to_disk`` — except the engine integration is
-    the follow-up PR's responsibility. Returns 501 once all wire-level
-    checks pass.
+    Flow: resolve the destination against the path whitelist (403 on
+    escape) → require a loaded engine (503) → enforce ``max_bytes`` from the
+    cheap in-memory footprint BEFORE writing (413) → snapshot via
+    ``EngineCore.save_cache_to_disk`` → write ``manifest.json`` alongside.
+
+    An empty prefix cache (disabled or 0 entries) is a valid export: it
+    returns 200 with ``entries_exported=0`` and still writes a manifest so
+    a peer can inspect the (empty) blob's provenance.
+
+    H-02/H-12: the resolved ``destination`` is logged server-side only; the
+    200 body carries counters + the caller-relative manifest filename, never
+    the ``$HOME``-rooted absolute path.
     """
     destination = _resolve_or_400(req.destination)
+    engine = _engine_or_503()
+    cache = _prefix_cache(engine)
+
+    # Cheap pre-write size gate. ``_current_memory`` is the live ledger the
+    # cache maintains on every store/evict — reading it costs nothing and
+    # lets us reject an over-cap export before touching the disk (the issue's
+    # H-04 "never start a write you can't afford" concern).
+    current_bytes = 0
+    if cache is not None:
+        current_bytes = int(getattr(cache, "_current_memory", 0))
+    if req.max_bytes is not None and current_bytes > req.max_bytes:
+        logger.info(
+            "cache/export: rejected — cache footprint %d B exceeds max_bytes %d B "
+            "(destination=%s)",
+            current_bytes,
+            req.max_bytes,
+            destination,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"cache footprint {current_bytes} bytes exceeds max_bytes "
+                f"{req.max_bytes}"
+            ),
+        )
+
+    # Snapshot to disk. Routed through the mlx-step worker thread inside the
+    # engine (that's where the KV arrays are materializable). Returns True if
+    # at least one entry committed; False for an empty / no-op cache — either
+    # way the manifest below records the outcome. Run in a threadpool so the
+    # asyncio loop isn't blocked by the (potentially multi-GB) write.
+    saved = await anyio.to_thread.run_sync(engine.save_cache_to_disk, str(destination))
+
+    manifest = build_manifest_from_engine_state(engine)
+    write_manifest(destination, manifest)
+
     logger.info(
-        "cache/export: validated destination=%s max_bytes=%s — %s",
+        "cache/export: wrote %d entries (%d B, saved=%s) to destination=%s",
+        manifest.entries,
+        manifest.total_bytes,
+        saved,
         destination,
-        req.max_bytes,
-        _NOT_IMPLEMENTED_MSG,
     )
-    raise HTTPException(status_code=501, detail=_NOT_IMPLEMENTED_DETAIL)
+    return ExportResponse(
+        protocol_version=PROTOCOL_VERSION,
+        entries_exported=manifest.entries,
+        bytes_written=manifest.total_bytes,
+        model_id=manifest.model_id,
+        quantization=manifest.quantization,
+        paged_cache=manifest.paged_cache,
+        turboquant_kv=manifest.turboquant_kv,
+        manifest_path="manifest.json",
+    )
 
 
-@router.post("/import", status_code=501)
+@router.post("/import", response_model=ImportResponse)
 async def import_cache(req: ImportRequest):
     """Import a peer instance's export into the local engine.
 
-    **Status: stub (issue #476).** Validates the request, resolves the
-    source under the sandbox, reads the manifest, and rejects on
-    protocol-version or model-id mismatch before reaching the engine
-    layer. The actual ``EngineCore.load_cache_from_disk`` call lands in
-    the follow-up.
+    Flow: resolve the source under the sandbox (403 on escape) → read the
+    manifest (404 missing / 400 malformed) → reject protocol-version or
+    model-id mismatch (409) → require a loaded engine (503) → optionally
+    clear the in-memory cache (``merge_strategy="replace"``) → hydrate via
+    ``EngineCore.load_cache_from_disk``.
+
+    ``entries_skipped`` is ``manifest.entries - entries_loaded`` floored at
+    0: the loader drops entries that fail per-entry validation (truncated
+    safetensors, cache-type incompatible under the current quant config —
+    see ``MemoryAwarePrefixCache.load_from_disk``), so a caller can tell a
+    partial import from a clean one without re-reading the blob.
     """
     source = _resolve_or_400(req.source)
     manifest = _read_manifest_or_http(source)
@@ -246,14 +376,45 @@ async def import_cache(req: ImportRequest):
             ),
         )
 
-    logger.info(
-        "cache/import: validated source=%s manifest=%s merge=%s — %s",
-        source,
-        manifest.model_id,
-        req.merge_strategy,
-        _NOT_IMPLEMENTED_MSG,
+    engine = _engine_or_503()
+
+    # merge_strategy="replace" — drop the current in-memory prefix cache so
+    # the imported blob is the ONLY thing present. ``MemoryAwarePrefixCache
+    # .clear()`` is the smallest correct primitive: it empties ``_entries`` /
+    # ``_sorted_keys`` / the radix index and zeroes ``_current_memory`` while
+    # carrying the monotonic Prometheus counters over (load_skipped /
+    # save_drift_drops) — exactly what a "replace the contents" reset wants.
+    # We deliberately do NOT call ``scheduler.deep_reset()``: that also tears
+    # down the BatchGenerator and paged manager, which would abort in-flight
+    # requests — far heavier than clearing the prefix cache.
+    if req.merge_strategy == "replace":
+        cache = _prefix_cache(engine)
+        if cache is not None:
+            cache.clear()
+            logger.info("cache/import: cleared in-memory prefix cache (replace)")
+
+    # Hydrate from disk. Also routed through the mlx-step worker thread so
+    # the loaded arrays are tagged with the right generation_stream. Run in
+    # a threadpool for the same reason as export.
+    entries_loaded = await anyio.to_thread.run_sync(
+        engine.load_cache_from_disk, str(source)
     )
-    raise HTTPException(status_code=501, detail=_NOT_IMPLEMENTED_DETAIL)
+
+    entries_skipped = max(0, manifest.entries - entries_loaded)
+    logger.info(
+        "cache/import: loaded %d/%d entries (skipped=%s, merge=%s) from source=%s",
+        entries_loaded,
+        manifest.entries,
+        entries_skipped,
+        req.merge_strategy,
+        source,
+    )
+    return ImportResponse(
+        protocol_version=PROTOCOL_VERSION,
+        entries_loaded=entries_loaded,
+        entries_skipped=entries_skipped,
+        bytes_loaded=manifest.total_bytes,
+    )
 
 
 @router.get("/info")

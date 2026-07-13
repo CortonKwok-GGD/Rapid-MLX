@@ -19,11 +19,16 @@ peer instance can refuse a mismatched import before touching tensors.
 
 from __future__ import annotations
 
+import datetime as _datetime
 import json
+import logging
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1"
 MANIFEST_FILENAME = "manifest.json"
@@ -218,6 +223,125 @@ def read_manifest(root: Path) -> Manifest:
             f"manifest.json must decode to a JSON object, got {type(data).__name__}"
         )
     return Manifest.from_dict(data)
+
+
+def _rapid_mlx_version() -> str:
+    """Best-effort installed ``rapid-mlx`` version for manifest provenance.
+
+    Falls back to ``""`` (never raises): a source checkout or an editable
+    install without dist metadata must still be able to export — the field
+    is informational (importers MUST NOT gate on it, see ``Manifest``).
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version("rapid-mlx")
+        except PackageNotFoundError:
+            return ""
+    except Exception:  # pragma: no cover — defensive; metadata API unavailable
+        return ""
+
+
+def build_manifest_from_engine_state(engine: Any) -> Manifest:
+    """Build a :class:`Manifest` describing the engine's current cache blob.
+
+    Reads the model id + cache-config knobs (quantization / paged / turbo-
+    quant) off the live engine so a peer instance can gate an import before
+    touching tensors. Every field access is defensive: a partially-built or
+    prefix-cache-disabled engine must still produce a well-formed manifest
+    (with ``entries``/``total_bytes`` = 0) rather than raise — the export
+    route already 503s when the engine is absent, so by the time we get here
+    the *engine* exists but its individual sub-objects may not.
+
+    Field provenance (verified against ``SchedulerConfig`` / the server
+    ``ServerConfig`` at 0.10.9):
+
+    * ``model_id`` — ``get_config().model_name`` (the operator-facing HF id
+      / alias the server booted with). Falls back to the engine's own
+      ``config.model_name`` / ``config.model_path`` if the server singleton
+      isn't populated (unit-test engines).
+    * ``quantization`` — ``scheduler.config.kv_cache_dtype`` (the canonical
+      R15 #300 operator-facing dtype string: ``bf16`` / ``int8`` / ``int4``).
+    * ``paged_cache`` — ``scheduler.config.use_paged_cache``.
+    * ``turboquant_kv`` — ``scheduler.config.kv_cache_turboquant``.
+    * ``index_format_version`` — the engine's on-disk prefix-cache index
+      format (``memory_cache._TOKENS_FORMAT_VERSION_IN_INDEX``), NOT the
+      manifest protocol version (see module docstring).
+    * ``entries`` / ``total_bytes`` — the live prefix-cache ledger
+      (``len(cache._entries)`` / ``cache._current_memory``); 0 when the
+      prefix cache is disabled or empty.
+    """
+    # Model id — prefer the server singleton (what the operator typed), fall
+    # back to the engine's own config for unit-test / embedded engines.
+    model_id = ""
+    try:
+        from ..config import get_config
+
+        model_id = get_config().model_name or ""
+    except Exception:  # pragma: no cover — config singleton import guard
+        model_id = ""
+    if not model_id:
+        engine_cfg = getattr(engine, "config", None)
+        if engine_cfg is not None:
+            model_id = (
+                getattr(engine_cfg, "model_name", None)
+                or getattr(engine_cfg, "model_path", None)
+                or ""
+            )
+
+    # Cache-config knobs off the scheduler's SchedulerConfig.
+    quantization = ""
+    paged_cache = False
+    turboquant_kv = False
+    scheduler = getattr(engine, "scheduler", None)
+    sched_cfg = getattr(scheduler, "config", None) if scheduler is not None else None
+    if sched_cfg is not None:
+        quantization = getattr(sched_cfg, "kv_cache_dtype", "") or ""
+        paged_cache = bool(getattr(sched_cfg, "use_paged_cache", False))
+        turboquant_kv = bool(getattr(sched_cfg, "kv_cache_turboquant", False))
+
+    # On-disk index format version — read the engine's own constant so the
+    # manifest tracks whatever the engine actually writes into index.json.
+    try:
+        from ..memory_cache import _TOKENS_FORMAT_VERSION_IN_INDEX
+
+        index_format_version = int(_TOKENS_FORMAT_VERSION_IN_INDEX)
+    except Exception:  # pragma: no cover — memory_cache import guard
+        index_format_version = 0
+
+    # Live prefix-cache ledger. ``memory_aware_cache`` is None when the
+    # prefix cache is disabled (--disable-prefix-cache) — export an empty
+    # snapshot rather than raising.
+    entries = 0
+    total_bytes = 0
+    prefix_cache = (
+        getattr(scheduler, "memory_aware_cache", None)
+        if scheduler is not None
+        else None
+    )
+    if prefix_cache is not None:
+        try:
+            entries = len(prefix_cache._entries)  # noqa: SLF001 — ledger read
+            total_bytes = int(prefix_cache._current_memory)  # noqa: SLF001
+        except Exception:  # pragma: no cover — defensive against a partial cache
+            entries = 0
+            total_bytes = 0
+
+    return Manifest(
+        protocol_version=PROTOCOL_VERSION,
+        model_id=model_id,
+        quantization=quantization,
+        paged_cache=paged_cache,
+        turboquant_kv=turboquant_kv,
+        index_format_version=index_format_version,
+        entries=entries,
+        total_bytes=total_bytes,
+        rapid_mlx_version=_rapid_mlx_version(),
+        created_at=_datetime.datetime.now(_datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    )
 
 
 def default_export_root() -> Path:
