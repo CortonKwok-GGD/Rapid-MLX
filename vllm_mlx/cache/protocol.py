@@ -294,7 +294,16 @@ def build_manifest_from_engine_state(engine: Any) -> Manifest:
     quantization = ""
     paged_cache = False
     turboquant_kv = False
-    scheduler = getattr(engine, "scheduler", None)
+    # ``_resolve_scheduler`` unwraps the production BatchedEngine
+    # (engine._engine.engine.scheduler) as well as a bare EngineCore
+    # (engine.scheduler). A plain ``getattr(engine, "scheduler")`` here
+    # collapsed to None under BatchedEngine, zeroing every field below
+    # (real-hardware smoke: 70 entries / 1.4 GB on disk but manifest
+    # reported entries=0). Lazy import to dodge the runtime.cache ↔
+    # cache.protocol import cycle.
+    from ..runtime.cache import _resolve_scheduler
+
+    scheduler = _resolve_scheduler(engine)
     sched_cfg = getattr(scheduler, "config", None) if scheduler is not None else None
     if sched_cfg is not None:
         quantization = getattr(sched_cfg, "kv_cache_dtype", "") or ""
@@ -312,7 +321,10 @@ def build_manifest_from_engine_state(engine: Any) -> Manifest:
 
     # Live prefix-cache ledger. ``memory_aware_cache`` is None when the
     # prefix cache is disabled (--disable-prefix-cache) — export an empty
-    # snapshot rather than raising.
+    # snapshot rather than raising. ``entries`` and ``total_bytes`` are read
+    # in SEPARATE try/excepts so a fault reading one (a partially-torn cache)
+    # doesn't zero the other — the coupled block previously discarded a good
+    # entry count when only the memory read raised.
     entries = 0
     total_bytes = 0
     prefix_cache = (
@@ -323,9 +335,11 @@ def build_manifest_from_engine_state(engine: Any) -> Manifest:
     if prefix_cache is not None:
         try:
             entries = len(prefix_cache._entries)  # noqa: SLF001 — ledger read
-            total_bytes = int(prefix_cache._current_memory)  # noqa: SLF001
         except Exception:  # pragma: no cover — defensive against a partial cache
             entries = 0
+        try:
+            total_bytes = int(prefix_cache._current_memory)  # noqa: SLF001
+        except Exception:  # pragma: no cover — defensive against a partial cache
             total_bytes = 0
 
     return Manifest(

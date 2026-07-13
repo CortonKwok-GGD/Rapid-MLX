@@ -105,6 +105,42 @@ class _FakeEngine:
         return len(cache._entries) if cache is not None else 0
 
 
+class _NestedFakeEngine(_FakeEngine):
+    """Fake of the PRODUCTION ``BatchedEngine`` nesting.
+
+    The real ``BatchedEngine`` does NOT expose ``.scheduler`` — the
+    scheduler lives at ``engine._engine.engine.scheduler`` (``._engine`` =
+    AsyncEngineCore wrapper, ``.engine`` = inner EngineCore). This fake
+    reparents ``_FakeEngine``'s scheduler under that same nesting and DELETES
+    the top-level ``.scheduler`` attribute so a route that reaches the cache
+    via a naive ``getattr(engine, "scheduler")`` gets None — reproducing the
+    real-hardware smoke bug (export reported entries=0 despite 70 real
+    entries on disk). ``save_cache_to_disk`` / ``load_cache_from_disk`` stay
+    inherited (BatchedEngine forwards them to the inner engine in prod).
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        real_scheduler = self.scheduler
+        # Reparent under the AsyncEngineCore→EngineCore chain and remove the
+        # direct attribute so ONLY the nested lookup succeeds.
+        del self.scheduler
+        inner_engine = SimpleNamespace(scheduler=real_scheduler)  # EngineCore
+        self._engine = SimpleNamespace(engine=inner_engine)  # AsyncEngineCore
+
+    @property
+    def _nested_scheduler(self):
+        return self._engine.engine.scheduler
+
+    def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
+        # Prod BatchedEngine forwards to the inner engine; the inner
+        # EngineCore runs the real save. Mirror the inherited stub but read
+        # the nested cache for the "did anything commit?" signal.
+        self.saved_to = cache_dir
+        cache = self._nested_scheduler.memory_aware_cache
+        return bool(cache and len(cache._entries))
+
+
 @pytest.fixture
 def cache_client(monkeypatch, sandbox):
     """FastAPI TestClient with the cache router + auth + a fake engine.
@@ -128,7 +164,11 @@ def cache_client(monkeypatch, sandbox):
     app = FastAPI()
     app.include_router(router)
     yield SimpleNamespace(
-        client=TestClient(app), sandbox=sandbox, cfg=cfg, FakeEngine=_FakeEngine
+        client=TestClient(app),
+        sandbox=sandbox,
+        cfg=cfg,
+        FakeEngine=_FakeEngine,
+        NestedFakeEngine=_NestedFakeEngine,
     )
 
     reset_config()
@@ -445,6 +485,108 @@ def test_export_under_max_bytes_returns_200(cache_client):
     )
     assert resp.status_code == 200, resp.text
     assert engine.saved_to is not None
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: production BatchedEngine nesting (real-hardware smoke bug)
+#
+# BatchedEngine has NO top-level ``.scheduler`` — the cache lives at
+# ``engine._engine.engine.scheduler.memory_aware_cache``. The routes reached
+# it via ``getattr(engine, "scheduler")`` which returned None under the prod
+# engine, so: manifest fields collapsed to 0/""; the max_bytes 413 gate read
+# _current_memory=0 (inert); merge_strategy="replace" never cleared. These
+# tests drive the SAME handlers with the nested engine shape to lock the fix.
+# ---------------------------------------------------------------------------
+
+
+def test_export_nested_engine_reports_real_entries(cache_client):
+    """The bug: export with a BatchedEngine-shaped engine reported
+    entries_exported=0 despite a populated nested cache. Now it must see the
+    real ledger + cache-config off ``engine._engine.engine.scheduler``."""
+    engine = cache_client.NestedFakeEngine(
+        entries=70,
+        current_memory=1_400_000_000,
+        kv_cache_dtype="int4",
+        use_paged_cache=True,
+        kv_cache_turboquant=True,
+    )
+    # Sanity: the engine really does NOT expose a top-level scheduler.
+    assert not hasattr(engine, "scheduler")
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/export", json={"destination": "nested"}, headers=_auth()
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["entries_exported"] == 70  # was 0 pre-fix
+    assert body["bytes_written"] == 1_400_000_000  # was 0 pre-fix
+    assert body["quantization"] == "int4"  # was "" pre-fix
+    assert body["paged_cache"] is True  # was False pre-fix
+    assert body["turboquant_kv"] is True  # was False pre-fix
+    assert engine.saved_to is not None
+
+
+def test_export_nested_engine_max_bytes_gate_fires(cache_client):
+    """The bug: with the cache seen as None, ``_current_memory`` read 0, so a
+    ``max_bytes:1`` export was NOT rejected (a second 1.4 GB blob got
+    written — H-04 gate inert). Now the 413 fires from the real footprint."""
+    engine = cache_client.NestedFakeEngine(entries=70, current_memory=1_400_000_000)
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "nested-big", "max_bytes": 1},
+        headers=_auth(),
+    )
+    assert resp.status_code == 413, resp.text
+    assert engine.saved_to is None  # write never started
+    assert not (Path(cache_client.sandbox).resolve() / "nested-big").exists()
+
+
+def test_import_nested_engine_replace_clears_real_cache(cache_client):
+    """The bug: replace never cleared under the nested engine (cache None), so
+    a re-import collided all entries as duplicates and loaded 0. Now
+    ``clear()`` runs on the REAL nested cache before load."""
+    _write_export_root(
+        cache_client.sandbox,
+        "nested-ready",
+        Manifest(protocol_version=PROTOCOL_VERSION, model_id="test-model", entries=70),
+    )
+    engine = cache_client.NestedFakeEngine(
+        entries=70, current_memory=1_400_000_000, load_returns=70
+    )
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import",
+        json={
+            "source": "nested-ready",
+            "expected_model_id": "test-model",
+            "merge_strategy": "replace",
+        },
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["entries_loaded"] == 70
+    # The REAL nested cache was cleared exactly once before the load.
+    nested_cache = engine._engine.engine.scheduler.memory_aware_cache
+    assert nested_cache.clear_calls == 1
+
+
+def test_build_manifest_nested_engine(cache_client):
+    """Unit-level: ``build_manifest_from_engine_state`` unwraps the nested
+    BatchedEngine directly (not just through the HTTP handler)."""
+    from vllm_mlx.cache.protocol import build_manifest_from_engine_state
+
+    engine = cache_client.NestedFakeEngine(
+        entries=12,
+        current_memory=999,
+        kv_cache_dtype="int8",
+        use_paged_cache=True,
+    )
+    m = build_manifest_from_engine_state(engine)
+    assert m.entries == 12
+    assert m.total_bytes == 999
+    assert m.quantization == "int8"
+    assert m.paged_cache is True
 
 
 def test_export_rejects_path_traversal(cache_client):

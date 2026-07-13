@@ -251,15 +251,21 @@ def _engine_or_503():
 def _prefix_cache(engine):
     """The engine's in-memory ``MemoryAwarePrefixCache`` or ``None``.
 
-    ``None`` when the prefix cache is disabled (``--disable-prefix-cache``)
-    or the scheduler hasn't finished building it. Callers treat ``None`` as
-    "empty snapshot" (0 entries / 0 bytes) rather than an error — an export
-    of an empty cache is a valid no-op that still writes a manifest.
+    Delegates to ``runtime.cache._resolve_memory_aware_cache`` so BOTH engine
+    shapes resolve: a bare ``EngineCore`` (``engine.scheduler``) AND the
+    production ``BatchedEngine`` (``engine._engine.engine.scheduler``). A
+    naive ``getattr(engine, "scheduler")`` here returned None under
+    BatchedEngine, which silently disarmed the ``max_bytes`` 413 gate (read
+    ``_current_memory``=0) and the ``merge_strategy="replace"`` clear (cache
+    None) — the real-hardware smoke bug this fix closes.
+
+    ``None`` still means "no prefix cache" (disabled via
+    ``--disable-prefix-cache`` or a genuinely foreign engine); callers treat
+    it as an empty snapshot (0 entries / 0 bytes), not an error.
     """
-    scheduler = getattr(engine, "scheduler", None)
-    if scheduler is None:
-        return None
-    return getattr(scheduler, "memory_aware_cache", None)
+    from ..runtime.cache import _resolve_memory_aware_cache
+
+    return _resolve_memory_aware_cache(engine)
 
 
 @router.post("/export", response_model=ExportResponse)
