@@ -58,6 +58,24 @@ rapid-mlx serve <model> [options]
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
 | `--tool-call-parser` | Tool call parser (e.g. `hermes`, `llama`, `deepseek`, `deepseek_v31`, `glm47`, `gemma4`, `minimax`, `kimi`, `harmony`, `qwen3_coder_xml`). Auto-detected from the model name; explicit flag overrides. | auto |
 
+#### Deprecated (no-op) flags
+
+These flags once controlled engine paths that have since been removed. They are
+**accepted-but-ignored** for backward compatibility — an old launch script that
+still passes them keeps booting instead of failing with `unrecognized
+arguments` — but they do nothing, are hidden from `--help`, and are slated for
+removal in a future release. Drop them from new commands.
+
+| Flag | Replacement |
+|------|-------------|
+| `--continuous-batching` | none — batching is always on |
+| `--simple-engine` | none — `BatchedEngine` is the sole engine |
+| `--kv-bits N` | `--kv-cache-quantization --kv-cache-quantization-bits N` (preserves the bit width) |
+| `--kv-group-size N` | `--kv-cache-quantization --kv-cache-quantization-group-size N` (preserves the group size) |
+| `--draft-model`, `--num-draft-tokens` | `--speculative-config` |
+| `--specprefill`, `--specprefill-threshold`, `--specprefill-keep-pct`, `--specprefill-draft-model` | none — prototype removed |
+| `--chunked-prefill-tokens` | none — native `prefill_step_size` is used |
+
 ### Examples
 
 ```bash

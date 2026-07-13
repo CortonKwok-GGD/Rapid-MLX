@@ -7055,6 +7055,82 @@ Examples:
         default=None,
         help=argparse.SUPPRESS,
     )
+    # Deprecated no-op flags — accepted-but-ignored for backward compat.
+    # These once controlled removed engine paths (the single BatchedEngine,
+    # legacy KV-bit quant, the --draft-model / --num-draft-tokens speculation
+    # frontend, the --specprefill prototype, and the legacy chunked-prefill
+    # monkey-patch that mlx-lm 0.31+ made unreachable). The implementations are
+    # gone, but the launcher must still PARSE these flags without an argparse
+    # hard-fail so existing user launch scripts (and older docs) keep booting.
+    # They are consumed-and-discarded: stored on ``args`` but never read. Hidden
+    # from --help (argparse.SUPPRESS); slated for removal in a future release.
+    serve_parser.add_argument(
+        "--continuous-batching",
+        action="store_true",
+        default=True,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--simple-engine",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=4,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--specprefill",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--specprefill-threshold",
+        type=int,
+        default=8192,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--specprefill-keep-pct",
+        type=float,
+        default=0.3,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--specprefill-draft-model",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--chunked-prefill-tokens",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
     serve_parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
