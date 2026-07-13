@@ -59,6 +59,7 @@ from ..cache.protocol import (
     default_export_root,
     read_manifest,
     resolve_cache_dir,
+    resolve_engine_model_id,
     write_manifest,
 )
 from ..config import get_config
@@ -112,13 +113,19 @@ class ExportRequest(BaseModel):
         default=None,
         ge=1,
         description=(
-            "Optional cap on the exported blob size, enforced with 413 in "
-            "TWO stages: a cheap pre-write check against the live in-memory "
-            "footprint (rejects before touching disk), AND a precise post-"
-            "write check against the committed on-disk size (catches cache "
-            "growth that raced the snapshot — the over-cap blob is then "
-            "discarded from disk). MVP is all-or-nothing — no partial-entry "
-            "eviction to fit under the cap."
+            "Optional cap on the exported blob's COMMITTED ON-DISK size "
+            "(the sum of real file sizes an importing peer will read: "
+            "entry_*.safetensors + entry_*_tokens.bin + index.json + "
+            "manifest.json, including safetensors headers / alignment / "
+            "serialization overhead — NOT just the logical KV byte count). "
+            "Enforced with 413 in TWO stages: a cheap pre-write check "
+            "against the live in-memory footprint (rejects before touching "
+            "disk), AND a precise post-write check against the actual "
+            "committed on-disk directory size (catches cache growth that "
+            "raced the snapshot AND the on-disk overhead the logical count "
+            "excludes — the over-cap blob is then discarded from disk). MVP "
+            "is all-or-nothing — no partial-entry eviction to fit under the "
+            "cap."
         ),
     )
 
@@ -279,28 +286,36 @@ def _prefix_cache(engine):
     return _resolve_memory_aware_cache(engine)
 
 
-def _discard_export(destination: Path) -> None:
-    """Delete a just-written export blob after a post-write reject (#1100
-    BLOCKING-2: max_bytes race).
+def _committed_dir_size(destination: Path) -> int:
+    """Sum the actual on-disk byte size of the committed export blob.
 
-    ``save_to_disk`` commits the blob (index.json + entry_* files) into
-    ``destination`` via an atomic rename before the route can enforce the
-    exact committed size. When the committed footprint exceeds ``max_bytes``
-    we must not leave the over-cap blob on disk for a peer to import.
+    #1100 BLOCKING-4: ``max_bytes`` is documented as capping the committed
+    ON-DISK blob size, but the old post-write gate summed only logical
+    ``memory_bytes`` (``manifest.total_bytes``) — excluding the tokens.bin
+    sidecars, index.json, manifest.json, and every safetensors header /
+    alignment / serialization overhead. An accepted export could therefore
+    exceed the cap on disk. This walks the export directory and sums real
+    file sizes (``os.stat``) so the cap is enforced against what a peer
+    actually reads.
 
-    A dedicated export sub-directory is removed wholesale. When
-    ``destination`` IS the sandbox root itself (the ``destination=None``
-    export shape), only the known ``save_to_disk`` artifacts are unlinked —
-    the root directory and anything else in it are preserved. Best-effort:
-    a leftover file is logged, never raised (the 413 is the caller-facing
-    outcome; a stray file is an operator-log concern, not a client error).
+    When ``destination`` IS the sandbox root (the ``destination=None``
+    export shape), only the known ``save_to_disk`` + manifest artifacts are
+    counted — unrelated files that happen to share the root are not this
+    export's footprint and must not be charged against its cap.
     """
+    root = default_export_root()
+    total = 0
     try:
-        root = default_export_root()
         if destination != root:
-            shutil.rmtree(destination, ignore_errors=True)
-            return
-        # destination is the sandbox root — unlink only the blob artifacts.
+            # Dedicated export sub-dir: every file under it is this export.
+            for dirpath, _dirnames, filenames in os.walk(destination):
+                for name in filenames:
+                    try:
+                        total += os.stat(os.path.join(dirpath, name)).st_size
+                    except OSError:  # pragma: no cover — racing unlink
+                        pass
+            return total
+        # destination is the sandbox root — count only this export's blobs.
         for name in os.listdir(destination):
             is_blob = name in ("index.json", MANIFEST_FILENAME) or (
                 name.startswith("entry_")
@@ -308,15 +323,141 @@ def _discard_export(destination: Path) -> None:
             )
             if is_blob:
                 try:
+                    total += os.stat(destination / name).st_size
+                except OSError:  # pragma: no cover — racing unlink
+                    pass
+    except OSError:  # pragma: no cover — destination vanished
+        pass
+    return total
+
+
+# The two files whose PRESENCE makes an export importable: ``manifest.json``
+# (the import route reads it first — no manifest → 404) and ``index.json``
+# (``load_from_disk`` needs it — no index → nothing loads). If cleanup can't
+# delete a blob, quarantining THESE two (rename to ``.rejected``) is enough
+# to guarantee the import path refuses it. The entry_* payload files alone
+# are inert without an index pointing at them.
+_IMPORT_CRITICAL_NAMES = (MANIFEST_FILENAME, "index.json")
+
+
+class _ExportDiscardError(RuntimeError):
+    """Raised when a rejected export blob could NOT be made non-importable.
+
+    #1100 BLOCKING-5: a 413/500 reject MUST guarantee the blob is not
+    importable. If deletion fails AND quarantine (rename the import-critical
+    files to ``.rejected``) also fails, we cannot honor that invariant —
+    surface a 500 rather than falsely claim the blob was discarded.
+    """
+
+
+def _quarantine_import_critical(destination: Path) -> bool:
+    """Rename import-critical files to ``.rejected`` so import refuses them.
+
+    Returns True if, after the attempt, NEITHER ``manifest.json`` nor
+    ``index.json`` remains at ``destination`` (the blob can no longer be
+    imported). Returns False if either still exists (quarantine failed).
+    """
+    for name in _IMPORT_CRITICAL_NAMES:
+        src = destination / name
+        if not src.exists():
+            continue
+        try:
+            os.replace(src, destination / f"{name}.rejected")
+        except OSError as exc:  # pragma: no cover — exercised via monkeypatch
+            logger.error("cache/export: quarantine rename failed for %s: %s", src, exc)
+    # Verify the invariant: no import-critical file remains.
+    return not any((destination / n).exists() for n in _IMPORT_CRITICAL_NAMES)
+
+
+def _blob_artifacts(destination: Path) -> list[str]:
+    """Names under ``destination`` that belong to a save_to_disk export."""
+    names = []
+    for name in os.listdir(destination):
+        is_blob = name in ("index.json", MANIFEST_FILENAME) or (
+            name.startswith("entry_")
+            and (name.endswith(".safetensors") or name.endswith("_tokens.bin"))
+        )
+        if is_blob:
+            names.append(name)
+    return names
+
+
+def _discard_export(destination: Path) -> None:
+    """Delete a just-written export blob after a post-write reject, and VERIFY
+    it is actually gone (#1100 BLOCKING-2 max_bytes race + BLOCKING-5
+    cleanup-verification).
+
+    ``save_to_disk`` commits the blob (index.json + entry_* files) into
+    ``destination`` via an atomic rename before the route can enforce the
+    exact committed size / detect a failed save. When we reject we must not
+    leave the blob on disk for a peer to import.
+
+    The round-1 helper used ``shutil.rmtree(..., ignore_errors=True)`` and
+    returned immediately, so a permission / filesystem failure silently left
+    the rejected blob on disk while the API claimed it was discarded — a peer
+    could then import it. This version:
+
+    1. Attempts wholesale removal (dedicated sub-dir) or per-artifact unlink
+       (sandbox-root export shape).
+    2. VERIFIES the import-critical files (manifest.json + index.json) are
+       gone. If any survives, QUARANTINES it (rename to ``.rejected`` so the
+       import path — which reads ``manifest.json`` / ``index.json`` by exact
+       name — refuses it).
+    3. If even quarantine can't remove them, raises ``_ExportDiscardError``
+       so the caller returns a 500 instead of falsely claiming the blob was
+       discarded. The invariant a 413/500 reject upholds: the blob is NOT
+       importable.
+
+    When ``destination`` IS the sandbox root itself (the ``destination=None``
+    export shape), only the known ``save_to_disk`` artifacts are touched —
+    the root directory and anything else in it are preserved.
+    """
+    root = default_export_root()
+    try:
+        if destination != root:
+            shutil.rmtree(destination, ignore_errors=True)
+        else:
+            # destination is the sandbox root — unlink only the blob artifacts.
+            for name in _blob_artifacts(destination):
+                try:
                     (destination / name).unlink()
                 except OSError:  # pragma: no cover — racing unlink
                     pass
-    except Exception as exc:  # pragma: no cover — cleanup is best-effort
+    except Exception as exc:  # pragma: no cover — defensive
         logger.warning(
-            "cache/export: cleanup after max_bytes reject failed (destination=%s): %s",
+            "cache/export: rmtree/unlink during discard raised (destination=%s): %s",
             destination,
             exc,
         )
+
+    # VERIFY the import-critical files are gone. On a dedicated sub-dir a
+    # successful rmtree removed the whole tree (nothing remains); on the
+    # sandbox-root shape the unlinks above should have cleared them.
+    survivors = [n for n in _IMPORT_CRITICAL_NAMES if (destination / n).exists()]
+    if not survivors:
+        return  # clean — blob is not importable.
+
+    # Deletion left import-critical files behind (EACCES, immutable flag, a
+    # racing reopen). Quarantine them so import refuses the blob.
+    logger.warning(
+        "cache/export: discard could not delete %s at %s — quarantining",
+        survivors,
+        destination,
+    )
+    if _quarantine_import_critical(destination):
+        logger.warning(
+            "cache/export: quarantined rejected blob at %s (renamed %s → .rejected)",
+            destination,
+            survivors,
+        )
+        return
+
+    # Could neither delete nor quarantine — the blob may still be importable.
+    # Do NOT claim success.
+    raise _ExportDiscardError(
+        f"rejected export blob at {destination} could not be made "
+        f"non-importable (survivors: {survivors})"
+    )
 
 
 @router.post("/export", response_model=ExportResponse)
@@ -347,9 +488,23 @@ async def export_cache(req: ExportRequest):
     # cache maintains on every store/evict — reading it costs nothing and
     # lets us reject an over-cap export before touching the disk (the issue's
     # H-04 "never start a write you can't afford" concern).
+    #
+    # #1100 BLOCKING-3: also snapshot whether the cache had ANY entries to
+    # save here, BEFORE the write. ``save_cache_to_disk`` returns False for
+    # BOTH a legitimately-empty cache (nothing to commit — 200 with zero
+    # counts) AND a genuine save FAILURE of a non-empty cache (rename never
+    # committed / all entries dropped by the post-write verify). We can't
+    # tell those apart from the boolean alone, so we remember the pre-write
+    # entry count as the discriminator: empty-before → False is legit;
+    # non-empty-before → False is a failed save.
     current_bytes = 0
+    had_entries_before = False
     if cache is not None:
         current_bytes = int(getattr(cache, "_current_memory", 0))
+        try:
+            had_entries_before = len(cache) > 0
+        except Exception:  # pragma: no cover — defensive against partial cache
+            had_entries_before = current_bytes > 0
     if req.max_bytes is not None and current_bytes > req.max_bytes:
         logger.info(
             "cache/export: rejected — cache footprint %d B exceeds max_bytes %d B "
@@ -373,41 +528,95 @@ async def export_cache(req: ExportRequest):
     # asyncio loop isn't blocked by the (potentially multi-GB) write.
     saved = await anyio.to_thread.run_sync(engine.save_cache_to_disk, str(destination))
 
+    # #1100 BLOCKING-3: a non-empty cache whose save committed NOTHING is a
+    # FAILURE, not an empty export. ``save_cache_to_disk`` returns False for
+    # a genuinely-empty cache (legit — 200 with zero counts) AND for a
+    # non-committing save of a non-empty cache (staging dir vanished, all
+    # entries dropped by the post-write verify, or the atomic rename never
+    # landed). Distinguished by the pre-write entry snapshot: if the cache
+    # HAD entries but nothing committed, surface a 500 (after cleaning up
+    # any partial blob) instead of returning 200 with stale live-ledger
+    # counters and no usable snapshot on disk.
+    if not saved and had_entries_before:
+        try:
+            _discard_export(destination)
+        except _ExportDiscardError as exc:
+            # Even the partial blob couldn't be made non-importable — surface
+            # it in the 500 so an operator knows a stray blob may remain.
+            logger.error("cache/export: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "cache export failed to commit and the partial blob could "
+                    "not be discarded"
+                ),
+            ) from exc
+        logger.error(
+            "cache/export: save FAILED — cache had entries but nothing committed "
+            "to disk (destination=%s); partial blob discarded",
+            destination,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="cache export failed to commit any entry to disk",
+        )
+
     # Build the manifest from the COMMITTED on-disk index (#1100 BLOCKING-3),
     # not the live ledger — ``cache_dir=destination`` makes the counters
     # match what a peer will actually load.
     manifest = build_manifest_from_engine_state(engine, cache_dir=destination)
 
-    # #1100 BLOCKING-2: precise post-write size enforcement. The pre-write
-    # gate above reads the live ledger, which can undercount if the cache
-    # grows between that check and the snapshot the step thread takes. Now
-    # that the blob is committed, ``manifest.total_bytes`` is its exact
-    # on-disk footprint — enforce ``max_bytes`` against it and DISCARD the
-    # over-cap blob so an importing peer never sees an export larger than
-    # the accepted cap.
-    if req.max_bytes is not None and manifest.total_bytes > req.max_bytes:
-        _discard_export(destination)
+    # Write the manifest BEFORE the size gate so the committed-blob measure
+    # below includes manifest.json — it's part of what a peer imports, so it
+    # must count against the cap (#1100 BLOCKING-4).
+    write_manifest(destination, manifest)
+
+    # #1100 BLOCKING-2 + BLOCKING-4: precise post-write size enforcement
+    # against the ACTUAL committed on-disk footprint. The pre-write gate
+    # reads the live logical ledger, which (a) can undercount if the cache
+    # grows between that check and the snapshot the step thread takes, and
+    # (b) counts only logical ``memory_bytes`` — excluding tokens.bin,
+    # index.json, manifest.json, and safetensors serialization overhead.
+    # ``_committed_dir_size`` sums the real file sizes now on disk, so the
+    # cap is enforced against exactly what an importing peer will read.
+    # Over-cap → DISCARD the whole blob (manifest included) and 413.
+    committed_bytes = _committed_dir_size(destination)
+    if req.max_bytes is not None and committed_bytes > req.max_bytes:
+        try:
+            _discard_export(destination)
+        except _ExportDiscardError as exc:
+            # #1100 BLOCKING-5: a 413 MUST guarantee the blob is not
+            # importable. If we couldn't delete OR quarantine it, we can't
+            # honor that invariant — return 500 instead of a 413 that lies.
+            logger.error("cache/export: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "cache export exceeded max_bytes but the oversized blob "
+                    "could not be discarded"
+                ),
+            ) from exc
         logger.info(
-            "cache/export: post-write reject — committed %d B exceeds max_bytes "
-            "%d B; blob discarded (destination=%s)",
-            manifest.total_bytes,
+            "cache/export: post-write reject — committed on-disk %d B exceeds "
+            "max_bytes %d B; blob discarded (destination=%s)",
+            committed_bytes,
             req.max_bytes,
             destination,
         )
         raise HTTPException(
             status_code=413,
             detail=(
-                f"cache footprint {manifest.total_bytes} bytes exceeds max_bytes "
+                f"cache footprint {committed_bytes} bytes exceeds max_bytes "
                 f"{req.max_bytes}"
             ),
         )
 
-    write_manifest(destination, manifest)
-
     logger.info(
-        "cache/export: wrote %d entries (%d B, saved=%s) to destination=%s",
+        "cache/export: wrote %d entries (%d logical B, %d on-disk B, saved=%s) "
+        "to destination=%s",
         manifest.entries,
         manifest.total_bytes,
+        committed_bytes,
         saved,
         destination,
     )
@@ -456,6 +665,18 @@ async def import_cache(req: ImportRequest):
             ),
         )
 
+    # Resolve the loaded engine BEFORE the identity gate so we can derive
+    # its model id the SAME way the manifest builder does (#1100
+    # BLOCKING-2). The gate previously read ``get_config().model_name``,
+    # which is empty for an embedded / unit-test engine that never
+    # populated ServerConfig — but ``build_manifest_from_engine_state``
+    # falls back to ``engine.config.model_name`` (populated), so an
+    # embedded engine's manifest carried a real id while the gate compared
+    # against "" and skipped the check, letting it import ANOTHER model's
+    # KV state. ``resolve_engine_model_id`` is the shared source of truth
+    # both call sites use so they can't drift again.
+    engine = _engine_or_503()
+
     # #1100 BLOCKING-1: unconditionally reject a manifest whose model_id
     # does not match the model THIS server loaded. KV cache is model-
     # specific (layer/head/dim geometry, quant layout) — loading another
@@ -466,11 +687,7 @@ async def import_cache(req: ImportRequest):
     # bearer-token holder shouldn't be able to probe what this server runs
     # by diffing mismatch messages; the caller can read its own manifest
     # (or GET /v1/cache/info) to see the id it shipped.
-    server_model_id = ""
-    try:
-        server_model_id = get_config().model_name or ""
-    except Exception:  # pragma: no cover — config singleton import guard
-        server_model_id = ""
+    server_model_id = resolve_engine_model_id(engine)
     if server_model_id and manifest.model_id != server_model_id:
         raise HTTPException(
             status_code=409,
@@ -486,8 +703,6 @@ async def import_cache(req: ImportRequest):
                 )
             ),
         )
-
-    engine = _engine_or_503()
 
     # merge_strategy="replace": the in-memory cache is cleared ATOMICALLY
     # inside the step-thread load — ``engine.load_cache_from_disk(...,
@@ -506,9 +721,9 @@ async def import_cache(req: ImportRequest):
 
     # #1100 BLOCKING-5: report the bytes THIS import actually loaded, not the
     # manifest's full ``total_bytes`` (which overstates when entries are
-    # skipped). Snapshot the cache footprint around the load: for "replace"
-    # the post-load footprint IS the loaded bytes (the cache was emptied
-    # first); for "merge" the positive delta is what got added.
+    # skipped). Snapshot the cache footprint around the load: for a committed
+    # "replace" the post-load footprint IS the loaded bytes (the cache was
+    # emptied first); for "merge" the positive delta is what got added.
     cache = _prefix_cache(engine)
     before_bytes = int(getattr(cache, "_current_memory", 0)) if cache is not None else 0
 
@@ -520,7 +735,20 @@ async def import_cache(req: ImportRequest):
     )
 
     after_bytes = int(getattr(cache, "_current_memory", 0)) if cache is not None else 0
-    bytes_loaded = after_bytes if replace else max(0, after_bytes - before_bytes)
+    if entries_loaded == 0:
+        # #1100 BLOCKING-1 interaction: a "replace" that ABORTED on a corrupt
+        # entry blob (stage-then-swap) returns 0 WITHOUT clearing, so
+        # ``after_bytes`` still reflects the PRESERVED existing cache — NOT
+        # anything this import loaded. Reporting ``after_bytes`` there would
+        # claim the untouched cache as loaded bytes. Nothing loaded → 0 bytes.
+        bytes_loaded = 0
+    elif replace:
+        # Committed replace: cache was cleared then filled with the staged
+        # set, so the post-load footprint is exactly the loaded bytes.
+        bytes_loaded = after_bytes
+    else:
+        # Merge: the positive delta over the pre-existing footprint.
+        bytes_loaded = max(0, after_bytes - before_bytes)
 
     entries_skipped = max(0, manifest.entries - entries_loaded)
     logger.info(

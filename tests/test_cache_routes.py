@@ -54,6 +54,12 @@ class _FakeCache:
         self._entries = {}
         self._current_memory = 0
 
+    def __len__(self) -> int:
+        # Mirror ``MemoryAwarePrefixCache.__len__`` so the export route's
+        # ``len(cache) > 0`` pre-write entry snapshot (#1100 BLOCKING-3)
+        # exercises the SAME code path the real cache does.
+        return len(self._entries)
+
 
 class _FakeEngine:
     """Faithful fake of the engine surface the cache routes touch.
@@ -815,6 +821,45 @@ def test_import_validated_request_returns_200(cache_client):
     assert engine.scheduler.memory_aware_cache.clear_calls == 1
 
 
+def test_import_replace_abort_reports_zero_bytes_loaded(cache_client):
+    """#1100 BLOCKING-1 × BLOCKING-5 interaction: a ``replace`` that ABORTS on
+    a corrupt entry blob returns 0 loaded WITHOUT clearing — so the preserved
+    cache's footprint must NOT be reported as ``bytes_loaded``. Nothing loaded
+    → bytes_loaded == 0 (the round-1 accounting reported ``after_bytes``,
+    which is the untouched existing cache under an aborted replace)."""
+    _write_export_root(
+        cache_client.sandbox,
+        "abort-src",
+        Manifest(protocol_version=PROTOCOL_VERSION, model_id="test-model", entries=9),
+    )
+
+    # A fake whose load simulates a replace-abort: returns 0 and does NOT
+    # clear — the existing cache footprint stays put.
+    engine = cache_client.FakeEngine(entries=4, current_memory=5000)
+
+    def _load_aborts(cache_dir, replace=False):
+        engine.loaded_from = cache_dir
+        engine.load_replace = replace
+        # replace aborted on corruption: no clear, footprint unchanged, 0 loaded.
+        return 0
+
+    engine.load_cache_from_disk = _load_aborts
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "abort-src", "merge_strategy": "replace"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["entries_loaded"] == 0
+    # NOT the preserved 5000-byte cache footprint — nothing was loaded.
+    assert body["bytes_loaded"] == 0
+    # The existing cache was left intact (never cleared).
+    assert engine.scheduler.memory_aware_cache.clear_calls == 0
+    assert engine.scheduler.memory_aware_cache._current_memory == 5000
+
+
 def test_import_merge_does_not_clear_cache(cache_client):
     """``merge_strategy="merge"`` (default) must NOT clear the in-memory
     cache — existing entries are kept and the new blob is layered on top."""
@@ -879,11 +924,228 @@ def test_import_rejects_mismatched_model_without_expected_id(cache_client):
         headers=_auth(),
     )
     assert resp.status_code == 409, resp.text
-    # The gate fires before the engine is touched — load never ran.
+    # The gate fires before the load — load never ran.
     assert engine.loaded_from is None
     # 409 detail must not name either model id (server or manifest).
     assert "test-model" not in resp.text
     assert "some-other-model-70b" not in resp.text
+
+
+def test_import_gate_uses_engine_config_when_server_singleton_empty(cache_client):
+    """#1100 BLOCKING-2: the model-id gate must derive the loaded model's id
+    the SAME way the manifest builder does — server singleton FIRST, then
+    ``engine.config.model_name``. For an embedded engine the server singleton's
+    ``model_name`` is empty, but the engine's own config carries a real id.
+    The round-1 gate read only the empty singleton and skipped the check,
+    letting an embedded engine import ANOTHER model's KV state. Here the
+    singleton is empty and the engine.config id is ``embedded/model-a``; a
+    manifest for ``embedded/model-b`` must still 409 (load never runs)."""
+    # Server singleton empty (embedded engine that never populated ServerConfig).
+    cache_client.cfg.model_name = ""
+    _write_export_root(
+        cache_client.sandbox,
+        "embedded-wrong",
+        Manifest(
+            protocol_version=PROTOCOL_VERSION,
+            model_id="embedded/model-b",  # != engine.config "embedded/model-a"
+            entries=4,
+        ),
+    )
+    engine = cache_client.FakeEngine(entries=2, current_memory=100, load_returns=4)
+    engine.config.model_name = "embedded/model-a"
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "embedded-wrong"},  # NO expected_model_id
+        headers=_auth(),
+    )
+    assert resp.status_code == 409, resp.text
+    assert engine.loaded_from is None  # gate fired — load never ran
+    # No-leak discipline: neither model id in the 409 body.
+    assert "embedded/model-a" not in resp.text
+    assert "embedded/model-b" not in resp.text
+
+
+def test_import_gate_engine_config_match_allows_load(cache_client):
+    """Complement to the gate test: when the server singleton is empty but the
+    manifest's model_id MATCHES the engine.config id, the import proceeds
+    (proving the fallback isn't over-rejecting — it resolves the right id)."""
+    cache_client.cfg.model_name = ""
+    _write_export_root(
+        cache_client.sandbox,
+        "embedded-ok",
+        Manifest(
+            protocol_version=PROTOCOL_VERSION,
+            model_id="embedded/model-a",  # == engine.config
+            entries=4,
+        ),
+    )
+    engine = cache_client.FakeEngine(entries=0, load_returns=4, loaded_bytes=10)
+    engine.config.model_name = "embedded/model-a"
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "embedded-ok", "merge_strategy": "merge"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert engine.loaded_from is not None  # gate passed — load ran
+    assert resp.json()["entries_loaded"] == 4
+
+
+def test_export_failed_save_of_nonempty_cache_returns_500(cache_client):
+    """#1100 BLOCKING-3: a non-empty cache whose save commits NOTHING is a
+    FAILURE (500), not an empty export (200). ``save_cache_to_disk`` returns
+    False for BOTH a genuinely-empty cache and a non-committing save; the
+    route distinguishes them by the pre-write entry snapshot. Here the cache
+    HAS entries but the save returns False → 500, and any partial blob is
+    cleaned up (nothing importable left on disk)."""
+    from pathlib import Path as _Path
+
+    engine = cache_client.FakeEngine(entries=5, current_memory=2048)
+
+    def _save_commits_nothing(cache_dir, should_abort=None):
+        # Simulate a non-empty cache whose save committed nothing (staging
+        # dir vanished / all entries dropped by post-write verify). Leave a
+        # stray partial blob to prove the route cleans it up.
+        engine.saved_to = cache_dir
+        d = _Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.json").write_text("{}")  # partial junk
+        return False  # nothing committed
+
+    engine.save_cache_to_disk = _save_commits_nothing
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "failed-save"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 500, resp.text
+    # The partial blob was discarded — no importable index.json left behind.
+    blob_dir = _Path(cache_client.sandbox) / "failed-save"
+    assert not (blob_dir / "index.json").exists()
+    assert not (blob_dir / "manifest.json").exists()
+
+
+def test_export_empty_cache_save_false_is_200_not_error(cache_client):
+    """The flip side of BLOCKING-3: a genuinely-EMPTY cache whose save returns
+    False is legitimate — 200 with zero counts, NOT a 500. The default
+    ``_FakeEngine`` with 0 entries returns False from ``save_cache_to_disk``;
+    the route must treat that as an empty export, not a failure."""
+    engine = cache_client.FakeEngine(entries=0, current_memory=0)
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "empty-ok"},
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["entries_exported"] == 0
+
+
+def test_export_discard_quarantines_when_delete_fails(cache_client, monkeypatch):
+    """#1100 BLOCKING-5: if the oversized-blob cleanup can't DELETE the blob
+    (permission / fs failure), it must QUARANTINE the import-critical files
+    (rename manifest.json + index.json to ``.rejected``) so the import path
+    refuses the blob. A 413 must guarantee the blob is not importable — a
+    stray manifest.json/index.json left readable would let a peer import an
+    over-cap blob."""
+    from pathlib import Path as _Path
+
+    import vllm_mlx.routes.cache as cache_mod
+
+    engine = cache_client.FakeEngine(entries=1, current_memory=10)
+
+    def _save_writes_big_blob(cache_dir, should_abort=None):
+        engine.saved_to = cache_dir
+        d = _Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.json").write_text(
+            '{"version":3,"entries":[{"index":0,"num_tokens":4,'
+            '"memory_bytes":42,"cache_types":["KVCache"]}]}'
+        )
+        (d / "entry_0.safetensors").write_text("x" * 5000)  # on-disk over cap
+        (d / "entry_0_tokens.bin").write_text("x")
+        return True
+
+    engine.save_cache_to_disk = _save_writes_big_blob
+    cache_client.cfg.engine = engine
+
+    # Make rmtree a no-op so deletion "fails" (the dedicated-subdir discard
+    # path uses rmtree) — forcing the quarantine path. os.replace (the
+    # quarantine rename) is left working.
+    monkeypatch.setattr(cache_mod.shutil, "rmtree", lambda *a, **k: None)
+
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "quarantine-me", "max_bytes": 1000},
+        headers=_auth(),
+    )
+    # Still a 413 (the invariant is honored via quarantine, not deletion).
+    assert resp.status_code == 413, resp.text
+    blob_dir = _Path(cache_client.sandbox) / "quarantine-me"
+    # Import-critical files renamed to .rejected → import path refuses them.
+    assert not (blob_dir / "index.json").exists()
+    assert not (blob_dir / "manifest.json").exists()
+    assert (blob_dir / "index.json.rejected").exists()
+    assert (blob_dir / "manifest.json.rejected").exists()
+
+    # Prove the blob is no longer importable: an import against it 404s
+    # (read_manifest finds no manifest.json).
+    imp = cache_client.client.post(
+        "/v1/cache/import",
+        json={"source": "quarantine-me"},
+        headers=_auth(),
+    )
+    assert imp.status_code == 404, imp.text
+
+
+def test_export_discard_500_when_neither_delete_nor_quarantine_works(
+    cache_client, monkeypatch
+):
+    """#1100 BLOCKING-5: if cleanup can neither DELETE nor QUARANTINE the
+    over-cap blob, the route must NOT claim a 413 discard (which promises the
+    blob is gone) — it returns 500 so the lie ("discarded") is never told and
+    an operator sees the stray blob signal."""
+    from pathlib import Path as _Path
+
+    import vllm_mlx.routes.cache as cache_mod
+
+    engine = cache_client.FakeEngine(entries=1, current_memory=10)
+
+    def _save_writes_big_blob(cache_dir, should_abort=None):
+        engine.saved_to = cache_dir
+        d = _Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.json").write_text(
+            '{"version":3,"entries":[{"index":0,"num_tokens":4,'
+            '"memory_bytes":42,"cache_types":["KVCache"]}]}'
+        )
+        (d / "entry_0.safetensors").write_text("x" * 5000)
+        (d / "entry_0_tokens.bin").write_text("x")
+        return True
+
+    engine.save_cache_to_disk = _save_writes_big_blob
+    cache_client.cfg.engine = engine
+
+    # Both deletion (rmtree no-op) AND quarantine (returns False = couldn't
+    # remove the import-critical files) fail. Patch the quarantine helper
+    # directly rather than os.replace — os.replace is shared with
+    # write_manifest, which runs BEFORE the gate and must succeed.
+    monkeypatch.setattr(cache_mod.shutil, "rmtree", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cache_mod, "_quarantine_import_critical", lambda destination: False
+    )
+
+    resp = cache_client.client.post(
+        "/v1/cache/export",
+        json={"destination": "stuck-blob", "max_bytes": 1000},
+        headers=_auth(),
+    )
+    # Neither delete nor quarantine worked → 500, NOT a 413 that lies.
+    assert resp.status_code == 500, resp.text
+    assert "discard" in resp.json()["detail"].lower()
 
 
 def test_load_from_disk_replace_preserves_cache_on_missing_source():
@@ -913,20 +1175,93 @@ def test_load_from_disk_replace_preserves_cache_on_missing_source():
     assert len(src_cache._entries) == before
 
 
+def test_load_from_disk_replace_preserves_cache_on_corrupt_entry_blob(tmp_path):
+    """#1100 BLOCKING-1: a VALID index.json paired with a corrupt/missing
+    entry_*.safetensors must NOT destroy the existing cache under
+    ``replace=True``. The round-1 fix cleared the live cache after the index
+    validated but BEFORE any entry blob was read, so this exact case wiped the
+    cache and loaded nothing. The stage-then-swap fix reads every entry FIRST
+    and aborts (existing cache intact) if any entry blob is corrupt."""
+    import mlx.core as mx
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    # 1. Build + save a real 1-entry snapshot to disk (valid index + blobs).
+    src_cache, load_cfg = _build_cache_with_arrays_layer()
+    for entry in src_cache._entries.values():
+        for layer in entry.cache:
+            state = getattr(layer, "state", None)
+            if state is not None:
+                mx.eval(state)
+    target = str(tmp_path / "snap")
+    with mx.stream(mx.default_stream(mx.default_device())):
+        assert src_cache.save_to_disk(target) is True
+
+    # 2. Corrupt the entry safetensors body while leaving index.json VALID —
+    #    truncate it to a few bytes so the header/body completeness check
+    #    rejects it as corrupt (not merely incompatible).
+    entry_sf = Path(target) / "entry_0.safetensors"
+    assert entry_sf.is_file()
+    entry_sf.write_bytes(b"\x00\x00\x00\x00")  # garbage — valid index, dead blob
+
+    # 3. A DIFFERENT populated destination cache attempts replace-import.
+    dst_cache = MemoryAwarePrefixCache(model=object(), config=load_cfg)
+    dst_tokens = (90, 91, 92)
+    dst_kv = _second_kvcache()
+    from vllm_mlx.memory_cache import _CacheEntry
+
+    entry = _CacheEntry.create(list(dst_tokens), dst_kv)
+    with dst_cache._lock:
+        dst_cache._entries[dst_tokens] = entry
+        dst_cache._current_memory += entry.memory_bytes
+    for layer in dst_kv:
+        state = getattr(layer, "state", None)
+        if state is not None:
+            mx.eval(state)
+    before_entries = dict(dst_cache._entries)
+    before_mem = dst_cache._current_memory
+    assert len(before_entries) == 1
+
+    with mx.stream(mx.default_stream(mx.default_device())):
+        loaded = dst_cache.load_from_disk(target, replace=True)
+
+    # Replace aborted on the corrupt entry — nothing loaded, cache preserved.
+    assert loaded == 0
+    assert dst_cache._entries == before_entries
+    assert dst_cache._current_memory == before_mem
+
+
+def _second_kvcache():
+    """A small standalone KVCache list for the destination-cache fixture."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    kv = KVCache()
+    kv.update_and_fetch(mx.zeros((1, 2, 3, 8)), mx.ones((1, 2, 3, 8)))
+    return [kv]
+
+
 def test_export_post_write_max_bytes_discards_oversized_blob(cache_client):
-    """#1100 BLOCKING-2 + BLOCKING-3: max_bytes is enforced against the
-    COMMITTED on-disk size (read from index.json), not just the pre-write
-    live ledger. A cache that grows between the pre-check and the snapshot
-    still can't produce an over-cap export — the oversized blob is discarded
-    from disk rather than left for a peer to import."""
+    """#1100 BLOCKING-2 + BLOCKING-4: max_bytes is enforced against the ACTUAL
+    COMMITTED ON-DISK size (sum of real file sizes via os.stat), NOT the
+    logical ``memory_bytes`` ledger. A cache that grows between the pre-check
+    and the snapshot — OR whose on-disk overhead (tokens.bin + index.json +
+    manifest.json + safetensors headers) pushes the real footprint over the
+    cap — still can't produce an over-cap export: the oversized blob is
+    discarded from disk rather than left for a peer to import.
+
+    Here the pre-check sees a tiny live footprint (10 B ≤ cap) but the save
+    writes a real 5000-byte entry file, so the committed directory size
+    exceeds the 1000 B cap and the export is rejected + discarded."""
     import json as _json
     from pathlib import Path as _Path
 
     engine = cache_client.FakeEngine(entries=1, current_memory=10, load_returns=0)
 
-    def _save_writes_big_index(cache_dir, should_abort=None):
+    def _save_writes_big_blob(cache_dir, should_abort=None):
         # Pre-check saw a tiny live footprint (10 B ≤ cap); the committed
-        # index reports 5000 B (simulating cache growth racing the snapshot).
+        # blob is genuinely large ON DISK (a 5000-byte entry file) — this is
+        # what the post-write committed-size gate must catch.
         engine.saved_to = cache_dir
         d = _Path(cache_dir)
         d.mkdir(parents=True, exist_ok=True)
@@ -934,28 +1269,32 @@ def test_export_post_write_max_bytes_discards_oversized_blob(cache_client):
             _json.dumps(
                 {
                     "version": 3,
-                    "total_memory_bytes": 5000,
+                    "total_memory_bytes": 42,
                     "entries": [
                         {
                             "index": 0,
                             "num_tokens": 4,
-                            "memory_bytes": 5000,
+                            "memory_bytes": 42,
                             "cache_types": ["KVCache"],
                         }
                     ],
                 }
             )
         )
-        (d / "entry_0.safetensors").write_text("x")
+        # A genuinely large on-disk entry file (5000 bytes) — even though the
+        # logical memory_bytes above is a mere 42, the REAL committed size
+        # blows the 1000 B cap. This is the exact class the old logical-only
+        # gate missed.
+        (d / "entry_0.safetensors").write_text("x" * 5000)
         (d / "entry_0_tokens.bin").write_text("x")
         return True
 
-    engine.save_cache_to_disk = _save_writes_big_index
+    engine.save_cache_to_disk = _save_writes_big_blob
     cache_client.cfg.engine = engine
 
     resp = cache_client.client.post(
         "/v1/cache/export",
-        json={"destination": "grew", "max_bytes": 1000},  # committed 5000 > 1000
+        json={"destination": "grew", "max_bytes": 1000},  # on-disk 5000+ > 1000
         headers=_auth(),
     )
     assert resp.status_code == 413, resp.text
@@ -963,7 +1302,7 @@ def test_export_post_write_max_bytes_discards_oversized_blob(cache_client):
     blob_dir = _Path(cache_client.sandbox) / "grew"
     assert not (blob_dir / "index.json").exists()
     assert not (blob_dir / "entry_0.safetensors").exists()
-    # No manifest was written for the rejected export.
+    # No manifest was written for the rejected export (it was discarded too).
     assert not (blob_dir / "manifest.json").exists()
 
 

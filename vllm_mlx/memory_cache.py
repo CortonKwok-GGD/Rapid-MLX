@@ -2584,17 +2584,26 @@ class MemoryAwarePrefixCache:
         """Load cache entries from disk.
 
         ``replace=True`` implements the export/import "replace" merge
-        strategy (#476) as an ATOMIC clear-then-load on this thread: the
-        in-memory cache is emptied via :meth:`clear` only AFTER the
-        on-disk ``index.json`` has been read and validated (every index-
-        level failure below returns 0 *without* clearing, so a missing/
-        corrupt/version-mismatched source leaves the existing cache
-        intact). The clear happens right before the per-entry load loop,
-        inside this single method — so no other caller can ``store`` into
-        the cache in the gap between clear and load (the route layer used
-        to ``clear()`` on the asyncio thread and ``load`` on the mlx-step
-        thread, leaving a window where a concurrent request repopulated
-        the "replaced" cache — codex #1100 BLOCKING-4). ``replace=False``
+        strategy (#476) as an ATOMIC stage-then-swap on this thread: EVERY
+        declared entry is read + validated into a temporary staging set
+        FIRST, and only if the whole blob stages cleanly is the in-memory
+        cache emptied via :meth:`clear` and the staged entries swapped in.
+        If ANY entry read fails with a corruption signal (missing file,
+        truncated tokens.bin, short safetensors body, uuid/length-prefix
+        mismatch, offset≠len) the load aborts WITHOUT clearing and returns
+        0 — so a missing/corrupt/version-mismatched source (whether the
+        index or a single entry blob) leaves the existing cache fully
+        intact (codex #1100 BLOCKING-1; the round-1 fix cleared before
+        reading entries, so a valid index + corrupt entry blob destroyed
+        the cache and loaded nothing). Both the clear and the swap run on
+        this single method / thread, so no other caller can ``store`` into
+        the cache in the gap (the route layer used to ``clear()`` on the
+        asyncio thread and ``load`` on the mlx-step thread, leaving a
+        window where a concurrent request repopulated the "replaced"
+        cache — codex #1100 BLOCKING-4). Benign skips (cache-type
+        incompatible under the current quant config, or an entry that
+        overflows the memory cap) are NOT corruption — they don't abort a
+        replace, they simply don't join the staged set. ``replace=False``
         (default) preserves the pre-existing merge-into-current behavior
         used by radix persistence and the offline CLI.
 
@@ -2748,30 +2757,44 @@ class MemoryAwarePrefixCache:
         else:
             expected_save_uuid = None
 
-        # BLOCKING-4 (#1100): atomic clear for the "replace" merge strategy.
-        # We reach here only after index.json was read + structurally
-        # validated (every failure path above returned 0 without touching
-        # the live cache), so clearing now cannot destroy the existing
-        # cache on a missing/corrupt/version-mismatched source. Doing it
-        # here — on the same mlx-step thread that runs the load loop below
-        # — closes the clear/load race the route layer had when it cleared
-        # on the asyncio thread. Per-entry corruption past this point is
-        # already handled by the skip counters (a valid index whose
-        # every entry file is unreadable yields an empty cache, which is
-        # the honest outcome of "replace with a blob that has no loadable
-        # entries").
-        if replace:
-            self.clear()
-            logger.info(
-                "[cache_persist] replace: cleared in-memory cache before load "
-                "(index validated, %d entries declared)",
-                len(index.get("entries", [])),
-            )
-
+        # BLOCKING-1 (#1100 codex round 2): STAGE-then-SWAP for the
+        # "replace" merge strategy. The round-1 fix cleared the live cache
+        # here — AFTER index.json validated but BEFORE any entry blob was
+        # read. A valid index.json paired with a missing/corrupt
+        # entry_*.safetensors therefore destroyed the existing cache and
+        # loaded nothing, breaking the documented "corrupt source leaves
+        # existing cache intact" guarantee (ImportRequest.merge_strategy).
+        #
+        # Fix: read + validate EVERY declared entry into a temporary
+        # ``staged`` structure first. Only if the whole blob stages
+        # cleanly do we clear the live cache and swap the staged entries
+        # in. If any entry read fails with a CORRUPTION signal during
+        # staging in replace mode, abort WITHOUT clearing — the existing
+        # cache is preserved and the caller sees the failure surfaced.
+        #
+        # Benign skips (cache-type incompatible under the current quant
+        # config, or an entry that would overflow the memory cap) are NOT
+        # corruption — they don't abort a replace; they just don't make it
+        # into the staged set, exactly as the merge path drops them today.
+        #
+        # In replace mode dedup + memory-fit are evaluated against the
+        # STAGED set (which starts empty). In merge mode they're evaluated
+        # against the LIVE cache, preserving the pre-#1100 behavior byte
+        # for byte.
         loaded = 0
         corrupt_skipped = 0
         duplicate_skipped = 0
         incompatible_skipped = 0
+
+        # Staged entries for the replace swap (also used as the running
+        # working set in merge mode so dedup/memory checks see entries
+        # loaded earlier in THIS call, matching the old in-place loop).
+        staged: dict[tuple, _CacheEntry] = {}
+        # Memory accounted so far. In merge mode we start from the live
+        # ledger (new entries add on top of what's already resident); in
+        # replace mode from 0 (the staged blob stands alone).
+        staged_memory = 0 if replace else self._current_memory
+        replace_aborted = False
         for entry_meta in index.get("entries", []):
             i = entry_meta["index"]
             expected_num_tokens = entry_meta["num_tokens"]
@@ -2781,6 +2804,9 @@ class MemoryAwarePrefixCache:
             if not os.path.exists(entry_path) or not os.path.exists(tokens_path):
                 logger.warning(f"[cache_persist] missing files for entry {i}, skipping")
                 corrupt_skipped += 1
+                if replace:
+                    replace_aborted = True
+                    break
                 continue
 
             # Cache-type compatibility check (#198 BUG B). Reject entries
@@ -2821,6 +2847,9 @@ class MemoryAwarePrefixCache:
                     f"{expected_num_tokens} tokens — corruption, skipping"
                 )
                 corrupt_skipped += 1
+                if replace:
+                    replace_aborted = True
+                    break
                 continue
 
             # mx.load mmaps safetensors lazily and will silently return
@@ -2833,6 +2862,9 @@ class MemoryAwarePrefixCache:
                     f"its header's declared data range — corruption, skipping"
                 )
                 corrupt_skipped += 1
+                if replace:
+                    replace_aborted = True
+                    break
                 continue
 
             try:
@@ -2852,18 +2884,25 @@ class MemoryAwarePrefixCache:
                         f"{reject_reason} — corruption, skipping"
                     )
                     corrupt_skipped += 1
+                    if replace:
+                        replace_aborted = True
+                        break
                     continue
 
                 # Skip duplicates (e.g. an entry that warmup already
-                # populated). Done BEFORE load_prompt_cache so a duplicate
-                # entry doesn't pay the safetensors mmap cost only to be
-                # discarded. Without this guard, bisect.insort would also
-                # create duplicate keys in _sorted_keys and memory would
-                # double-count. Benign — not a corruption signal.
+                # populated, or a duplicate key WITHIN this blob). Checked
+                # against BOTH the live cache (merge only) and the staged
+                # set built so far in this call. Done BEFORE
+                # load_prompt_cache so a duplicate entry doesn't pay the
+                # safetensors mmap cost only to be discarded. Benign — not
+                # a corruption signal, so it never aborts a replace.
                 tokens_key = tuple(tokens)
-                if tokens_key in self._entries:
+                already_present = tokens_key in staged or (
+                    not replace and tokens_key in self._entries
+                )
+                if already_present:
                     logger.debug(
-                        f"[cache_persist] entry {i} already present in cache "
+                        f"[cache_persist] entry {i} already present "
                         f"(len={len(tokens)}), skipping disk copy"
                     )
                     duplicate_skipped += 1
@@ -2884,16 +2923,20 @@ class MemoryAwarePrefixCache:
                             f"— corruption, skipping"
                         )
                         corrupt_skipped += 1
+                        if replace:
+                            replace_aborted = True
+                            break
                         continue
 
                 # Estimate memory
                 memory = estimate_kv_cache_memory(cache)
 
-                # Check if it fits
-                if self._current_memory + memory > self._max_memory:
+                # Check if it fits against the running (live+staged in
+                # merge, staged-only in replace) accounting.
+                if staged_memory + memory > self._max_memory:
                     logger.info(
                         f"[cache_persist] entry {i} would exceed memory limit "
-                        f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
+                        f"({(staged_memory + memory) / _BYTES_PER_MB:.0f}MB > "
                         f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
                     )
                     break
@@ -2903,13 +2946,12 @@ class MemoryAwarePrefixCache:
                     cache=cache,
                     memory_bytes=memory,
                 )
-                self._entries[tokens_key] = entry
-                self._current_memory += memory
-                bisect.insort(self._sorted_keys, tokens_key)
+                staged[tokens_key] = entry
+                staged_memory += memory
                 loaded += 1
 
                 logger.info(
-                    f"[cache_persist] loaded entry {i}: "
+                    f"[cache_persist] staged entry {i}: "
                     f"{len(tokens)} tokens, "
                     f"{memory / _BYTES_PER_MB:.1f}MB KV"
                 )
@@ -2917,6 +2959,41 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to load entry {i}: {e}")
                 corrupt_skipped += 1
+                if replace:
+                    replace_aborted = True
+                    break
+
+        # BLOCKING-1 (#1100): a replace that hit ANY corruption during
+        # staging aborts WITHOUT touching the live cache — the existing
+        # cache is preserved intact. We never clear before this point, so
+        # there is nothing to roll back.
+        if replace and replace_aborted:
+            self._stats.load_skipped += corrupt_skipped
+            logger.warning(
+                "[cache_persist] replace ABORTED: source blob at %s has a "
+                "corrupt/missing entry (%d corrupt so far) — existing cache "
+                "left intact, nothing loaded",
+                cache_dir,
+                corrupt_skipped,
+            )
+            return 0
+
+        # Commit the staged entries. In replace mode we clear the live
+        # cache now — AFTER the whole blob staged cleanly — then swap the
+        # staged entries in. ``clear()`` carries the monotonic counters
+        # over (load_skipped / save_drift_drops). In merge mode there's
+        # nothing to clear; the staged set already excludes live duplicates.
+        if replace:
+            self.clear()
+            logger.info(
+                "[cache_persist] replace: cleared in-memory cache after full "
+                "staging (%d entries staged, index validated)",
+                len(staged),
+            )
+        for tokens_key, entry in staged.items():
+            self._entries[tokens_key] = entry
+            self._current_memory += entry.memory_bytes
+            bisect.insort(self._sorted_keys, tokens_key)
 
         self._stats.entry_count = len(self._entries)
         self._stats.current_memory_bytes = self._current_memory

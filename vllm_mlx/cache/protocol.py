@@ -290,6 +290,45 @@ def _read_committed_cache_counts(cache_dir: str | Path) -> tuple[int, int] | Non
         return None
 
 
+def resolve_engine_model_id(engine: Any) -> str:
+    """Resolve the model id for a loaded engine, server-singleton first.
+
+    BLOCKING-2 (#1100 codex round 2): the import route's model-identity
+    gate and the manifest builder MUST derive the loaded model's id the
+    SAME way, or they disagree on embedded engines. The manifest builder
+    fell back to ``engine.config.model_name`` when the server singleton's
+    ``model_name`` was empty (which it is for an embedded / unit-test
+    engine that never populated ``ServerConfig``); the gate read only the
+    empty singleton and therefore skipped the check — letting an embedded
+    engine import another model's KV state. This single helper is the one
+    source of truth both call sites use, so they can't drift again.
+
+    Resolution order (first non-empty wins):
+
+    1. ``get_config().model_name`` — the operator-facing HF id / alias the
+       server booted with (empty for embedded engines).
+    2. ``engine.config.model_name`` — the engine's own config.
+    3. ``engine.config.model_path`` — last-resort path form.
+
+    Returns ``""`` only when none of the above yields an id.
+    """
+    try:
+        from ..config import get_config
+
+        model_id = get_config().model_name or ""
+    except Exception:  # pragma: no cover — config singleton import guard
+        model_id = ""
+    if not model_id:
+        engine_cfg = getattr(engine, "config", None)
+        if engine_cfg is not None:
+            model_id = (
+                getattr(engine_cfg, "model_name", None)
+                or getattr(engine_cfg, "model_path", None)
+                or ""
+            )
+    return model_id
+
+
 def build_manifest_from_engine_state(
     engine: Any, cache_dir: str | Path | None = None
 ) -> Manifest:
@@ -332,22 +371,10 @@ def build_manifest_from_engine_state(
     — still correct for callers that only want the config knobs.
     """
     # Model id — prefer the server singleton (what the operator typed), fall
-    # back to the engine's own config for unit-test / embedded engines.
-    model_id = ""
-    try:
-        from ..config import get_config
-
-        model_id = get_config().model_name or ""
-    except Exception:  # pragma: no cover — config singleton import guard
-        model_id = ""
-    if not model_id:
-        engine_cfg = getattr(engine, "config", None)
-        if engine_cfg is not None:
-            model_id = (
-                getattr(engine_cfg, "model_name", None)
-                or getattr(engine_cfg, "model_path", None)
-                or ""
-            )
+    # back to the engine's own config for unit-test / embedded engines. The
+    # import route's identity gate shares this exact resolution via
+    # ``resolve_engine_model_id`` so the two can't drift (#1100 BLOCKING-2).
+    model_id = resolve_engine_model_id(engine)
 
     # Cache-config knobs off the scheduler's SchedulerConfig.
     quantization = ""
