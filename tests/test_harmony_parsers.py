@@ -1140,7 +1140,6 @@ class TestHarmonyStreaming:
     def test_final_channel_streaming_emits_content(self, parser):
         """Final channel tokens are emitted as content after <|message|>."""
         # Build final channel token by token
-        base = ""
         chunks = [
             "<|channel|>final\n",
             "<|message|>",

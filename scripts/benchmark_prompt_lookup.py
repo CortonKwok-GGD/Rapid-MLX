@@ -182,8 +182,6 @@ def run_prompt_lookup(
 
     generated_ids = []
     draft_accepted_total = 0
-    draft_proposed_total = 0
-    draft_attempts = 0
 
     for token_id, logprobs, from_draft in prompt_lookup_generate_step(
         tokens,

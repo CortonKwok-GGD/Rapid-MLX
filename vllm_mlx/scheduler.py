@@ -5706,7 +5706,6 @@ class Scheduler:
                 break
 
         # Clear finished tracking for next step
-        old_finished = self.finished_req_ids
         self.finished_req_ids = set()
 
         # Adaptive interval: scale inversely with concurrency to prevent
