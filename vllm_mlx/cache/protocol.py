@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as _datetime
 import json
 import logging
+import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -391,7 +392,20 @@ def validate_committed_index_data(
         if not _valid_nonneg_int(entry.get("num_tokens")):
             return False, f"entry {pos} has invalid 'num_tokens'", 0, 0
         mb = entry.get("memory_bytes", 0)
-        if isinstance(mb, bool) or not isinstance(mb, (int, float)) or mb < 0:
+        # #1100 codex round 9 (#2): reject non-finite floats. Python's json
+        # parses ``NaN``/``Infinity`` into float('nan')/float('inf'); a bare
+        # ``mb < 0`` check passes them through, and the ``int(mb)`` below then
+        # raises (crashing the import) instead of rejecting the malformed index.
+        # Require a finite, integral, nonnegative value (memory_bytes is a byte
+        # COUNT — fractional/NaN/Inf is meaningless).
+        if (
+            isinstance(mb, bool)
+            or not isinstance(mb, (int, float))
+            or (
+                isinstance(mb, float) and (not math.isfinite(mb) or not mb.is_integer())
+            )
+            or mb < 0
+        ):
             return False, f"entry {pos} has invalid 'memory_bytes'", 0, 0
         total += int(mb)
     return True, "", len(entries_list), total
@@ -488,6 +502,40 @@ def resolve_engine_model_id(engine: Any) -> str:
     return model_id
 
 
+def resolve_engine_cache_geometry(engine: Any) -> tuple[str, bool, bool]:
+    """Return the loaded engine's KV-cache geometry ``(quantization,
+    paged_cache, turboquant_kv)``.
+
+    #1100 codex round 9 (#1): the manifest carries these knobs and the import
+    gate must validate the imported blob's geometry AGAINST the loaded engine,
+    not just the model_id string — two checkpoints sharing an alias but built
+    with different KV-cache dtype / paged / turboquant settings produce
+    byte-incompatible KV tensors, and loading one into the other corrupts
+    inference. This is the single source of truth both the manifest BUILDER (on
+    export) and the import GATE use, so they can't drift on how geometry is read
+    (the same one-source-of-truth discipline ``resolve_engine_model_id`` gives
+    the id gate). Reads ``scheduler.config`` via ``_resolve_scheduler`` (which
+    unwraps the production BatchedEngine nesting); returns the conservative
+    ``("", False, False)`` only when no scheduler config is reachable.
+
+    NOTE: this is a NECESSARY-not-SUFFICIENT geometry check — it covers the KV
+    knobs the manifest already records. A full immutable fingerprint (model
+    revision hash, tokenizer, architecture) is tracked as a follow-up; it needs
+    engine-side fingerprint computation + a manifest schema addition beyond this
+    PR's export/import wiring scope.
+    """
+    from ..runtime.cache import _resolve_scheduler
+
+    scheduler = _resolve_scheduler(engine)
+    sched_cfg = getattr(scheduler, "config", None) if scheduler is not None else None
+    if sched_cfg is None:
+        return "", False, False
+    quantization = getattr(sched_cfg, "kv_cache_dtype", "") or ""
+    paged_cache = bool(getattr(sched_cfg, "use_paged_cache", False))
+    turboquant_kv = bool(getattr(sched_cfg, "kv_cache_turboquant", False))
+    return quantization, paged_cache, turboquant_kv
+
+
 def build_manifest_from_engine_state(
     engine: Any,
     cache_dir: str | Path | None = None,
@@ -546,25 +594,20 @@ def build_manifest_from_engine_state(
     # ``resolve_engine_model_id`` so the two can't drift (#1100 BLOCKING-2).
     model_id = resolve_engine_model_id(engine)
 
-    # Cache-config knobs off the scheduler's SchedulerConfig.
-    quantization = ""
-    paged_cache = False
-    turboquant_kv = False
-    # ``_resolve_scheduler`` unwraps the production BatchedEngine
-    # (engine._engine.engine.scheduler) as well as a bare EngineCore
-    # (engine.scheduler). A plain ``getattr(engine, "scheduler")`` here
-    # collapsed to None under BatchedEngine, zeroing every field below
-    # (real-hardware smoke: 70 entries / 1.4 GB on disk but manifest
-    # reported entries=0). Lazy import to dodge the runtime.cache ↔
-    # cache.protocol import cycle.
+    # Cache-config knobs off the scheduler's SchedulerConfig. Read via the
+    # SHARED ``resolve_engine_cache_geometry`` (which unwraps the production
+    # BatchedEngine nesting the same way ``_resolve_scheduler`` does — a plain
+    # ``getattr(engine, "scheduler")`` collapsed to None under BatchedEngine,
+    # zeroing every field: real-hardware smoke saw 70 entries / 1.4 GB on disk
+    # but manifest reported entries=0). Using the same helper the import gate
+    # uses keeps builder and gate from drifting on how geometry is read.
+    quantization, paged_cache, turboquant_kv = resolve_engine_cache_geometry(engine)
+
+    # The unwrapped scheduler is also the source of the live-ledger entry-count
+    # fallback below (when there's no committed index). Resolve it the same way.
     from ..runtime.cache import _resolve_scheduler
 
     scheduler = _resolve_scheduler(engine)
-    sched_cfg = getattr(scheduler, "config", None) if scheduler is not None else None
-    if sched_cfg is not None:
-        quantization = getattr(sched_cfg, "kv_cache_dtype", "") or ""
-        paged_cache = bool(getattr(sched_cfg, "use_paged_cache", False))
-        turboquant_kv = bool(getattr(sched_cfg, "kv_cache_turboquant", False))
 
     # On-disk index format version — read the engine's own constant so the
     # manifest tracks whatever the engine actually writes into index.json.

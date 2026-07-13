@@ -902,6 +902,78 @@ def test_import_model_id_mismatch_returns_409(cache_client):
     assert "model_id" in resp.json()["detail"]
 
 
+def test_import_kv_geometry_quant_mismatch_returns_409(cache_client):
+    """#1100 codex round 9 (#1): matching model_id is necessary but NOT
+    sufficient — a blob exported under a different KV ``quantization``
+    (``kv_cache_dtype``) is byte-incompatible with the loaded engine even for
+    the SAME model, so it must 409. The gate reads the engine's geometry via the
+    SAME helper the manifest builder uses."""
+    _write_export_root(
+        cache_client.sandbox,
+        "geo",
+        Manifest(
+            protocol_version=PROTOCOL_VERSION,
+            model_id="test-model",
+            quantization="int4",  # blob was exported under int4 KV cache
+            entries=1,
+        ),
+    )
+    # Engine loaded with a DIFFERENT KV dtype (bf16) — incompatible geometry.
+    engine = cache_client.FakeEngine(
+        entries=1, current_memory=100, load_returns=1, kv_cache_dtype="bf16"
+    )
+    engine.config.model_name = "test-model"
+    cache_client.cfg.model_name = "test-model"
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import", json={"source": "geo"}, headers=_auth()
+    )
+    assert resp.status_code == 409, resp.text
+    assert "kv_cache_dtype" in resp.json()["detail"]
+    assert engine.loaded_from is None  # gate fired before load
+
+    # Same geometry (both int4) → the gate passes (load runs, 200).
+    engine2 = cache_client.FakeEngine(
+        entries=1, current_memory=100, load_returns=1, kv_cache_dtype="int4"
+    )
+    engine2.config.model_name = "test-model"
+    cache_client.cfg.engine = engine2
+    ok = cache_client.client.post(
+        "/v1/cache/import", json={"source": "geo"}, headers=_auth()
+    )
+    assert ok.status_code == 200, ok.text
+    assert engine2.loaded_from is not None
+
+
+def test_import_legacy_manifest_without_quant_still_imports(cache_client):
+    """#1100 codex round 9 (#1): the geometry gate must NOT break importing an
+    older-but-valid export. A legacy manifest predating the ``quantization``
+    field carries ``quantization=""`` (unknown); unknown-vs-known is treated as
+    unverifiable-yet-permitted (the model_id + protocol gates already passed) so
+    the manifest contract stays additive/back-compatible."""
+    _write_export_root(
+        cache_client.sandbox,
+        "legacy",
+        Manifest(
+            protocol_version=PROTOCOL_VERSION,
+            model_id="test-model",
+            quantization="",  # legacy: field absent → empty
+            entries=1,
+        ),
+    )
+    engine = cache_client.FakeEngine(
+        entries=1, current_memory=100, load_returns=1, kv_cache_dtype="bf16"
+    )
+    engine.config.model_name = "test-model"
+    cache_client.cfg.model_name = "test-model"
+    cache_client.cfg.engine = engine
+    resp = cache_client.client.post(
+        "/v1/cache/import", json={"source": "legacy"}, headers=_auth()
+    )
+    assert resp.status_code == 200, resp.text
+    assert engine.loaded_from is not None
+
+
 def test_import_validated_request_returns_200(cache_client):
     """All wire checks pass → engine.load_cache_from_disk runs, 200 summary.
 
@@ -1610,6 +1682,31 @@ async def test_import_holds_dest_lock_against_concurrent_export(cache_client):
 
     engine.save_cache_to_disk = _instrumented_save
     engine.load_cache_from_disk = _instrumented_load
+
+    # #1100 codex round 9 (#3): the default ``_FakeEngine.save_cache_with_outcome``
+    # / ``load_cache_with_result`` wrap their op under ``self._step_lock`` (to
+    # mimic the real single step thread). But that lock ALSO serializes a
+    # concurrent export's save against this import's load — so the test would
+    # stay green even if the ROUTE dropped its per-destination lock in the
+    # validate->load gap (the fake's lock, not the route's, would keep the swap
+    # out). Install UNSYNCHRONIZED wrappers so the ONLY thing that can keep the
+    # export blocked during the load is the route's dest lock under test.
+    from vllm_mlx.cache.protocol import LoadResult, SaveOutcome
+
+    def _unsync_save_with_outcome(cache_dir, should_abort=None):
+        engine.save_cache_to_disk(cache_dir, should_abort=should_abort)
+        cache = engine.scheduler.memory_aware_cache
+        outcome = getattr(cache, "_last_save_outcome", "empty") if cache else "empty"
+        return SaveOutcome(outcome=outcome)
+
+    def _unsync_load_with_result(cache_dir, replace=False):
+        entries = engine.load_cache_from_disk(cache_dir, replace=replace)
+        cache = engine.scheduler.memory_aware_cache
+        bytes_loaded = int(getattr(cache, "_last_load_bytes", 0)) if cache else 0
+        return LoadResult(entries=entries, bytes_loaded=bytes_loaded)
+
+    engine.save_cache_with_outcome = _unsync_save_with_outcome
+    engine.load_cache_with_result = _unsync_load_with_result
     cache_client.cfg.engine = engine
     cache_mod.read_manifest = _wrapped_read_manifest
 
@@ -2953,6 +3050,52 @@ def test_base_engine_save_outcome_default_distinguishes_failed_from_empty():
     assert empty.save_cache_with_outcome("/tmp/whatever").outcome == "empty"
 
 
+def test_base_engine_load_result_default_tolerates_old_one_arg_signature():
+    """#1100 codex round 9 (#4): the ``load_cache_with_result`` default must not
+    break a pre-existing engine that overrides only the OLD one-arg
+    ``load_cache_from_disk(self, cache_dir)`` (pre-#476, before ``replace`` was
+    added). For the default MERGE path (``replace=False``) it must call with the
+    historical one-arg shape, not pass ``replace=`` and TypeError. A replace
+    request DOES pass the keyword (an engine that can't replace should surface
+    that, not silently degrade)."""
+    from vllm_mlx.engine.base import BaseEngine
+
+    _stubs = {
+        name: (lambda self, *a, **k: None) for name in BaseEngine.__abstractmethods__
+    }
+
+    class _OldMergeEngine(BaseEngine):
+        locals().update(_stubs)
+
+        def __init__(self):
+            self.calls = []
+
+        def load_cache_from_disk(self, cache_dir):  # OLD one-arg signature
+            self.calls.append(("one-arg", cache_dir))
+            return 7
+
+    e = _OldMergeEngine()
+    # Merge path must work with the legacy signature (no replace= keyword).
+    res = e.load_cache_with_result("/tmp/x", replace=False)
+    assert res.entries == 7
+    assert e.calls == [("one-arg", "/tmp/x")]
+
+    # A new-style engine accepting replace= still gets the keyword on replace.
+    class _NewEngine(BaseEngine):
+        locals().update(_stubs)
+
+        def __init__(self):
+            self.saw_replace = None
+
+        def load_cache_from_disk(self, cache_dir, replace: bool = False):
+            self.saw_replace = replace
+            return 3
+
+    n = _NewEngine()
+    assert n.load_cache_with_result("/tmp/x", replace=True).entries == 3
+    assert n.saw_replace is True
+
+
 def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_path):
     """#1100 codex round 7 (#3): ``_read_committed_cache_counts`` must FAIL
     CLOSED over the WHOLE index. The old loop skipped malformed entries yet
@@ -2999,6 +3142,12 @@ def test_read_committed_cache_counts_rejects_malformed_index_fail_closed(tmp_pat
         [_good(0), {"index": True, "num_tokens": 4, "memory_bytes": 100}],  # bool≠int
         [_good(0), {"index": "1", "num_tokens": 4, "memory_bytes": 100}],  # str
         [_good(0), {"index": 1, "num_tokens": 4, "memory_bytes": -5}],  # neg bytes
+        # #1100 codex round 9 (#2): non-finite / non-integral memory_bytes.
+        # json parses NaN/Infinity; a bare ``mb < 0`` check would pass them and
+        # int(NaN) would then CRASH the import instead of rejecting the index.
+        [_good(0), {"index": 1, "num_tokens": 4, "memory_bytes": float("nan")}],
+        [_good(0), {"index": 1, "num_tokens": 4, "memory_bytes": float("inf")}],
+        [_good(0), {"index": 1, "num_tokens": 4, "memory_bytes": 1.5}],  # fractional
     ]
     for entries in malformed_cases:
         _write_index(entries)

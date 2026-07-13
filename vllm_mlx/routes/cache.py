@@ -63,6 +63,7 @@ from ..cache.protocol import (
     default_export_root,
     read_manifest,
     resolve_cache_dir,
+    resolve_engine_cache_geometry,
     resolve_engine_model_id,
     write_manifest,
 )
@@ -1234,6 +1235,47 @@ async def import_cache(req: ImportRequest):
                     ManifestMismatchError(
                         "model_id", req.expected_model_id, manifest.model_id
                     )
+                ),
+            )
+
+        # #1100 codex round 9 (#1): KV-cache GEOMETRY gate. Matching model_id is
+        # necessary but NOT sufficient — a blob exported under a different KV
+        # dtype is byte-incompatible with the loaded engine even for the SAME
+        # model, and hydrating it corrupts inference or crashes the fetch. The
+        # manifest records the cache knobs; gate the import against the loaded
+        # engine's actual geometry (read via the SAME helper the manifest
+        # builder uses, so builder and gate can't drift).
+        #
+        # ``quantization`` (``kv_cache_dtype``) is the highest-signal axis — a
+        # different dtype means a different tensor layout, guaranteed
+        # corruption. It is the ONLY axis we hard-gate, and ONLY when BOTH sides
+        # carry a KNOWN (non-empty) value: an empty string is "unknown" (a
+        # legacy manifest predating this field, or an unresolvable scheduler),
+        # and rejecting unknown-vs-known would break importing older-but-valid
+        # exports — the manifest contract is additive/back-compat. The
+        # ``paged_cache`` / ``turboquant_kv`` booleans default to False on an old
+        # manifest, so a bare bool compare would false-positive against a
+        # paged/turbo server; they are recorded for provenance but NOT hard-
+        # gated here (a fuller fingerprint is a tracked follow-up). The 409 body
+        # names the axis but not the values (no config-probe oracle).
+        server_quant, _server_paged, _server_turbo = resolve_engine_cache_geometry(
+            engine
+        )
+        if (
+            manifest.quantization
+            and server_quant
+            and manifest.quantization != server_quant
+        ):
+            logger.warning(
+                "cache/import: rejected — KV cache quantization mismatch (source=%s)",
+                source,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "manifest KV-cache quantization does not match the loaded "
+                    "engine (kv_cache_dtype); the exported cache is incompatible "
+                    "with this server's cache configuration"
                 ),
             )
 

@@ -336,10 +336,30 @@ class BaseEngine(ABC):
         Same rationale as ``save_cache_with_outcome``. The default delegates
         to ``load_cache_from_disk`` and reports 0 loaded bytes (the count is
         authoritative; bytes are best-effort for engines that don't override).
+
+        #1100 codex round 9 (#4): ``replace`` was added to
+        ``load_cache_from_disk`` for #476. A pre-existing engine that overrides
+        only the OLD one-arg ``load_cache_from_disk(self, cache_dir)`` would
+        ``TypeError`` on the ``replace=`` keyword — even for the default merge
+        path it never asked to change. Preserve the old call shape when
+        ``replace`` is False (the historical default), and only pass the keyword
+        when a replace was actually requested; if that raises ``TypeError`` the
+        engine genuinely can't do a replace, which we surface rather than
+        silently degrade to a merge.
         """
         from ..cache.protocol import LoadResult
 
-        entries = self.load_cache_from_disk(cache_dir, replace=replace)
+        if replace:
+            entries = self.load_cache_from_disk(cache_dir, replace=True)
+        else:
+            # Back-compat: call with the historical one-arg signature so a
+            # subclass predating the ``replace`` parameter still works.
+            try:
+                entries = self.load_cache_from_disk(cache_dir)
+            except TypeError:
+                # A subclass whose signature REQUIRES replace= (unlikely but
+                # possible) — fall back to the explicit keyword.
+                entries = self.load_cache_from_disk(cache_dir, replace=False)
         return LoadResult(entries=entries, bytes_loaded=0)
 
     def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
