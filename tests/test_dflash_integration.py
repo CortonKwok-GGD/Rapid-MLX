@@ -36,6 +36,24 @@ _skip_without_mlx_vlm = pytest.mark.skipif(
     reason="mlx_vlm not installed (DFlash test path needs [dflash] extras)",
 )
 
+
+@pytest.fixture(autouse=True)
+def _reset_dflash_shared_globals():
+    """Isolate the process-global rate limiter across DFlash tests.
+
+    ``_build_app`` / ``run_dflash_server`` call ``configure_rate_limiter``,
+    which mutates a module-level singleton shared with the main server. A
+    DFlash test that enables the limiter (``rate_limit>0``) would otherwise
+    leak that enabled state into unrelated later tests (e.g.
+    ``tests/test_embeddings_timeout_admission.py``), turning their requests
+    into surprise 429s. Reset the limiter to disabled after every test here.
+    """
+    yield
+    from vllm_mlx.middleware.auth import configure_rate_limiter
+
+    configure_rate_limiter(0, enabled=False)
+
+
 # =============================================================================
 # CLI flag plumbing — argparse exposes --speculative-config and the eligibility check
 # fires before the model load when an ineligible alias is passed.
@@ -2138,6 +2156,7 @@ def test_dflash_rate_limited_request_does_not_reserve_slot() -> None:
     from a leftover route dependency)."""
     from fastapi.testclient import TestClient
 
+    from vllm_mlx.middleware.auth import configure_rate_limiter
     from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
     from vllm_mlx.speculative.dflash.server import _build_app
 
@@ -2157,20 +2176,26 @@ def test_dflash_rate_limited_request_does_not_reserve_slot() -> None:
         rate_limit=1,
         max_concurrent_requests=4,
     )
-    client = TestClient(app)
-    admission = app.state.dflash_admission
+    try:
+        client = TestClient(app)
+        admission = app.state.dflash_admission
 
-    # Empty messages → 400, but the request still counts as the single
-    # allowed request (limiter consulted ONCE, not twice).
-    empty = {"model": "qwen3.5-27b-8bit", "messages": []}
-    r1 = client.post("/v1/chat/completions", json=empty)
-    assert r1.status_code == 400, r1.text
-    # Second request is over the per-minute budget → 429 from the middleware,
-    # before any slot is reserved.
-    r2 = client.post("/v1/chat/completions", json=empty)
-    assert r2.status_code == 429, r2.text
-    assert r2.json()["error"]["code"] == "rate_limit_exceeded"
-    assert admission._reservations == 0, "codex #3 regression: 429 reserved a slot"
+        # Empty messages → 400, but the request still counts as the single
+        # allowed request (limiter consulted ONCE, not twice).
+        empty = {"model": "qwen3.5-27b-8bit", "messages": []}
+        r1 = client.post("/v1/chat/completions", json=empty)
+        assert r1.status_code == 400, r1.text
+        # Second request is over the per-minute budget → 429 from the
+        # middleware, before any slot is reserved.
+        r2 = client.post("/v1/chat/completions", json=empty)
+        assert r2.status_code == 429, r2.text
+        assert r2.json()["error"]["code"] == "rate_limit_exceeded"
+        assert admission._reservations == 0, "codex #3 regression: 429 reserved a slot"
+    finally:
+        # The rate limiter is a process-global singleton; leaving it enabled
+        # would pollute every later test that exercises admission/rate paths
+        # (e.g. tests/test_embeddings_timeout_admission.py). Reset it.
+        configure_rate_limiter(0, enabled=False)
 
 
 def test_dflash_stream_terminal_frame_delivered_on_timeout(monkeypatch) -> None:
