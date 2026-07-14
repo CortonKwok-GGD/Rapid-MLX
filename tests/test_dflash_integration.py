@@ -559,6 +559,64 @@ def test_dflash_nonstream_timeout_keeps_gpu_slot_until_worker_finishes(
     asyncio.run(exercise_timeout())
 
 
+def test_dflash_timeout_message_reports_original_not_post_render_budget(
+    monkeypatch,
+) -> None:
+    """codex round-5 #6: the 504 message reports the ORIGINAL configured
+    timeout, not the render-reduced remaining budget.
+
+    The endpoint charges prompt-render time against one absolute deadline and
+    hands the REMAINING budget to the completion helper as ``timeout``. But a
+    user who set a 60s timeout and spent 20s rendering should read "timed out
+    after 60.0 seconds", not "40.0" — otherwise they chase a phantom shorter
+    limit. ``timeout_label`` carries the original for diagnostics.
+    """
+    import asyncio
+    import sys
+    import time
+    import types
+
+    from fastapi import HTTPException
+
+    from vllm_mlx.speculative.dflash import server as srv
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.generate = lambda *a, **kw: (
+        time.sleep(0.05)
+        or SimpleNamespace(text="x", prompt_tokens=1, generation_tokens=1)
+    )
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        with pytest.raises(HTTPException) as excinfo:
+            await srv._non_stream_completion(
+                prompt="prompt",
+                request=MagicMock(),
+                served_model_name="qwen3.5-27b-8bit",
+                gen_kwargs={},
+                model=MagicMock(),
+                processor=MagicMock(),
+                timeout=0.01,  # enforced remaining budget (tiny → 504)
+                timeout_label=60.0,  # ORIGINAL configured timeout
+                admission_reservation=reservation,
+            )
+        assert excinfo.value.status_code == 504
+        # Message reports the ORIGINAL 60.0s, NOT the 0.01s remaining budget
+        # (which would round to "0.0 seconds").
+        assert "60.0 seconds" in excinfo.value.detail, excinfo.value.detail
+        assert "after 0.0 seconds" not in excinfo.value.detail
+        # Let the detached worker finish so the lock/slot release.
+        await asyncio.sleep(0.1)
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
 def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
     monkeypatch,
 ) -> None:
@@ -829,6 +887,50 @@ def test_dflash_stream_claims_slot_only_when_iteration_begins() -> None:
         )
         await stream2.aclose()
         assert admission._reservations == 0
+
+    asyncio.run(exercise())
+
+
+def test_dflash_stream_admission_released_when_aclose_is_cancelled() -> None:
+    """codex round-5 #4: ``_stream_with_admission`` must release the slot even
+    if ``aclose()`` raises ``asyncio.CancelledError``.
+
+    ``CancelledError`` subclasses ``BaseException``, not ``Exception``, so the
+    pre-fix ``except Exception`` around ``await aclose()`` let it skip the
+    mandatory ``reservation.release()`` — permanently leaking a slot whenever a
+    client cancellation propagated through generator teardown. The release now
+    lives in its own unconditional ``finally``.
+    """
+    import asyncio
+
+    from vllm_mlx.speculative.dflash import server as srv
+
+    class _CancelOnClose:
+        """An async-iterator whose ``aclose`` raises CancelledError."""
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            raise asyncio.CancelledError
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        wrapped = srv._stream_with_admission(_CancelOnClose(), reservation)
+        # Drive the wrapper to completion; its ``finally`` closes the inner
+        # stream (which raises CancelledError) and must STILL release the slot.
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in wrapped:
+                pass
+        assert admission._reservations == 0, (
+            "codex #4 regression: CancelledError in aclose() skipped the "
+            "admission release"
+        )
+        assert reservation.claimed is True
 
     asyncio.run(exercise())
 
@@ -2206,6 +2308,17 @@ def test_dflash_stream_backpressure_delivers_terminal_notice(monkeypatch) -> Non
         )
         assert '"finish_reason": "length"' in rest
         assert "data: [DONE]" in rest
+        # codex round-5 #3: the [DONE] terminator MUST be last — after the
+        # final finish_reason/error frame — even when both spill to the
+        # direct-emit path. A regressed ordering would deliver [DONE] first.
+        assert rest.index('"finish_reason": "length"') < rest.index("data: [DONE]"), (
+            "codex #3 ordering regression: [DONE] delivered before final frame"
+        )
+        # [DONE] is the very last non-empty frame.
+        nonempty = [f for f in rest.split("\n\n") if f.strip()]
+        assert nonempty[-1].strip() == "data: [DONE]", (
+            f"codex #3 ordering regression: last frame was {nonempty[-1]!r}"
+        )
         # Lock + slot released after the abort.
         for _ in range(300):
             if not srv._dflash_lock.locked() and admission._reservations == 0:
@@ -2382,6 +2495,14 @@ def test_dflash_unauthenticated_request_does_not_reserve_slot() -> None:
         assert r.status_code == 401, r.text
     finally:
         held.release()
+
+    # codex round-5 #5: the 401 must carry the RFC 6750 bearer challenge.
+    r = client.post("/v1/chat/completions", json=body)
+    assert r.status_code == 401, r.text
+    assert r.headers.get("WWW-Authenticate") == "Bearer", (
+        "codex #5 regression: 401 dropped the WWW-Authenticate: Bearer "
+        "challenge required for bearer-protected resources"
+    )
 
 
 def test_dflash_rate_limited_request_does_not_reserve_slot() -> None:

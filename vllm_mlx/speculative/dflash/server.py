@@ -82,6 +82,23 @@ _dflash_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="dflash-worker"
 )
 
+# Separate executor for prompt rendering (codex round-4 #4 → round-5 #1/#2).
+# ``_render_prompt`` applies the chat template + tokenizes into a *string* —
+# pure CPU tokenizer work that never creates mlx GPU arrays, so it does NOT
+# need the thread-local GPU affinity ``_dflash_executor`` enforces. Keeping it
+# OFF the single GPU worker is what makes it safe to offload: a render must
+# never run between the token steps of a lock-owning generation (that would
+# steal its deadline and touch its model/processor mid-generation). This pool
+# is single-worker too, so renders serialize among themselves — cheap, and it
+# sidesteps any tokenizer thread-safety question — while remaining fully
+# independent of ``_dflash_lock`` and GPU generation. Because an in-flight
+# render here holds no GPU/serial resource, an uncancellable render that
+# overruns its deadline can be abandoned and its admission slot released
+# immediately (nothing serial is left running).
+_dflash_render_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="dflash-render"
+)
+
 
 # F2 (codex round-2 #1): bound the producer→consumer SSE handoff queue so a
 # stalled client cannot make the producer buffer an entire completion in
@@ -261,12 +278,22 @@ class _DFlashAdmissionMiddleware:
                 _extract_bearer_token(request.headers.get("Authorization"))
             )
         except HTTPException as exc:
+            # codex round-5 #5: a 401 must carry the ``WWW-Authenticate:
+            # Bearer`` challenge (RFC 6750). Forward any headers the
+            # ``HTTPException`` attached, and — because the shared
+            # ``_verify_api_key_values`` raises a bare 401 without the
+            # challenge — inject it here for a 401 so the DFlash auth rejection
+            # is spec-compliant rather than an unchallenged 401.
+            challenge_headers = dict(exc.headers or {})
+            if exc.status_code == 401:
+                challenge_headers.setdefault("WWW-Authenticate", "Bearer")
             await _send_json_error(
                 send,
                 status_code=exc.status_code,
                 message=str(exc.detail),
                 error_type="invalid_request_error",
                 code="invalid_api_key",
+                extra_headers=challenge_headers,
             )
             return
 
@@ -318,6 +345,7 @@ async def _send_json_error(
     error_type: str,
     code: str,
     retry_after: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> None:
     """Emit an OpenAI-shaped error JSON response from inside ASGI middleware.
 
@@ -325,6 +353,11 @@ async def _send_json_error(
     before FastAPI's exception machinery is reachable — the request body has
     not been read. Used for the middleware's pre-admission 401 / 429 / 503
     (F1 + codex round-3 #3).
+
+    ``extra_headers`` carries response headers the caught ``HTTPException``
+    attached (codex round-5 #5) — notably ``WWW-Authenticate: Bearer`` on a
+    401, the RFC 6750 challenge that FastAPI's own auth path emits and that a
+    hand-rolled middleware rejection would otherwise drop.
     """
     body = json.dumps(
         {
@@ -342,6 +375,13 @@ async def _send_json_error(
     ]
     if retry_after:
         headers.append((b"retry-after", str(retry_after).encode("ascii")))
+    if extra_headers:
+        for name, value in extra_headers.items():
+            # ``retry-after`` is handled above; skip a duplicate if both paths
+            # supply it. Header names are ASCII-lowercased per ASGI convention.
+            if name.lower() == "retry-after" and retry_after:
+                continue
+            headers.append((name.lower().encode("ascii"), str(value).encode("ascii")))
     try:
         await send(
             {"type": "http.response.start", "status": status_code, "headers": headers}
@@ -484,11 +524,12 @@ class _DFlashStreamLease:
 
 @atexit.register
 def _shutdown_dflash_executor() -> None:
-    """Drain the DFlash worker on interpreter exit. Python registers an
+    """Drain the DFlash workers on interpreter exit. Python registers an
     implicit atexit for ThreadPoolExecutor, but registering ours
     explicitly makes shutdown order deterministic and silences
     "unfinished thread" warnings during graceful uvicorn termination."""
     _dflash_executor.shutdown(wait=False, cancel_futures=True)
+    _dflash_render_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _build_app(
@@ -714,6 +755,13 @@ def _build_app(
             effective_timeout = (
                 request.timeout if request.timeout is not None else default_timeout
             )
+            # codex round-5 #6: keep the ORIGINAL configured timeout for
+            # human-facing diagnostics. ``effective_timeout`` is rewritten below
+            # to the post-render REMAINING budget (so the absolute deadline
+            # spans render + generation), but a 504 message should still say
+            # "timed out after 60s" for a 60s request that spent 20s rendering
+            # — not "after 40s" — or users chase a phantom shorter limit.
+            request_timeout_for_diagnostics = effective_timeout
             loop = asyncio.get_running_loop()
             request_deadline = (
                 loop.time() + effective_timeout
@@ -740,18 +788,30 @@ def _build_app(
             else:
                 enable_thinking = _extract_thinking_from_request(request)
 
-            # codex round-4 #4: OFFLOAD rendering to the DFlash worker thread so
-            # a heavy chat template cannot block the event loop (starving other
+            # codex round-4 #4 → round-5 #1/#2: OFFLOAD rendering so a heavy
+            # chat template cannot block the event loop (starving other
             # connections, health checks, and — critically — the very deadline
-            # enforcement we rely on elsewhere). Bound it by the request
-            # deadline so an expensive render on an already-tight budget fails
-            # fast with a 504 rather than running unbounded.
+            # enforcement we rely on elsewhere), and bound it by the request
+            # deadline so an expensive render on a tight budget fails fast with
+            # a 504 rather than running unbounded.
+            #
+            # It runs on ``_dflash_render_executor`` — a pool SEPARATE from the
+            # single GPU worker — NOT ``_dflash_executor``. Using the GPU worker
+            # (the round-4 mistake) let a later request's render run between the
+            # token steps of the lock-owning generation, consuming its deadline
+            # and touching its model/processor mid-generation. Rendering
+            # produces only a string (pure CPU tokenizer work, no mlx GPU
+            # arrays), so it needs neither the GPU thread affinity nor
+            # ``_dflash_lock``. Because this render holds NO serial/GPU resource,
+            # an uncancellable overrun can be abandoned and its admission slot
+            # released immediately (round-5 #2) — nothing serial is left running
+            # behind it, unlike a timed-out generation worker.
             def _render() -> str:
                 return _render_prompt(
                     processor, model, request, enable_thinking=enable_thinking
                 )
 
-            render_future = loop.run_in_executor(_dflash_executor, _render)
+            render_future = loop.run_in_executor(_dflash_render_executor, _render)
             if request_deadline is None:
                 prompt = await render_future
             else:
@@ -770,18 +830,20 @@ def _build_app(
                         asyncio.shield(render_future), timeout=render_budget
                     )
                 except asyncio.TimeoutError as exc:
-                    # The render is running on the single serial worker; letting
-                    # it keep running would block the next request's generation.
-                    # ``shield`` kept the future alive across our ``wait_for``
-                    # cancellation; cancel it explicitly now (a no-op if the
-                    # sync body already started, but it prevents a queued render
-                    # from firing) and surface the timeout.
+                    # ``shield`` kept the render alive across our ``wait_for``
+                    # cancellation; cancel it now (a no-op if its sync body
+                    # already started, but it prevents a queued render from
+                    # firing). Abandoning it is safe — it runs on the separate
+                    # render pool, holds no GPU lock, and its result is simply
+                    # discarded — so the ``except BaseException`` below releases
+                    # the admission slot immediately with nothing left to defer.
                     render_future.cancel()
                     raise HTTPException(
                         status_code=504,
                         detail=(
                             "DFlash prompt rendering exceeded the request "
-                            f"timeout of {effective_timeout:.1f} seconds."
+                            f"timeout of {request_timeout_for_diagnostics:.1f} "
+                            "seconds."
                         ),
                     ) from exc
 
@@ -838,6 +900,7 @@ def _build_app(
                         model=model,
                         processor=processor,
                         timeout=effective_timeout,
+                        timeout_label=request_timeout_for_diagnostics,
                         admission_reservation=reservation,
                     ),
                     reservation,
@@ -862,6 +925,7 @@ def _build_app(
                 model=model,
                 processor=processor,
                 timeout=effective_timeout,
+                timeout_label=request_timeout_for_diagnostics,
                 admission_reservation=reservation,
             )
         finally:
@@ -961,15 +1025,24 @@ async def _stream_with_admission(
         # return. Closing the inner generator here covers client disconnects
         # and send failures too, so its GPU cleanup runs before the slot is
         # made available again.
+        #
+        # codex round-5 #4: ``reservation.release()`` MUST run even if
+        # ``aclose()`` raises ``asyncio.CancelledError`` — which subclasses
+        # ``BaseException``, NOT ``Exception``, so an ``except Exception`` would
+        # let it skip the release and permanently leak the slot on a client
+        # cancellation. Put the release in its own unconditional ``finally`` so
+        # it fires regardless of how ``aclose()`` unwinds, then let cancellation
+        # propagate.
         aclose = getattr(stream, "aclose", None)
-        if aclose is not None:
-            try:
+        try:
+            if aclose is not None:
                 await aclose()
-            except Exception:  # noqa: BLE001 -- release remains mandatory
-                logger.debug(
-                    "DFlash stream close raised; releasing admission", exc_info=True
-                )
-        reservation.release()
+        except Exception:  # noqa: BLE001 -- release remains mandatory
+            logger.debug(
+                "DFlash stream close raised; releasing admission", exc_info=True
+            )
+        finally:
+            reservation.release()
 
 
 async def _stream_completion(
@@ -981,11 +1054,21 @@ async def _stream_completion(
     model: Any,
     processor: Any,
     timeout: float | None = None,
+    timeout_label: float | None = None,
     admission_reservation: _DFlashAdmissionReservation | None = None,
 ) -> AsyncIterator[bytes]:
     """Stream OpenAI-format chunks. Generation happens under the serial
-    lock; chunks are forwarded as ``data: ...\\n\\n`` SSE events."""
+    lock; chunks are forwarded as ``data: ...\\n\\n`` SSE events.
+
+    ``timeout`` is the ENFORCED remaining budget (post prompt-render);
+    ``timeout_label`` is the ORIGINAL configured request timeout used only in
+    human-facing timeout messages (codex round-5 #6), so a client sees the
+    limit it actually asked for rather than the render-reduced remainder. When
+    omitted (direct callers/tests) it mirrors ``timeout``."""
     from mlx_vlm import stream_generate
+
+    if timeout_label is None:
+        timeout_label = timeout
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -1208,7 +1291,9 @@ async def _stream_completion(
             # generator to drive; the lease's deferred cleanup owns closing
             # the (possibly in-flight) worker.
             if gen_or_err is timed_out:
-                error_message = f"DFlash stream timed out after {timeout:.1f} seconds."
+                error_message = (
+                    f"DFlash stream timed out after {timeout_label:.1f} seconds."
+                )
                 finish_reason = "length"
                 gen = None
             elif isinstance(gen_or_err, Exception):
@@ -1251,7 +1336,7 @@ async def _stream_completion(
                     # tracked by the lease and cleaned up (lock + slot held
                     # until it stops) via ``__aexit__``'s deferred path.
                     error_message = (
-                        f"DFlash stream timed out after {timeout:.1f} seconds."
+                        f"DFlash stream timed out after {timeout_label:.1f} seconds."
                     )
                     finish_reason = "length"
                     break
@@ -1315,7 +1400,7 @@ async def _stream_completion(
                     await _emit(f"data: {json.dumps(piece)}\n\n".encode())
                 except _DFlashStreamDeadlineError:
                     error_message = (
-                        f"DFlash stream timed out after {timeout:.1f} seconds."
+                        f"DFlash stream timed out after {timeout_label:.1f} seconds."
                     )
                     finish_reason = "length"
                     break
@@ -1378,10 +1463,22 @@ async def _stream_completion(
         # it drains, rather than dropping them. A truly-departed client's
         # consumer is already cancelled, so the direct emit is a harmless
         # no-op; a slow-but-present client gets its terminator.
+        #
+        # codex round-5 #3: ORDER is a contract — the [DONE] terminator must
+        # arrive LAST, after the final finish_reason/error frame. Once ANY
+        # terminal frame spills to ``pending_terminal`` (queue full), every
+        # subsequent frame MUST go there too, even if the queue drains in
+        # between; otherwise a later ``[DONE]`` could be enqueued and delivered
+        # ahead of the still-pending final frame. ``spilled`` latches that.
+        spilled = False
         for frame in (final_frame, done_frame):
+            if spilled:
+                pending_terminal.append(frame)
+                continue
             try:
                 await _emit(frame, terminal=True)
             except _DFlashClientGoneError:
+                spilled = True
                 pending_terminal.append(frame)
 
     async def _drive_producer() -> None:
@@ -1482,6 +1579,7 @@ async def _non_stream_completion(
     model: Any,
     processor: Any,
     timeout: float = 1800.0,
+    timeout_label: float | None = None,
     admission_reservation: _DFlashAdmissionReservation | None = None,
 ) -> ChatCompletionResponse:
     """Run generation under the serial lock and enforce a safe deadline.
@@ -1490,8 +1588,15 @@ async def _non_stream_completion(
     dedicated worker. On timeout we return a 504, but keep both the serial
     lock and admission slot until the worker exits; otherwise a second call
     could overlap the first GPU operation on the same thread.
+
+    ``timeout`` is the ENFORCED remaining budget (post prompt-render);
+    ``timeout_label`` is the ORIGINAL configured request timeout reported in
+    the 504 message (codex round-5 #6). Omitted → mirrors ``timeout``.
     """
     from mlx_vlm import generate
+
+    if timeout_label is None:
+        timeout_label = timeout
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -1578,7 +1683,7 @@ async def _non_stream_completion(
             _defer_worker_cleanup()
         raise HTTPException(
             status_code=504,
-            detail=f"DFlash request timed out after {timeout:.1f} seconds.",
+            detail=f"DFlash request timed out after {timeout_label:.1f} seconds.",
         ) from exc
     except asyncio.CancelledError:
         if lock_acquired and worker_future is not None:
