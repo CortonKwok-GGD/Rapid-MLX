@@ -211,12 +211,61 @@ class _DFlashAdmissionMiddleware:
         ):
             return await self.app(scope, receive, send)
 
+        # codex round-3 #3: reject unauthenticated / over-rate-limit clients
+        # BEFORE reserving a slot. Otherwise a client that will ultimately be
+        # 401'd or 429'd (e.g. one dribbling a slow body upload) still holds a
+        # scarce DFlash slot for the whole request, denying service to
+        # authorized callers. These checks are header-only — no body is read —
+        # and they run OUTSIDE the admission gate. Because the chat route's
+        # ``verify_api_key`` / ``check_rate_limit`` dependencies are dropped
+        # for this path (this middleware is now the single source of truth on
+        # ``/v1/chat/completions``), the rate limiter is consulted exactly
+        # once per request, so counting stays correct.
+        from starlette.requests import Request as _StarletteRequest
+
+        from ...middleware.auth import (
+            _extract_bearer_token,
+            _rate_limit_client_id,
+            _verify_api_key_values,
+            rate_limiter,
+        )
+
+        request = _StarletteRequest(scope, receive)
+        try:
+            _verify_api_key_values(
+                _extract_bearer_token(request.headers.get("Authorization"))
+            )
+        except HTTPException as exc:
+            await _send_json_error(
+                send,
+                status_code=exc.status_code,
+                message=str(exc.detail),
+                error_type="invalid_request_error",
+                code="invalid_api_key",
+            )
+            return
+
+        allowed, retry_after = rate_limiter.is_allowed(_rate_limit_client_id(request))
+        if not allowed:
+            await _send_json_error(
+                send,
+                status_code=429,
+                message=f"Rate limit exceeded. Retry after {retry_after} seconds.",
+                error_type="rate_limit_error",
+                code="rate_limit_exceeded",
+                retry_after=str(retry_after),
+            )
+            return
+
         try:
             reservation = self._admission.reserve()
         except HTTPException as exc:
-            await _send_503(
+            await _send_json_error(
                 send,
-                detail=str(exc.detail),
+                status_code=503,
+                message=str(exc.detail),
+                error_type="service_unavailable",
+                code="at_capacity",
                 retry_after=(exc.headers or {}).get("Retry-After"),
             )
             return
@@ -236,18 +285,28 @@ class _DFlashAdmissionMiddleware:
                 reservation.release(force=True)
 
 
-async def _send_503(send, *, detail: str, retry_after: str | None) -> None:
-    """Emit an OpenAI-shaped 503 from inside ASGI middleware (F1).
+async def _send_json_error(
+    send,
+    *,
+    status_code: int,
+    message: str,
+    error_type: str,
+    code: str,
+    retry_after: str | None = None,
+) -> None:
+    """Emit an OpenAI-shaped error JSON response from inside ASGI middleware.
 
-    Hand-rolled (not ``HTTPException``) because we reject before FastAPI's
-    exception machinery is reachable — the request body has not been read.
+    Hand-rolled (not ``HTTPException``) because these rejections happen
+    before FastAPI's exception machinery is reachable — the request body has
+    not been read. Used for the middleware's pre-admission 401 / 429 / 503
+    (F1 + codex round-3 #3).
     """
     body = json.dumps(
         {
             "error": {
-                "message": detail,
-                "type": "service_unavailable",
-                "code": "at_capacity",
+                "message": message,
+                "type": error_type,
+                "code": code,
                 "param": None,
             }
         }
@@ -259,10 +318,12 @@ async def _send_503(send, *, detail: str, retry_after: str | None) -> None:
     if retry_after:
         headers.append((b"retry-after", str(retry_after).encode("ascii")))
     try:
-        await send({"type": "http.response.start", "status": 503, "headers": headers})
+        await send(
+            {"type": "http.response.start", "status": status_code, "headers": headers}
+        )
         await send({"type": "http.response.body", "body": body, "more_body": False})
     except Exception:  # noqa: BLE001 -- client already gone; nothing to emit
-        logger.debug("DFlash 503 send failed (client already disconnected)")
+        logger.debug("DFlash %d send failed (client already disconnected)", status_code)
 
 
 class _DFlashStreamLease:
@@ -450,7 +511,6 @@ def _build_app(
     cfg.default_timeout = max(0.0, float(default_timeout))
 
     from ...middleware.auth import (
-        check_rate_limit,
         configure_rate_limiter,
         verify_api_key,
     )
@@ -477,13 +537,26 @@ def _build_app(
     # middleware also enforces the configured body-receive idle timeout, so a
     # DFlash request cannot bypass the slow-client protection by taking this
     # dedicated app path.
+    # Middleware nesting (``add_middleware`` wraps last-added OUTERMOST).
+    # Target order, outer → inner:
+    #   body-size (413/408)  →  admission (auth/rate/reserve)  →  body-depth
+    #   →  route (Pydantic body bind)
+    # Rationale:
+    #   * body-size stays OUTERMOST so an oversized body is rejected with 413
+    #     (and a slow upload with 408) as cheaply as possible — before any
+    #     auth/rate/admission work (codex round-3 didn't ask to move these
+    #     generic DoS gates, and 413-cheapest-first is the established
+    #     contract the security test pins).
+    #   * admission sits INSIDE body-size but OUTSIDE body-depth + the route,
+    #     so its header-only auth + rate rejection (codex round-3 #3) runs
+    #     before a slot is reserved, and the reservation is taken before
+    #     body-depth reads the body and before FastAPI binds the Pydantic
+    #     model (F1 — bounds parsed-body memory).
+    # Add order to realize that nesting: body-depth (innermost), then
+    # admission, then body-size (outermost) last.
     install_request_body_depth_middleware(app)
-    install_request_body_limit_middleware(app)
-    # F1: admission runs OUTERMOST so a slot is reserved before the body-
-    # size / body-depth wrappers even read bytes and before FastAPI binds
-    # the Pydantic body. ``add_middleware`` wraps last-added first, so this
-    # call must come after the two above to sit on the outside.
     app.add_middleware(_DFlashAdmissionMiddleware, admission=admission)
+    install_request_body_limit_middleware(app)
     # F-090/F-091: register CORS only when an explicit origin allowlist is
     # configured. ``cors_origins=[]`` (the new default — see
     # ``vllm_mlx/server.py::configure_cors_from_env``) skips the middleware
@@ -536,10 +609,12 @@ def _build_app(
             ]
         )
 
-    @app.post(
-        "/v1/chat/completions",
-        dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
-    )
+    # codex round-3 #3: auth + rate-limit for this route are enforced in
+    # ``_DFlashAdmissionMiddleware`` BEFORE the admission slot is reserved and
+    # before the body is read — NOT as route dependencies here. Keeping them
+    # here too would consult the rate limiter twice per request (halving the
+    # effective limit) and would run only AFTER a slot was already reserved.
+    @app.post("/v1/chat/completions")
     async def create_chat_completion(
         request: ChatCompletionRequest, http_request: Request
     ):
@@ -853,17 +928,36 @@ async def _stream_completion(
         last_token_id: int | None = None
         error_message: str | None = None
 
-        async def _emit(item: bytes) -> None:
-            """Put one SSE frame on the bounded queue with a backpressure
-            deadline (codex round-2 #1). If the queue stays full past the
-            backpressure timeout the consumer has stopped reading, so raise
-            ``_DFlashClientGoneError`` to abort generation instead of buffering
-            an unbounded completion for a client that is gone."""
+        async def _emit(item: bytes, *, terminal: bool = False) -> None:
+            """Put one SSE frame on the bounded queue.
+
+            For streamed content frames the wait is bounded by BOTH the
+            backpressure timeout and the request deadline:
+            * codex round-2 #1: a full bounded queue means the consumer
+              stopped reading; waiting forever would buffer an unbounded
+              completion.
+            * codex round-3 #2: waiting the full backpressure timeout while
+              ignoring a shorter request deadline would let a stalled client
+              retain the sole GPU lock + admission slot well past the
+              configured timeout.
+            So the content wait is ``min(backpressure_timeout, deadline-now)``;
+            when either elapses we raise ``_DFlashClientGoneError`` to abort
+            generation and unwind the lease.
+
+            ``terminal=True`` frames (the final finish_reason/usage chunk and
+            ``[DONE]``, incl. the timeout/error notice) are delivered under the
+            plain backpressure timeout only — NOT the deadline bound. They are
+            emitted AFTER the lease is released, so they cannot hold the GPU
+            lock, and their whole purpose is to tell the client how the stream
+            ended (e.g. "timed out"); dropping them because the deadline is
+            already gone would leave the client with a truncated, unexplained
+            stream. The bounded queue still caps the wait so a truly-gone
+            client can't wedge the terminator."""
+            wait = _STREAM_BACKPRESSURE_TIMEOUT_SECONDS
+            if not terminal and deadline is not None:
+                wait = min(wait, max(0.0, deadline - loop.time()))
             try:
-                await asyncio.wait_for(
-                    queue.put(item),
-                    timeout=_STREAM_BACKPRESSURE_TIMEOUT_SECONDS,
-                )
+                await asyncio.wait_for(queue.put(item), timeout=wait)
             except asyncio.TimeoutError as exc:
                 raise _DFlashClientGoneError from exc
 
@@ -1091,38 +1185,39 @@ async def _stream_completion(
                 "type": "dflash_runtime_error",
                 "message": error_message,
             }
-        await _emit(f"data: {json.dumps(final)}\n\n".encode())
-        await _emit(b"data: [DONE]\n\n")
+        await _emit(f"data: {json.dumps(final)}\n\n".encode(), terminal=True)
+        await _emit(b"data: [DONE]\n\n", terminal=True)
 
     async def _drive_producer() -> None:
-        """Run ``_produce`` and always terminate the queue with a sentinel.
+        """Run ``_produce``; swallow the client-gone abort.
 
-        The ``finally`` guarantees the consumer's drain loop wakes and
-        exits even if ``_produce`` is cancelled (client disconnect) or
-        raises — otherwise ``queue.get()`` would block forever.
+        codex round-3 #1: this NO LONGER relies on pushing a queue sentinel
+        to terminate the consumer (a full bounded queue could drop it, hanging
+        a slow-but-resuming client). The consumer instead terminates from this
+        task's completion state — see the drain loop below. We still push a
+        best-effort sentinel to wake a consumer that is blocked in
+        ``queue.get()`` right now, but correctness no longer depends on it.
         """
         try:
             await _produce()
         except _DFlashClientGoneError:
-            # codex round-2 #1: the client stopped reading and the bounded
-            # queue stayed full past the backpressure timeout. ``_produce``
+            # codex round-2 #1/#3: the client stopped reading (bounded queue
+            # stayed full past the backpressure / deadline bound). ``_produce``
             # already unwound ``async with lease`` (generator closed, lock +
-            # slot released or deferred). Nothing more to emit — fall through
-            # to the sentinel so the drain loop (if still alive) exits.
+            # slot released or deferred). Nothing more to emit.
             logger.debug(
-                "DFlash stream aborted: client stopped reading past the "
-                "%.0fs backpressure timeout",
-                _STREAM_BACKPRESSURE_TIMEOUT_SECONDS,
+                "DFlash stream aborted: client stopped reading within the "
+                "backpressure/deadline bound"
             )
         finally:
-            # Sentinel wakes the consumer's drain loop. Use ``put_nowait``
-            # inside a guard: if the bounded queue is full (the very
-            # backpressure that aborted us), drop the sentinel — the consumer
-            # is gone and its ``finally`` cancels this task anyway.
+            # Best-effort wake for a consumer currently blocked on
+            # ``queue.get()``. If the queue is full the sentinel is dropped,
+            # but the consumer's producer-completion check still terminates
+            # it, so no hang. ``put_nowait`` never blocks.
             try:
                 queue.put_nowait(None)
             except asyncio.QueueFull:
-                logger.debug("DFlash stream queue full at teardown; sentinel dropped")
+                pass
 
     # F2: start generation in its own task BEFORE the first client read.
     # ``ensure_future`` schedules the producer eagerly so its deadline
@@ -1139,10 +1234,22 @@ async def _stream_completion(
         # the prior contract. The producer may already be mid-generation by
         # now; its output waits in the queue behind this marker.
         yield f"data: {json.dumps(first)}\n\n".encode()
+        # codex round-3 #1: drive termination from producer-completion state,
+        # not solely a queue sentinel. The top-of-loop check
+        # ``producer.done() and queue.empty()`` guarantees termination even if
+        # the sentinel was dropped: the sentinel is only ever dropped when the
+        # queue is FULL (``put_nowait`` raises only on a full queue), and a
+        # full queue means ``await queue.get()`` returns immediately — it can
+        # never block forever. Once the producer is done and every buffered
+        # item has been yielded, ``queue.empty()`` is True and the loop exits.
         while True:
+            if producer.done() and queue.empty():
+                break
             item = await queue.get()
             if item is None:
-                break
+                # Best-effort sentinel — just re-loop; the top-of-loop check
+                # performs the actual termination decision.
+                continue
             yield item
         # Surface a producer crash (not one of the sentinel-wrapped
         # generation errors, which are already emitted as error SSE) so it

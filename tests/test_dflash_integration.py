@@ -2073,6 +2073,161 @@ def test_dflash_admission_reserved_before_body_parse(monkeypatch) -> None:
     assert response.json()["error"]["code"] == "at_capacity"
 
 
+def test_dflash_unauthenticated_request_does_not_reserve_slot() -> None:
+    """codex round-3 #3: auth is enforced BEFORE the admission slot is
+    reserved. A missing / wrong API key must return 401 and must NOT occupy
+    a DFlash slot — otherwise an unauthenticated client could exhaust every
+    slot (e.g. via slow body uploads) and deny service to authorized callers.
+    """
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+    from vllm_mlx.speculative.dflash.server import _build_app
+
+    model = MagicMock()
+    model.config = MagicMock()
+    app = _build_app(
+        model=model,
+        processor=MagicMock(),
+        runtime=DFlashRuntime(
+            drafter=MagicMock(),
+            kind="dflash",
+            drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        ),
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=[],
+        api_key="secret",
+        max_concurrent_requests=1,
+    )
+    client = TestClient(app)
+    admission = app.state.dflash_admission
+
+    body = {
+        "model": "qwen3.5-27b-8bit",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    # No key → 401 and no slot consumed.
+    r = client.post("/v1/chat/completions", json=body)
+    assert r.status_code == 401, r.text
+    assert admission._reservations == 0, "codex #3 regression: 401 reserved a slot"
+
+    # Wrong key → 401 and no slot consumed.
+    r = client.post(
+        "/v1/chat/completions", headers={"Authorization": "Bearer nope"}, json=body
+    )
+    assert r.status_code == 401, r.text
+    assert admission._reservations == 0, (
+        "codex #3 regression: wrong key reserved a slot"
+    )
+
+    # A slot held externally must NOT block the pre-admission 401 — the auth
+    # rejection happens before the admission gate is even consulted.
+    held = admission.reserve()
+    try:
+        r = client.post("/v1/chat/completions", json=body)
+        assert r.status_code == 401, r.text
+    finally:
+        held.release()
+
+
+def test_dflash_rate_limited_request_does_not_reserve_slot() -> None:
+    """codex round-3 #3: rate-limit rejection also happens BEFORE reserving,
+    and the limiter is consulted exactly once per request (no double-count
+    from a leftover route dependency)."""
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+    from vllm_mlx.speculative.dflash.server import _build_app
+
+    model = MagicMock()
+    model.config = MagicMock()
+    app = _build_app(
+        model=model,
+        processor=MagicMock(),
+        runtime=DFlashRuntime(
+            drafter=MagicMock(),
+            kind="dflash",
+            drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        ),
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=[],
+        rate_limit=1,
+        max_concurrent_requests=4,
+    )
+    client = TestClient(app)
+    admission = app.state.dflash_admission
+
+    # Empty messages → 400, but the request still counts as the single
+    # allowed request (limiter consulted ONCE, not twice).
+    empty = {"model": "qwen3.5-27b-8bit", "messages": []}
+    r1 = client.post("/v1/chat/completions", json=empty)
+    assert r1.status_code == 400, r1.text
+    # Second request is over the per-minute budget → 429 from the middleware,
+    # before any slot is reserved.
+    r2 = client.post("/v1/chat/completions", json=empty)
+    assert r2.status_code == 429, r2.text
+    assert r2.json()["error"]["code"] == "rate_limit_exceeded"
+    assert admission._reservations == 0, "codex #3 regression: 429 reserved a slot"
+
+
+def test_dflash_stream_terminal_frame_delivered_on_timeout(monkeypatch) -> None:
+    """codex round-3 #2: the deadline-bounded backpressure on content frames
+    must NOT suppress the TERMINAL timeout/error + [DONE] frames. Even when
+    the request deadline is already blown, the client must still receive the
+    "timed out" notice and the stream terminator — otherwise it sees a
+    truncated stream with no explanation.
+    """
+    import asyncio
+    import sys
+    import time
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    class _SlowGenerator:
+        def __next__(self):
+            time.sleep(0.05)
+            raise StopIteration
+
+        def close(self):
+            pass
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = lambda *_a, **_kw: _SlowGenerator()
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise() -> None:
+        stream = srv._stream_completion(
+            prompt="p",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 8},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0.01,  # already blown by the time the terminal frames emit
+        )
+        body = b"".join([chunk async for chunk in stream]).decode()
+        # Terminal frames survive the deadline bound.
+        assert "DFlash stream timed out after 0.0 seconds." in body
+        assert "data: [DONE]" in body
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
 # =============================================================================
 # End-to-end — heavy. Requires:
 #   - ``RAPID_MLX_DFLASH_E2E=1`` env var (opt-in; CI doesn't set it)
