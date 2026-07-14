@@ -91,10 +91,16 @@ _dflash_executor = concurrent.futures.ThreadPoolExecutor(
 # steal its deadline and touch its model/processor mid-generation). This pool
 # is single-worker too, so renders serialize among themselves — cheap, and it
 # sidesteps any tokenizer thread-safety question — while remaining fully
-# independent of ``_dflash_lock`` and GPU generation. Because an in-flight
-# render here holds no GPU/serial resource, an uncancellable render that
-# overruns its deadline can be abandoned and its admission slot released
-# immediately (nothing serial is left running).
+# independent of ``_dflash_lock`` and GPU generation.
+#
+# codex round-8 #5: an uncancellable render that overruns its deadline does NOT
+# free its admission slot immediately. The endpoint retains the slot (claim +
+# defer) until the render's ``concurrent.futures.Future`` actually completes
+# and releases from its callback (codex round-7 #2). Holding the slot is what
+# keeps ``max_concurrent_requests`` honest: a burst of cancelled/timed-out
+# requests each keeps its render counted until it drains, so they cannot pile
+# up unbounded on this pool's queue. (The slot is held only for accounting —
+# the render still touches no GPU/serial resource, so nothing blocks the GPU.)
 _dflash_render_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="dflash-render"
 )
@@ -913,6 +919,20 @@ def _build_app(
                     processor, model, request, enable_thinking=enable_thinking
                 )
 
+            # codex round-8 #1: validate the remaining budget BEFORE submitting
+            # any work. Submitting first — then checking ``render_budget <= 0``
+            # — could still start an uncancellable tokenizer render on an
+            # already-expired deadline before returning the 504. Check first;
+            # only submit when there is time to render.
+            if request_deadline is not None and request_deadline - loop.time() <= 0:
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        "DFlash request deadline elapsed before prompt "
+                        "rendering could start."
+                    ),
+                )
+
             # codex round-7 #2: submit via the executor DIRECTLY so we hold the
             # ``concurrent.futures.Future`` — which tracks the ACTUAL worker
             # thread. (``loop.run_in_executor`` returns an asyncio future whose
@@ -929,15 +949,6 @@ def _build_app(
                 prompt = await render_awaitable
             else:
                 render_budget = request_deadline - loop.time()
-                if render_budget <= 0:
-                    render_cf.cancel()
-                    raise HTTPException(
-                        status_code=504,
-                        detail=(
-                            "DFlash request deadline elapsed before prompt "
-                            "rendering could start."
-                        ),
-                    )
                 try:
                     prompt = await asyncio.wait_for(
                         asyncio.shield(render_awaitable), timeout=render_budget
@@ -1035,6 +1046,7 @@ def _build_app(
                         processor=processor,
                         timeout=effective_timeout,
                         timeout_label=request_timeout_for_diagnostics,
+                        deadline=request_deadline,
                         admission_reservation=reservation,
                     ),
                     reservation,
@@ -1060,6 +1072,7 @@ def _build_app(
                 processor=processor,
                 timeout=effective_timeout,
                 timeout_label=request_timeout_for_diagnostics,
+                deadline=request_deadline,
                 admission_reservation=reservation,
             )
         finally:
@@ -1189,10 +1202,19 @@ async def _stream_completion(
     processor: Any,
     timeout: float | None = None,
     timeout_label: float | None = None,
+    deadline: float | None = None,
     admission_reservation: _DFlashAdmissionReservation | None = None,
 ) -> AsyncIterator[bytes]:
     """Stream OpenAI-format chunks. Generation happens under the serial
     lock; chunks are forwarded as ``data: ...\\n\\n`` SSE events.
+
+    ``deadline`` is an ABSOLUTE ``loop.time()`` instant (codex round-8 #2). The
+    endpoint establishes one deadline spanning render + generation and passes
+    it here directly; reconstructing a fresh deadline from a relative
+    ``timeout`` at this point would silently hand back the wall-clock time spent
+    between the endpoint and the first stream step (returning ``StreamingResponse``
+    + header send). When ``deadline`` is omitted (direct callers/tests) it is
+    derived from ``timeout`` as before.
 
     ``timeout`` is the ENFORCED remaining budget (post prompt-render);
     ``timeout_label`` is the ORIGINAL configured request timeout used only in
@@ -1239,7 +1261,13 @@ async def _stream_completion(
         _eos_ids.update(int(t) for t in _eos if isinstance(t, int))
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout if timeout and timeout > 0 else None
+    # codex round-8 #2: prefer the absolute ``deadline`` the endpoint passed
+    # (which already spans render + generation on this loop's clock). Only
+    # derive one from the relative ``timeout`` when a direct caller/test omits
+    # it — otherwise the clock would be re-based here, refunding the time spent
+    # returning the response and sending headers.
+    if deadline is None and timeout and timeout > 0:
+        deadline = loop.time() + timeout
     timed_out = object()
     lease = _DFlashStreamLease(loop, admission_reservation, deadline)
 
@@ -1708,6 +1736,7 @@ async def _non_stream_completion(
     processor: Any,
     timeout: float = 1800.0,
     timeout_label: float | None = None,
+    deadline: float | None = None,
     admission_reservation: _DFlashAdmissionReservation | None = None,
 ) -> ChatCompletionResponse:
     """Run generation under the serial lock and enforce a safe deadline.
@@ -1717,9 +1746,12 @@ async def _non_stream_completion(
     lock and admission slot until the worker exits; otherwise a second call
     could overlap the first GPU operation on the same thread.
 
-    ``timeout`` is the ENFORCED remaining budget (post prompt-render);
-    ``timeout_label`` is the ORIGINAL configured request timeout reported in
-    the 504 message (codex round-5 #6). Omitted → mirrors ``timeout``.
+    ``deadline`` is an ABSOLUTE ``loop.time()`` instant (codex round-8 #2)
+    spanning render + generation; when omitted (direct callers/tests) it is
+    derived from the relative ``timeout``. ``timeout`` is the ENFORCED remaining
+    budget (post prompt-render); ``timeout_label`` is the ORIGINAL configured
+    request timeout reported in the 504 message (codex round-5 #6). Omitted →
+    mirrors ``timeout``.
     """
     from mlx_vlm import generate
 
@@ -1743,7 +1775,11 @@ async def _non_stream_completion(
     # already-expired deadline and returned an immediate 504, while the
     # same value disabled the streaming deadline — identical requests
     # behaving oppositely by path.
-    deadline = loop.time() + timeout if timeout and timeout > 0 else None
+    #
+    # codex round-8 #2: prefer the absolute ``deadline`` the endpoint passed;
+    # only derive from the relative ``timeout`` when a direct caller omitted it.
+    if deadline is None and timeout and timeout > 0:
+        deadline = loop.time() + timeout
     lock_acquired = False
     worker_future: asyncio.Future[Any] | None = None
 

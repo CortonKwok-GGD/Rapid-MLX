@@ -57,6 +57,7 @@ def _reset_dflash_shared_globals():
       (e.g. a test setting ``api_key`` must not silently authenticate — or
       reject — a later test that assumes no key).
     """
+    from vllm_mlx import server as _main_server
     from vllm_mlx.config import get_config
 
     cfg = get_config()
@@ -69,6 +70,11 @@ def _reset_dflash_shared_globals():
             "default_timeout",
         )
     }
+    # codex round-8 #3: the CORS tests here call ``configure_cors_from_env``,
+    # which writes the process-global ``_last_resolved_cors_policy`` in
+    # ``vllm_mlx.server``. Snapshot + restore it too so a resolved policy from
+    # one test can't leak into a later one under randomized ordering.
+    _cors_snapshot = _main_server._last_resolved_cors_policy
     try:
         yield
     finally:
@@ -77,6 +83,7 @@ def _reset_dflash_shared_globals():
         configure_rate_limiter(0, enabled=False)
         for field, value in _snapshot.items():
             setattr(cfg, field, value)
+        _main_server._last_resolved_cors_policy = _cors_snapshot
 
 
 # =============================================================================
@@ -634,6 +641,80 @@ def test_dflash_timeout_message_reports_original_not_post_render_budget(
         assert "after 0.0 seconds" not in excinfo.value.detail
         # Let the detached worker finish so the lock/slot release.
         await asyncio.sleep(0.1)
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
+def test_dflash_stream_uses_absolute_deadline_over_relative_timeout(
+    monkeypatch,
+) -> None:
+    """codex round-8 #2: an absolute ``deadline`` takes precedence over a
+    relative ``timeout``, so the wall-clock spent before the first stream step
+    is NOT refunded to the request budget.
+
+    We pass a ``deadline`` that is ALREADY in the past alongside a large
+    ``timeout``. If the helper re-based the clock from ``timeout`` (the bug),
+    the stream would run to completion; honoring the absolute past deadline, it
+    must time out immediately.
+    """
+    import asyncio
+    import sys
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    class _Gen:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return SimpleNamespace(
+                text="tok", generation_tokens=1, prompt_tokens=1, token=1
+            )
+
+        def close(self):
+            pass
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = lambda *a, **kw: _Gen()
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        loop = asyncio.get_running_loop()
+        stream = srv._stream_completion(
+            prompt="p",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 8},
+            model=MagicMock(),
+            processor=MagicMock(),
+            # A large relative timeout that MUST be ignored in favor of...
+            timeout=999.0,
+            timeout_label=999.0,
+            # ...this already-expired absolute deadline.
+            deadline=loop.time() - 1.0,
+            admission_reservation=reservation,
+        )
+        body = b"".join([chunk async for chunk in stream]).decode()
+        # Immediate timeout — the past deadline wins over the 999s timeout.
+        assert "timed out" in body, (
+            "codex #8 regression: relative timeout re-based the clock, "
+            "ignoring the absolute (already-expired) deadline"
+        )
+        assert "data: [DONE]" in body
 
     srv._dflash_lock = asyncio.Lock()
     try:
