@@ -43,7 +43,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -84,12 +84,32 @@ _dflash_executor = concurrent.futures.ThreadPoolExecutor(
 
 
 class _DFlashAdmissionReservation:
-    """One request slot from a :class:`_DFlashAdmission` gate."""
+    """One request slot from a :class:`_DFlashAdmission` gate.
+
+    Ownership handoff (F1): the reservation is minted at the ASGI layer
+    *before* the request body is parsed, so ``max_concurrent_requests``
+    bounds the number of concurrently parsed bodies rather than only the
+    number of requests already inside the endpoint. The middleware keeps
+    a safety-net ``finally`` that force-releases the slot, but once the
+    endpoint (stream lease / non-stream path) takes ownership via
+    :meth:`claim` it is responsible for the release — including the
+    deferred-until-worker-exits case — and the middleware net becomes a
+    no-op. This prevents a double decrement of ``_reservations``.
+    """
 
     def __init__(self, admission: _DFlashAdmission) -> None:
         self._admission = admission
         self._deferred = False
         self._released = False
+        self._claimed = False
+
+    def claim(self) -> None:
+        """Mark the endpoint as the owner of this slot's release."""
+        self._claimed = True
+
+    @property
+    def claimed(self) -> bool:
+        return self._claimed
 
     def defer_release(self) -> None:
         """Keep the slot until a timed-out worker has actually stopped."""
@@ -129,6 +149,99 @@ class _DFlashAdmission:
                 )
             self._reservations += 1
         return _DFlashAdmissionReservation(self)
+
+
+class _DFlashAdmissionMiddleware:
+    """ASGI gate that reserves a DFlash slot BEFORE the body is parsed (F1).
+
+    ``_DFlashAdmission`` was previously consulted inside the endpoint —
+    i.e. after FastAPI had already streamed, JSON-decoded, and
+    Pydantic-validated the full ``ChatCompletionRequest``. That bounded
+    the number of requests *in generation* but not the number of
+    concurrently parsed bodies: an authenticated burst could inflate
+    unbounded parsed-body memory and only trip the 503 once each body was
+    already resident. Reserving here — before ``self.app`` (and therefore
+    before FastAPI's route body-binding) runs — makes
+    ``max_concurrent_requests`` bound parsed-body memory too.
+
+    The reservation is stashed in ``scope["state"]`` so the endpoint reuses
+    the same slot (it calls :meth:`_DFlashAdmissionReservation.claim`
+    and owns the release, including the deferred-worker-cleanup case). The
+    middleware keeps a ``finally`` safety-net that force-releases the slot
+    only when the endpoint never claimed it — e.g. the request was bounced
+    by auth / rate-limit / body-size / validation before generation began,
+    or never matched the chat route at all. This retains the reservation
+    across the full streaming-response lifecycle without ever double
+    decrementing the counter.
+    """
+
+    _GUARDED_METHOD = "POST"
+    _GUARDED_PATH = "/v1/chat/completions"
+
+    def __init__(self, app: Any, admission: _DFlashAdmission) -> None:
+        self.app = app
+        self._admission = admission
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != self._GUARDED_METHOD
+            or scope.get("path") != self._GUARDED_PATH
+        ):
+            return await self.app(scope, receive, send)
+
+        try:
+            reservation = self._admission.reserve()
+        except HTTPException as exc:
+            await _send_503(
+                send,
+                detail=str(exc.detail),
+                retry_after=(exc.headers or {}).get("Retry-After"),
+            )
+            return
+
+        # Hand the slot to the endpoint via ASGI scope state. Starlette
+        # seeds ``scope["state"]`` per-request; create it defensively for
+        # bare-ASGI callers/tests that omit it.
+        state = scope.setdefault("state", {})
+        state["dflash_reservation"] = reservation
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            # Safety net only. Once the endpoint claims the slot it owns
+            # the release (possibly deferred until a timed-out worker
+            # exits), so force-releasing here would double-decrement.
+            if not reservation.claimed:
+                reservation.release(force=True)
+
+
+async def _send_503(send, *, detail: str, retry_after: str | None) -> None:
+    """Emit an OpenAI-shaped 503 from inside ASGI middleware (F1).
+
+    Hand-rolled (not ``HTTPException``) because we reject before FastAPI's
+    exception machinery is reachable — the request body has not been read.
+    """
+    body = json.dumps(
+        {
+            "error": {
+                "message": detail,
+                "type": "service_unavailable",
+                "code": "at_capacity",
+                "param": None,
+            }
+        }
+    ).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    if retry_after:
+        headers.append((b"retry-after", str(retry_after).encode("ascii")))
+    try:
+        await send({"type": "http.response.start", "status": 503, "headers": headers})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+    except Exception:  # noqa: BLE001 -- client already gone; nothing to emit
+        logger.debug("DFlash 503 send failed (client already disconnected)")
 
 
 class _DFlashStreamLease:
@@ -197,9 +310,18 @@ class _DFlashStreamLease:
     def _capture_generator(self, future: asyncio.Future[Any]) -> None:
         if not self._active_future_makes_generator or self._generator is not None:
             return
+        # F3: catch ``BaseException`` — a cancelled ``run_in_executor``
+        # future raises ``CancelledError`` from ``.result()``, and
+        # ``CancelledError`` subclasses ``BaseException`` (not
+        # ``Exception``). The pre-fix ``except Exception`` let that escape
+        # out of ``__aexit__`` before ``_close_generator_and_release`` /
+        # ``_release`` ran, permanently leaking ``_dflash_lock`` when the
+        # client cancelled during generator construction (the tiny window
+        # after ``run_in_executor`` submits but before the single worker
+        # thread picks the task up, so ``future.cancel()`` succeeds).
         try:
             candidate = future.result()
-        except Exception:  # noqa: BLE001 -- worker error has no generator to close
+        except BaseException:  # noqa: BLE001 -- worker error/cancel has no generator to close
             return
         if not isinstance(candidate, Exception) and hasattr(candidate, "close"):
             self._generator = candidate
@@ -336,6 +458,11 @@ def _build_app(
     # dedicated app path.
     install_request_body_depth_middleware(app)
     install_request_body_limit_middleware(app)
+    # F1: admission runs OUTERMOST so a slot is reserved before the body-
+    # size / body-depth wrappers even read bytes and before FastAPI binds
+    # the Pydantic body. ``add_middleware`` wraps last-added first, so this
+    # call must come after the two above to sit on the outside.
+    app.add_middleware(_DFlashAdmissionMiddleware, admission=admission)
     # F-090/F-091: register CORS only when an explicit origin allowlist is
     # configured. ``cors_origins=[]`` (the new default — see
     # ``vllm_mlx/server.py::configure_cors_from_env``) skips the middleware
@@ -392,7 +519,9 @@ def _build_app(
         "/v1/chat/completions",
         dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
     )
-    async def create_chat_completion(request: ChatCompletionRequest):
+    async def create_chat_completion(
+        request: ChatCompletionRequest, http_request: Request
+    ):
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
         if request.n is not None and request.n > 1:
@@ -424,7 +553,17 @@ def _build_app(
                     "in DFlash mode. Restart without DFlash."
                 ),
             )
-        reservation = admission.reserve()
+        # F1: the slot was reserved at the ASGI layer
+        # (``_DFlashAdmissionMiddleware``) BEFORE this body was parsed, so
+        # admission bounds parsed-body memory too. Reuse that slot and take
+        # ownership of its release (``claim``); the middleware's safety-net
+        # release becomes a no-op once claimed. A direct-ASGI/test caller
+        # that bypasses the middleware won't have seeded scope state, so
+        # fall back to reserving here (unclaimed → still gated).
+        reservation = getattr(http_request.state, "dflash_reservation", None)
+        if reservation is None:
+            reservation = admission.reserve()
+        reservation.claim()
         try:
             # Render chat messages into a single prompt string via mlx-vlm's
             # processor. We pass through the model's chat template so the
@@ -612,7 +751,9 @@ async def _stream_completion(
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    # First chunk — role marker
+    # First chunk — role marker. Emitted by the consumer loop below,
+    # before the producer task is started, so the client sees the role
+    # delta before any GPU lock is touched (matches the prior contract).
     first = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -622,16 +763,6 @@ async def _stream_completion(
             {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
         ],
     }
-    yield f"data: {json.dumps(first)}\n\n".encode()
-
-    finish_reason = "stop"
-    total_completion_tokens = 0
-    prompt_tokens = 0
-    # Track the last token id to disambiguate "hit max_tokens but the
-    # final token was actually EOS" — without this we'd falsely flag a
-    # natural-stop response as truncated when it lands on exactly the
-    # budget. None means "no token observed yet".
-    last_token_id: int | None = None
 
     # Track max_tokens so we can report ``finish_reason="length"`` when
     # generation was truncated (OpenAI clients distinguish "stop"
@@ -651,203 +782,315 @@ async def _stream_completion(
     elif isinstance(_eos, (list, tuple, set)):
         _eos_ids.update(int(t) for t in _eos if isinstance(t, int))
 
-    error_message: str | None = None
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout if timeout and timeout > 0 else None
     timed_out = object()
     lease = _DFlashStreamLease(loop, admission_reservation, deadline)
 
-    async def _await_worker(func: Any, *, makes_generator: bool = False) -> Any:
-        """Wait without cancelling an mlx operation on deadline expiry."""
-        if lease.timed_out:
-            return timed_out
-        future = loop.run_in_executor(_dflash_executor, func)
-        lease.track_future(future, makes_generator=makes_generator)
-        if deadline is None:
-            result = await future
-            lease.clear_future(future)
-            return result
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            # The future was submitted by the caller already. It may be a
-            # GPU step, so wait for it before releasing the serial lock.
+    # F2: decouple generation from socket writes. Generation runs in a
+    # dedicated producer task that OWNS the lease (serial GPU lock +
+    # admission slot) and pushes ready-to-send SSE byte chunks onto this
+    # queue. This outer coroutine only drains the queue and yields to the
+    # client socket. If the client applies backpressure (stops reading),
+    # the outer ``yield`` suspends — but the producer keeps running and
+    # its deadline checks keep firing, so a stalled reader can no longer
+    # pin ``_dflash_lock`` past ``timeout``. Lease acquisition/release is
+    # therefore independent of downstream socket writes. The queue is
+    # unbounded but generation is ``max_tokens``-bounded, so buffered
+    # memory is bounded by the completion length.
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    async def _produce() -> None:
+        """Own the lease, generate, and push SSE chunks onto the queue.
+
+        Always terminates the queue with a ``None`` sentinel so the
+        consumer's drain loop can exit even on error/cancel. Runs under
+        ``async with lease`` so the serial lock + admission slot are
+        released (or deferred until a timed-out/cancelled worker exits)
+        the moment generation finishes, regardless of consumer speed.
+        """
+        finish_reason = "stop"
+        total_completion_tokens = 0
+        prompt_tokens = 0
+        # Track the last token id to disambiguate "hit max_tokens but the
+        # final token was actually EOS" — without this we'd falsely flag a
+        # natural-stop response as truncated when it lands on exactly the
+        # budget. None means "no token observed yet".
+        last_token_id: int | None = None
+        error_message: str | None = None
+
+        async def _await_worker(func: Any, *, makes_generator: bool = False) -> Any:
+            """Wait without cancelling an mlx operation on deadline expiry."""
+            if lease.timed_out:
+                return timed_out
+            # F5: recheck the remaining deadline BEFORE submitting the
+            # executor job. Acquiring the serial lock (and prior token
+            # steps) can consume the whole budget; submitting first — as
+            # the pre-fix code did — would start expensive, non-preemptible
+            # GPU work for an already-expired request and keep the lock
+            # held until it finished. Check first; only submit if time
+            # remains.
+            if deadline is not None and deadline - loop.time() <= 0:
+                return timed_out
+            future = loop.run_in_executor(_dflash_executor, func)
+            lease.track_future(future, makes_generator=makes_generator)
+            if deadline is None:
+                # F3: shield so a client cancellation during this bare
+                # await cannot tear a non-preemptible GPU step mid-flight
+                # while leaving the lock leaked. The shield keeps the
+                # underlying worker running; the raised ``CancelledError``
+                # unwinds into ``lease.__aexit__``, which defers cleanup
+                # until the worker completes and then releases the lock.
+                # ``clear_future`` runs only on the normal (uncancelled)
+                # path — on cancel we leave ``_active_future`` set so
+                # ``__aexit__`` sees the in-flight future and routes it
+                # through deferred cleanup.
+                result = await asyncio.shield(future)
+                lease.clear_future(future)
+                return result
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # The future was submitted just above. It may be a GPU
+                # step, so wait for it before releasing the serial lock.
+                result = await asyncio.shield(future)
+                lease.clear_future(future)
+                return result, timed_out
+            done, _pending = await asyncio.wait({future}, timeout=remaining)
+            if done:
+                result = future.result()
+                lease.clear_future(future)
+                return result
+
+            # mlx work is not preemptible. Let the in-flight token step
+            # finish while the serial lock remains held, then close its
+            # generator rather than letting another request overlap it on
+            # the GPU worker.
             result = await asyncio.shield(future)
             lease.clear_future(future)
             return result, timed_out
-        done, _pending = await asyncio.wait({future}, timeout=remaining)
-        if done:
-            result = future.result()
-            lease.clear_future(future)
-            return result
 
-        # mlx work is not preemptible. Let the in-flight token step finish
-        # while the serial lock remains held, then close its generator rather
-        # than letting another request overlap it on the GPU worker.
-        result = await asyncio.shield(future)
-        lease.clear_future(future)
-        return result, timed_out
+        finish_reason = "stop"
+        async with lease:
+            # mlx-vlm's stream_generate is a sync generator — run it in a
+            # thread pool so we don't block the FastAPI event loop. Iterate
+            # by polling with ``run_in_executor`` per chunk. We're already
+            # inside a coroutine, so use ``get_running_loop`` (the 3.10+
+            # idiom; ``get_event_loop`` is deprecated for in-coroutine use).
+            # The executor MUST be ``_dflash_executor`` (single-thread) so
+            # consecutive ``next(gen)`` calls land on the same worker —
+            # mlx's GPU Stream is thread-local and a hand-off across worker
+            # threads would crash mid-generation.
+            # Create the generator on the same worker that will drive it,
+            # not on the event-loop thread — otherwise the first ``next``
+            # crosses a thread boundary just like the rest.
+            #
+            # Wrap construction in a sentinel pattern too: if
+            # ``stream_generate`` raises at setup time (OOM, missing kernel,
+            # bad arg) the exception would otherwise propagate out of the
+            # async generator and leave the SSE client hanging without a
+            # ``[DONE]``. Surfacing it as an error SSE keeps the contract
+            # the same as the mid-stream error path below.
+            def _make_gen():
+                try:
+                    return stream_generate(model, processor, prompt, **gen_kwargs)
+                except Exception as e:  # noqa: BLE001 — surface upstream; outer code converts to error SSE
+                    return e
 
-    async with lease:
-        # mlx-vlm's stream_generate is a sync generator — run it in a
-        # thread pool so we don't block the FastAPI event loop. Iterate
-        # by polling with ``run_in_executor`` per chunk. We're already
-        # inside a coroutine, so use ``get_running_loop`` (the 3.10+
-        # idiom; ``get_event_loop`` is deprecated for in-coroutine use).
-        # The executor MUST be ``_dflash_executor`` (single-thread) so
-        # consecutive ``next(gen)`` calls land on the same worker —
-        # mlx's GPU Stream is thread-local and a hand-off across worker
-        # threads would crash mid-generation.
-        # Create the generator on the same worker that will drive it,
-        # not on the event-loop thread — otherwise the first ``next``
-        # crosses a thread boundary just like the rest.
-        #
-        # Wrap construction in a sentinel pattern too: if
-        # ``stream_generate`` raises at setup time (OOM, missing kernel,
-        # bad arg) the exception would otherwise propagate out of the
-        # async generator and leave the SSE client hanging without a
-        # ``[DONE]``. Surfacing it as an error SSE keeps the contract
-        # the same as the mid-stream error path below.
-        def _make_gen():
-            try:
-                return stream_generate(model, processor, prompt, **gen_kwargs)
-            except Exception as e:  # noqa: BLE001 — surface upstream; outer code converts to error SSE
-                return e
-
-        gen_or_err = await _await_worker(_make_gen, makes_generator=True)
-        timed_out_after_generation = False
-        if gen_or_err is timed_out:
-            timed_out_after_generation = True
-        elif isinstance(gen_or_err, tuple):
-            gen_or_err, _timeout_marker = gen_or_err
-            timed_out_after_generation = _timeout_marker is timed_out
-        if timed_out_after_generation:
-            error_message = f"DFlash stream timed out after {timeout:.1f} seconds."
-            finish_reason = "length"
-            gen = (
-                None
-                if gen_or_err is timed_out or isinstance(gen_or_err, Exception)
-                else gen_or_err
-            )
-            if gen is not None:
-                lease.set_generator(gen)
-        elif isinstance(gen_or_err, Exception):
-            logger.exception(
-                "DFlash stream_generate raised at construction: %s",
-                gen_or_err,
-                exc_info=gen_or_err,
-            )
-            error_message = f"{type(gen_or_err).__name__}: {gen_or_err}"
-            # OpenAI ChatCompletion only accepts {stop, length, tool_calls,
-            # content_filter, function_call}. The error block on the final
-            # SSE chunk carries the abort details for clients.
-            finish_reason = "length"
-            gen = None
-        else:
-            gen = gen_or_err
-            lease.set_generator(gen)
-
-        # Sentinels distinguish "generator exhausted" (None) from
-        # "generator raised mid-stream" (an Exception instance). Catching
-        # only StopIteration would let any other mlx-vlm error propagate
-        # through run_in_executor, abort the response coroutine, and
-        # leave the SSE client hanging without a final ``[DONE]`` — the
-        # client then either times out or holds the connection forever.
-        def _next_chunk():
-            try:
-                return next(gen)
-            except StopIteration:
-                return None
-            except Exception as e:  # noqa: BLE001 — surface upstream; loop converts to error SSE
-                return e
-
-        while gen is not None:
-            chunk = await _await_worker(_next_chunk)
+            gen_or_err = await _await_worker(_make_gen, makes_generator=True)
             timed_out_after_generation = False
-            if isinstance(chunk, tuple):
-                chunk, _timeout_marker = chunk
+            if gen_or_err is timed_out:
+                timed_out_after_generation = True
+            elif isinstance(gen_or_err, tuple):
+                gen_or_err, _timeout_marker = gen_or_err
                 timed_out_after_generation = _timeout_marker is timed_out
             if timed_out_after_generation:
                 error_message = f"DFlash stream timed out after {timeout:.1f} seconds."
                 finish_reason = "length"
-                break
-            if chunk is None:
-                break
-            if isinstance(chunk, Exception):
-                logger.exception(
-                    "DFlash stream_generate raised mid-stream: %s",
-                    chunk,
-                    exc_info=chunk,
+                gen = (
+                    None
+                    if gen_or_err is timed_out or isinstance(gen_or_err, Exception)
+                    else gen_or_err
                 )
-                error_message = f"{type(chunk).__name__}: {chunk}"
-                # See above for OpenAI spec literal-set rationale.
+                if gen is not None:
+                    lease.set_generator(gen)
+            elif isinstance(gen_or_err, Exception):
+                logger.exception(
+                    "DFlash stream_generate raised at construction: %s",
+                    gen_or_err,
+                    exc_info=gen_or_err,
+                )
+                error_message = f"{type(gen_or_err).__name__}: {gen_or_err}"
+                # OpenAI ChatCompletion only accepts {stop, length,
+                # tool_calls, content_filter, function_call}. The error
+                # block on the final SSE chunk carries the abort details
+                # for clients.
                 finish_reason = "length"
-                break
-            # Always sync token counts from the chunk — even when text
-            # is empty (mlx-vlm occasionally emits trailing flush
-            # chunks carrying the final token counters but no
-            # incremental text). Skipping the update would leave the
-            # final usage block with stale numbers.
-            total_completion_tokens = chunk.generation_tokens
-            prompt_tokens = chunk.prompt_tokens
-            _ct = getattr(chunk, "token", None)
-            if isinstance(_ct, int):
-                last_token_id = _ct
-            if not chunk.text:
-                continue
-            piece = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": served_model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": chunk.text},
-                        "finish_reason": None,
-                    }
-                ],
+                gen = None
+            else:
+                gen = gen_or_err
+                lease.set_generator(gen)
+
+            # Sentinels distinguish "generator exhausted" (None) from
+            # "generator raised mid-stream" (an Exception instance).
+            # Catching only StopIteration would let any other mlx-vlm error
+            # propagate through run_in_executor, abort the response
+            # coroutine, and leave the SSE client hanging without a final
+            # ``[DONE]`` — the client then either times out or holds the
+            # connection forever.
+            def _next_chunk():
+                try:
+                    return next(gen)
+                except StopIteration:
+                    return None
+                except Exception as e:  # noqa: BLE001 — surface upstream; loop converts to error SSE
+                    return e
+
+            while gen is not None:
+                chunk = await _await_worker(_next_chunk)
+                timed_out_after_generation = False
+                if isinstance(chunk, tuple):
+                    chunk, _timeout_marker = chunk
+                    timed_out_after_generation = _timeout_marker is timed_out
+                if timed_out_after_generation:
+                    error_message = (
+                        f"DFlash stream timed out after {timeout:.1f} seconds."
+                    )
+                    finish_reason = "length"
+                    break
+                if chunk is None:
+                    break
+                if isinstance(chunk, Exception):
+                    logger.exception(
+                        "DFlash stream_generate raised mid-stream: %s",
+                        chunk,
+                        exc_info=chunk,
+                    )
+                    error_message = f"{type(chunk).__name__}: {chunk}"
+                    # See above for OpenAI spec literal-set rationale.
+                    finish_reason = "length"
+                    break
+                # Always sync token counts from the chunk — even when text
+                # is empty (mlx-vlm occasionally emits trailing flush
+                # chunks carrying the final token counters but no
+                # incremental text). Skipping the update would leave the
+                # final usage block with stale numbers.
+                total_completion_tokens = chunk.generation_tokens
+                prompt_tokens = chunk.prompt_tokens
+                _ct = getattr(chunk, "token", None)
+                if isinstance(_ct, int):
+                    last_token_id = _ct
+                if not chunk.text:
+                    continue
+                piece = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": served_model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": chunk.text},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                # F2: push to the queue instead of yielding to the socket
+                # directly, so the lease (and its lock) is never held across
+                # a suspended socket write.
+                await queue.put(f"data: {json.dumps(piece)}\n\n".encode())
+
+        # Length-truncation detection — mlx-vlm's GenerationResult has no
+        # ``finish_reason`` field, so we infer "length" by comparing the
+        # completion token count to the budget. Only set when we exited the
+        # loop normally (StopIteration), not when the generator errored or
+        # produced fewer tokens (natural stop).
+        #
+        # Subtle case: if the model emitted EOS exactly at ``max_tokens``,
+        # the stop was natural and reporting "length" would mislead clients
+        # into auto-continuing (only to get an immediate EOS again). Check
+        # the last token id against the resolved EOS set to keep the
+        # classification honest in this edge case.
+        if (
+            finish_reason == "stop"
+            and _max_tokens is not None
+            and total_completion_tokens >= _max_tokens
+            and last_token_id not in _eos_ids
+        ):
+            finish_reason = "length"
+
+        # Final chunk — finish_reason + usage. If we broke out of the loop
+        # because the underlying generator raised, attach an OpenAI-style
+        # error block so the client gets a readable failure instead of
+        # silent truncation.
+        final = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": served_model_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": prompt_tokens + total_completion_tokens,
+            },
+        }
+        if error_message is not None:
+            final["error"] = {
+                "type": "dflash_runtime_error",
+                "message": error_message,
             }
-            yield f"data: {json.dumps(piece)}\n\n".encode()
+        await queue.put(f"data: {json.dumps(final)}\n\n".encode())
+        await queue.put(b"data: [DONE]\n\n")
 
-    # Length-truncation detection — mlx-vlm's GenerationResult has no
-    # ``finish_reason`` field, so we infer "length" by comparing the
-    # completion token count to the budget. Only set when we exited the
-    # loop normally (StopIteration), not when the generator errored or
-    # produced fewer tokens (natural stop).
-    #
-    # Subtle case: if the model emitted EOS exactly at ``max_tokens``,
-    # the stop was natural and reporting "length" would mislead clients
-    # into auto-continuing (only to get an immediate EOS again). Check
-    # the last token id against the resolved EOS set to keep the
-    # classification honest in this edge case.
-    if (
-        finish_reason == "stop"
-        and _max_tokens is not None
-        and total_completion_tokens >= _max_tokens
-        and last_token_id not in _eos_ids
-    ):
-        finish_reason = "length"
+    async def _drive_producer() -> None:
+        """Run ``_produce`` and always terminate the queue with a sentinel.
 
-    # Final chunk — finish_reason + usage. If we broke out of the loop
-    # because the underlying generator raised, attach an OpenAI-style
-    # error block so the client gets a readable failure instead of
-    # silent truncation.
-    final = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": served_model_name,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": total_completion_tokens,
-            "total_tokens": prompt_tokens + total_completion_tokens,
-        },
-    }
-    if error_message is not None:
-        final["error"] = {"type": "dflash_runtime_error", "message": error_message}
-    yield f"data: {json.dumps(final)}\n\n".encode()
-    yield b"data: [DONE]\n\n"
+        The ``finally`` guarantees the consumer's drain loop wakes and
+        exits even if ``_produce`` is cancelled (client disconnect) or
+        raises — otherwise ``queue.get()`` would block forever.
+        """
+        try:
+            await _produce()
+        finally:
+            queue.put_nowait(None)
+
+    # F2: start generation in its own task BEFORE the first client read.
+    # ``ensure_future`` schedules the producer eagerly so its deadline
+    # checks and lease lifecycle run independently of when (or whether) the
+    # consumer pulls the next chunk. This coroutine only shuttles
+    # already-formatted SSE bytes from the queue to the socket, so client
+    # backpressure suspends THIS coroutine — never the lease-holding
+    # producer. Creating it before the role-marker yield (rather than after)
+    # also guarantees ``producer`` is defined for the ``finally`` cleanup
+    # even if the client reads exactly the role marker and then disconnects.
+    producer = asyncio.ensure_future(_drive_producer())
+    try:
+        # Role marker first — emitted before any generated chunk, matching
+        # the prior contract. The producer may already be mid-generation by
+        # now; its output waits in the queue behind this marker.
+        yield f"data: {json.dumps(first)}\n\n".encode()
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+        # Surface a producer crash (not one of the sentinel-wrapped
+        # generation errors, which are already emitted as error SSE) so it
+        # is logged rather than silently swallowed.
+        await producer
+    finally:
+        # Client disconnect / ``aclose`` cancels this generator. Cancel the
+        # producer so its ``async with lease`` unwinds and releases (or
+        # defers) the serial lock + admission slot; then await it so the
+        # lease cleanup actually completes before we return.
+        if not producer.done():
+            producer.cancel()
+        try:
+            await producer
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 -- lease cleanup is what matters here
+            logger.debug("DFlash stream producer raised on teardown", exc_info=True)
 
 
 async def _non_stream_completion(
@@ -880,7 +1123,14 @@ async def _non_stream_completion(
         admission_reservation = _DFlashAdmission(0).reserve()
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+    # F4: unify zero-timeout policy with the streaming path. ``timeout <= 0``
+    # means "no deadline" on BOTH completion paths (matches the main
+    # server's ``default_timeout`` semantics and ``_stream_completion``'s
+    # ``timeout and timeout > 0`` gate). Previously a 0 here built an
+    # already-expired deadline and returned an immediate 504, while the
+    # same value disabled the streaming deadline — identical requests
+    # behaving oppositely by path.
+    deadline = loop.time() + timeout if timeout and timeout > 0 else None
     lock_acquired = False
     worker_future: asyncio.Future[Any] | None = None
 
@@ -898,11 +1148,18 @@ async def _non_stream_completion(
         # release it in this coroutine's finally block.
         lock_acquired = False
 
+    def _remaining() -> float | None:
+        """Seconds left before the deadline, or ``None`` for no deadline."""
+        return None if deadline is None else deadline - loop.time()
+
     try:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
+        remaining = _remaining()
+        if remaining is not None and remaining <= 0:
             raise asyncio.TimeoutError
-        await asyncio.wait_for(_dflash_lock.acquire(), timeout=remaining)
+        if remaining is None:
+            await _dflash_lock.acquire()
+        else:
+            await asyncio.wait_for(_dflash_lock.acquire(), timeout=remaining)
         lock_acquired = True
 
         # mlx-vlm's ``generate`` blocks; offload to the dedicated
@@ -920,13 +1177,22 @@ async def _non_stream_completion(
             except Exception as e:  # noqa: BLE001 — surface as HTTPException below
                 return e
 
-        worker_future = loop.run_in_executor(_dflash_executor, _generate_safely)
-        remaining = deadline - loop.time()
-        if remaining <= 0:
+        # F5: recompute and validate the remaining deadline BEFORE
+        # submitting to the executor. Acquiring the serial lock can itself
+        # consume the whole budget; submitting first (as the pre-fix code
+        # did) would start expensive GPU work for an already-expired
+        # request and hold the lock until it finished. Check first, submit
+        # only if time remains.
+        remaining = _remaining()
+        if remaining is not None and remaining <= 0:
             raise asyncio.TimeoutError
-        result = await asyncio.wait_for(
-            asyncio.shield(worker_future), timeout=remaining
-        )
+        worker_future = loop.run_in_executor(_dflash_executor, _generate_safely)
+        if remaining is None:
+            result = await asyncio.shield(worker_future)
+        else:
+            result = await asyncio.wait_for(
+                asyncio.shield(worker_future), timeout=remaining
+            )
     except asyncio.TimeoutError as exc:
         if lock_acquired and worker_future is not None:
             _defer_worker_cleanup()

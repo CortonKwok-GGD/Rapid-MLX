@@ -1651,6 +1651,376 @@ def test_run_dflash_server_loads_models_on_executor_thread(monkeypatch) -> None:
 
 
 # =============================================================================
+# Adversarial concurrency / liveness regressions (PR #1109 codex review).
+# These pin the five BLOCKING findings so a future refactor cannot silently
+# reintroduce a lock leak, an unstarted-but-charged GPU job, a path-dependent
+# zero-timeout, or an admission gate that runs after body parse.
+# =============================================================================
+
+
+@_skip_without_mlx_vlm
+def test_dflash_stream_cancel_during_construction_releases_lock(monkeypatch) -> None:
+    """F3: cancelling while the generator is still being CONSTRUCTED must
+    not leak ``_dflash_lock``.
+
+    Reproduces the codex finding: with no deadline, the worker future is
+    awaited bare; a client cancellation that lands in the tiny window while
+    ``_make_gen`` is in flight used to unwind through ``__aexit__`` →
+    ``_capture_generator`` → ``future.result()``, which raised
+    ``CancelledError`` (a ``BaseException``, not caught by ``except
+    Exception``) and skipped the lock release entirely. After the fix the
+    lease's ``__aexit__`` always drives cleanup to completion.
+    """
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    in_construction = threading.Event()
+    allow_construction_to_finish = threading.Event()
+
+    class _EmptyGenerator:
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            pass
+
+    def blocking_stream_generate(*_args, **_kwargs):
+        # Block INSIDE generator construction so the cancellation can land
+        # while the ``_make_gen`` worker future is still in flight.
+        in_construction.set()
+        assert allow_construction_to_finish.wait(timeout=5)
+        return _EmptyGenerator()
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = blocking_stream_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        stream = srv._stream_completion(
+            prompt="prompt",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0,  # no deadline -> bare-await construction path
+            admission_reservation=reservation,
+        )
+        # Role marker first; the producer then starts constructing the gen.
+        await anext(stream)
+        assert await asyncio.to_thread(in_construction.wait, 1)
+
+        # Cancel mid-construction, then let construction finish so the
+        # deferred cleanup can run the generator close + lock release.
+        await stream.aclose()
+        allow_construction_to_finish.set()
+
+        # The lock and the admission slot must both be freed once the
+        # detached worker unwinds — poll briefly for the deferred cleanup.
+        for _ in range(200):
+            if not srv._dflash_lock.locked() and admission._reservations == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert not srv._dflash_lock.locked(), "F3 regression: lock leaked"
+        assert admission._reservations == 0, "F3 regression: admission slot leaked"
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
+@_skip_without_mlx_vlm
+def test_dflash_nonstream_expired_deadline_skips_gpu_work(monkeypatch) -> None:
+    """F5: a non-stream request whose deadline expired while acquiring the
+    serial lock must NOT submit GPU work.
+
+    Hold the lock with a foreign owner so the request's ``wait_for`` on the
+    lock burns its whole (tiny) budget; release just after so acquisition
+    succeeds but the deadline is already gone. ``generate`` must never be
+    called, and the 504 must come back immediately without a detached
+    worker holding the lock.
+    """
+    import asyncio
+    import sys
+    import types
+
+    from fastapi import HTTPException
+
+    from vllm_mlx.speculative.dflash import server as srv
+
+    generate_calls = [0]
+
+    def spy_generate(*_args, **_kwargs):
+        generate_calls[0] += 1
+        return SimpleNamespace(text="x", prompt_tokens=1, generation_tokens=1)
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.generate = spy_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+
+        # Foreign owner holds the lock; release it just after the request's
+        # deadline expires so the request acquires it already-expired.
+        await srv._dflash_lock.acquire()
+
+        async def _release_soon() -> None:
+            await asyncio.sleep(0.03)
+            srv._dflash_lock.release()
+
+        releaser = asyncio.create_task(_release_soon())
+        with pytest.raises(HTTPException) as excinfo:
+            await srv._non_stream_completion(
+                prompt="prompt",
+                request=MagicMock(),
+                served_model_name="qwen3.5-27b-8bit",
+                gen_kwargs={},
+                model=MagicMock(),
+                processor=MagicMock(),
+                timeout=0.01,
+                admission_reservation=reservation,
+            )
+        await releaser
+        assert excinfo.value.status_code == 504
+        # The core F5 assertion: no GPU work started for an expired request.
+        assert generate_calls[0] == 0, "F5 regression: GPU work started after deadline"
+        # And no detached worker is holding the lock (nothing was submitted).
+        assert not srv._dflash_lock.locked()
+        reservation.release()
+        assert admission._reservations == 0
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
+@_skip_without_mlx_vlm
+def test_dflash_zero_timeout_is_no_deadline_on_both_paths(monkeypatch) -> None:
+    """F4: ``timeout <= 0`` means "no deadline" consistently on the stream
+    AND non-stream paths — not "unlimited" on one and "immediate 504" on
+    the other.
+    """
+    import asyncio
+    import sys
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    class _OneChunk:
+        text = "hi"
+        generation_tokens = 1
+        prompt_tokens = 2
+        token = 7
+
+    def _gen():
+        yield _OneChunk()
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = lambda *a, **kw: _gen()
+    fake_mlx_vlm.generate = lambda *a, **kw: SimpleNamespace(
+        text="hi", prompt_tokens=2, generation_tokens=1
+    )
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise() -> None:
+        # Stream path with timeout=0 must generate normally (no immediate
+        # timeout SSE) and finish cleanly.
+        stream = srv._stream_completion(
+            prompt="p",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 8},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0,
+        )
+        body = b"".join([chunk async for chunk in stream]).decode()
+        assert "DFlash stream timed out" not in body
+        assert '"content": "hi"' in body
+        assert "data: [DONE]" in body
+        assert not srv._dflash_lock.locked()
+
+        # Non-stream path with timeout=0 must NOT return an immediate 504 —
+        # it must run to completion (the pre-fix bug returned 504 here).
+        resp = await srv._non_stream_completion(
+            prompt="p",
+            request=MagicMock(),
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 8},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0,
+        )
+        assert resp.choices[0].message.content == "hi"
+        assert not srv._dflash_lock.locked()
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
+@_skip_without_mlx_vlm
+def test_dflash_stream_backpressure_does_not_hold_lock(monkeypatch) -> None:
+    """F2: a slow/stalled consumer must not pin ``_dflash_lock``.
+
+    Generation runs in a producer task that owns the lease; the consumer
+    only shuttles bytes to the socket. So once the (short) generation
+    finishes, the lock is released even if the consumer never reads another
+    chunk. We prove it by draining exactly the role marker, then — without
+    reading any generated chunk — waiting for the lock to free while the
+    producer completes independently.
+    """
+    import asyncio
+    import sys
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    class _TwoChunks:
+        def __init__(self):
+            self._n = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self._n += 1
+            if self._n > 2:
+                raise StopIteration
+            return SimpleNamespace(
+                text=f"tok{self._n}",
+                generation_tokens=self._n,
+                prompt_tokens=3,
+                token=100 + self._n,
+            )
+
+        def close(self):
+            pass
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = lambda *a, **kw: _TwoChunks()
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        stream = srv._stream_completion(
+            prompt="p",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 8},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=30,
+            admission_reservation=reservation,
+        )
+        # Read ONLY the role marker, then stop reading (simulate a stalled
+        # socket). The producer keeps running to completion in the
+        # background and must release the lock + slot without us reading
+        # any more chunks.
+        assert b'"role": "assistant"' in await anext(stream)
+        for _ in range(300):
+            if not srv._dflash_lock.locked() and admission._reservations == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert not srv._dflash_lock.locked(), (
+            "F2 regression: lock held while consumer is not reading"
+        )
+        assert admission._reservations == 0, (
+            "F2 regression: slot held under backpressure"
+        )
+        # Drain the rest so the generator closes cleanly.
+        async for _ in stream:
+            pass
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
+@_skip_without_mlx_vlm
+def test_dflash_admission_reserved_before_body_parse(monkeypatch) -> None:
+    """F1: the ASGI admission middleware rejects with 503 BEFORE FastAPI
+    parses the request body.
+
+    We fill the single admission slot, then post a body that is intentionally
+    invalid JSON. If admission ran only inside the endpoint (post-parse),
+    FastAPI would 400 on the bad JSON first; with the ASGI gate the 503 wins
+    because it fires before the body is read.
+    """
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+    from vllm_mlx.speculative.dflash.server import _build_app
+
+    app = _build_app(
+        model=MagicMock(),
+        processor=MagicMock(),
+        runtime=DFlashRuntime(
+            drafter=MagicMock(),
+            kind="dflash",
+            drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        ),
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=[],
+        max_concurrent_requests=1,
+    )
+    # Occupy the only slot so the incoming request must be rejected.
+    reservation = app.state.dflash_admission.reserve()
+    try:
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            content=b'{"model": "x", "messages": [ THIS IS NOT VALID JSON',
+        )
+    finally:
+        reservation.release()
+
+    # 503 (admission) — NOT 400 (body parse) — proves the gate ran first.
+    assert response.status_code == 503, response.text
+    assert response.headers.get("Retry-After") == "1"
+    assert response.json()["error"]["code"] == "at_capacity"
+
+
+# =============================================================================
 # End-to-end — heavy. Requires:
 #   - ``RAPID_MLX_DFLASH_E2E=1`` env var (opt-in; CI doesn't set it)
 #   - mlx-vlm 0.5.0+ installed (skipif gates this)
