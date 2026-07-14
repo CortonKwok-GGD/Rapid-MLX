@@ -333,6 +333,566 @@ def test_healthz_and_models_routes() -> None:
     assert body["data"][0]["id"] == "qwen3.5-27b-8bit"
 
 
+def test_run_dflash_server_wires_security_configuration(monkeypatch) -> None:
+    """DFlash must enforce the same auth, rate, and body guards as serve.
+
+    The production entry point is exercised with mocked model loading so this
+    test covers the actual ``run_dflash_server`` -> ``_build_app`` wiring
+    without downloading the DFlash model pair or binding a TCP port.
+    """
+    import sys
+    import types
+
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx.config import get_config
+    from vllm_mlx.speculative.dflash import server as srv
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+
+    runtime = DFlashRuntime(
+        drafter=MagicMock(),
+        kind="dflash",
+        drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+    )
+    monkeypatch.setattr(srv, "have_runtime", lambda: True)
+    monkeypatch.setattr(srv, "load_runtime", lambda _repo: runtime)
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.load = lambda _repo: (MagicMock(), MagicMock())
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    captured: dict = {}
+    import uvicorn
+
+    monkeypatch.setattr(
+        uvicorn,
+        "run",
+        lambda app, **_kwargs: captured.setdefault("app", app),
+    )
+
+    srv.run_dflash_server(
+        main_model_repo="mlx-community/Qwen3.5-27B-8bit",
+        drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        host="127.0.0.1",
+        port=58997,
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=[],
+        uvicorn_log_level="info",
+        api_key="dflash-secret",
+        rate_limit=1,
+        max_request_bytes=512,
+        body_receive_timeout_seconds=7.5,
+        default_timeout=12.5,
+        max_concurrent_requests=3,
+    )
+
+    app = captured["app"]
+    client = TestClient(app)
+    auth = {"Authorization": "Bearer dflash-secret"}
+
+    # Probe routes remain available to load balancers, but every /v1 route
+    # requires the configured bearer key.
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/v1/models", headers=auth).status_code == 200
+
+    # The first request reaches DFlash's normal validation path (empty
+    # messages -> 400) and therefore consumes the one-request rate budget;
+    # the second must be rejected before it can reach generation.
+    invalid_chat = {"model": "qwen3.5-27b-8bit", "messages": []}
+    assert (
+        client.post("/v1/chat/completions", headers=auth, json=invalid_chat).status_code
+        == 400
+    )
+    assert (
+        client.post("/v1/chat/completions", headers=auth, json=invalid_chat).status_code
+        == 429
+    )
+
+    # The generic ASGI guard runs before FastAPI parses the JSON body.
+    oversized = client.post(
+        "/v1/chat/completions",
+        headers={**auth, "Content-Type": "application/json"},
+        content=b"x" * 513,
+    )
+    assert oversized.status_code == 413
+    assert get_config().max_request_bytes == 512
+    assert get_config().body_receive_timeout_seconds == 7.5
+    assert get_config().default_timeout == 12.5
+    assert app.state.dflash_admission._max_concurrent_requests == 3
+
+
+def test_dflash_cli_forwards_security_and_resource_limits() -> None:
+    """The dedicated server must receive every relevant ``serve`` policy.
+
+    Keep this as a structural CLI contract: invoking ``serve_command`` would
+    otherwise require a model alias, preflight checks, and an actual listener
+    before the DFlash fork is reached.
+    """
+    import ast
+    import inspect
+
+    from vllm_mlx import cli
+
+    tree = ast.parse(inspect.getsource(cli.serve_command))
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_dflash_server"
+    )
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+
+    expected = {
+        "api_key": "server._api_key",
+        "rate_limit": "args.rate_limit",
+        "max_request_bytes": "server._max_request_bytes",
+        "body_receive_timeout_seconds": "server._body_receive_timeout_seconds",
+        "default_timeout": "server._default_timeout",
+        "max_concurrent_requests": "args.max_concurrent_requests",
+        "cors_policy": "server.get_resolved_cors_policy()",
+    }
+    assert {name: ast.unparse(keywords[name]) for name in expected} == expected
+
+
+def test_dflash_admission_cap_rejects_before_prompt_rendering() -> None:
+    """DFlash must bound its serial queue before prompt work or generation."""
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+    from vllm_mlx.speculative.dflash.server import _build_app
+
+    app = _build_app(
+        model=MagicMock(),
+        processor=MagicMock(),
+        runtime=DFlashRuntime(
+            drafter=MagicMock(),
+            kind="dflash",
+            drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        ),
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=[],
+        max_concurrent_requests=1,
+    )
+    reservation = app.state.dflash_admission.reserve()
+    try:
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3.5-27b-8bit",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        reservation.release()
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+
+
+def test_dflash_nonstream_timeout_keeps_gpu_slot_until_worker_finishes(
+    monkeypatch,
+) -> None:
+    """A 504 must not let another call overlap the still-running worker."""
+    import asyncio
+    import sys
+    import time
+    import types
+
+    from fastapi import HTTPException
+
+    from vllm_mlx.speculative.dflash import server as srv
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+
+    def slow_generate(*_args, **_kwargs):
+        time.sleep(0.05)
+        return SimpleNamespace(text="done", prompt_tokens=1, generation_tokens=1)
+
+    fake_mlx_vlm.generate = slow_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    async def exercise_timeout() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        with pytest.raises(HTTPException) as excinfo:
+            await srv._non_stream_completion(
+                prompt="prompt",
+                request=MagicMock(),
+                served_model_name="qwen3.5-27b-8bit",
+                gen_kwargs={},
+                model=MagicMock(),
+                processor=MagicMock(),
+                timeout=0.01,
+                admission_reservation=reservation,
+            )
+        assert excinfo.value.status_code == 504
+        assert admission._reservations == 1
+        assert srv._dflash_lock.locked()
+
+        # The detached worker owns the lock until ``slow_generate`` returns.
+        await asyncio.sleep(0.1)
+        assert admission._reservations == 0
+        assert not srv._dflash_lock.locked()
+
+    asyncio.run(exercise_timeout())
+
+
+def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
+    monkeypatch,
+) -> None:
+    """DFlash honors stream deadlines without overlapping GPU work."""
+    import asyncio
+    import sys
+    import time
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    class _SlowGenerator:
+        def __next__(self):
+            time.sleep(0.05)
+            raise StopIteration
+
+        def close(self):
+            pass
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = lambda *_args, **_kwargs: _SlowGenerator()
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+    stream = srv._stream_completion(
+        prompt="prompt",
+        request=request,
+        served_model_name="qwen3.5-27b-8bit",
+        gen_kwargs={"max_tokens": 8},
+        model=MagicMock(),
+        processor=MagicMock(),
+        timeout=0.01,
+    )
+
+    async def drain() -> list[bytes]:
+        return [chunk async for chunk in stream]
+
+    body = b"".join(asyncio.run(drain())).decode()
+    assert "DFlash stream timed out after 0.0 seconds." in body
+    assert "data: [DONE]" in body
+    assert not srv._dflash_lock.locked()
+
+
+def test_dflash_stream_timeout_bounds_lock_queue_wait(monkeypatch) -> None:
+    """A stream deadline expires while waiting for DFlash's serial lock."""
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    started = threading.Event()
+    release_first = threading.Event()
+    generated = 0
+
+    class _BlockingGenerator:
+        def __next__(self):
+            started.set()
+            assert release_first.wait(timeout=5)
+            raise StopIteration
+
+        def close(self):
+            pass
+
+    class _EmptyGenerator:
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            pass
+
+    def stream_generate(*_args, **_kwargs):
+        nonlocal generated
+        generated += 1
+        return _BlockingGenerator() if generated == 1 else _EmptyGenerator()
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = stream_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise_queue_timeout() -> None:
+        first = srv._stream_completion(
+            prompt="first",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={},
+            model=MagicMock(),
+            processor=MagicMock(),
+        )
+        await anext(first)
+        first_next = asyncio.create_task(anext(first))
+        assert await asyncio.to_thread(started.wait, 1)
+
+        second = srv._stream_completion(
+            prompt="second",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0.01,
+        )
+        await anext(second)
+        try:
+            timeout_event = await anext(second)
+            assert b"DFlash stream timed out" in timeout_event
+            assert generated == 1
+        finally:
+            release_first.set()
+            await first_next
+
+    # asyncio.Lock binds to the first loop that has waiters. Production has
+    # one long-lived uvicorn loop; tests intentionally create short-lived
+    # loops, so leave the module global fresh for the next isolated case.
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise_queue_timeout())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
+def test_dflash_stream_cancellation_releases_admission_slot() -> None:
+    """Client disconnects must not leave DFlash permanently at capacity."""
+    import asyncio
+
+    from vllm_mlx.speculative.dflash import server as srv
+
+    closed = False
+
+    async def source():
+        nonlocal closed
+        try:
+            yield b"data: first\n\n"
+            await asyncio.Event().wait()
+        finally:
+            closed = True
+
+    async def cancel_stream() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        stream = srv._stream_with_admission(source(), reservation)
+        assert await anext(stream) == b"data: first\n\n"
+        await stream.aclose()
+        assert closed
+        assert admission._reservations == 0
+
+    asyncio.run(cancel_stream())
+
+
+def test_dflash_stream_cancellation_waits_for_worker_cleanup(monkeypatch) -> None:
+    """A cancelled stream cannot let a new generator overtake its close."""
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    first_step_started = threading.Event()
+    allow_first_step_to_finish = threading.Event()
+    first_closed = threading.Event()
+    events: list[str] = []
+    generated = 0
+
+    class _FirstGenerator:
+        def __next__(self):
+            first_step_started.set()
+            assert allow_first_step_to_finish.wait(timeout=5)
+            raise StopIteration
+
+        def close(self):
+            events.append("first-close")
+            first_closed.set()
+
+    class _SecondGenerator:
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            pass
+
+    def stream_generate(*_args, **_kwargs):
+        nonlocal generated
+        generated += 1
+        if generated == 1:
+            events.append("first-generate")
+            return _FirstGenerator()
+        events.append("second-generate")
+        return _SecondGenerator()
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = stream_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise_cancellation() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=2)
+        first = srv._stream_completion(
+            prompt="first",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={},
+            model=MagicMock(),
+            processor=MagicMock(),
+            admission_reservation=admission.reserve(),
+        )
+        # The role marker is emitted before the GPU worker starts.
+        await anext(first)
+        first_next = asyncio.create_task(anext(first))
+        assert await asyncio.to_thread(first_step_started.wait, 1)
+
+        first_next.cancel()
+        # Do not await the cancelled consumer yet: its worker is still in a
+        # blocking token step. A new stream must remain outside the serial
+        # worker until that step's generator has been closed.
+        await asyncio.sleep(0)
+
+        second = srv._stream_completion(
+            prompt="second",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={},
+            model=MagicMock(),
+            processor=MagicMock(),
+            admission_reservation=admission.reserve(),
+        )
+        await anext(second)
+        second_next = asyncio.create_task(anext(second))
+        await asyncio.sleep(0.01)
+        assert "second-generate" not in events
+
+        allow_first_step_to_finish.set()
+        assert await asyncio.to_thread(first_closed.wait, 1)
+        with pytest.raises(asyncio.CancelledError):
+            await first_next
+        await second_next
+        assert events.index("first-close") < events.index("second-generate")
+        await second.aclose()
+        assert admission._reservations == 0
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise_cancellation())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
+def test_dflash_inherits_explicit_cors_policy(monkeypatch) -> None:
+    """DFlash must not broaden the operator's resolved CORS settings."""
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx import server
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+    from vllm_mlx.speculative.dflash.server import _build_app
+
+    monkeypatch.setenv("RAPID_MLX_CORS_ALLOW_METHODS", "POST")
+    monkeypatch.setenv("RAPID_MLX_CORS_ALLOW_HEADERS", "Content-Type")
+    monkeypatch.setenv("RAPID_MLX_CORS_MAX_AGE", "17")
+    monkeypatch.setenv("RAPID_MLX_CORS_ALLOW_CREDENTIALS", "false")
+    server.configure_cors_from_env(["https://console.example"])
+    policy = server.get_resolved_cors_policy()
+    assert policy is not None
+
+    app = _build_app(
+        model=MagicMock(),
+        processor=MagicMock(),
+        runtime=DFlashRuntime(
+            drafter=MagicMock(),
+            kind="dflash",
+            drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        ),
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=list(policy.origins),
+        cors_policy=policy,
+    )
+    client = TestClient(app)
+    allowed = {
+        "Origin": "https://console.example",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "Content-Type",
+    }
+    response = client.options("/v1/chat/completions", headers=allowed)
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Methods"] == "POST"
+    assert response.headers["Access-Control-Max-Age"] == "17"
+    assert "Access-Control-Allow-Credentials" not in response.headers
+
+    denied = client.options(
+        "/v1/chat/completions",
+        headers={**allowed, "Access-Control-Request-Headers": "Authorization"},
+    )
+    assert denied.status_code == 400
+
+
+def test_dflash_cors_wildcard_forces_credentials_off(monkeypatch) -> None:
+    """A CORS policy snapshot must retain Fetch's wildcard invariant."""
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx import server
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+    from vllm_mlx.speculative.dflash.server import _build_app
+
+    monkeypatch.setenv("RAPID_MLX_CORS_ALLOW_CREDENTIALS", "true")
+    server.configure_cors_from_env(["*"])
+    policy = server.get_resolved_cors_policy()
+    assert policy is not None
+    assert policy.allow_credentials is False
+
+    app = _build_app(
+        model=MagicMock(),
+        processor=MagicMock(),
+        runtime=DFlashRuntime(
+            drafter=MagicMock(),
+            kind="dflash",
+            drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        ),
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=list(policy.origins),
+        cors_policy=policy,
+    )
+    response = TestClient(app).options(
+        "/v1/chat/completions",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert "Access-Control-Allow-Credentials" not in response.headers
+
+
 def test_chat_completions_rejects_tools() -> None:
     """DFlash v1 doesn't run a tool-call parser. The route must reject
     tool requests with a clear 400 — silent passthrough would surprise
