@@ -39,19 +39,44 @@ _skip_without_mlx_vlm = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _reset_dflash_shared_globals():
-    """Isolate the process-global rate limiter across DFlash tests.
+    """Isolate the process-global server state that DFlash tests mutate.
 
-    ``_build_app`` / ``run_dflash_server`` call ``configure_rate_limiter``,
-    which mutates a module-level singleton shared with the main server. A
-    DFlash test that enables the limiter (``rate_limit>0``) would otherwise
-    leak that enabled state into unrelated later tests (e.g.
-    ``tests/test_embeddings_timeout_admission.py``), turning their requests
-    into surprise 429s. Reset the limiter to disabled after every test here.
+    ``_build_app`` / ``run_dflash_server`` mutate two shared singletons that
+    outlive a single test:
+
+    * the process-global rate limiter (via ``configure_rate_limiter``) — a
+      DFlash test that enables it (``rate_limit>0``) would otherwise leak that
+      enabled state into unrelated later tests (e.g.
+      ``tests/test_embeddings_timeout_admission.py``), turning their requests
+      into surprise 429s; and
+
+    * the shared ``get_config()`` singleton — ``_build_app`` writes ``api_key``,
+      ``max_request_bytes``, ``body_receive_timeout_seconds`` and
+      ``default_timeout`` into it. codex round-7 #4: snapshot and restore ALL
+      of these so tests are not order-dependent under randomized execution
+      (e.g. a test setting ``api_key`` must not silently authenticate — or
+      reject — a later test that assumes no key).
     """
-    yield
-    from vllm_mlx.middleware.auth import configure_rate_limiter
+    from vllm_mlx.config import get_config
 
-    configure_rate_limiter(0, enabled=False)
+    cfg = get_config()
+    _snapshot = {
+        field: getattr(cfg, field)
+        for field in (
+            "api_key",
+            "max_request_bytes",
+            "body_receive_timeout_seconds",
+            "default_timeout",
+        )
+    }
+    try:
+        yield
+    finally:
+        from vllm_mlx.middleware.auth import configure_rate_limiter
+
+        configure_rate_limiter(0, enabled=False)
+        for field, value in _snapshot.items():
+            setattr(cfg, field, value)
 
 
 # =============================================================================
@@ -628,6 +653,8 @@ def test_dflash_format_timeout_seconds_adaptive_precision() -> None:
     assert _format_timeout_seconds(0.01) == "0.010 seconds"
     assert _format_timeout_seconds(0.005) == "0.005 seconds"
     assert _format_timeout_seconds(0.0) == "0 seconds"
+    # codex round-7 #3: sub-millisecond timeouts floor instead of "0.000".
+    assert _format_timeout_seconds(0.0001) == "<0.001 seconds"
 
 
 def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
@@ -2506,6 +2533,11 @@ def test_dflash_slow_prompt_render_is_charged_against_deadline(monkeypatch) -> N
     the deadline now spans rendering. (It also could not have surfaced a 504
     at all if rendering still ran unbounded on the event loop.)
     """
+    # A render that overruns the 0.05s request budget. Runs on the separate
+    # render pool (offloaded), so the event loop stays free to enforce the
+    # deadline via ``asyncio.wait_for``. Uses an event so the test controls
+    # exactly when the (uncancellable, already-running) render finishes.
+    import threading
     import time
 
     from fastapi.testclient import TestClient
@@ -2514,11 +2546,10 @@ def test_dflash_slow_prompt_render_is_charged_against_deadline(monkeypatch) -> N
     from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
     from vllm_mlx.speculative.dflash.server import _build_app
 
-    # A render that vastly overruns the 0.05s request budget. Runs on the
-    # DFlash worker thread (offloaded), so the event loop stays free to
-    # enforce the deadline via ``asyncio.wait_for``.
+    render_may_finish = threading.Event()
+
     def _slow_render(*_args, **_kwargs) -> str:
-        time.sleep(0.4)
+        render_may_finish.wait(timeout=5)
         return "rendered"
 
     monkeypatch.setattr(srv, "_render_prompt", _slow_render)
@@ -2539,18 +2570,33 @@ def test_dflash_slow_prompt_render_is_charged_against_deadline(monkeypatch) -> N
     client = TestClient(app)
     admission = app.state.dflash_admission
 
-    r = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "qwen3.5-27b-8bit",
-            "messages": [{"role": "user", "content": "hi"}],
-            "timeout": 0.05,
-        },
-    )
-    assert r.status_code == 504, r.text
-    # The slot must not leak when rendering times out.
+    try:
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3.5-27b-8bit",
+                "messages": [{"role": "user", "content": "hi"}],
+                "timeout": 0.05,
+            },
+        )
+        assert r.status_code == 504, r.text
+        # codex round-7 #2: the render is STILL running (uncancellable), so the
+        # admission slot is HELD — not freed — until it drains. This is what
+        # stops a burst of cancelled/timed-out requests from piling up renders
+        # on the single-worker pool while capacity is handed back out.
+        assert admission._reservations == 1, (
+            "codex #7 regression: slot freed while the render was still running"
+        )
+    finally:
+        # Let the render finish; the deferred callback then releases the slot.
+        render_may_finish.set()
+
+    for _ in range(300):
+        if admission._reservations == 0:
+            break
+        time.sleep(0.01)
     assert admission._reservations == 0, (
-        "codex #4 regression: render-timeout leaked an admission slot"
+        "codex #4/#7 regression: slot not released after the render drained"
     )
 
 

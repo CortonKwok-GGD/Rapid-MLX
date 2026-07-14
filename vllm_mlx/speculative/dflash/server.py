@@ -143,6 +143,11 @@ def _format_timeout_seconds(seconds: float) -> str:
     """
     if seconds <= 0:
         return "0 seconds"
+    if seconds < 0.001:
+        # codex round-7 #3: below the 3-decimal resolution ``:.3f`` would print
+        # "0.000 seconds" — the very misleading zero this formatter exists to
+        # avoid. Report a floor instead so the message stays truthful.
+        return "<0.001 seconds"
     if seconds < 0.1:
         # e.g. 0.01 → "0.010", 0.005 → "0.005"
         return f"{seconds:.3f} seconds"
@@ -552,8 +557,21 @@ class _DFlashStreamLease:
                 # The client task can be cancelled a second time while it is
                 # already unwinding. The queued close still owns the GPU
                 # ordering, so release only from its completion callback.
+                #
+                # codex round-7 #1: DEFER the admission release too — otherwise
+                # the reservation could be force-released here while
+                # ``generator.close()`` (and thus the serial GPU lock) is still
+                # in flight, freeing capacity for a new request to overlap
+                # teardown. And RE-RAISE the ``CancelledError`` rather than
+                # swallowing it: this coroutine runs inside the cancelled client
+                # task's unwind, so returning normally would resurrect a
+                # cancelled task and let producer work continue past
+                # cancellation. The completion callback still owns the eventual
+                # lock + slot release.
+                if self._reservation is not None:
+                    self._reservation.defer_release()
                 close_future.add_done_callback(lambda _done: self._release())
-                return
+                raise
         self._release()
 
     def _release(self) -> None:
@@ -815,6 +833,11 @@ def _build_app(
         reservation = getattr(http_request.state, "dflash_reservation", None)
         if reservation is None:
             reservation = admission.reserve()
+        # Tracks the offloaded render's ``concurrent.futures.Future`` (the real
+        # worker-thread state) so the failure/cancellation cleanup can decide
+        # whether the slot may be freed now or must be held until an in-flight
+        # render actually finishes (codex round-7 #2).
+        render_future: concurrent.futures.Future[str] | None = None
         try:
             # F4 (codex round-2 #3): resolve the effective timeout with an
             # ``is None`` check, NOT ``request.timeout or default_timeout``.
@@ -890,13 +913,24 @@ def _build_app(
                     processor, model, request, enable_thinking=enable_thinking
                 )
 
-            render_future = loop.run_in_executor(_dflash_render_executor, _render)
+            # codex round-7 #2: submit via the executor DIRECTLY so we hold the
+            # ``concurrent.futures.Future`` — which tracks the ACTUAL worker
+            # thread. (``loop.run_in_executor`` returns an asyncio future whose
+            # ``.cancel()`` marks itself done while the thread keeps running, so
+            # its ``.done()`` cannot tell "still executing" from "finished" — the
+            # exact ambiguity that let the slot be freed under a live render.)
+            # ``asyncio.wrap_future`` gives an awaitable view; cancelling that
+            # view never touches the underlying thread future, so
+            # ``render_cf.done()`` in the cleanup below reflects true completion.
+            render_cf = _dflash_render_executor.submit(_render)
+            render_future = render_cf  # tracked for the cleanup handler
+            render_awaitable = asyncio.wrap_future(render_cf)
             if request_deadline is None:
-                prompt = await render_future
+                prompt = await render_awaitable
             else:
                 render_budget = request_deadline - loop.time()
                 if render_budget <= 0:
-                    render_future.cancel()
+                    render_cf.cancel()
                     raise HTTPException(
                         status_code=504,
                         detail=(
@@ -906,17 +940,13 @@ def _build_app(
                     )
                 try:
                     prompt = await asyncio.wait_for(
-                        asyncio.shield(render_future), timeout=render_budget
+                        asyncio.shield(render_awaitable), timeout=render_budget
                     )
                 except asyncio.TimeoutError as exc:
-                    # ``shield`` kept the render alive across our ``wait_for``
-                    # cancellation; cancel it now (a no-op if its sync body
-                    # already started, but it prevents a queued render from
-                    # firing). Abandoning it is safe — it runs on the separate
-                    # render pool, holds no GPU lock, and its result is simply
-                    # discarded — so the ``except BaseException`` below releases
-                    # the admission slot immediately with nothing left to defer.
-                    render_future.cancel()
+                    # ``cancel()`` stops the render only if it is still QUEUED;
+                    # a render already running on the pool keeps going (the
+                    # cleanup handler below holds the slot until it drains).
+                    render_cf.cancel()
                     raise HTTPException(
                         status_code=504,
                         detail=(
@@ -966,7 +996,31 @@ def _build_app(
                     )
                 effective_timeout = remaining_budget
         except BaseException:
-            reservation.release()
+            # codex round-7 #2: if we are unwinding while the offloaded render
+            # is STILL in flight (timeout/cancel/disconnect), releasing the slot
+            # now would let repeated cancelled requests each leave a render
+            # running/queued on the single-worker render pool while freeing
+            # capacity — an unbounded pileup that bypasses
+            # ``max_concurrent_requests``. Try to cancel it; if it was still
+            # queued the cancel succeeds and we release immediately, but if it
+            # is already running (cancel returns False) DEFER the slot release
+            # to the render's completion so the admission gate keeps counting it
+            # until the work actually drains. A finished render releases at once.
+            if render_future is not None and not render_future.done():
+                render_future.cancel()
+            if render_future is not None and not render_future.done():
+                # Still running (uncancellable) — hold the slot until it drains.
+                # CLAIM ownership so the ASGI middleware safety net does not
+                # force-release the (as-yet unclaimed) slot out from under the
+                # still-running render; the completion callback then owns the
+                # single deferred release.
+                reservation.claim()
+                reservation.defer_release()
+                render_future.add_done_callback(
+                    lambda _f: reservation.release(force=True)
+                )
+            else:
+                reservation.release()
             raise
 
         if request.stream:
