@@ -617,6 +617,19 @@ def test_dflash_timeout_message_reports_original_not_post_render_budget(
         srv._dflash_lock = asyncio.Lock()
 
 
+def test_dflash_format_timeout_seconds_adaptive_precision() -> None:
+    """codex round-6 #5: small positive timeouts keep meaningful digits."""
+    from vllm_mlx.speculative.dflash.server import _format_timeout_seconds
+
+    assert _format_timeout_seconds(60.0) == "60.0 seconds"
+    assert _format_timeout_seconds(1.5) == "1.5 seconds"
+    # Sub-second and sub-100ms: NOT collapsed to "0.0 seconds".
+    assert _format_timeout_seconds(0.25) == "0.25 seconds"
+    assert _format_timeout_seconds(0.01) == "0.010 seconds"
+    assert _format_timeout_seconds(0.005) == "0.005 seconds"
+    assert _format_timeout_seconds(0.0) == "0 seconds"
+
+
 def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
     monkeypatch,
 ) -> None:
@@ -689,7 +702,9 @@ def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
         elapsed = asyncio.get_running_loop().time() - started
 
         # The timeout SSE + DONE are emitted without blocking on the worker.
-        assert "DFlash stream timed out after 0.0 seconds." in body
+        # codex round-6 #5: adaptive precision renders the 0.01s deadline as
+        # "0.010 seconds", not a misleading "0.0 seconds".
+        assert "DFlash stream timed out after 0.010 seconds." in body
         assert "data: [DONE]" in body
         # The worker step must NOT gate the response — the fixed path surfaces
         # the timeout well before the worker's (much longer) sleep elapses.
@@ -2334,6 +2349,107 @@ def test_dflash_stream_backpressure_delivers_terminal_notice(monkeypatch) -> Non
         srv._dflash_lock = asyncio.Lock()
 
 
+def test_dflash_hung_generator_close_does_not_block_terminal_sse(monkeypatch) -> None:
+    """codex round-6 #2: a hung ``generator.close()`` must NOT block the
+    terminal SSE (final frame + [DONE]).
+
+    ``__aexit__`` closes the generator on the serial worker. If that close
+    hangs (a runaway mlx-vlm GPU-teardown finally block), awaiting it inline
+    would stall the producer's terminal frames indefinitely. The lease now
+    bounds the close wait and DETACHES a slow close, retaining the lock/slot
+    until it finishes while letting the response terminate promptly. Here the
+    generator errors mid-stream (so we hit the terminal path) and its
+    ``close()`` blocks; the client must still get [DONE] quickly.
+    """
+    import asyncio
+    import sys
+    import threading
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    # Tiny close grace so the test doesn't wait the real 5s to detach.
+    monkeypatch.setattr(srv, "_STREAM_GENERATOR_CLOSE_GRACE_SECONDS", 0.05)
+
+    close_called = threading.Event()
+    release_close = threading.Event()
+
+    class _HangOnCloseGenerator:
+        def __init__(self):
+            self._n = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self._n += 1
+            if self._n == 1:
+                return SimpleNamespace(
+                    text="tok1", generation_tokens=1, prompt_tokens=3, token=101
+                )
+            # Error mid-stream → terminal error path → __aexit__ closes gen.
+            raise RuntimeError("boom")
+
+        def close(self):
+            close_called.set()
+            # Block until the test explicitly releases — simulates a hung close.
+            release_close.wait(timeout=5)
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = lambda *a, **kw: _HangOnCloseGenerator()
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        stream = srv._stream_completion(
+            prompt="p",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 8},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0,
+            admission_reservation=reservation,
+        )
+        started = asyncio.get_running_loop().time()
+        body = b"".join([chunk async for chunk in stream]).decode()
+        elapsed = asyncio.get_running_loop().time() - started
+
+        # The terminal [DONE] arrived even though close() is still blocked.
+        assert "data: [DONE]" in body
+        assert await asyncio.to_thread(close_called.wait, 1)
+        # The stream terminated on the ~0.05s detach grace, NOT the 5s close.
+        assert elapsed < 1.0, (
+            f"codex #6 regression: terminal SSE blocked on hung close ({elapsed:.2f}s)"
+        )
+        # Lock/slot stay HELD until the detached close finishes.
+        assert srv._dflash_lock.locked()
+        assert admission._reservations == 1
+        # Now let the close complete; lock + slot release from its callback.
+        release_close.set()
+        for _ in range(300):
+            if not srv._dflash_lock.locked() and admission._reservations == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert not srv._dflash_lock.locked()
+        assert admission._reservations == 0
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_close.set()
+        srv._dflash_lock = asyncio.Lock()
+
+
 def test_dflash_admission_reserved_before_body_parse(monkeypatch) -> None:
     """F1: the ASGI admission middleware rejects with 503 BEFORE FastAPI
     parses the request body.
@@ -2504,6 +2620,17 @@ def test_dflash_unauthenticated_request_does_not_reserve_slot() -> None:
         "challenge required for bearer-protected resources"
     )
 
+    # codex round-6 #1: the /v1/models route (which uses a route dependency,
+    # not the chat ASGI middleware) must ALSO emit the challenge on 401.
+    r = client.get("/v1/models")
+    assert r.status_code == 401, r.text
+    assert r.headers.get("WWW-Authenticate") == "Bearer", (
+        "codex #6 regression: /v1/models 401 dropped WWW-Authenticate: Bearer"
+    )
+    # And a correct key still passes.
+    r = client.get("/v1/models", headers={"Authorization": "Bearer secret"})
+    assert r.status_code == 200, r.text
+
 
 def test_dflash_rate_limited_request_does_not_reserve_slot() -> None:
     """codex round-3 #3: rate-limit rejection also happens BEFORE reserving,
@@ -2620,7 +2747,8 @@ def test_dflash_stream_terminal_frame_delivered_on_timeout(monkeypatch) -> None:
         )
         body = b"".join([chunk async for chunk in stream]).decode()
         # Terminal frames survive the deadline bound.
-        assert "DFlash stream timed out after 0.0 seconds." in body
+        # codex round-6 #5: 0.01s renders as "0.010 seconds" (adaptive).
+        assert "DFlash stream timed out after 0.010 seconds." in body
         assert "data: [DONE]" in body
 
     srv._dflash_lock = asyncio.Lock()

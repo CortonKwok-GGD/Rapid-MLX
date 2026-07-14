@@ -124,6 +124,32 @@ _dflash_render_executor = concurrent.futures.ThreadPoolExecutor(
 _STREAM_QUEUE_MAXSIZE = 64
 _STREAM_BACKPRESSURE_TIMEOUT_SECONDS = 30.0
 
+# codex round-6 #2: grace window for a synchronous ``generator.close()`` before
+# the lease stops awaiting it and detaches the close (retaining the lock/slot
+# until the close future finishes). A normal close returns in microseconds, so
+# this only ever triggers for a genuinely hung teardown — and even a tiny value
+# would keep the fast path synchronous; 5s just avoids detaching on a briefly
+# slow (but not hung) GPU cleanup under load.
+_STREAM_GENERATOR_CLOSE_GRACE_SECONDS = 5.0
+
+
+def _format_timeout_seconds(seconds: float) -> str:
+    """Human-facing rendering of a timeout in seconds (codex round-6 #5).
+
+    A fixed ``:.1f`` renders a valid sub-100 ms limit like ``0.01`` as
+    "0.0 seconds", a misleading operational message. Use adaptive precision so
+    small positive timeouts keep enough significant digits to be meaningful,
+    while typical multi-second values stay clean.
+    """
+    if seconds <= 0:
+        return "0 seconds"
+    if seconds < 0.1:
+        # e.g. 0.01 → "0.010", 0.005 → "0.005"
+        return f"{seconds:.3f} seconds"
+    if seconds < 1:
+        return f"{seconds:.2f} seconds"
+    return f"{seconds:.1f} seconds"
+
 
 class _DFlashClientGoneError(Exception):
     """Raised inside the stream producer when a CONTENT-frame ``put`` blocks
@@ -502,7 +528,26 @@ class _DFlashStreamLease:
 
             close_future = self._loop.run_in_executor(_dflash_executor, _close_gen)
             try:
-                await asyncio.shield(close_future)
+                # codex round-6 #2: bound the close wait. ``generator.close()``
+                # runs the generator's finally blocks (mlx-vlm GPU teardown),
+                # which normally return in microseconds — so on the common path
+                # this await completes immediately and the lock/slot release
+                # synchronously, preserving the fast-path contract. But a hung
+                # close would otherwise block ``__aexit__`` — and therefore the
+                # producer's terminal SSE (timeout notice + [DONE]) —
+                # indefinitely. If the close overruns the grace window, DETACH
+                # it (like an in-flight worker): keep the serial lock + slot
+                # held until the close future actually completes (release fires
+                # from its done-callback) while letting the response proceed.
+                await asyncio.wait_for(
+                    asyncio.shield(close_future),
+                    timeout=_STREAM_GENERATOR_CLOSE_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                if self._reservation is not None:
+                    self._reservation.defer_release()
+                close_future.add_done_callback(lambda _done: self._release())
+                return
             except asyncio.CancelledError:
                 # The client task can be cancelled a second time while it is
                 # already unwinding. The queued close still owns the GPU
@@ -578,12 +623,43 @@ def _build_app(
 
     from ...middleware.auth import (
         configure_rate_limiter,
-        verify_api_key,
     )
     from ...middleware.body_depth import install_request_body_depth_middleware
     from ...middleware.body_size import install_request_body_limit_middleware
 
     configure_rate_limiter(rate_limit, enabled=rate_limit > 0)
+
+    from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+    from ...middleware.auth import _verify_api_key_values
+
+    _bearer_scheme = HTTPBearer(auto_error=False)
+
+    async def _verify_api_key_with_bearer_challenge(
+        credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    ) -> bool:
+        """``verify_api_key`` that attaches the RFC 6750 bearer challenge.
+
+        codex round-5 #5 / round-6 #1: the shared ``verify_api_key`` raises a
+        bare 401 (no ``WWW-Authenticate`` header). Any DFlash bearer-protected
+        route that used it directly returned an unchallenged 401. This wrapper
+        runs the same verification but re-raises the 401 WITH the challenge so
+        ``/v1/models`` is RFC-compliant, mirroring the chat route's ASGI
+        middleware — without editing the shared verifier (a different lane).
+        """
+        bearer_key = credentials.credentials if credentials is not None else None
+        try:
+            return _verify_api_key_values(bearer_key)
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                headers = dict(exc.headers or {})
+                headers.setdefault("WWW-Authenticate", "Bearer")
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                    headers=headers,
+                ) from exc
+            raise
 
     app = FastAPI(title="Rapid-MLX (DFlash)")
     # DFlash has one GPU worker and serializes generation with
@@ -663,7 +739,10 @@ def _build_app(
             "drafter": runtime.drafter_repo,
         }
 
-    @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
+    @app.get(
+        "/v1/models",
+        dependencies=[Depends(_verify_api_key_with_bearer_challenge)],
+    )
     async def list_models() -> ModelsResponse:
         return ModelsResponse(
             data=[
@@ -842,8 +921,8 @@ def _build_app(
                         status_code=504,
                         detail=(
                             "DFlash prompt rendering exceeded the request "
-                            f"timeout of {request_timeout_for_diagnostics:.1f} "
-                            "seconds."
+                            "timeout of "
+                            f"{_format_timeout_seconds(request_timeout_for_diagnostics)}."
                         ),
                     ) from exc
 
@@ -881,7 +960,8 @@ def _build_app(
                         status_code=504,
                         detail=(
                             "DFlash request deadline elapsed during prompt "
-                            f"rendering (timeout {effective_timeout:.1f}s)."
+                            "rendering (timeout "
+                            f"{_format_timeout_seconds(request_timeout_for_diagnostics)})."
                         ),
                     )
                 effective_timeout = remaining_budget
@@ -1291,9 +1371,7 @@ async def _stream_completion(
             # generator to drive; the lease's deferred cleanup owns closing
             # the (possibly in-flight) worker.
             if gen_or_err is timed_out:
-                error_message = (
-                    f"DFlash stream timed out after {timeout_label:.1f} seconds."
-                )
+                error_message = f"DFlash stream timed out after {_format_timeout_seconds(timeout_label)}."
                 finish_reason = "length"
                 gen = None
             elif isinstance(gen_or_err, Exception):
@@ -1335,9 +1413,7 @@ async def _stream_completion(
                     # timeout immediately; the still-running token step is
                     # tracked by the lease and cleaned up (lock + slot held
                     # until it stops) via ``__aexit__``'s deferred path.
-                    error_message = (
-                        f"DFlash stream timed out after {timeout_label:.1f} seconds."
-                    )
+                    error_message = f"DFlash stream timed out after {_format_timeout_seconds(timeout_label)}."
                     finish_reason = "length"
                     break
                 if chunk is None:
@@ -1399,9 +1475,7 @@ async def _stream_completion(
                 try:
                     await _emit(f"data: {json.dumps(piece)}\n\n".encode())
                 except _DFlashStreamDeadlineError:
-                    error_message = (
-                        f"DFlash stream timed out after {timeout_label:.1f} seconds."
-                    )
+                    error_message = f"DFlash stream timed out after {_format_timeout_seconds(timeout_label)}."
                     finish_reason = "length"
                     break
                 except _DFlashClientGoneError:
@@ -1683,7 +1757,7 @@ async def _non_stream_completion(
             _defer_worker_cleanup()
         raise HTTPException(
             status_code=504,
-            detail=f"DFlash request timed out after {timeout_label:.1f} seconds.",
+            detail=f"DFlash request timed out after {_format_timeout_seconds(timeout_label)}.",
         ) from exc
     except asyncio.CancelledError:
         if lock_acquired and worker_future is not None:
