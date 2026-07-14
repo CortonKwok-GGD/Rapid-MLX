@@ -544,18 +544,32 @@ def test_dflash_nonstream_timeout_keeps_gpu_slot_until_worker_finishes(
 def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
     monkeypatch,
 ) -> None:
-    """DFlash honors stream deadlines without overlapping GPU work."""
+    """DFlash honors stream deadlines without overlapping GPU work.
+
+    codex round-2 #2: the timeout SSE must be emitted IMMEDIATELY on
+    deadline expiry — the response must NOT block on the non-preemptible
+    in-flight worker step. The lock stays held (deferred cleanup) until the
+    detached worker actually exits, then is released. Here the worker sleeps
+    0.05s while the deadline is 0.01s, so a fix that awaited the worker
+    before emitting the timeout would keep the client waiting the full 0.05s;
+    the fixed path emits the timeout SSE right away and releases the lock
+    only after the worker done-callback runs.
+    """
     import asyncio
     import sys
+    import threading
     import time
     import types
 
     from vllm_mlx.api.models import ChatCompletionRequest, Message
     from vllm_mlx.speculative.dflash import server as srv
 
+    worker_finished = threading.Event()
+
     class _SlowGenerator:
         def __next__(self):
             time.sleep(0.05)
+            worker_finished.set()
             raise StopIteration
 
         def close(self):
@@ -570,23 +584,48 @@ def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
         messages=[Message(role="user", content="hi")],
         stream=True,
     )
-    stream = srv._stream_completion(
-        prompt="prompt",
-        request=request,
-        served_model_name="qwen3.5-27b-8bit",
-        gen_kwargs={"max_tokens": 8},
-        model=MagicMock(),
-        processor=MagicMock(),
-        timeout=0.01,
-    )
 
-    async def drain() -> list[bytes]:
-        return [chunk async for chunk in stream]
+    async def exercise() -> None:
+        stream = srv._stream_completion(
+            prompt="prompt",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 8},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0.01,
+        )
+        started = asyncio.get_running_loop().time()
+        body = b"".join([chunk async for chunk in stream]).decode()
+        elapsed = asyncio.get_running_loop().time() - started
 
-    body = b"".join(asyncio.run(drain())).decode()
-    assert "DFlash stream timed out after 0.0 seconds." in body
-    assert "data: [DONE]" in body
-    assert not srv._dflash_lock.locked()
+        # The timeout SSE + DONE are emitted without blocking on the worker.
+        assert "DFlash stream timed out after 0.0 seconds." in body
+        assert "data: [DONE]" in body
+        # The 0.05s worker step must NOT gate the response — the fixed path
+        # surfaces the timeout well before the worker's sleep elapses.
+        assert elapsed < 0.05, (
+            f"timeout SSE blocked on the in-flight worker ({elapsed:.3f}s); "
+            "codex round-2 #2 regression"
+        )
+
+        # The lock stays held by deferred cleanup until the detached worker
+        # exits; then the done-callback releases it. Poll (keeping the loop
+        # alive) until that happens.
+        assert await asyncio.to_thread(worker_finished.wait, 1)
+        for _ in range(200):
+            if not srv._dflash_lock.locked():
+                break
+            await asyncio.sleep(0.01)
+        assert not srv._dflash_lock.locked(), (
+            "lock not released after the deferred worker finished"
+        )
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
 
 
 def test_dflash_stream_timeout_bounds_lock_queue_wait(monkeypatch) -> None:
@@ -1658,7 +1697,6 @@ def test_run_dflash_server_loads_models_on_executor_thread(monkeypatch) -> None:
 # =============================================================================
 
 
-@_skip_without_mlx_vlm
 def test_dflash_stream_cancel_during_construction_releases_lock(monkeypatch) -> None:
     """F3: cancelling while the generator is still being CONSTRUCTED must
     not leak ``_dflash_lock``.
@@ -1744,16 +1782,19 @@ def test_dflash_stream_cancel_during_construction_releases_lock(monkeypatch) -> 
         srv._dflash_lock = asyncio.Lock()
 
 
-@_skip_without_mlx_vlm
 def test_dflash_nonstream_expired_deadline_skips_gpu_work(monkeypatch) -> None:
     """F5: a non-stream request whose deadline expired while acquiring the
     serial lock must NOT submit GPU work.
 
-    Hold the lock with a foreign owner so the request's ``wait_for`` on the
-    lock burns its whole (tiny) budget; release just after so acquisition
-    succeeds but the deadline is already gone. ``generate`` must never be
-    called, and the 504 must come back immediately without a detached
-    worker holding the lock.
+    Deterministic construction (codex round-2 #4): the lock is FREE, so
+    acquisition succeeds immediately — this test does NOT rely on the
+    lock-acquire ``wait_for`` timing out (which would leave the F5
+    post-acquisition recheck untested and pass even if it were deleted).
+    Instead a fake monotonic clock jumps PAST the deadline between the
+    deadline computation and the post-acquire recheck, so acquisition
+    succeeds but the recheck sees an already-expired deadline and must
+    raise 504 BEFORE submitting the executor job. ``generate`` must never
+    be called.
     """
     import asyncio
     import sys
@@ -1777,15 +1818,29 @@ def test_dflash_nonstream_expired_deadline_skips_gpu_work(monkeypatch) -> None:
         admission = srv._DFlashAdmission(max_concurrent_requests=1)
         reservation = admission.reserve()
 
-        # Foreign owner holds the lock; release it just after the request's
-        # deadline expires so the request acquires it already-expired.
-        await srv._dflash_lock.acquire()
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        # Deterministic clock: ``loop.time`` returns ``real_now + advance``.
+        # The lock is FREE, so acquisition succeeds instantly (this does NOT
+        # rely on the acquire ``wait_for`` timing out — the flaw codex #4
+        # flagged). We advance the clock PAST the deadline the instant the
+        # lock is acquired, via an ``acquire`` wrapper, so that:
+        #   * the deadline anchor + pre-acquire remaining-time check both see
+        #     ``advance == 0`` (plenty of budget), and
+        #   * the POST-acquire remaining-time recheck (the actual F5 guard)
+        #     sees ``advance == +10s`` → deadline blown → 504 before submit.
+        advance = {"v": 0.0}
+        monkeypatch.setattr(loop, "time", lambda: real_time() + advance["v"])
 
-        async def _release_soon() -> None:
-            await asyncio.sleep(0.03)
-            srv._dflash_lock.release()
+        real_acquire = srv._dflash_lock.acquire
 
-        releaser = asyncio.create_task(_release_soon())
+        async def acquire_then_blow_deadline() -> bool:
+            got = await real_acquire()
+            advance["v"] = 10.0  # deadline (anchor + 5s) is now in the past
+            return got
+
+        monkeypatch.setattr(srv._dflash_lock, "acquire", acquire_then_blow_deadline)
+
         with pytest.raises(HTTPException) as excinfo:
             await srv._non_stream_completion(
                 prompt="prompt",
@@ -1794,14 +1849,15 @@ def test_dflash_nonstream_expired_deadline_skips_gpu_work(monkeypatch) -> None:
                 gen_kwargs={},
                 model=MagicMock(),
                 processor=MagicMock(),
-                timeout=0.01,
+                timeout=5.0,  # positive deadline; blown right after acquire
                 admission_reservation=reservation,
             )
-        await releaser
+        monkeypatch.setattr(loop, "time", real_time)
+
         assert excinfo.value.status_code == 504
         # The core F5 assertion: no GPU work started for an expired request.
         assert generate_calls[0] == 0, "F5 regression: GPU work started after deadline"
-        # And no detached worker is holding the lock (nothing was submitted).
+        # Nothing was submitted, so no detached worker holds the lock.
         assert not srv._dflash_lock.locked()
         reservation.release()
         assert admission._reservations == 0
@@ -1813,7 +1869,6 @@ def test_dflash_nonstream_expired_deadline_skips_gpu_work(monkeypatch) -> None:
         srv._dflash_lock = asyncio.Lock()
 
 
-@_skip_without_mlx_vlm
 def test_dflash_zero_timeout_is_no_deadline_on_both_paths(monkeypatch) -> None:
     """F4: ``timeout <= 0`` means "no deadline" consistently on the stream
     AND non-stream paths — not "unlimited" on one and "immediate 504" on
@@ -1887,7 +1942,6 @@ def test_dflash_zero_timeout_is_no_deadline_on_both_paths(monkeypatch) -> None:
         srv._dflash_lock = asyncio.Lock()
 
 
-@_skip_without_mlx_vlm
 def test_dflash_stream_backpressure_does_not_hold_lock(monkeypatch) -> None:
     """F2: a slow/stalled consumer must not pin ``_dflash_lock``.
 
@@ -1975,7 +2029,6 @@ def test_dflash_stream_backpressure_does_not_hold_lock(monkeypatch) -> None:
         srv._dflash_lock = asyncio.Lock()
 
 
-@_skip_without_mlx_vlm
 def test_dflash_admission_reserved_before_body_parse(monkeypatch) -> None:
     """F1: the ASGI admission middleware rejects with 503 BEFORE FastAPI
     parses the request body.

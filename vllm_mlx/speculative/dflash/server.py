@@ -83,6 +83,27 @@ _dflash_executor = concurrent.futures.ThreadPoolExecutor(
 )
 
 
+# F2 (codex round-2 #1): bound the producer→consumer SSE handoff queue so a
+# stalled client cannot make the producer buffer an entire completion in
+# memory. Once the queue is full, the producer waits at most
+# ``_STREAM_BACKPRESSURE_TIMEOUT_SECONDS`` for the consumer to drain a slot;
+# if the client is truly gone, generation is aborted and the generator +
+# lease are cleaned up. The bound is chunk-count, not bytes — each queued
+# item is one small SSE frame, so a modest count keeps buffered memory tiny
+# without throttling a healthy fast reader.
+_STREAM_QUEUE_MAXSIZE = 64
+_STREAM_BACKPRESSURE_TIMEOUT_SECONDS = 30.0
+
+
+class _DFlashClientGoneError(Exception):
+    """Raised inside the stream producer when the SSE handoff queue stays
+    full past ``_STREAM_BACKPRESSURE_TIMEOUT_SECONDS`` — i.e. the client
+    has stopped reading. Signals the producer to abort generation and let
+    the lease close the generator + release the GPU lock / admission slot,
+    rather than buffering an unbounded completion for a client that is
+    almost certainly gone."""
+
+
 class _DFlashAdmissionReservation:
     """One request slot from a :class:`_DFlashAdmission` gate.
 
@@ -604,6 +625,15 @@ def _build_app(
                 draft_model=runtime.drafter,
                 draft_kind=runtime.kind,
             )
+            # F4 (codex round-2 #3): resolve the effective timeout with an
+            # ``is None`` check, NOT ``request.timeout or default_timeout``.
+            # ``or`` treats an explicit ``timeout=0`` as falsy and swaps in
+            # ``default_timeout``, silently contradicting the ``timeout <= 0``
+            # "no deadline" semantics both completion paths now honor. Only
+            # an omitted (``None``) timeout should fall back to the default.
+            effective_timeout = (
+                request.timeout if request.timeout is not None else default_timeout
+            )
         except BaseException:
             reservation.release()
             raise
@@ -618,7 +648,7 @@ def _build_app(
                         gen_kwargs=gen_kwargs,
                         model=model,
                         processor=processor,
-                        timeout=request.timeout or default_timeout,
+                        timeout=effective_timeout,
                         admission_reservation=reservation,
                     ),
                     reservation,
@@ -634,7 +664,7 @@ def _build_app(
                 gen_kwargs=gen_kwargs,
                 model=model,
                 processor=processor,
-                timeout=request.timeout or default_timeout,
+                timeout=effective_timeout,
                 admission_reservation=reservation,
             )
         finally:
@@ -795,10 +825,14 @@ async def _stream_completion(
     # the outer ``yield`` suspends — but the producer keeps running and
     # its deadline checks keep firing, so a stalled reader can no longer
     # pin ``_dflash_lock`` past ``timeout``. Lease acquisition/release is
-    # therefore independent of downstream socket writes. The queue is
-    # unbounded but generation is ``max_tokens``-bounded, so buffered
-    # memory is bounded by the completion length.
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    # therefore independent of downstream socket writes.
+    #
+    # codex round-2 #1: the queue is BOUNDED so a stalled client cannot make
+    # the producer buffer the whole completion. When the queue fills, the
+    # producer's ``put`` blocks; if it stays blocked past the backpressure
+    # timeout, the client is treated as gone and generation is aborted with
+    # the generator + lease cleaned up.
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
 
     async def _produce() -> None:
         """Own the lease, generate, and push SSE chunks onto the queue.
@@ -818,6 +852,20 @@ async def _stream_completion(
         # budget. None means "no token observed yet".
         last_token_id: int | None = None
         error_message: str | None = None
+
+        async def _emit(item: bytes) -> None:
+            """Put one SSE frame on the bounded queue with a backpressure
+            deadline (codex round-2 #1). If the queue stays full past the
+            backpressure timeout the consumer has stopped reading, so raise
+            ``_DFlashClientGoneError`` to abort generation instead of buffering
+            an unbounded completion for a client that is gone."""
+            try:
+                await asyncio.wait_for(
+                    queue.put(item),
+                    timeout=_STREAM_BACKPRESSURE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise _DFlashClientGoneError from exc
 
         async def _await_worker(func: Any, *, makes_generator: bool = False) -> Any:
             """Wait without cancelling an mlx operation on deadline expiry."""
@@ -850,24 +898,31 @@ async def _stream_completion(
                 return result
             remaining = deadline - loop.time()
             if remaining <= 0:
-                # The future was submitted just above. It may be a GPU
-                # step, so wait for it before releasing the serial lock.
-                result = await asyncio.shield(future)
-                lease.clear_future(future)
-                return result, timed_out
+                # F2 (codex round-2 #2): the deadline is already gone. Do
+                # NOT block on the non-preemptible worker — a hung token
+                # step would make the timeout ineffective indefinitely.
+                # Return the timeout marker IMMEDIATELY, leaving
+                # ``_active_future`` tracked so the lease's ``__aexit__``
+                # routes the still-running worker through deferred cleanup
+                # (retaining the lock + admission slot until the worker
+                # actually stops, then closing its generator). Mark the
+                # lease timed-out so any further ``_await_worker`` call
+                # short-circuits.
+                lease.timed_out = True
+                return timed_out
             done, _pending = await asyncio.wait({future}, timeout=remaining)
             if done:
                 result = future.result()
                 lease.clear_future(future)
                 return result
 
-            # mlx work is not preemptible. Let the in-flight token step
-            # finish while the serial lock remains held, then close its
-            # generator rather than letting another request overlap it on
-            # the GPU worker.
-            result = await asyncio.shield(future)
-            lease.clear_future(future)
-            return result, timed_out
+            # F2 (codex round-2 #2): the wait elapsed before the worker
+            # finished. Same policy as above — surface the timeout
+            # immediately and defer the in-flight worker's cleanup to the
+            # lease instead of blocking the response on a non-preemptible
+            # step. ``_active_future`` stays tracked for ``__aexit__``.
+            lease.timed_out = True
+            return timed_out
 
         finish_reason = "stop"
         async with lease:
@@ -897,22 +952,15 @@ async def _stream_completion(
                     return e
 
             gen_or_err = await _await_worker(_make_gen, makes_generator=True)
-            timed_out_after_generation = False
+            # ``_await_worker`` now returns the ``timed_out`` sentinel
+            # immediately on deadline expiry (codex round-2 #2) — never a
+            # tuple. When it times out during construction we have no
+            # generator to drive; the lease's deferred cleanup owns closing
+            # the (possibly in-flight) worker.
             if gen_or_err is timed_out:
-                timed_out_after_generation = True
-            elif isinstance(gen_or_err, tuple):
-                gen_or_err, _timeout_marker = gen_or_err
-                timed_out_after_generation = _timeout_marker is timed_out
-            if timed_out_after_generation:
                 error_message = f"DFlash stream timed out after {timeout:.1f} seconds."
                 finish_reason = "length"
-                gen = (
-                    None
-                    if gen_or_err is timed_out or isinstance(gen_or_err, Exception)
-                    else gen_or_err
-                )
-                if gen is not None:
-                    lease.set_generator(gen)
+                gen = None
             elif isinstance(gen_or_err, Exception):
                 logger.exception(
                     "DFlash stream_generate raised at construction: %s",
@@ -947,11 +995,11 @@ async def _stream_completion(
 
             while gen is not None:
                 chunk = await _await_worker(_next_chunk)
-                timed_out_after_generation = False
-                if isinstance(chunk, tuple):
-                    chunk, _timeout_marker = chunk
-                    timed_out_after_generation = _timeout_marker is timed_out
-                if timed_out_after_generation:
+                if chunk is timed_out:
+                    # codex round-2 #2: deadline hit mid-stream. Surface the
+                    # timeout immediately; the still-running token step is
+                    # tracked by the lease and cleaned up (lock + slot held
+                    # until it stops) via ``__aexit__``'s deferred path.
                     error_message = (
                         f"DFlash stream timed out after {timeout:.1f} seconds."
                     )
@@ -994,10 +1042,14 @@ async def _stream_completion(
                         }
                     ],
                 }
-                # F2: push to the queue instead of yielding to the socket
-                # directly, so the lease (and its lock) is never held across
-                # a suspended socket write.
-                await queue.put(f"data: {json.dumps(piece)}\n\n".encode())
+                # F2: push to the bounded queue instead of yielding to the
+                # socket directly, so the lease (and its lock) is never held
+                # across a suspended socket write. ``_emit`` raises
+                # ``_DFlashClientGoneError`` if the queue stays full past the
+                # backpressure timeout — that unwinds through
+                # ``async with lease`` (closing the generator + releasing the
+                # lock) and is swallowed in ``_drive_producer``.
+                await _emit(f"data: {json.dumps(piece)}\n\n".encode())
 
         # Length-truncation detection — mlx-vlm's GenerationResult has no
         # ``finish_reason`` field, so we infer "length" by comparing the
@@ -1039,8 +1091,8 @@ async def _stream_completion(
                 "type": "dflash_runtime_error",
                 "message": error_message,
             }
-        await queue.put(f"data: {json.dumps(final)}\n\n".encode())
-        await queue.put(b"data: [DONE]\n\n")
+        await _emit(f"data: {json.dumps(final)}\n\n".encode())
+        await _emit(b"data: [DONE]\n\n")
 
     async def _drive_producer() -> None:
         """Run ``_produce`` and always terminate the queue with a sentinel.
@@ -1051,8 +1103,26 @@ async def _stream_completion(
         """
         try:
             await _produce()
+        except _DFlashClientGoneError:
+            # codex round-2 #1: the client stopped reading and the bounded
+            # queue stayed full past the backpressure timeout. ``_produce``
+            # already unwound ``async with lease`` (generator closed, lock +
+            # slot released or deferred). Nothing more to emit — fall through
+            # to the sentinel so the drain loop (if still alive) exits.
+            logger.debug(
+                "DFlash stream aborted: client stopped reading past the "
+                "%.0fs backpressure timeout",
+                _STREAM_BACKPRESSURE_TIMEOUT_SECONDS,
+            )
         finally:
-            queue.put_nowait(None)
+            # Sentinel wakes the consumer's drain loop. Use ``put_nowait``
+            # inside a guard: if the bounded queue is full (the very
+            # backpressure that aborted us), drop the sentinel — the consumer
+            # is gone and its ``finally`` cancels this task anyway.
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                logger.debug("DFlash stream queue full at teardown; sentinel dropped")
 
     # F2: start generation in its own task BEFORE the first client read.
     # ``ensure_future`` schedules the producer eagerly so its deadline
