@@ -568,10 +568,15 @@ def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
     deadline expiry — the response must NOT block on the non-preemptible
     in-flight worker step. The lock stays held (deferred cleanup) until the
     detached worker actually exits, then is released. Here the worker sleeps
-    0.05s while the deadline is 0.01s, so a fix that awaited the worker
-    before emitting the timeout would keep the client waiting the full 0.05s;
-    the fixed path emits the timeout SSE right away and releases the lock
-    only after the worker done-callback runs.
+    a long ``_WORKER_SLEEP`` while the deadline is ``_DEADLINE``, so a fix
+    that awaited the worker before emitting the timeout would keep the client
+    waiting the full worker sleep; the fixed path emits the timeout SSE right
+    away and releases the lock only after the worker done-callback runs.
+
+    codex round-4 #6: the elapsed-time assertion uses a threshold with ample
+    separation from BOTH the deadline and the worker completion (rather than
+    comparing against the worker's exact sleep), so it is not
+    scheduler-sensitive on loaded CI hosts.
     """
     import asyncio
     import sys
@@ -582,11 +587,19 @@ def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
     from vllm_mlx.api.models import ChatCompletionRequest, Message
     from vllm_mlx.speculative.dflash import server as srv
 
+    # Wide separation (codex round-4 #6): deadline 10 ms, worker 500 ms,
+    # assertion threshold 200 ms. The fixed path returns the timeout in
+    # ~10 ms; a regressed (worker-awaiting) path would take ~500 ms. 200 ms
+    # sits well clear of both, so ordinary scheduler jitter cannot flip it.
+    _DEADLINE = 0.01
+    _WORKER_SLEEP = 0.5
+    _ELAPSED_THRESHOLD = 0.2
+
     worker_finished = threading.Event()
 
     class _SlowGenerator:
         def __next__(self):
-            time.sleep(0.05)
+            time.sleep(_WORKER_SLEEP)
             worker_finished.set()
             raise StopIteration
 
@@ -611,7 +624,7 @@ def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
             gen_kwargs={"max_tokens": 8},
             model=MagicMock(),
             processor=MagicMock(),
-            timeout=0.01,
+            timeout=_DEADLINE,
         )
         started = asyncio.get_running_loop().time()
         body = b"".join([chunk async for chunk in stream]).decode()
@@ -620,9 +633,9 @@ def test_dflash_stream_timeout_stops_after_the_inflight_worker_step(
         # The timeout SSE + DONE are emitted without blocking on the worker.
         assert "DFlash stream timed out after 0.0 seconds." in body
         assert "data: [DONE]" in body
-        # The 0.05s worker step must NOT gate the response — the fixed path
-        # surfaces the timeout well before the worker's sleep elapses.
-        assert elapsed < 0.05, (
+        # The worker step must NOT gate the response — the fixed path surfaces
+        # the timeout well before the worker's (much longer) sleep elapses.
+        assert elapsed < _ELAPSED_THRESHOLD, (
             f"timeout SSE blocked on the in-flight worker ({elapsed:.3f}s); "
             "codex round-2 #2 regression"
         )
@@ -758,6 +771,66 @@ def test_dflash_stream_cancellation_releases_admission_slot() -> None:
         assert admission._reservations == 0
 
     asyncio.run(cancel_stream())
+
+
+def test_dflash_stream_claims_slot_only_when_iteration_begins() -> None:
+    """codex round-4 #1: ownership of the admission slot must transfer to the
+    stream (``claim``) only once ``_stream_with_admission`` is actually
+    iterated — NOT when the endpoint returns the ``StreamingResponse``.
+
+    If the endpoint claimed the slot eagerly and Starlette then failed to send
+    the response headers (client vanished during startup), the stream body
+    would never run, its ``finally`` release would never fire, and the
+    middleware safety net — seeing a *claimed* slot — would decline to release
+    it, permanently shrinking capacity. Guarding on ``claimed`` here proves an
+    unstarted stream stays unclaimed (middleware reclaims it) and a started
+    one claims + releases itself.
+    """
+    import asyncio
+
+    from vllm_mlx.speculative.dflash import server as srv
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+
+        # 1. Response-startup failure: the wrapped generator is created but
+        #    never iterated (Starlette never got past sending headers). The
+        #    slot must remain UNCLAIMED so the middleware's safety net owns
+        #    the release.
+        never_started = False
+
+        async def unused_source():
+            nonlocal never_started
+            never_started = True
+            yield b"data: x\n\n"
+
+        reservation = admission.reserve()
+        stream = srv._stream_with_admission(unused_source(), reservation)
+        assert reservation.claimed is False, (
+            "codex #1 regression: slot claimed before the stream was iterated"
+        )
+        assert never_started is False
+        # The middleware safety net force-releases an unclaimed slot.
+        await stream.aclose()
+        if not reservation.claimed:
+            reservation.release(force=True)
+        assert admission._reservations == 0
+
+        # 2. Normal start: iterating the wrapper transfers ownership (claim),
+        #    and closing it releases the slot exactly once.
+        async def source():
+            yield b"data: first\n\n"
+
+        reservation2 = admission.reserve()
+        stream2 = srv._stream_with_admission(source(), reservation2)
+        assert await anext(stream2) == b"data: first\n\n"
+        assert reservation2.claimed is True, (
+            "codex #1 regression: iterating the stream did not claim the slot"
+        )
+        await stream2.aclose()
+        assert admission._reservations == 0
+
+    asyncio.run(exercise())
 
 
 def test_dflash_stream_cancellation_waits_for_worker_cleanup(monkeypatch) -> None:
@@ -2047,6 +2120,107 @@ def test_dflash_stream_backpressure_does_not_hold_lock(monkeypatch) -> None:
         srv._dflash_lock = asyncio.Lock()
 
 
+def test_dflash_stream_backpressure_delivers_terminal_notice(monkeypatch) -> None:
+    """codex round-4 #3: hitting the server-side backpressure cap must NOT
+    truncate the stream silently — the client gets an explicit terminal error
+    frame + ``[DONE]``.
+
+    Previously a full queue past ``_STREAM_BACKPRESSURE_TIMEOUT_SECONDS`` raised
+    ``_DFlashClientGoneError``, which ``_drive_producer`` swallowed with no
+    terminator. A client that was merely SLOW (not gone) then saw an
+    unexplained truncation. Now the producer converts that abort into a
+    ``finish_reason="length"`` error notice + ``[DONE]`` so a resuming client
+    always learns why generation stopped — even with ``timeout=0`` (no request
+    deadline), where only this backpressure cap applies.
+    """
+    import asyncio
+    import sys
+    import types
+
+    from vllm_mlx.api.models import ChatCompletionRequest, Message
+    from vllm_mlx.speculative.dflash import server as srv
+
+    # Tiny queue + tiny backpressure window so the test triggers the cap fast.
+    monkeypatch.setattr(srv, "_STREAM_QUEUE_MAXSIZE", 2)
+    monkeypatch.setattr(srv, "_STREAM_BACKPRESSURE_TIMEOUT_SECONDS", 0.05)
+
+    class _ManyChunks:
+        def __init__(self):
+            self._n = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self._n += 1
+            if self._n > 50:
+                raise StopIteration
+            return SimpleNamespace(
+                text=f"tok{self._n}",
+                generation_tokens=self._n,
+                prompt_tokens=3,
+                token=100 + self._n,
+            )
+
+        def close(self):
+            pass
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    fake_mlx_vlm.stream_generate = lambda *a, **kw: _ManyChunks()
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    request = ChatCompletionRequest(
+        model="qwen3.5-27b-8bit",
+        messages=[Message(role="user", content="hi")],
+        stream=True,
+    )
+
+    async def exercise() -> None:
+        admission = srv._DFlashAdmission(max_concurrent_requests=1)
+        reservation = admission.reserve()
+        stream = srv._stream_completion(
+            prompt="p",
+            request=request,
+            served_model_name="qwen3.5-27b-8bit",
+            gen_kwargs={"max_tokens": 100},
+            model=MagicMock(),
+            processor=MagicMock(),
+            timeout=0,  # NO request deadline — only the backpressure cap.
+            admission_reservation=reservation,
+        )
+        # A SLOW-but-connected client: read the role marker, pause long enough
+        # to trip the content-frame backpressure cap (0.05s) on the full
+        # 2-slot queue, then keep draining. The producer aborts generation on
+        # backpressure but must still deliver a terminal notice + [DONE]; the
+        # continued draining gives those terminal frames queue room to land.
+        assert b'"role": "assistant"' in await anext(stream)
+        await asyncio.sleep(0.15)  # > backpressure window → content put aborts
+        rest_frames: list[bytes] = []
+        async for chunk in stream:
+            rest_frames.append(chunk)
+            await asyncio.sleep(0.005)  # keep draining, slowly
+        rest = b"".join(rest_frames).decode()
+        assert "server-side backpressure" in rest, (
+            "codex #3 regression: backpressure abort truncated the stream "
+            "without a terminal error notice"
+        )
+        assert '"finish_reason": "length"' in rest
+        assert "data: [DONE]" in rest
+        # Lock + slot released after the abort.
+        for _ in range(300):
+            if not srv._dflash_lock.locked() and admission._reservations == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert not srv._dflash_lock.locked()
+        assert admission._reservations == 0
+
+    srv._dflash_lock = asyncio.Lock()
+    try:
+        asyncio.run(exercise())
+    finally:
+        srv._dflash_lock = asyncio.Lock()
+
+
 def test_dflash_admission_reserved_before_body_parse(monkeypatch) -> None:
     """F1: the ASGI admission middleware rejects with 503 BEFORE FastAPI
     parses the request body.
@@ -2089,6 +2263,66 @@ def test_dflash_admission_reserved_before_body_parse(monkeypatch) -> None:
     assert response.status_code == 503, response.text
     assert response.headers.get("Retry-After") == "1"
     assert response.json()["error"]["code"] == "at_capacity"
+
+
+def test_dflash_slow_prompt_render_is_charged_against_deadline(monkeypatch) -> None:
+    """codex round-4 #4: prompt rendering time is charged against the request
+    ``timeout``, and rendering is offloaded off the event loop.
+
+    The pre-fix endpoint rendered the prompt SYNCHRONOUSLY before either
+    completion helper established its deadline, so an expensive chat template
+    could block the event loop and blow past the configured ``timeout`` with
+    no enforcement. Here we make ``_render_prompt`` take far longer than the
+    request ``timeout`` and assert the request is rejected with 504 — proving
+    the deadline now spans rendering. (It also could not have surfaced a 504
+    at all if rendering still ran unbounded on the event loop.)
+    """
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from vllm_mlx.speculative.dflash import server as srv
+    from vllm_mlx.speculative.dflash.runtime import DFlashRuntime
+    from vllm_mlx.speculative.dflash.server import _build_app
+
+    # A render that vastly overruns the 0.05s request budget. Runs on the
+    # DFlash worker thread (offloaded), so the event loop stays free to
+    # enforce the deadline via ``asyncio.wait_for``.
+    def _slow_render(*_args, **_kwargs) -> str:
+        time.sleep(0.4)
+        return "rendered"
+
+    monkeypatch.setattr(srv, "_render_prompt", _slow_render)
+
+    app = _build_app(
+        model=MagicMock(),
+        processor=MagicMock(),
+        runtime=DFlashRuntime(
+            drafter=MagicMock(),
+            kind="dflash",
+            drafter_repo="z-lab/Qwen3.5-27B-DFlash",
+        ),
+        served_model_name="qwen3.5-27b-8bit",
+        default_max_tokens=64,
+        cors_origins=[],
+        max_concurrent_requests=1,
+    )
+    client = TestClient(app)
+    admission = app.state.dflash_admission
+
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3.5-27b-8bit",
+            "messages": [{"role": "user", "content": "hi"}],
+            "timeout": 0.05,
+        },
+    )
+    assert r.status_code == 504, r.text
+    # The slot must not leak when rendering times out.
+    assert admission._reservations == 0, (
+        "codex #4 regression: render-timeout leaked an admission slot"
+    )
 
 
 def test_dflash_unauthenticated_request_does_not_reserve_slot() -> None:
@@ -2174,7 +2408,7 @@ def test_dflash_rate_limited_request_does_not_reserve_slot() -> None:
         default_max_tokens=64,
         cors_origins=[],
         rate_limit=1,
-        max_concurrent_requests=4,
+        max_concurrent_requests=1,
     )
     try:
         client = TestClient(app)
@@ -2185,12 +2419,34 @@ def test_dflash_rate_limited_request_does_not_reserve_slot() -> None:
         empty = {"model": "qwen3.5-27b-8bit", "messages": []}
         r1 = client.post("/v1/chat/completions", json=empty)
         assert r1.status_code == 400, r1.text
-        # Second request is over the per-minute budget → 429 from the
-        # middleware, before any slot is reserved.
-        r2 = client.post("/v1/chat/completions", json=empty)
-        assert r2.status_code == 429, r2.text
-        assert r2.json()["error"]["code"] == "rate_limit_exceeded"
-        assert admission._reservations == 0, "codex #3 regression: 429 reserved a slot"
+
+        # codex round-4 #5: prove rate-limiting runs BEFORE admission by
+        # occupying the *only* admission slot before the over-limit request.
+        # A correct impl rejects with 429 (rate-limit checked first, no slot
+        # touched). A regressed impl that reserves-first would instead find
+        # the gate full and return 503 — or, worse, reserve + then release,
+        # masking a pre-admission DoS. Asserting 429 (NOT 503) with the slot
+        # held closes that hole; the old "reservations == 0 afterwards"
+        # assertion alone could not tell reserve-then-release from
+        # never-reserve.
+        held = admission.reserve()
+        try:
+            assert admission._reservations == 1
+            r2 = client.post("/v1/chat/completions", json=empty)
+            assert r2.status_code == 429, (
+                f"codex #5 regression: over-limit request returned "
+                f"{r2.status_code} (expected 429 from pre-admission "
+                f"rate-limit, not 503 from the full gate)"
+            )
+            assert r2.json()["error"]["code"] == "rate_limit_exceeded"
+            # The externally held slot is the ONLY reservation; the rejected
+            # request must not have minted (or transiently minted) another.
+            assert admission._reservations == 1, (
+                "codex #5 regression: 429 request touched the admission gate"
+            )
+        finally:
+            held.release()
+        assert admission._reservations == 0
     finally:
         # The rate limiter is a process-global singleton; leaving it enabled
         # would pollute every later test that exercises admission/rate paths

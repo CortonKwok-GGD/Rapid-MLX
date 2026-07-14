@@ -91,17 +91,42 @@ _dflash_executor = concurrent.futures.ThreadPoolExecutor(
 # lease are cleaned up. The bound is chunk-count, not bytes — each queued
 # item is one small SSE frame, so a modest count keeps buffered memory tiny
 # without throttling a healthy fast reader.
+#
+# codex round-4 #3: ``_STREAM_BACKPRESSURE_TIMEOUT_SECONDS`` is an EXPLICIT,
+# documented server-side backpressure cap, INDEPENDENT of the per-request
+# ``timeout``. It applies even when ``timeout=0`` ("no request deadline"),
+# because a client that has stopped reading must not be able to pin an
+# unbounded in-memory completion (or the sole GPU lock) indefinitely — that
+# is itself a denial-of-service vector, deadline or not. Crucially, hitting
+# this cap no longer truncates the stream silently: the producer converts the
+# backpressure abort into a terminal ``finish_reason="length"`` error frame +
+# ``[DONE]`` (see ``_stream_completion``'s content-emit handler), so a client
+# that is merely slow still receives an explicit explanation of why the
+# stream ended. Only a client that has genuinely departed misses it — and
+# that terminal ``_emit`` is itself swallowed rather than hanging.
 _STREAM_QUEUE_MAXSIZE = 64
 _STREAM_BACKPRESSURE_TIMEOUT_SECONDS = 30.0
 
 
 class _DFlashClientGoneError(Exception):
-    """Raised inside the stream producer when the SSE handoff queue stays
-    full past ``_STREAM_BACKPRESSURE_TIMEOUT_SECONDS`` — i.e. the client
-    has stopped reading. Signals the producer to abort generation and let
-    the lease close the generator + release the GPU lock / admission slot,
-    rather than buffering an unbounded completion for a client that is
-    almost certainly gone."""
+    """Raised inside the stream producer when a CONTENT-frame ``put`` blocks
+    on a full SSE handoff queue past ``_STREAM_BACKPRESSURE_TIMEOUT_SECONDS``
+    — i.e. the client has stopped reading. Signals the producer to abort
+    generation and let the lease close the generator + release the GPU lock /
+    admission slot, rather than buffering an unbounded completion for a client
+    that is almost certainly gone. (Terminal frames use a longer/independent
+    bound and never raise this — see ``_emit``.)"""
+
+
+class _DFlashStreamDeadlineError(Exception):
+    """Raised inside the stream producer when the REQUEST DEADLINE expires
+    while a content frame is waiting for queue capacity (codex round-3 #2).
+
+    Distinct from :class:`_DFlashClientGoneError`: the client may be perfectly
+    healthy — the configured request ``timeout`` simply elapsed. This routes
+    to the normal stream-timeout path (emit the ``finish_reason="length"``
+    timeout notice + ``[DONE]``) instead of silently aborting, so the client
+    always learns why the stream ended."""
 
 
 class _DFlashAdmissionReservation:
@@ -651,16 +676,51 @@ def _build_app(
             )
         # F1: the slot was reserved at the ASGI layer
         # (``_DFlashAdmissionMiddleware``) BEFORE this body was parsed, so
-        # admission bounds parsed-body memory too. Reuse that slot and take
-        # ownership of its release (``claim``); the middleware's safety-net
-        # release becomes a no-op once claimed. A direct-ASGI/test caller
-        # that bypasses the middleware won't have seeded scope state, so
-        # fall back to reserving here (unclaimed → still gated).
+        # admission bounds parsed-body memory too. Reuse that slot. A
+        # direct-ASGI/test caller that bypasses the middleware won't have
+        # seeded scope state, so fall back to reserving here (still gated).
+        #
+        # Ownership handoff (``claim``) is deliberately NOT taken here
+        # (codex round-4 #1). If we claimed now, a client that disconnects
+        # while Starlette is sending the ``StreamingResponse`` headers would
+        # leave the stream iterator unstarted — its ``finally`` release never
+        # runs — while the middleware's safety net refuses to release a
+        # *claimed* slot, permanently leaking capacity. Instead each path
+        # claims only at the point its release is guaranteed to fire:
+        #   * non-stream: inside the ``finally`` below, which always runs;
+        #   * stream: inside ``_stream_with_admission`` when the iterator
+        #     actually begins. Until then the slot stays *unclaimed*, so the
+        #     middleware's safety-net ``finally`` owns the release if response
+        #     startup fails.
         reservation = getattr(http_request.state, "dflash_reservation", None)
         if reservation is None:
             reservation = admission.reserve()
-        reservation.claim()
         try:
+            # F4 (codex round-2 #3): resolve the effective timeout with an
+            # ``is None`` check, NOT ``request.timeout or default_timeout``.
+            # ``or`` treats an explicit ``timeout=0`` as falsy and swaps in
+            # ``default_timeout``, silently contradicting the ``timeout <= 0``
+            # "no deadline" semantics both completion paths now honor. Only
+            # an omitted (``None``) timeout should fall back to the default.
+            #
+            # codex round-4 #4: resolve this BEFORE rendering the prompt and
+            # establish ONE absolute deadline here — prompt rendering (chat
+            # template application + tokenization) can be non-trivial, and the
+            # pre-fix code charged its cost to nobody: each completion helper
+            # started its own ``deadline = now + timeout`` only AFTER rendering
+            # returned, so a slow template could blow well past the client's
+            # configured ``timeout`` unenforced. ``timeout=0`` still means "no
+            # deadline" (``request_deadline is None``).
+            effective_timeout = (
+                request.timeout if request.timeout is not None else default_timeout
+            )
+            loop = asyncio.get_running_loop()
+            request_deadline = (
+                loop.time() + effective_timeout
+                if effective_timeout and effective_timeout > 0
+                else None
+            )
+
             # Render chat messages into a single prompt string via mlx-vlm's
             # processor. We pass through the model's chat template so the
             # tokenizer-side reasoning/tool markers match what the model was
@@ -679,9 +739,51 @@ def _build_app(
                 enable_thinking: bool | None = False
             else:
                 enable_thinking = _extract_thinking_from_request(request)
-            prompt = _render_prompt(
-                processor, model, request, enable_thinking=enable_thinking
-            )
+
+            # codex round-4 #4: OFFLOAD rendering to the DFlash worker thread so
+            # a heavy chat template cannot block the event loop (starving other
+            # connections, health checks, and — critically — the very deadline
+            # enforcement we rely on elsewhere). Bound it by the request
+            # deadline so an expensive render on an already-tight budget fails
+            # fast with a 504 rather than running unbounded.
+            def _render() -> str:
+                return _render_prompt(
+                    processor, model, request, enable_thinking=enable_thinking
+                )
+
+            render_future = loop.run_in_executor(_dflash_executor, _render)
+            if request_deadline is None:
+                prompt = await render_future
+            else:
+                render_budget = request_deadline - loop.time()
+                if render_budget <= 0:
+                    render_future.cancel()
+                    raise HTTPException(
+                        status_code=504,
+                        detail=(
+                            "DFlash request deadline elapsed before prompt "
+                            "rendering could start."
+                        ),
+                    )
+                try:
+                    prompt = await asyncio.wait_for(
+                        asyncio.shield(render_future), timeout=render_budget
+                    )
+                except asyncio.TimeoutError as exc:
+                    # The render is running on the single serial worker; letting
+                    # it keep running would block the next request's generation.
+                    # ``shield`` kept the future alive across our ``wait_for``
+                    # cancellation; cancel it explicitly now (a no-op if the
+                    # sync body already started, but it prevents a queued render
+                    # from firing) and surface the timeout.
+                    render_future.cancel()
+                    raise HTTPException(
+                        status_code=504,
+                        detail=(
+                            "DFlash prompt rendering exceeded the request "
+                            f"timeout of {effective_timeout:.1f} seconds."
+                        ),
+                    ) from exc
 
             max_tokens = (
                 request.max_tokens
@@ -700,15 +802,27 @@ def _build_app(
                 draft_model=runtime.drafter,
                 draft_kind=runtime.kind,
             )
-            # F4 (codex round-2 #3): resolve the effective timeout with an
-            # ``is None`` check, NOT ``request.timeout or default_timeout``.
-            # ``or`` treats an explicit ``timeout=0`` as falsy and swaps in
-            # ``default_timeout``, silently contradicting the ``timeout <= 0``
-            # "no deadline" semantics both completion paths now honor. Only
-            # an omitted (``None``) timeout should fall back to the default.
-            effective_timeout = (
-                request.timeout if request.timeout is not None else default_timeout
-            )
+
+            # Pass the REMAINING budget (post-render) to the completion helper,
+            # not the original timeout, so the single absolute deadline
+            # established above spans render + generation. ``0`` keeps its "no
+            # deadline" meaning ONLY when the request had no deadline to begin
+            # with; a request that DID set a deadline which rendering fully
+            # consumed must NOT collapse into the no-deadline sentinel (that
+            # would let generation run unbounded) — surface a 504 instead.
+            if request_deadline is None:
+                effective_timeout = 0.0
+            else:
+                remaining_budget = request_deadline - loop.time()
+                if remaining_budget <= 0:
+                    raise HTTPException(
+                        status_code=504,
+                        detail=(
+                            "DFlash request deadline elapsed during prompt "
+                            f"rendering (timeout {effective_timeout:.1f}s)."
+                        ),
+                    )
+                effective_timeout = remaining_budget
         except BaseException:
             reservation.release()
             raise
@@ -731,6 +845,14 @@ def _build_app(
                 media_type="text/event-stream",
             )
 
+        # Non-stream path: take ownership now. Unlike the streaming path,
+        # this coroutine is awaited directly, so the ``finally`` below is
+        # guaranteed to run (no header-send-then-abort gap). Claiming here is
+        # required because ``_non_stream_completion`` may ``defer_release`` the
+        # slot until a timed-out worker actually exits; if the slot were still
+        # unclaimed the middleware safety net would force-release it out from
+        # under the still-running worker.
+        reservation.claim()
         try:
             return await _non_stream_completion(
                 prompt=prompt,
@@ -818,7 +940,19 @@ def _render_prompt(
 async def _stream_with_admission(
     stream: AsyncIterator[bytes], reservation: _DFlashAdmissionReservation
 ) -> AsyncIterator[bytes]:
-    """Release an admission slot even when Starlette cancels an SSE stream."""
+    """Release an admission slot even when Starlette cancels an SSE stream.
+
+    Ownership handoff happens here, at the first body of this generator —
+    i.e. only once Starlette has begun consuming the ``StreamingResponse``
+    (codex round-4 #1). Claiming any earlier (e.g. in the endpoint before
+    returning the response) risks a leak: if sending the response headers
+    fails, this generator is never iterated, its ``finally`` release never
+    runs, and the middleware safety net would refuse to release a *claimed*
+    slot. By claiming here, an unstarted stream stays unclaimed and the
+    middleware ``finally`` reclaims the slot. Once claimed, the ``finally``
+    below owns the release for the whole stream lifecycle.
+    """
+    reservation.claim()
     try:
         async for chunk in stream:
             yield chunk
@@ -909,6 +1043,15 @@ async def _stream_completion(
     # the generator + lease cleaned up.
     queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
 
+    # codex round-4 #3: terminal frames (the ``finish_reason`` notice + [DONE])
+    # that could NOT be pushed through the bounded queue — because it stayed
+    # full past the backpressure cap — are stashed here for the CONSUMER to
+    # emit DIRECTLY to the socket after it finishes draining. This guarantees a
+    # connected-but-slow client always receives an explicit stream terminator
+    # even when the queue-based handoff itself hit backpressure; the consumer
+    # owns the socket and will deliver these to any client still reading.
+    pending_terminal: list[bytes] = []
+
     async def _produce() -> None:
         """Own the lease, generate, and push SSE chunks onto the queue.
 
@@ -931,34 +1074,47 @@ async def _stream_completion(
         async def _emit(item: bytes, *, terminal: bool = False) -> None:
             """Put one SSE frame on the bounded queue.
 
-            For streamed content frames the wait is bounded by BOTH the
-            backpressure timeout and the request deadline:
-            * codex round-2 #1: a full bounded queue means the consumer
-              stopped reading; waiting forever would buffer an unbounded
-              completion.
-            * codex round-3 #2: waiting the full backpressure timeout while
-              ignoring a shorter request deadline would let a stalled client
-              retain the sole GPU lock + admission slot well past the
-              configured timeout.
-            So the content wait is ``min(backpressure_timeout, deadline-now)``;
-            when either elapses we raise ``_DFlashClientGoneError`` to abort
-            generation and unwind the lease.
+            CONTENT frames (``terminal=False``) are emitted while the lease
+            holds the GPU lock, so a full queue means the lock is pinned. The
+            wait is bounded by BOTH:
+            * the request deadline (codex round-2 #2): a full queue must not
+              let a stalled client retain the sole GPU lock past the configured
+              ``timeout``; and
+            * the backpressure timeout (codex round-2 #1): even with no
+              deadline, an indefinitely-stalled client must not make the
+              producer buffer an unbounded completion.
+            On timeout we tell the two apart (codex round-3 #2):
+            * the request DEADLINE elapsed → raise ``_DFlashStreamDeadlineError``
+              so the loop emits the normal timeout notice + ``[DONE]`` (the
+              client is told why the stream ended); vs
+            * pure BACKPRESSURE (no deadline, or backpressure shorter than the
+              remaining deadline) → raise ``_DFlashClientGoneError`` to abort
+              silently (the client is gone; nothing to tell it).
 
-            ``terminal=True`` frames (the final finish_reason/usage chunk and
-            ``[DONE]``, incl. the timeout/error notice) are delivered under the
-            plain backpressure timeout only — NOT the deadline bound. They are
-            emitted AFTER the lease is released, so they cannot hold the GPU
-            lock, and their whole purpose is to tell the client how the stream
-            ended (e.g. "timed out"); dropping them because the deadline is
-            already gone would leave the client with a truncated, unexplained
-            stream. The bounded queue still caps the wait so a truly-gone
-            client can't wedge the terminator."""
-            wait = _STREAM_BACKPRESSURE_TIMEOUT_SECONDS
-            if not terminal and deadline is not None:
-                wait = min(wait, max(0.0, deadline - loop.time()))
+            TERMINAL frames (final finish_reason/usage chunk, timeout/error
+            notice, ``[DONE]``) are emitted AFTER the lease is released, so they
+            cannot pin the GPU lock. They wait only on the backpressure timeout
+            — NEVER the deadline — so an already-blown deadline can't suppress
+            the explanation of how the stream ended. A truly-gone client can
+            still not wedge them thanks to the backpressure cap."""
+            backpressure = _STREAM_BACKPRESSURE_TIMEOUT_SECONDS
+            deadline_left = (
+                None
+                if (terminal or deadline is None)
+                else max(0.0, deadline - loop.time())
+            )
+            wait = (
+                backpressure
+                if deadline_left is None
+                else min(backpressure, deadline_left)
+            )
             try:
                 await asyncio.wait_for(queue.put(item), timeout=wait)
             except asyncio.TimeoutError as exc:
+                # Deadline expiry is signalled ONLY when the deadline is what
+                # actually bounded the wait (it is <= the backpressure cap).
+                if deadline_left is not None and deadline_left <= backpressure:
+                    raise _DFlashStreamDeadlineError from exc
                 raise _DFlashClientGoneError from exc
 
         async def _await_worker(func: Any, *, makes_generator: bool = False) -> Any:
@@ -1138,12 +1294,40 @@ async def _stream_completion(
                 }
                 # F2: push to the bounded queue instead of yielding to the
                 # socket directly, so the lease (and its lock) is never held
-                # across a suspended socket write. ``_emit`` raises
-                # ``_DFlashClientGoneError`` if the queue stays full past the
-                # backpressure timeout — that unwinds through
-                # ``async with lease`` (closing the generator + releasing the
-                # lock) and is swallowed in ``_drive_producer``.
-                await _emit(f"data: {json.dumps(piece)}\n\n".encode())
+                # across a suspended socket write. ``_emit`` on a content frame
+                # can raise on two timeouts, and BOTH now route through the
+                # terminal notice path (codex round-3 #2 + round-4 #3) so the
+                # stream ALWAYS ends with an explicit error + ``[DONE]`` rather
+                # than a silent truncation:
+                #   * ``_DFlashStreamDeadlineError`` — the request ``timeout``
+                #     elapsed while a content frame waited for queue capacity.
+                #   * ``_DFlashClientGoneError`` — the queue stayed full past
+                #     the ``_STREAM_BACKPRESSURE_TIMEOUT_SECONDS`` server-side
+                #     backpressure cap. This bound applies even when
+                #     ``timeout=0`` ("no request deadline"), because an
+                #     unbounded in-memory completion for a client that has
+                #     stopped reading is itself a DoS. A client that is merely
+                #     slow (not gone) still gets a terminal explanation; a truly
+                #     departed client's terminal ``_emit`` will itself hit the
+                #     cap and be swallowed in ``_drive_producer`` — no hang
+                #     either way.
+                try:
+                    await _emit(f"data: {json.dumps(piece)}\n\n".encode())
+                except _DFlashStreamDeadlineError:
+                    error_message = (
+                        f"DFlash stream timed out after {timeout:.1f} seconds."
+                    )
+                    finish_reason = "length"
+                    break
+                except _DFlashClientGoneError:
+                    error_message = (
+                        "DFlash stream aborted: the client did not read "
+                        "buffered output within "
+                        f"{_STREAM_BACKPRESSURE_TIMEOUT_SECONDS:.0f}s of "
+                        "server-side backpressure."
+                    )
+                    finish_reason = "length"
+                    break
 
         # Length-truncation detection — mlx-vlm's GenerationResult has no
         # ``finish_reason`` field, so we infer "length" by comparing the
@@ -1185,8 +1369,20 @@ async def _stream_completion(
                 "type": "dflash_runtime_error",
                 "message": error_message,
             }
-        await _emit(f"data: {json.dumps(final)}\n\n".encode(), terminal=True)
-        await _emit(b"data: [DONE]\n\n", terminal=True)
+        final_frame = f"data: {json.dumps(final)}\n\n".encode()
+        done_frame = b"data: [DONE]\n\n"
+        # codex round-4 #3: terminal frames must reach a connected client even
+        # if the queue is still full from a backpressure abort. Try the queue
+        # first (normal fast path); on backpressure, hand the remaining
+        # terminal frames to the consumer to emit DIRECTLY to the socket after
+        # it drains, rather than dropping them. A truly-departed client's
+        # consumer is already cancelled, so the direct emit is a harmless
+        # no-op; a slow-but-present client gets its terminator.
+        for frame in (final_frame, done_frame):
+            try:
+                await _emit(frame, terminal=True)
+            except _DFlashClientGoneError:
+                pending_terminal.append(frame)
 
     async def _drive_producer() -> None:
         """Run ``_produce``; swallow the client-gone abort.
@@ -1251,6 +1447,13 @@ async def _stream_completion(
                 # performs the actual termination decision.
                 continue
             yield item
+        # codex round-4 #3: emit any terminal frames the producer could not
+        # push through a backpressure-full queue. We own the socket and the
+        # producer has finished, so these go straight to the client — the
+        # bounded queue never blocks them. A departed client's generator is
+        # already closed, so this yields into a no-op teardown.
+        for frame in pending_terminal:
+            yield frame
         # Surface a producer crash (not one of the sentinel-wrapped
         # generation errors, which are already emitted as error SSE) so it
         # is logged rather than silently swallowed.
