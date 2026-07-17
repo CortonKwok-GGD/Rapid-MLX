@@ -613,10 +613,19 @@ def test_persistent_load_respects_hybrid_bound(tmp_path):
     assert loaded == 1
 
 
-def test_persistent_load_drops_all_when_disabled(tmp_path):
-    """Reloading with N=0 (the default / disabled state) must drop ALL non-
-    trimmable entries — byte-for-byte the #1075 drop-at-store behavior applied
-    after a restart. This is the core "default is unchanged" guarantee."""
+def test_persistent_load_retains_all_when_disabled(tmp_path):
+    """#1111 regression: reloading with N=0 (the default / disabled state) is an
+    EXPLICIT import, so it must RETAIN every imported non-trimmable entry — the
+    retention bound does not gate an operator's deliberate disk import (#476).
+
+    ``hybrid_reuse_max_entries`` governs opportunistic within-session prefix
+    reuse at STORE time; N=0 disables that opportunistic retention. It does NOT
+    mean "reject an explicit disk import". #1111 wrongly gated the load commit
+    on N <= 0, so a default-config import dropped its own entries and reported
+    ``entries_loaded == 0``. The store-path #1075 anti-leak drop is unaffected —
+    the live-store loop still drops non-trimmable entries at N=0 (guarded by
+    ``test_hybrid_store_is_dropped`` / ``test_default_config_keeps_drop_policy``
+    above)."""
     cache_dir = _persist_three_hybrid_entries(tmp_path)
 
     dst_config = MemoryCacheConfig(
@@ -626,16 +635,18 @@ def test_persistent_load_drops_all_when_disabled(tmp_path):
     loaded = dst.load_from_disk(cache_dir, replace=True)
 
     stats = dst.get_stats()
-    assert stats["non_trimmable_entries"] == 0, (
-        "With reuse disabled, a restart must retain NO non-trimmable entries"
+    assert stats["non_trimmable_entries"] == 3, (
+        "An explicit import must retain all imported non-trimmable entries "
+        "even with opportunistic retention disabled (N=0)"
     )
-    assert len(dst._entries) == 0
-    assert loaded == 0
+    assert len(dst._entries) == 3
+    assert loaded == 3
 
 
-def test_persistent_load_keeps_trimmable_entries_when_disabled(tmp_path):
-    """The disabled-state drop is scoped to NON-trimmable entries only — a
-    persisted dense (all-KVCache) entry must still reload normally with N=0."""
+def test_persistent_load_keeps_both_kinds_when_disabled(tmp_path):
+    """#1111 regression: an explicit import with N=0 must reload BOTH a dense
+    (trimmable KVCache) entry AND a hybrid (non-trimmable ArraysCache) entry —
+    the retention bound gates neither on the explicit disk-import path."""
     import mlx.core as mx
     from mlx_lm.models.cache import KVCache
 
@@ -652,8 +663,9 @@ def test_persistent_load_keeps_trimmable_entries_when_disabled(tmp_path):
     mx.eval(dense.state)
     dense_key = list(range(500, 508))
     assert src.store(dense_key, [dense]) is True
-    # One hybrid entry too, so we can prove the drop is selective.
-    src.store(list(range(1000, 1008)), _real_hybrid_cache())
+    # One hybrid entry too, so we can prove the reload covers both kinds.
+    hybrid_key = list(range(1000, 1008))
+    src.store(hybrid_key, _real_hybrid_cache())
 
     cache_dir = str(tmp_path / "snap")
     assert src.save_to_disk(cache_dir) is True
@@ -664,9 +676,14 @@ def test_persistent_load_keeps_trimmable_entries_when_disabled(tmp_path):
     dst = MemoryAwarePrefixCache(MagicMock(), dst_config)
     dst.load_from_disk(cache_dir, replace=True)
 
-    assert dst.get_stats()["non_trimmable_entries"] == 0
+    assert dst.get_stats()["non_trimmable_entries"] == 1, (
+        "The hybrid (non-trimmable) entry must survive an N=0 explicit import"
+    )
     assert tuple(dense_key) in dst._entries, (
         "Dense (trimmable) entries must survive an N=0 reload"
+    )
+    assert tuple(hybrid_key) in dst._entries, (
+        "Hybrid (non-trimmable) entries must survive an N=0 explicit import"
     )
 
 
@@ -712,3 +729,36 @@ def test_merge_load_into_full_hybrid_cache_counts_only_imported(tmp_path):
     assert tuple(range(9000, 9008)) not in dst._entries
     # loaded_bytes ledger must stay coherent (non-negative, matches survivor).
     assert dst._last_load_bytes > 0
+
+
+def test_load_bound_seam_disabled_retains_but_positive_bound_trims(tmp_path):
+    """#1111 regression guard — pins the exact seam of the fix: the SAME 3-entry
+    snapshot imported under N=0 vs N=2 must yield DIFFERENT retention.
+
+    * N=0 (retention disabled): an explicit import retains ALL 3 non-trimmable
+      entries — the retention bound does not gate the disk-import path.
+    * N>0 (retention enabled): the load path still LRU-trims the reloaded
+      snapshot down to N, so #1111's bounded guarantee holds on reload.
+
+    A test-targeted "always keep on load" hack would make the N=2 arm keep 3;
+    the store-path-parity hack #1111 shipped would make the N=0 arm keep 0.
+    Only the intended seam (bound applies on load iff N>0) passes both arms."""
+    cache_dir = _persist_three_hybrid_entries(tmp_path)
+
+    disabled = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=0
+        ),
+    )
+    assert disabled.load_from_disk(cache_dir, replace=True) == 3
+    assert disabled.get_stats()["non_trimmable_entries"] == 3
+
+    bounded = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=2
+        ),
+    )
+    assert bounded.load_from_disk(cache_dir, replace=True) == 2
+    assert bounded.get_stats()["non_trimmable_entries"] == 2

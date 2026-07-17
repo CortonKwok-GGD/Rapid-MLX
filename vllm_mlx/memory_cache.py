@@ -1944,20 +1944,29 @@ class MemoryAwarePrefixCache:
         #1103: non-trimmable entries carry unique-superset keys across
         conversations (#1025), so unlike KV-only entries they are never
         reclaimed by prefix-subset eviction and can pile up unbounded. This
-        bound is the single source of truth for how many are retained and is
-        shared by BOTH the store path (after inserting a fresh non-trimmable
-        entry) and the persistent-load commit path (after installing a staged
-        set, which may carry legacy hybrid entries from a pre-#1075 snapshot).
+        bound is the single source of truth for how many are retained.
 
-        Semantics MATCH the store-time gate exactly:
+        Semantics:
 
         * ``hybrid_reuse_max_entries <= 0`` (disabled, the default) → drop ALL
-          non-trimmable entries, so a server restart that reloads a snapshot is
-          byte-for-byte the #1075 drop-at-store behavior — including retaining
-          NONE when N == 0.
+          non-trimmable entries (``keep = max(limit, 0) == 0``).
         * ``> 0`` → LRU-evict the oldest non-trimmable entries until at most N
           remain. ``_entries`` is an ``OrderedDict`` in LRU order, so the head
           of the filtered list is the least-recently-used.
+
+        Call sites and why they differ on the ``N <= 0`` case:
+
+        * The live-STORE path (after inserting a fresh non-trimmable entry)
+          calls this UNCONDITIONALLY — including ``N <= 0`` — because that path
+          is the opportunistic within-session prefix reuse the bound governs;
+          dropping at store when disabled is the #1075 anti-leak policy.
+        * The persistent-LOAD / disk-import commit path calls this ONLY when
+          ``N > 0`` (#1111 regression fix). An explicit import (#476) is an
+          operator deliberately installing entries, NOT opportunistic
+          retention, so ``N <= 0`` must not drop what was explicitly loaded.
+          When ``N > 0`` the load path still trims a reloaded snapshot down to
+          N. Callers on the load path reconcile the returned victim keys
+          against only the freshly-imported (``staged``) entries.
         """
         limit = self._config.hybrid_reuse_max_entries
         non_trimmable_keys = [
@@ -3430,26 +3439,43 @@ class MemoryAwarePrefixCache:
 
                 loaded_bytes += entry.memory_bytes
 
-            # #1103 codex BLOCKING-1: loaded snapshots can carry non-trimmable
-            # hybrid entries (flagged at staging above). Unlike the store path,
-            # nothing gated them on the way in, so a restart could retain them
-            # ABOVE ``hybrid_reuse_max_entries`` — or retain them at all when
-            # N == 0 — breaking both the opt-in AND the bounded guarantee.
-            # Enforce the SAME bound the store path applies: with N <= 0 this
-            # drops every non-trimmable entry (byte-for-byte #1075 after a
-            # restart); with N > 0 it LRU-trims down to N. Runs inside the
-            # commit critical section so a scraper never sees an over-bound
-            # cache. Reconcile the reported tallies against ONLY the evicted
-            # keys that belonged to THIS import (``staged``): in merge mode the
-            # bound can evict PRE-EXISTING non-trimmable entries too, and those
-            # were never counted in ``loaded`` / ``loaded_bytes``, so
+            # #1111 regression fix: an explicit disk load / import is an
+            # operator DELIBERATELY installing specific entries (#476 export ->
+            # import). It is NOT the opportunistic within-session prefix-reuse
+            # STORE path, so the *retention* bound must not silently drop what
+            # was explicitly imported. ``hybrid_reuse_max_entries`` governs how
+            # many non-trimmable entries the live-store path keeps hot; N == 0
+            # means "opportunistic hybrid reuse is DISABLED", not "reject every
+            # imported hybrid entry". #1111 conflated the two and gated the load
+            # commit on N <= 0, so a default-config import dropped its own
+            # ArraysCache entry -> entries_loaded == 0 (roundtrip broke).
+            #
+            # Correct seam:
+            #  * N <= 0 (default / disabled): DO NOT drop on load. The explicit
+            #    import installs every staged entry; the retention bound simply
+            #    does not apply to an operator-initiated load. This does NOT
+            #    re-open the #1075 leak: that leak is the LIVE-store loop
+            #    accumulating cross-conversation unique-superset keys unbounded
+            #    (still gated at store, unchanged). A one-time load of an
+            #    already-bounded snapshot file is not that loop.
+            #  * N > 0: still LRU-trim a loaded snapshot down to N, so a
+            #    reloaded snapshot can never exceed the configured retention
+            #    size — matching the live-session bound (#1111's bounded
+            #    guarantee is preserved for the opt-in path).
+            #
+            # Runs inside the commit critical section so a scraper never sees an
+            # over-bound cache. Reconcile the reported tallies against ONLY the
+            # evicted keys that belonged to THIS import (``staged``): in merge
+            # mode the bound can evict PRE-EXISTING non-trimmable entries too,
+            # and those were never counted in ``loaded`` / ``loaded_bytes``, so
             # subtracting them would under-count (potentially to 0) a load that
             # actually installed new entries.
-            for victim in self._enforce_hybrid_bound_locked():
-                staged_entry = staged.get(victim)
-                if staged_entry is not None:
-                    loaded -= 1
-                    loaded_bytes -= staged_entry.memory_bytes
+            if self._config.hybrid_reuse_max_entries > 0:
+                for victim in self._enforce_hybrid_bound_locked():
+                    staged_entry = staged.get(victim)
+                    if staged_entry is not None:
+                        loaded -= 1
+                        loaded_bytes -= staged_entry.memory_bytes
 
             self._stats.entry_count = len(self._entries)
             self._stats.current_memory_bytes = self._current_memory
