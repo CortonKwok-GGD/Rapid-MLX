@@ -62,11 +62,12 @@ def test_response_cache_counters_reflect_singleton_state(metrics_client):
 
     c = get_response_cache()
     c.configure(4)
-    c.get("miss-a")  # miss
-    c.put("k", object())
-    c.get("k")  # hit
-    c.get("k")  # hit
-    c.get("miss-b")  # miss
+    ep = c.current_epoch()
+    c.get("miss-a", ep)  # miss
+    c.put("k", object(), ep)
+    c.get("k", ep)  # hit
+    c.get("k", ep)  # hit
+    c.get("miss-b", ep)  # miss
 
     body = metrics_client.client.get("/metrics").text
     lines = _metric_lines(body)

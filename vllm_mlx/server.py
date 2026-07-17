@@ -1529,21 +1529,34 @@ def load_model(
 
     # Opt-in prompt-deterministic response cache: configure the process
     # singleton's LRU capacity from the resolved SchedulerConfig knob.
-    # 0 (default) keeps the cache inert. ``configure_response_cache`` also
-    # DROPS all cached entries — a stored completion is only valid for the
-    # exact model artifact that produced it, but the key spans only the
-    # model id, so clearing on every (re)load prevents serving completions
-    # from a previously-loaded model after a hot reload of changed weights
-    # under the same id. Best-effort: a cache-config failure must never
-    # block model load.
+    # 0 (default) keeps the cache inert. ``configure_response_cache``
+    # atomically sets capacity, clears the store, and bumps the epoch — a
+    # stored completion is only valid for the exact model artifact that
+    # produced it, but the key spans only the model id, so this (re)load
+    # invalidation prevents serving completions from a previously-loaded
+    # model after a hot reload of changed weights under the same id.
+    # Best-effort: a cache-config failure must never block model load — but
+    # on failure we must NOT leave the PREVIOUS cache live under the NEW
+    # model (that would serve stale cross-model output), so force the cache
+    # to a disabled + empty state before falling through.
     try:
         from .response_cache import configure_response_cache
 
         configure_response_cache(
             int(getattr(scheduler_config, "response_cache_entries", 0) or 0)
         )
-    except Exception as _rc_e:  # pragma: no cover — defensive
-        logger.debug(f"response cache configure failed (non-fatal): {_rc_e}")
+    except Exception as _rc_e:
+        logger.warning(
+            f"response cache reconfigure failed on model load ({_rc_e}); "
+            "forcing the cache disabled + empty so it cannot serve stale "
+            "cross-model output"
+        )
+        try:
+            from .response_cache import get_response_cache
+
+            get_response_cache().reconfigure(0)
+        except Exception:  # pragma: no cover — defensive
+            pass
 
     # Set native tool format support on the engine (thread-safe via instance property)
     _engine.preserve_native_tool_format = _detect_native_tool_support()

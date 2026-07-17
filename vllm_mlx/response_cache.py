@@ -80,6 +80,25 @@ class ResponseCache:
     serialized response body plus the small amount of metadata it needs
     to rebuild a fresh :class:`Response` (with a new ``id`` / ``created``)
     on a hit.
+
+    Epoch versioning
+    ----------------
+    A stored completion is only valid for the exact model artifact that
+    produced it, but the cache key spans only the model *id* (not the
+    weights), so a hot reload of changed weights under the same id must
+    invalidate the whole cache. :meth:`reconfigure` — the load-time entry
+    point — bumps ``_epoch`` while it clears the store, all under ONE lock
+    acquisition. Every :meth:`get`/:meth:`put` carries the epoch the
+    caller observed at request start: an operation whose epoch no longer
+    matches the current one is rejected. This closes two holes that
+    clear-on-load alone could not:
+
+    * split-lock TOCTOU — capacity-set and clear were two separate lock
+      acquisitions; now they are one atomic critical section.
+    * in-flight-put poisoning — an old-model generation still running when
+      the reload happens would otherwise ``put`` its stale completion into
+      the freshly-cleared cache; its epoch is now stale, so the ``put`` is
+      dropped.
     """
 
     def __init__(self, capacity: int = 0) -> None:
@@ -91,6 +110,9 @@ class ResponseCache:
         # Counters are process-local and monotonic (see module docstring).
         self._hits = 0
         self._misses = 0
+        # Bumped on every load-time reconfigure; gates get/put against the
+        # epoch the caller observed at request start (see class docstring).
+        self._epoch = 0
 
     @property
     def enabled(self) -> bool:
@@ -101,15 +123,28 @@ class ResponseCache:
     def capacity(self) -> int:
         return self._capacity
 
-    def configure(self, capacity: int) -> None:
-        """(Re)set the LRU capacity.
+    def current_epoch(self) -> int:
+        """Return the current epoch (read under the lock).
 
-        Called once at server boot from the resolved
-        ``SchedulerConfig.response_cache_entries``. Shrinking capacity
-        evicts the coldest entries so the invariant ``len <= capacity``
-        holds immediately. Counters are intentionally NOT reset here —
-        they are process-lifetime monotonic. ``configure(0)`` disables
-        the cache and clears the store.
+        The chat route captures this ONCE at request start and threads the
+        same value into its later :meth:`get` and :meth:`put` so a request
+        that began under the previous model cannot read or poison the
+        cache after a reload bumps the epoch.
+        """
+        with self._lock:
+            return self._epoch
+
+    def configure(self, capacity: int) -> None:
+        """(Re)set the LRU capacity WITHOUT bumping the epoch or clearing.
+
+        Kept for callers that only want a capacity change (e.g. a runtime
+        resize) with the existing entries intact. The load path uses
+        :meth:`reconfigure` instead, which additionally clears + bumps the
+        epoch for cross-model invalidation. Shrinking capacity evicts the
+        coldest entries so ``len <= capacity`` holds immediately. Counters
+        are intentionally NOT reset here — they are process-lifetime
+        monotonic. ``configure(0)`` disables the cache and clears the
+        store.
         """
         if capacity < 0:
             raise ValueError("ResponseCache capacity must be >= 0")
@@ -121,7 +156,26 @@ class ResponseCache:
             while len(self._store) > self._capacity:
                 self._store.popitem(last=False)
 
-    def get(self, key: str) -> Any | None:
+    def reconfigure(self, capacity: int) -> None:
+        """Atomic load-time (re)configuration: set capacity, clear, bump epoch.
+
+        This is the model-load invalidation point. All three effects
+        happen under a SINGLE lock acquisition so there is no window in
+        which the new capacity is live but the old entries have not yet
+        been dropped (the split-lock TOCTOU that ``configure`` + ``clear``
+        had). Bumping ``_epoch`` additionally invalidates any in-flight
+        request that observed the previous epoch — its later ``put`` is
+        dropped, so an old-model generation completing after the reload
+        cannot poison the freshly-cleared cache.
+        """
+        if capacity < 0:
+            raise ValueError("ResponseCache capacity must be >= 0")
+        with self._lock:
+            self._capacity = int(capacity)
+            self._store.clear()
+            self._epoch += 1
+
+    def get(self, key: str, epoch: int) -> Any | None:
         """Return the stored value for ``key`` and mark it MRU, or None.
 
         A hit ticks the hit counter AND moves the entry to the most-
@@ -130,10 +184,20 @@ class ResponseCache:
         (capacity 0) this is a no-op that returns None and ticks NOTHING
         — an inert cache must have zero observable effect, including on
         metrics.
+
+        ``epoch`` is the value the caller observed at request start via
+        :meth:`current_epoch`. If it no longer matches the current epoch
+        (a reload happened mid-request) the lookup is rejected: it returns
+        None and ticks NOTHING — a stale-epoch request is not a real
+        lookup outcome, so it must not consume a new-model entry nor
+        distort the hit/miss counters.
         """
-        if self._capacity == 0:
-            return None
         with self._lock:
+            # Disabled/stale checks live INSIDE the lock so a concurrent
+            # reconfigure() cannot flip capacity or epoch between the check
+            # and the store access while we still tick a miss.
+            if self._capacity == 0 or epoch != self._epoch:
+                return None
             if key in self._store:
                 self._store.move_to_end(key)
                 self._hits += 1
@@ -141,16 +205,22 @@ class ResponseCache:
             self._misses += 1
             return None
 
-    def put(self, key: str, value: Any) -> None:
+    def put(self, key: str, value: Any, epoch: int) -> None:
         """Insert ``value`` under ``key`` as the most-recently-used entry.
 
         No-op when disabled (capacity 0). On overflow, evicts the
         least-recently-used entry (``last=False``). Re-inserting an
         existing key refreshes both its value and its recency.
+
+        ``epoch`` is the value the caller observed at request start via
+        :meth:`current_epoch`. If it no longer matches the current epoch
+        the store is dropped: an old-model generation that finishes after
+        a reload must not poison the freshly-cleared cache.
         """
-        if self._capacity == 0:
-            return
         with self._lock:
+            # Disabled/stale checks live INSIDE the lock (see get()).
+            if self._capacity == 0 or epoch != self._epoch:
+                return
             if key in self._store:
                 self._store.move_to_end(key)
             self._store[key] = value
@@ -158,7 +228,7 @@ class ResponseCache:
                 self._store.popitem(last=False)
 
     def clear(self) -> None:
-        """Drop all cached entries (does not touch counters)."""
+        """Drop all cached entries (does not touch counters or epoch)."""
         with self._lock:
             self._store.clear()
 
@@ -341,20 +411,18 @@ def get_response_cache() -> ResponseCache:
 
 
 def configure_response_cache(capacity: int) -> None:
-    """(Re)configure the singleton at model load and DROP all cached entries.
+    """(Re)configure the singleton at model load — atomic invalidation.
 
     Called once per ``load_model`` (server boot AND every hot reload). A
     stored completion is only valid for the exact model artifact that
     produced it, but the cache key spans just the model *id* + inputs — not
     the underlying weights. Reloading changed weights under the same id
-    would otherwise serve completions from the PREVIOUS model. Clearing the
-    store on every (re)configure makes a reload start from an empty cache,
-    so no cross-model-version stale hit is possible. ``configure`` alone
-    preserves entries whenever capacity stays positive, so the explicit
-    ``clear`` is required — it is the load-time invalidation point.
+    would otherwise serve completions from the PREVIOUS model. Delegates to
+    :meth:`ResponseCache.reconfigure`, which — under one lock acquisition —
+    sets the new capacity, clears the store, and bumps the epoch so any
+    in-flight old-model request cannot read or poison the new-model cache.
     """
-    _response_cache.configure(capacity)
-    _response_cache.clear()
+    _response_cache.reconfigure(capacity)
 
 
 def reset_response_cache_for_tests() -> None:

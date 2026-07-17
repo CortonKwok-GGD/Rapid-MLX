@@ -2316,6 +2316,12 @@ async def _create_chat_completion_impl(
     # plain miss (correct); only an exact deterministic match is served.
     _response_cache = None
     _response_cache_key: str | None = None
+    # Epoch captured ONCE at request start and threaded into BOTH the
+    # lookup and the later store. A model reload bumps the cache epoch; a
+    # request that began under the previous model keeps the old epoch, so
+    # its lookup can't consume a new-model entry and its store is dropped
+    # (no cross-model poisoning). See ResponseCache epoch versioning.
+    _response_cache_epoch = 0
     _cacheable = (
         not request.stream
         and not has_media
@@ -2325,6 +2331,7 @@ async def _create_chat_completion_impl(
     if _cacheable:
         _response_cache = get_response_cache()
         if _response_cache.enabled:
+            _response_cache_epoch = _response_cache.current_epoch()
             # Key on the SAME inputs the engine's generation path consumes,
             # NOT a second independent render. The engine renders the prompt
             # internally from ``messages`` via ``_apply_chat_template`` at
@@ -2366,7 +2373,9 @@ async def _create_chat_completion_impl(
             # path.
             if _computed_key is not UNCACHEABLE:
                 _response_cache_key = _computed_key
-                _cached = _response_cache.get(_response_cache_key)
+                _cached = _response_cache.get(
+                    _response_cache_key, _response_cache_epoch
+                )
                 if _cached is not None:
                     # HIT — rebuild a fresh Response from the stored
                     # ChatCompletionResponse with a new id/created
@@ -3645,8 +3654,13 @@ async def _create_chat_completion_impl(
     # so the guard is just an early-out for the common inert path. We
     # store the ChatCompletionResponse object; a later hit rebuilds a
     # fresh Response with a new id/created from it.
+    #
+    # The store carries the epoch captured at request start: if a model
+    # reload happened while this (old-model) request was generating, the
+    # epoch is now stale and ``put`` drops the write — so an in-flight
+    # old-model completion can never poison the freshly-reloaded cache.
     if _response_cache is not None and _response_cache_key is not None:
-        _response_cache.put(_response_cache_key, chat_response)
+        _response_cache.put(_response_cache_key, chat_response, _response_cache_epoch)
     # L-05: surface silent ``enable_thinking`` drop on non-Qwen parsers.
     # Empty dict when the client didn't set the flag OR the active
     # parser honors it (qwen3) — kwargs spread is the right shape.

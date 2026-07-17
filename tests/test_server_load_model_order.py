@@ -189,6 +189,62 @@ def test_load_model_mtp_kwarg_rejects_conflicting_dflash_config():
         )
 
 
+def test_load_model_response_cache_reconfigure_failure_forces_disabled(monkeypatch):
+    """If ``configure_response_cache`` raises during ``load_model``, the
+    swallowing except-path must NOT leave the PREVIOUS cache live under the
+    NEW model (that would serve stale cross-model output). It must force the
+    cache to a disabled + empty state.
+
+    Mutation-kill: remove the ``get_response_cache().reconfigure(0)`` from
+    the except path → the pre-seeded entry survives and the cache stays
+    enabled, so this fails.
+    """
+    from vllm_mlx import response_cache as rc
+    from vllm_mlx import server
+
+    # Pre-seed a live, populated cache — simulating the PREVIOUS model's
+    # cache still holding entries when the reload begins.
+    rc.reset_response_cache_for_tests()
+    cache = rc.get_response_cache()
+    cache.reconfigure(16)  # enabled
+    ep = cache.current_epoch()
+    cache.put("prev-model-key", "prev-model-output", ep)
+    assert cache.enabled is True
+    assert cache.snapshot()["entries"] == 1
+
+    # Make the load-path reconfigure blow up (e.g. a parse error on the
+    # resolved capacity, or any internal failure).
+    def _boom(_capacity):
+        raise RuntimeError("simulated reconfigure failure")
+
+    monkeypatch.setattr(rc, "configure_response_cache", _boom)
+
+    monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
+    monkeypatch.setattr(server, "_engine", None, raising=False)
+    monkeypatch.setattr(server, "_enable_auto_tool_choice", False, raising=False)
+    monkeypatch.setattr(server, "_tool_call_parser", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser_name", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser", None, raising=False)
+    monkeypatch.setattr(server, "_tool_parser_instance", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
+    monkeypatch.setattr(server, "_model_alias", None, raising=False)
+
+    # load_model must NOT raise (best-effort), but must force the cache safe.
+    server.load_model("mlx-community/Qwen3.5-9B-4bit")
+
+    cache = rc.get_response_cache()
+    assert cache.enabled is False, (
+        "reconfigure failure left the cache ENABLED — it could serve stale "
+        "cross-model completions"
+    )
+    assert cache.snapshot()["entries"] == 0, (
+        "reconfigure failure left the PREVIOUS model's entries live"
+    )
+
+    rc.reset_response_cache_for_tests()
+
+
 def test_load_model_mtp_kwarg_rejects_legacy_optimistic_config():
     """PR #1050 hard-reject: server.load_model(mtp=True) with a
     scheduler_config carrying ``mtp_optimistic=True`` must fail because
