@@ -592,9 +592,13 @@ def _persist_three_hybrid_entries(tmp_path) -> str:
     return cache_dir
 
 
-def test_persistent_load_respects_hybrid_bound(tmp_path):
-    """Reloading a snapshot of 3 hybrid entries with N=1 must retain only 1 —
-    the bound is applied at commit time, exactly like the store path."""
+def test_persistent_load_imports_are_protected_from_bound(tmp_path):
+    """#1111 regression (PROTECTED-entry semantics): reloading a snapshot of 3
+    hybrid entries with a LOW bound (N=1) must still retain ALL 3 — imported
+    entries are PROTECTED (SGLang ``lock_ref`` / vLLM ``ref_cnt`` idiom) and
+    exempt from the opportunistic retention bound, which governs live-store
+    entries only. The bound would otherwise LRU-trim a reloaded snapshot below
+    what the operator explicitly imported."""
     cache_dir = _persist_three_hybrid_entries(tmp_path)
 
     dst_config = MemoryCacheConfig(
@@ -604,13 +608,13 @@ def test_persistent_load_respects_hybrid_bound(tmp_path):
     loaded = dst.load_from_disk(cache_dir, replace=True)
 
     stats = dst.get_stats()
-    assert stats["non_trimmable_entries"] == 1, (
-        "Persistent load must LRU-trim hybrid entries down to the bound"
+    assert stats["non_trimmable_entries"] == 3, (
+        "Imported (protected) entries must survive the retention bound"
     )
-    assert len(dst._entries) == 1
-    # The reported loaded count must reflect only SURVIVING entries, not the
-    # 3 that were staged before the bound trimmed 2 away.
-    assert loaded == 1
+    assert len(dst._entries) == 3
+    assert loaded == 3
+    # All installed entries carry the protected marker.
+    assert all(e.protected for e in dst._entries.values())
 
 
 def test_persistent_load_retains_all_when_disabled(tmp_path):
@@ -687,15 +691,19 @@ def test_persistent_load_keeps_both_kinds_when_disabled(tmp_path):
     )
 
 
-def test_merge_load_into_full_hybrid_cache_counts_only_imported(tmp_path):
-    """#1103 codex BLOCKING-1: merge-loading (replace=False) ONE new hybrid
-    entry into a cache already AT the bound must report ``loaded == 1``.
+def test_merge_load_evicts_opportunistic_not_imported(tmp_path):
+    """#1111 regression: merge-loading (replace=False) an imported entry into a
+    cache that already holds OPPORTUNISTIC entries AT the bound must evict the
+    OPPORTUNISTIC (unprotected) one, never the imported (protected) one, and
+    report ``loaded == 1``.
 
-    The bound pass runs at commit and, being LRU, evicts the PRE-EXISTING
-    entry (older) to make room for the freshly imported one. That eviction
-    must NOT be subtracted from the import's ``loaded`` tally — the old code
-    subtracted every bound eviction and returned 0 (or corrupted the byte
-    total) for a load that actually installed a new entry.
+    Ports SGLang's protected/evictable split: the retention bound acts on the
+    evictable (opportunistic live-store #1075) set ONLY. The imported entry is
+    protected, so it survives; a pre-existing OPPORTUNISTIC entry above the
+    bound is the LRU victim. That eviction belongs to the destination, not this
+    import, so it must NOT be subtracted from the import's ``loaded`` tally (the
+    reconciliation loop only nets ``staged`` victims — and imports are never
+    victims).
     """
     # Snapshot on disk: a single NEW hybrid entry to import.
     src_config = MemoryCacheConfig(
@@ -706,43 +714,72 @@ def test_merge_load_into_full_hybrid_cache_counts_only_imported(tmp_path):
     cache_dir = str(tmp_path / "snap")
     assert src.save_to_disk(cache_dir) is True
 
-    # Destination already holds a pre-existing hybrid entry and the bound is
-    # N=1, so it is already FULL before the import.
+    # Destination already holds TWO pre-existing OPPORTUNISTIC (unprotected)
+    # hybrid entries under N=2, so it is FULL of evictable entries before the
+    # import. These were stored live, so ``protected`` is False.
     dst_config = MemoryCacheConfig(
-        max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=1
+        max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=2
     )
     dst = MemoryAwarePrefixCache(MagicMock(), dst_config)
     assert dst.store(list(range(9000, 9008)), _real_hybrid_cache()) is True
-    assert dst.get_stats()["non_trimmable_entries"] == 1
+    assert dst.store(list(range(9100, 9108)), _real_hybrid_cache()) is True
+    assert dst.get_stats()["non_trimmable_entries"] == 2
+    assert not dst._entries[tuple(range(9000, 9008))].protected
 
     loaded = dst.load_from_disk(cache_dir, replace=False)
 
-    # The imported entry survived the bound (it is the most-recent), the
-    # pre-existing one was LRU-evicted — but that eviction belongs to the
-    # destination, not this import, so the imported count stays 1.
-    assert loaded == 1, (
-        "Merge-load must count the surviving imported entry, not net it "
-        "against the pre-existing entry the bound evicted"
-    )
-    assert dst.get_stats()["non_trimmable_entries"] == 1
+    # The import is protected -> survives regardless of the bound. The bound's
+    # evictable set is now the 2 opportunistic entries (imports excluded);
+    # N=2 keeps both, so nothing is evicted and the import is purely additive.
+    assert loaded == 1, "Merge-load must count only the imported entry"
     assert tuple(range(7000, 7008)) in dst._entries
-    assert tuple(range(9000, 9008)) not in dst._entries
+    assert dst._entries[tuple(range(7000, 7008))].protected
+    assert tuple(range(9000, 9008)) in dst._entries
+    assert tuple(range(9100, 9108)) in dst._entries
     # loaded_bytes ledger must stay coherent (non-negative, matches survivor).
     assert dst._last_load_bytes > 0
 
 
-def test_load_bound_seam_disabled_retains_but_positive_bound_trims(tmp_path):
+def test_enforcer_never_evicts_protected_imports(tmp_path):
+    """The enforcer's victim list must NEVER contain a protected (imported) key,
+    even when the bound is far below the number of imported entries. This is the
+    direct invariant the load-commit reconciliation relies on: because staged
+    imports are protected, they are never victims, so the ``loaded`` tally is
+    never spuriously netted down.
+
+    Imports 3 protected entries under N=1 and asserts the enforcer, invoked
+    directly, evicts none of them (returns an empty victim list)."""
+    cache_dir = _persist_three_hybrid_entries(tmp_path)
+    dst = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=1
+        ),
+    )
+    assert dst.load_from_disk(cache_dir, replace=True) == 3
+    assert all(e.protected for e in dst._entries.values())
+
+    # Directly invoke the enforcer: the evictable (unprotected) candidate set is
+    # empty, so nothing is evicted regardless of the tight N=1 bound.
+    with dst._lock:
+        victims = dst._enforce_hybrid_bound_locked()
+    assert victims == []
+    assert dst.get_stats()["non_trimmable_entries"] == 3
+
+
+def test_load_seam_imports_protected_at_any_bound(tmp_path):
     """#1111 regression guard — pins the exact seam of the fix: the SAME 3-entry
-    snapshot imported under N=0 vs N=2 must yield DIFFERENT retention.
+    imported snapshot retains ALL 3 under BOTH N=0 (disabled) and a low N=1
+    bound, because imported entries are PROTECTED and exempt from the
+    opportunistic retention bound at every N.
 
-    * N=0 (retention disabled): an explicit import retains ALL 3 non-trimmable
-      entries — the retention bound does not gate the disk-import path.
-    * N>0 (retention enabled): the load path still LRU-trims the reloaded
-      snapshot down to N, so #1111's bounded guarantee holds on reload.
-
-    A test-targeted "always keep on load" hack would make the N=2 arm keep 3;
-    the store-path-parity hack #1111 shipped would make the N=0 arm keep 0.
-    Only the intended seam (bound applies on load iff N>0) passes both arms."""
+    Mutation checks:
+    * The #1111 store-parity behavior (drop-on-load at N<=0) would make the N=0
+      arm keep 0 -> fails here.
+    * A "bound also trims imports at N>0" behavior would make the N=1 arm keep 1
+      -> fails here.
+    Only the protected/evictable split (imports never counted against the bound)
+    passes both arms."""
     cache_dir = _persist_three_hybrid_entries(tmp_path)
 
     disabled = MemoryAwarePrefixCache(
@@ -754,11 +791,61 @@ def test_load_bound_seam_disabled_retains_but_positive_bound_trims(tmp_path):
     assert disabled.load_from_disk(cache_dir, replace=True) == 3
     assert disabled.get_stats()["non_trimmable_entries"] == 3
 
-    bounded = MemoryAwarePrefixCache(
+    low_bound = MemoryAwarePrefixCache(
         MagicMock(),
         MemoryCacheConfig(
-            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=2
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=1
         ),
     )
-    assert bounded.load_from_disk(cache_dir, replace=True) == 2
-    assert bounded.get_stats()["non_trimmable_entries"] == 2
+    assert low_bound.load_from_disk(cache_dir, replace=True) == 3
+    assert low_bound.get_stats()["non_trimmable_entries"] == 3
+
+
+def test_import_survives_a_later_unrelated_live_store(tmp_path):
+    """#1111 codex BLOCKING (load-then-store mutation-kill): the CORE bug was
+    that an imported non-trimmable entry survived the load MOMENT but the next
+    ordinary live ``store`` that fired the retention enforcer LRU-evicted it —
+    so an import survived ZERO subsequent requests.
+
+    With the protected-entry fix the imported entry is exempt from the enforcer
+    at the LIVE-STORE call site too, so it survives an unrelated later store.
+    Exercised under N>0 (where a fresh opportunistic hybrid store IS admitted
+    and DOES fire the enforcer at the store call site — the only config where
+    the enforcer can run after an import). Reverting the protected exclusion in
+    ``_enforce_hybrid_bound_locked`` makes this assertion fail."""
+    # Import a hybrid entry (protected) into an N=1 cache.
+    src = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=9
+        ),
+    )
+    assert src.store(list(range(1000, 1008)), _real_hybrid_cache()) is True
+    cache_dir = str(tmp_path / "snap")
+    assert src.save_to_disk(cache_dir) is True
+
+    dst = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=1
+        ),
+    )
+    assert dst.load_from_disk(cache_dir, replace=True) == 1
+    imported_key = tuple(range(1000, 1008))
+    assert imported_key in dst._entries
+    assert dst._entries[imported_key].protected
+
+    # An UNRELATED later live store of a fresh opportunistic hybrid entry. At
+    # N=1 this IS admitted (bypasses the N<=0 store gate) and fires the enforcer
+    # at the store call site over the whole non-trimmable set.
+    assert dst.store(list(range(2000, 2008)), _real_hybrid_cache()) is True
+
+    # The imported (protected) entry MUST still be present — it survived the
+    # enforcer that ran during the unrelated store.
+    assert imported_key in dst._entries, (
+        "Imported entry was wiped by a later unrelated live store — the "
+        "protected exclusion regressed (#1111 codex BLOCKING)"
+    )
+    # Both survive: the protected import + the 1 opportunistic entry within N=1.
+    assert dst.get_stats()["non_trimmable_entries"] == 2
+    assert tuple(range(2000, 2008)) in dst._entries
