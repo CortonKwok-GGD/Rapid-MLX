@@ -1545,8 +1545,10 @@ def load_model(
     #
     # Best-effort: a cache-config failure must never block model load — but
     # on failure the PREVIOUS cache must NOT stay live under the NEW model
-    # (that would serve stale cross-model output), so force the cache to a
-    # disabled + empty state before falling through.
+    # (that would serve stale cross-model output). The fail-safe rebinds the
+    # singleton to a fresh disabled instance via ``force_disable_response_
+    # cache`` rather than calling a method on the possibly-wedged instance
+    # that just failed — a fresh capacity-0 object is inert by construction.
     try:
         from .response_cache import configure_response_cache
 
@@ -1560,9 +1562,9 @@ def load_model(
             "cross-model output"
         )
         try:
-            from .response_cache import get_response_cache
+            from .response_cache import force_disable_response_cache
 
-            get_response_cache().reconfigure(0)
+            force_disable_response_cache()
         except Exception:  # pragma: no cover — defensive
             pass
 

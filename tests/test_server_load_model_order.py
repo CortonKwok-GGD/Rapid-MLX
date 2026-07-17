@@ -191,13 +191,14 @@ def test_load_model_mtp_kwarg_rejects_conflicting_dflash_config():
 
 def test_load_model_response_cache_reconfigure_failure_forces_disabled(monkeypatch):
     """If ``configure_response_cache`` raises during ``load_model``, the
-    swallowing except-path must NOT leave the PREVIOUS cache live under the
-    NEW model (that would serve stale cross-model output). It must force the
-    cache to a disabled + empty state.
+    fail-safe must NOT leave the PREVIOUS cache live under the NEW model
+    (that would serve stale cross-model output). It rebinds the singleton to
+    a FRESH disabled instance — an independent fail-closed path that does not
+    reuse the possibly-wedged instance/method that just failed.
 
-    Mutation-kill: remove the ``get_response_cache().reconfigure(0)`` from
-    the except path → the pre-seeded entry survives and the cache stays
-    enabled, so this fails.
+    Mutation-kill: remove the ``force_disable_response_cache()`` call from
+    the except path → the pre-seeded, enabled cache object survives with its
+    entries, so this fails.
     """
     from vllm_mlx import response_cache as rc
     from vllm_mlx import server
@@ -205,12 +206,12 @@ def test_load_model_response_cache_reconfigure_failure_forces_disabled(monkeypat
     # Pre-seed a live, populated cache — simulating the PREVIOUS model's
     # cache still holding entries when the reload begins.
     rc.reset_response_cache_for_tests()
-    cache = rc.get_response_cache()
-    cache.reconfigure(16)  # enabled
-    ep = cache.current_epoch()
-    cache.put("prev-model-key", "prev-model-output", ep)
-    assert cache.enabled is True
-    assert cache.snapshot()["entries"] == 1
+    old_cache = rc.get_response_cache()
+    old_cache.reconfigure(16)  # enabled
+    ep = old_cache.current_epoch()
+    old_cache.put("prev-model-key", "prev-model-output", ep)
+    assert old_cache.enabled is True
+    assert old_cache.snapshot()["entries"] == 1
 
     # Make the load-path reconfigure blow up (e.g. a parse error on the
     # resolved capacity, or any internal failure).
@@ -233,14 +234,22 @@ def test_load_model_response_cache_reconfigure_failure_forces_disabled(monkeypat
     # load_model must NOT raise (best-effort), but must force the cache safe.
     server.load_model("mlx-community/Qwen3.5-9B-4bit")
 
-    cache = rc.get_response_cache()
-    assert cache.enabled is False, (
+    new_cache = rc.get_response_cache()
+    # The fail-safe rebinds to a BRAND-NEW instance — not the wedged old one.
+    assert new_cache is not old_cache, (
+        "reconfigure failure did not rebind the singleton — the old "
+        "(possibly wedged) instance is still live"
+    )
+    assert new_cache.enabled is False, (
         "reconfigure failure left the cache ENABLED — it could serve stale "
         "cross-model completions"
     )
-    assert cache.snapshot()["entries"] == 0, (
+    assert new_cache.snapshot()["entries"] == 0, (
         "reconfigure failure left the PREVIOUS model's entries live"
     )
+    # The old object's entries are irrelevant now that it is unreferenced by
+    # the singleton, but confirm the live singleton exposes none.
+    assert new_cache.capacity == 0
 
     rc.reset_response_cache_for_tests()
 

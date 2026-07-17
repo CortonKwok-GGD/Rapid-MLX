@@ -425,6 +425,20 @@ def configure_response_cache(capacity: int) -> None:
     _response_cache.reconfigure(capacity)
 
 
+def force_disable_response_cache() -> None:
+    """Rebind the singleton to a fresh, disabled cache — fail-closed reset.
+
+    Used as the fail-safe on a model-load reconfigure failure. It does NOT
+    call any method on the existing instance (which may be in the wedged
+    state that caused the failure): it replaces the module singleton with a
+    brand-new ``ResponseCache(capacity=0)``. A fresh object at capacity 0 is
+    inert by construction — no store, no lookup — so the previous model's
+    cache cannot survive the failure and serve stale cross-model output.
+    """
+    global _response_cache
+    _response_cache = ResponseCache(capacity=0)
+
+
 def reset_response_cache_for_tests() -> None:
     """Reset the singleton to a fresh, disabled cache (tests only)."""
     global _response_cache

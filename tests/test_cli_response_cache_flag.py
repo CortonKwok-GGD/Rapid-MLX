@@ -186,11 +186,36 @@ def test_scheduler_config_still_rejects_negative_as_defense_in_depth():
 # ── bench must NOT advertise the flag ─────────────────────────────────
 
 
-def test_bench_does_not_register_response_cache_entries():
+def test_bench_does_not_register_response_cache_entries(capsys):
     """The response cache is serve-only; ``bench --response-cache-entries``
     must be REJECTED by argparse (the flag was an advertised no-op and was
-    removed). A SystemExit(2) from argparse proves the flag is gone."""
+    removed).
+
+    Hardened so it cannot pass on the WRONG reason: a bare
+    ``pytest.raises(SystemExit(2))`` would also be satisfied by any downstream
+    exit-2 (e.g. bench_command later failing on the bogus model). This test
+    proves three things:
+
+      1. ``bench_command`` is NEVER reached — patched with a sentinel that
+         raises if called, so parsing must have failed before dispatch.
+      2. argparse exits with code 2 (its parse-error code).
+      3. stderr specifically names the unrecognized flag, so the exit is
+         attributable to ``--response-cache-entries`` and not some other
+         parse problem.
+
+    Mutation-kill: register ``--response-cache-entries`` on the bench parser
+    → argparse accepts it, dispatch reaches the sentinel, and the sentinel's
+    ``AssertionError`` (or the missing stderr/exit-code) turns this red.
+    """
+
+    def _must_not_run(_args):
+        raise AssertionError(
+            "bench_command was reached — argparse accepted "
+            "--response-cache-entries instead of rejecting it"
+        )
+
     with (
+        mock.patch.object(cli, "bench_command", _must_not_run),
         mock.patch.object(
             sys,
             "argv",
@@ -205,5 +230,14 @@ def test_bench_does_not_register_response_cache_entries():
         pytest.raises(SystemExit) as excinfo,
     ):
         cli.main()
+
     # argparse exits 2 on an unrecognized argument.
     assert excinfo.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "unrecognized arguments" in stderr, (
+        f"expected an argparse unrecognized-argument error, got: {stderr!r}"
+    )
+    assert "--response-cache-entries" in stderr, (
+        "the parse error must name --response-cache-entries so the exit is "
+        f"attributable to that flag, got: {stderr!r}"
+    )
