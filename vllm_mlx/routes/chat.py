@@ -63,6 +63,11 @@ from ..api.utils import (
 from ..config import get_config
 from ..engine import GenerationOutput
 from ..middleware.auth import check_rate_limit, verify_api_key
+from ..response_cache import (
+    get_response_cache,
+    is_deterministic,
+    make_cache_key,
+)
 from ..service.helpers import (
     _TOOL_USE_REQUIRED_SUFFIX,
     _TOOL_USE_SYSTEM_SUFFIX,
@@ -2290,6 +2295,89 @@ async def _create_chat_completion_impl(
             ),
         )
 
+    # ── Opt-in prompt-deterministic response cache — LOOKUP ──────────
+    #
+    # Short-circuit a completely repeated DETERMINISTIC request with the
+    # previously-computed completion: zero admission, zero engine work,
+    # zero GPU decode. Placed AFTER cloud routing (cloud requests never
+    # produce a local stored completion) and BEFORE the admission gate
+    # (a cache hit must not consume a GPU slot). Disabled by default
+    # (``--response-cache-entries 0``) → this whole block is skipped and
+    # the request path is byte-for-byte unchanged.
+    #
+    # Correctness contract (see vllm_mlx/response_cache.py): this RETURNS
+    # A STORED VALID COMPLETION — it never recomputes. At temperature==0
+    # a fresh recompute may differ by an epsilon (batched MLX SDPA
+    # numerics diverge q_len==1 vs >=2 under quant weights), but that is
+    # irrelevant: the cache serves a valid prior response, exactly like
+    # OpenAI prompt caching. We deliberately DO NOT cache streaming,
+    # multimodal, or non-greedy (sampled) requests — each is skipped as a
+    # plain miss (correct); only an exact deterministic match is served.
+    _response_cache = None
+    _response_cache_key: str | None = None
+    _cacheable = (
+        not request.stream
+        and not has_media
+        and not engine.is_mllm
+        and is_deterministic(chat_kwargs)
+    )
+    if _cacheable:
+        _response_cache = get_response_cache()
+        if _response_cache.enabled:
+            try:
+                _rendered_prompt = engine.build_prompt(
+                    messages,
+                    tools=chat_kwargs.get("tools"),
+                    enable_thinking=chat_kwargs.get("enable_thinking"),
+                )
+            except Exception:
+                # A build_prompt failure here is a real error the engine
+                # path will surface downstream; do not cache, just fall
+                # through to normal generation (which raises the proper
+                # 400/500) — swallowing it as a miss keeps the error
+                # behaviour identical to the cache-disabled path.
+                _rendered_prompt = None
+            if _rendered_prompt is not None:
+                # ``extra`` carries output-shape-affecting request fields
+                # that are NOT in chat_kwargs but change the response body
+                # (JSON coercion / logprobs field). A change in any yields
+                # a different key → miss → correct recompute.
+                _rf = request.response_format
+                _response_cache_key = make_cache_key(
+                    model=_resolve_model_name(request.model),
+                    prompt=_rendered_prompt,
+                    sampling_kwargs=chat_kwargs,
+                    extra={
+                        "response_format": (
+                            _rf.model_dump() if hasattr(_rf, "model_dump") else _rf
+                        ),
+                        "logprobs": bool(getattr(request, "logprobs", None)),
+                        "top_logprobs": getattr(request, "top_logprobs", None),
+                    },
+                )
+                _cached = _response_cache.get(_response_cache_key)
+                if _cached is not None:
+                    # HIT — rebuild a fresh Response from the stored
+                    # ChatCompletionResponse with a new id/created
+                    # (each hit is a distinct response object, matching
+                    # OpenAI's cached-prompt behaviour). Headers are
+                    # request-derived + cheap, so recompute them rather
+                    # than caching request-specific state.
+                    fresh = _cached.model_copy(
+                        update={
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                            "created": int(time.time()),
+                        }
+                    )
+                    _hit_headers = enable_thinking_warning_header(
+                        request, getattr(cfg, "reasoning_parser_name", None)
+                    )
+                    return Response(
+                        content=fresh.model_dump_json(exclude_none=True),
+                        media_type="application/json",
+                        headers=_hit_headers or None,
+                    )
+
     # Local-path admission gate: reserve a slot before kicking the
     # engine. Placed AFTER cloud routing so cloud-routable requests
     # don't 503 just because the local cap is full (codex R9), and
@@ -3538,6 +3626,16 @@ async def _create_chat_completion_impl(
         ],
         usage=_build_usage(output, reasoning_text),
     )
+    # ── Response cache — STORE ───────────────────────────────────────
+    #
+    # Store the assembled response under the key computed at the lookup
+    # site (only set when the request was cacheable AND the cache is
+    # enabled AND the prompt rendered). ``put`` is a no-op when disabled,
+    # so the guard is just an early-out for the common inert path. We
+    # store the ChatCompletionResponse object; a later hit rebuilds a
+    # fresh Response with a new id/created from it.
+    if _response_cache is not None and _response_cache_key is not None:
+        _response_cache.put(_response_cache_key, chat_response)
     # L-05: surface silent ``enable_thinking`` drop on non-Qwen parsers.
     # Empty dict when the client didn't set the flag OR the active
     # parser honors it (qwen3) — kwargs spread is the right shape.

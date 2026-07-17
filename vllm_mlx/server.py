@@ -1527,6 +1527,22 @@ def load_model(
     # that format on subsequent turns. See #225.
     _sync_config()
 
+    # Opt-in prompt-deterministic response cache: configure the process
+    # singleton's LRU capacity from the resolved SchedulerConfig knob.
+    # 0 (default) keeps the cache inert. Idempotent — configure() is a
+    # straight capacity overwrite with no dependence on prior state, so
+    # it is safe on the twice-called load_model() path (same contract as
+    # _sync_config above). Best-effort: a cache-config failure must never
+    # block model load.
+    try:
+        from .response_cache import configure_response_cache
+
+        configure_response_cache(
+            int(getattr(scheduler_config, "response_cache_entries", 0) or 0)
+        )
+    except Exception as _rc_e:  # pragma: no cover — defensive
+        logger.debug(f"response cache configure failed (non-fatal): {_rc_e}")
+
     # Set native tool format support on the engine (thread-safe via instance property)
     _engine.preserve_native_tool_format = _detect_native_tool_support()
     if _engine.preserve_native_tool_format:

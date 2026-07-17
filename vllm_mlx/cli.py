@@ -2988,6 +2988,8 @@ def serve_command(args):
         cache_memory_percent=args.cache_memory_percent,
         # #1103: bounded trim-free hybrid (recurrent-state) prefix reuse.
         hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
+        # Opt-in prompt-deterministic response cache (exact-match short-circuit).
+        response_cache_entries=getattr(args, "response_cache_entries", 0),
         # Paged cache options
         use_paged_cache=args.use_paged_cache,
         paged_cache_block_size=args.paged_cache_block_size,
@@ -4044,6 +4046,9 @@ def bench_command(args):
             # Bench path mirrors serve so hybrid-reuse effects show up in
             # `rapid-mlx bench` numbers too.
             hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
+            # Opt-in prompt-deterministic response cache. Bench mirrors serve
+            # so the knob is accepted on both parsers with identical semantics.
+            response_cache_entries=getattr(args, "response_cache_entries", 0),
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -6827,6 +6832,22 @@ Examples:
             "cold)."
         ),
     )
+    # Opt-in prompt-deterministic RESPONSE CACHE (exact-match short-circuit).
+    # Distinct from the prefix/KV cache above: this returns the ENTIRE stored
+    # completion for a completely repeated GREEDY request (temperature==0 or
+    # top_k==1), doing zero GPU decode. Default 0 = fully disabled.
+    serve_parser.add_argument(
+        "--response-cache-entries",
+        type=int,
+        default=0,
+        help=(
+            "Retain up to N fully-computed deterministic (greedy) chat "
+            "responses; a completely repeated request returns the stored "
+            "completion verbatim with zero GPU decode. 0 disables (default: 0). "
+            "Only temperature==0 / top_k==1 requests are cached — sampled "
+            "requests are never short-circuited."
+        ),
+    )
     serve_parser.add_argument(
         "--no-memory-aware-cache",
         action="store_true",
@@ -7705,6 +7726,23 @@ Examples:
             "Retain up to N hybrid (recurrent-state) prefix-cache entries for "
             "exact/prefix-extension reuse; 0 disables (default: 0). Useful for "
             "stable-system-prompt agent workloads on GatedDeltaNet/Mamba models."
+        ),
+    )
+    # Response cache — register on bench too so `rapid-mlx bench
+    # --response-cache-entries N` is accepted and the SchedulerConfig
+    # getattr below reads a real value instead of falling back to 0
+    # (mirrors the #1103 codex BLOCKING-2 fix for --hybrid-cache-entries,
+    # which was serve-only and rejected on bench).
+    bench_parser.add_argument(
+        "--response-cache-entries",
+        type=int,
+        default=0,
+        help=(
+            "Retain up to N fully-computed deterministic (greedy) chat "
+            "responses; a completely repeated request returns the stored "
+            "completion verbatim with zero GPU decode. 0 disables (default: 0). "
+            "Only temperature==0 / top_k==1 requests are cached — sampled "
+            "requests are never short-circuited."
         ),
     )
     # Paged cache options (experimental)
