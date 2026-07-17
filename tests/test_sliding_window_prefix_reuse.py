@@ -207,3 +207,47 @@ def test_scheduler_exact_hit_trimmable_trims_and_keeps_cache():
     assert kv.offset == off_before - 1
     assert tokens == [6]
     assert req.cached_tokens == 6  # unchanged
+
+
+def test_scheduler_exact_hit_trim_exception_falls_back_to_cold_prefill(monkeypatch):
+    """If trim inspection/execution RAISES, the helper must NOT proceed on top of
+    an un-trimmed cache (that reintroduces the exact-hit drift this helper exists
+    to prevent) — it must reset the request to a cold full prefill, exactly like
+    the non-trimmable branch. Mutation-kill for the except-path reset: with the
+    old 'log and continue' body, prompt_cache stays set and tokens == [last],
+    so this test goes red."""
+    from unittest.mock import MagicMock
+
+    import mlx_lm.models.cache as _mlx_cache
+
+    from vllm_mlx.scheduler import Scheduler
+
+    sched = Scheduler.__new__(Scheduler)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("simulated trim inspection failure")
+
+    # The helper does `from mlx_lm.models.cache import can_trim_prompt_cache`
+    # INSIDE the try at call time, so patching the module attribute makes the
+    # in-function import resolve to the raising stub -> forces the except path.
+    monkeypatch.setattr(_mlx_cache, "can_trim_prompt_cache", _boom)
+
+    kv = KVCache()  # trimmable in principle, but inspection will raise first
+    k = mx.random.normal((B, H, 6, D))
+    kv.update_and_fetch(k, k)
+    mx.eval(kv.keys, kv.values)
+
+    req = MagicMock()
+    req.prompt_token_ids = [1, 2, 3, 4, 5, 6]
+    req.prompt_cache = [kv]
+    req.cached_tokens = 6
+    req.remaining_tokens = []
+    req.request_id = "req-exc-00000"
+
+    tokens = sched._resolve_exact_hit_tokens(req)
+
+    # exception path fell back to a cold full prefill (no drift)
+    assert req.prompt_cache is None
+    assert req.cached_tokens == 0
+    assert req.remaining_tokens == [1, 2, 3, 4, 5, 6]
+    assert tokens == [1, 2, 3, 4, 5, 6]

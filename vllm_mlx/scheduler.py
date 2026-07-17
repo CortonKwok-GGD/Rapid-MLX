@@ -4123,13 +4123,23 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
         except Exception as _trim_exc:  # noqa: BLE001
+            # Any trim failure (inspection raised, or a partial/half-applied
+            # trim) leaves the reused cache in an unknown state. Re-forwarding
+            # only the last token on top of an un-trimmed cache reintroduces the
+            # exact-hit drift this helper exists to prevent, so fall back to the
+            # SAME cold full-prefill as the non-trimmable branch — byte-equal to
+            # cold by construction, never drifting.
             logger.debug(
                 "[cache_fetch] exact-hit trim(1) failed for "
-                "request=%s: %s (continuing without trim; "
-                "output may drift from fresh baseline)",
+                "request=%s: %s (dropping reused cache and full-prefilling "
+                "to stay byte-equal to cold)",
                 request.request_id[:12],
                 _trim_exc,
             )
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            return request.prompt_token_ids
         return tokens_to_process
 
     def _schedule_waiting(self) -> list[Request]:
