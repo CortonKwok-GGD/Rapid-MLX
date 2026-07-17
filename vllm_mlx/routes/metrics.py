@@ -402,12 +402,14 @@ def _render_response_cache_counters() -> list[str]:
             "rapid_mlx_response_cache_misses_total",
             "counter",
             (
-                "Prompt-deterministic response-cache misses — eligible "
-                "greedy chat requests that had no stored completion and "
-                "were computed by the engine (then stored). Non-greedy / "
-                "streaming / multimodal requests are NOT eligible and do "
-                "NOT tick this counter. Pair with "
-                "rapid_mlx_response_cache_hits_total for the hit rate."
+                "Prompt-deterministic response-cache LOOKUP misses — eligible "
+                "greedy chat requests that reached the cache lookup and found "
+                "no stored completion. Ticked at lookup time (before "
+                "admission / generation), so a subsequently rejected or "
+                "failed request is still counted as a lookup miss and may not "
+                "produce a stored entry. Non-greedy / streaming / multimodal "
+                "requests are NOT eligible and do NOT tick this counter. Pair "
+                "with rapid_mlx_response_cache_hits_total for the hit rate."
             ),
             int(rc_stats.get("misses", 0)),
         )

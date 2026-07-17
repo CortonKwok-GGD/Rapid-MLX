@@ -2325,45 +2325,46 @@ async def _create_chat_completion_impl(
     if _cacheable:
         _response_cache = get_response_cache()
         if _response_cache.enabled:
-            try:
-                _rendered_prompt = engine.build_prompt(
-                    messages,
-                    tools=chat_kwargs.get("tools"),
-                    enable_thinking=chat_kwargs.get("enable_thinking"),
-                )
-            except Exception:
-                # A build_prompt failure here is a real error the engine
-                # path will surface downstream; do not cache, just fall
-                # through to normal generation (which raises the proper
-                # 400/500) — swallowing it as a miss keeps the error
-                # behaviour identical to the cache-disabled path.
-                _rendered_prompt = None
-            if _rendered_prompt is not None:
-                # ``extra`` carries output-shape-affecting request fields
-                # that are NOT in chat_kwargs but change the response body
-                # (JSON coercion / logprobs field). A change in any yields
-                # a different key → miss → correct recompute.
-                _rf = request.response_format
-                _computed_key = make_cache_key(
-                    model=_resolve_model_name(request.model),
-                    prompt=_rendered_prompt,
-                    sampling_kwargs=chat_kwargs,
-                    extra={
-                        "response_format": (
-                            _rf.model_dump() if hasattr(_rf, "model_dump") else _rf
-                        ),
-                        "logprobs": bool(getattr(request, "logprobs", None)),
-                        "top_logprobs": getattr(request, "top_logprobs", None),
-                    },
-                )
-            # UNCACHEABLE (a key component can't be stably canonicalized):
-            # bypass BOTH lookup and store — leaving ``_response_cache_key``
-            # None means the store guard at the end of the request is a
-            # no-op. No ``.get()`` call means no spurious miss is ticked and
-            # no unstable key is ever hashed. The request runs the normal
+            # Key on the SAME inputs the engine's generation path consumes,
+            # NOT a second independent render. The engine renders the prompt
+            # internally from ``messages`` via ``_apply_chat_template`` at
+            # generation time, using ``tools`` / ``enable_thinking`` /
+            # ``forced_assistant_prefix`` — all of which already live in
+            # ``chat_kwargs`` (the exact dict passed to generation). Calling
+            # ``build_prompt`` here to produce a key would render a SECOND
+            # time, and if the chat template were ever time/state-dependent
+            # the two renders — hence the key and the actually-generated-from
+            # prompt — could diverge, storing a completion under a key the
+            # engine never generated from. Keying on the raw messages plus
+            # ``chat_kwargs`` makes the key a pure function of what generation
+            # consumes, so there is no second render to drift.
+            #
+            # ``extra`` carries output-shape-affecting request fields that
+            # are NOT in chat_kwargs but change the response body (JSON
+            # coercion / logprobs field). A change in any yields a different
+            # key → miss → correct recompute.
+            _rf = request.response_format
+            _computed_key = make_cache_key(
+                model=_resolve_model_name(request.model),
+                prompt=messages,
+                sampling_kwargs=chat_kwargs,
+                extra={
+                    "response_format": (
+                        _rf.model_dump() if hasattr(_rf, "model_dump") else _rf
+                    ),
+                    "logprobs": bool(getattr(request, "logprobs", None)),
+                    "top_logprobs": getattr(request, "top_logprobs", None),
+                },
+            )
+            # UNCACHEABLE (a key component can't be stably canonicalized,
+            # e.g. a non-serializable object in messages): bypass BOTH
+            # lookup and store — leaving ``_response_cache_key`` None means
+            # the store guard at the end of the request is a no-op. No
+            # ``.get()`` call means no spurious miss is ticked and no
+            # unstable key is ever hashed. The request runs the normal
             # generation path, byte-for-byte identical to the cache-disabled
             # path.
-            if _rendered_prompt is not None and _computed_key is not UNCACHEABLE:
+            if _computed_key is not UNCACHEABLE:
                 _response_cache_key = _computed_key
                 _cached = _response_cache.get(_response_cache_key)
                 if _cached is not None:

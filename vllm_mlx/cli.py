@@ -4046,13 +4046,12 @@ def bench_command(args):
             # Bench path mirrors serve so hybrid-reuse effects show up in
             # `rapid-mlx bench` numbers too.
             hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
-            # NOTE: the prompt-deterministic response cache is a chat/serve
-            # feature — its lookup/store logic lives ONLY in the chat route
-            # (vllm_mlx/routes/chat.py). `rapid-mlx bench` never consumes it,
-            # so the bench parser deliberately does NOT expose
-            # --response-cache-entries (codex #1123 BLOCKING-2: the bench
-            # flag was an advertised no-op). SchedulerConfig defaults it to 0
-            # here, keeping bench semantics unchanged.
+            # The prompt-deterministic response cache is a chat/serve
+            # feature — its lookup/store logic lives only in the chat route
+            # (vllm_mlx/routes/chat.py), and `rapid-mlx bench` never consumes
+            # it. The bench parser therefore does not expose
+            # --response-cache-entries; SchedulerConfig defaults it to 0 here,
+            # leaving bench semantics unchanged.
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -7732,12 +7731,12 @@ Examples:
             "stable-system-prompt agent workloads on GatedDeltaNet/Mamba models."
         ),
     )
-    # NOTE: --response-cache-entries is intentionally NOT registered on the
-    # bench parser (codex #1123 BLOCKING-2). The prompt-deterministic response
-    # cache is a chat/serve feature whose lookup/store logic lives only in the
-    # chat route; `rapid-mlx bench` never consumes it, so exposing the flag
-    # here would advertise a no-op (and wiring bench to cache would change its
-    # measurement semantics). The flag stays serve-only.
+    # --response-cache-entries is intentionally NOT registered on the bench
+    # parser. The prompt-deterministic response cache is a chat/serve feature
+    # whose lookup/store logic lives only in the chat route; `rapid-mlx bench`
+    # never consumes it, so exposing the flag here would advertise a no-op
+    # (and wiring bench to the cache would change its measurement semantics).
+    # The flag stays serve-only.
     # Paged cache options (experimental)
     bench_parser.add_argument(
         "--use-paged-cache",

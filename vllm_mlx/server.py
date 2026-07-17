@@ -1529,10 +1529,12 @@ def load_model(
 
     # Opt-in prompt-deterministic response cache: configure the process
     # singleton's LRU capacity from the resolved SchedulerConfig knob.
-    # 0 (default) keeps the cache inert. Idempotent — configure() is a
-    # straight capacity overwrite with no dependence on prior state, so
-    # it is safe on the twice-called load_model() path (same contract as
-    # _sync_config above). Best-effort: a cache-config failure must never
+    # 0 (default) keeps the cache inert. ``configure_response_cache`` also
+    # DROPS all cached entries — a stored completion is only valid for the
+    # exact model artifact that produced it, but the key spans only the
+    # model id, so clearing on every (re)load prevents serving completions
+    # from a previously-loaded model after a hot reload of changed weights
+    # under the same id. Best-effort: a cache-config failure must never
     # block model load.
     try:
         from .response_cache import configure_response_cache

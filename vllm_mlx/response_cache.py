@@ -274,11 +274,15 @@ def make_cache_key(
     so the key spans:
 
     * ``model`` — the resolved model id.
-    * ``prompt`` — the fully-rendered prompt the engine consumes (string
-      or token-id list). Keying on the RENDERED prompt (not the raw
-      messages) automatically folds in chat-template, tools, and
-      ``forced_assistant_prefix`` differences: two requests that render
-      to the same prompt string ARE the same generation input.
+    * ``prompt`` — the render-determining generation input. The caller
+      passes the SAME value generation consumes (the ``messages`` list on
+      the chat route). Keying on the raw messages rather than a re-rendered
+      prompt string avoids a SECOND, independent chat-template render whose
+      output could drift from the engine's own internal render (e.g. if the
+      template were time/state-dependent) — which would store a completion
+      under a key the engine never generated from. The render-affecting
+      knobs (``tools`` / ``enable_thinking`` / ``forced_assistant_prefix``)
+      travel in ``sampling_kwargs`` below, so they are part of the key too.
     * ``sampling_kwargs`` — the resolved kwargs dict passed to the engine
       (``temperature``, ``top_p``, ``top_k``, ``min_p``, ``seed``,
       ``max_tokens``, ``stop``, ``presence_penalty``,
@@ -337,8 +341,20 @@ def get_response_cache() -> ResponseCache:
 
 
 def configure_response_cache(capacity: int) -> None:
-    """Set the singleton's LRU capacity from the resolved CLI knob."""
+    """(Re)configure the singleton at model load and DROP all cached entries.
+
+    Called once per ``load_model`` (server boot AND every hot reload). A
+    stored completion is only valid for the exact model artifact that
+    produced it, but the cache key spans just the model *id* + inputs — not
+    the underlying weights. Reloading changed weights under the same id
+    would otherwise serve completions from the PREVIOUS model. Clearing the
+    store on every (re)configure makes a reload start from an empty cache,
+    so no cross-model-version stale hit is possible. ``configure`` alone
+    preserves entries whenever capacity stays positive, so the explicit
+    ``clear`` is required — it is the load-time invalidation point.
+    """
     _response_cache.configure(capacity)
+    _response_cache.clear()
 
 
 def reset_response_cache_for_tests() -> None:

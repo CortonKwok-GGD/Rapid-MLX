@@ -352,13 +352,9 @@ class SchedulerConfig:
     # SchedulerConfig purely so the CLI plumbs it through the same
     # construction sites as every other cache knob.
     #
-    # Codex #1123 BLOCKING-1: this field lives at the VERY END of the
-    # dataclass (after every pre-existing field, including all the
-    # speculative-decoding fields) so no positional ``SchedulerConfig(...)``
-    # construction can silently rebind. Inserting it mid-list — as the
-    # original PR did, between ``hybrid_cache_entries`` and ``spec_decode`` —
-    # shifted every subsequent positional argument. Do NOT relocate it back
-    # into the middle.
+    # Keep this field last: positional ``SchedulerConfig(...)`` construction
+    # binds by position, so appending new fields at the end avoids shifting
+    # the position of any existing field.
     response_cache_entries: int = 0
 
     def __post_init__(self) -> None:

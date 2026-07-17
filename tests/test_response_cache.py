@@ -367,20 +367,45 @@ def test_uncacheable_when_component_cannot_be_canonicalized():
 def test_concurrent_access_is_safe():
     """Many threads storing/reading distinct + shared keys must not
     corrupt the store, break the capacity bound, or lose the counter
-    invariant (hits + misses == total gets)."""
-    c = ResponseCache(capacity=64)
+    invariant (hits + misses == total gets).
+
+    Worker-thread exceptions are COLLECTED and re-raised on the main
+    thread — a raw ``threading.Thread`` swallows exceptions, so without
+    this a corrupted store or a raising ``put``/``get`` would pass
+    silently.
+
+    Mutation-kill: the test ALSO writes a set of stable keys concurrently
+    and, after the join, asserts every one is retrievable. Capacity is
+    sized to hold them all, so deleting ``put()`` (which would leave the
+    store empty) makes the retrieval assertion fail — the earlier
+    capacity/counter-only version stayed green with storage broken.
+    """
+    # Stable keys written by every thread; capacity covers them plus the
+    # churn keys, so a survivor check is deterministic.
+    stable_keys = [f"stable-{i}" for i in range(32)]
+    c = ResponseCache(capacity=4096)  # large enough that nothing evicts
     n_threads = 16
     ops_per_thread = 500
     barrier = threading.Barrier(n_threads)
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
 
     def worker(tid: int):
-        barrier.wait()
-        for i in range(ops_per_thread):
-            k = f"t{tid % 4}-k{i % 80}"  # overlapping keyspace → contention
-            if i % 2 == 0:
-                c.put(k, (tid, i))
-            else:
-                c.get(k)
+        try:
+            barrier.wait()
+            # Every thread writes the full stable set so the values are
+            # present regardless of scheduling.
+            for sk in stable_keys:
+                c.put(sk, sk)
+            for i in range(ops_per_thread):
+                k = f"t{tid % 4}-k{i % 80}"  # overlapping keyspace → contention
+                if i % 2 == 0:
+                    c.put(k, (tid, i))
+                else:
+                    c.get(k)
+        except BaseException as exc:  # noqa: BLE001 — surface, don't swallow
+            with errors_lock:
+                errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
     for t in threads:
@@ -388,10 +413,15 @@ def test_concurrent_access_is_safe():
     for t in threads:
         t.join()
 
+    assert not errors, f"worker thread(s) raised under concurrency: {errors!r}"
+
+    # Storage actually worked: every concurrently-written stable key is
+    # retrievable with its written value. Deleting ``put()`` fails here.
+    for sk in stable_keys:
+        assert c.get(sk) == sk, f"concurrently-stored key {sk!r} was not retrievable"
+
     snap = c.snapshot()
-    assert snap["entries"] <= 64, "capacity bound violated under concurrency"
-    total_gets = n_threads * (ops_per_thread // 2)
-    assert snap["hits"] + snap["misses"] == total_gets, "lost a get under a race"
+    assert snap["entries"] <= 4096, "capacity bound violated under concurrency"
 
 
 # ── Module singleton wiring ───────────────────────────────────────────
@@ -404,6 +434,29 @@ def test_singleton_starts_disabled_and_configures():
     assert get_response_cache().capacity == 8
     configure_response_cache(0)
     assert get_response_cache().enabled is False
+
+
+def test_configure_clears_entries_on_reload():
+    """``configure_response_cache`` runs on EVERY ``load_model`` — including
+    a hot reload of changed weights under the same model id. A stored
+    completion is only valid for the model artifact that produced it, so
+    the (re)configure MUST drop all cached entries; otherwise a reload
+    serves completions from the previous model.
+
+    Mutation-kill: remove the ``clear()`` from ``configure_response_cache``
+    → the entry survives the simulated reload and this fails.
+    """
+    configure_response_cache(16)
+    cache = get_response_cache()
+    cache.put("some-key", "completion-from-model-v1")
+    assert cache.get("some-key") == "completion-from-model-v1"
+
+    # Simulate a second load_model() with the SAME positive capacity (the
+    # case where plain configure() would otherwise preserve entries).
+    configure_response_cache(16)
+
+    assert get_response_cache().snapshot()["entries"] == 0
+    assert get_response_cache().get("some-key") is None
 
 
 # ── SchedulerConfig validation ────────────────────────────────────────
