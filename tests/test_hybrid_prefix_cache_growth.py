@@ -891,18 +891,28 @@ def test_startup_reload_cycle_does_not_grow_protected_set(tmp_path):
     def _snapshot_of_live_cache(cache, out_dir):
         assert cache.save_to_disk(out_dir) is True
 
-    # Persist an initial snapshot of N opportunistic hybrid entries (stored
-    # under a generous bound so they all land on disk unprotected).
+    def _hybrid_keys(cache):
+        # Non-trimmable keys in LRU order (OrderedDict insertion order).
+        return [key for key, e in cache._entries.items() if e.non_trimmable]
+
+    # Persist an initial snapshot of THREE opportunistic hybrid entries (stored
+    # under a generous bound so they all land on disk unprotected). Three (> n)
+    # so the reload genuinely has to trim, not merely fit.
     seed = MemoryAwarePrefixCache(
         MagicMock(),
         MemoryCacheConfig(
             max_memory_mb=200, max_entries=64, hybrid_reuse_max_entries=9
         ),
     )
-    for base in (100, 200):
+    for base in (100, 200, 300):
         assert seed.store(list(range(base, base + 8)), _real_hybrid_cache())
     snap = str(tmp_path / "snap")
     _snapshot_of_live_cache(seed, snap)
+    # Track the persisted hybrid-key order in Python state (mirrors what is on
+    # disk). save_to_disk writes _entries in LRU order, so this is the exact
+    # persisted order the reload will see. On cycle 0 = the 3-entry seed.
+    persisted_keys = _hybrid_keys(seed)
+    assert len(persisted_keys) == 3
 
     # Simulate restart cycles: each boot reloads the persisted snapshot as the
     # STARTUP path does (protected_import=False), then live-stores one fresh
@@ -914,26 +924,92 @@ def test_startup_reload_cycle_does_not_grow_protected_set(tmp_path):
                 max_memory_mb=200, max_entries=64, hybrid_reuse_max_entries=n
             ),
         )
+        # The reload must retain EXACTLY min(persisted, n).
+        expected_retained = min(len(persisted_keys), n)
+
         # STARTUP auto-load — reloaded entries must be UNPROTECTED.
         booted.load_from_disk(snap, replace=True, protected_import=False)
+
         # No reloaded entry may be protected (they are opportunistic on disk).
         assert not any(e.protected for e in booted._entries.values()), (
             "startup-reloaded entries must be UNPROTECTED (protected_import=False)"
         )
+
+        reloaded_keys = _hybrid_keys(booted)
+        # (a) NOT "keeps too many" (growth): retained == min(persisted, n).
+        # (b) NOT "keeps nothing" (discard-all): expected_retained is > 0 here,
+        #     so a reload that dropped everything would violate this equality.
+        assert len(reloaded_keys) == expected_retained, (
+            f"cycle {cycle}: reload retained {len(reloaded_keys)} non-trimmable, "
+            f"expected exactly min(persisted={len(persisted_keys)}, n={n})="
+            f"{expected_retained} — either grew (protected bug) or discarded all"
+        )
+        # (c) The survivors are the MOST-RECENT n persisted keys (LRU keeps the
+        #     tail of the persisted order). Pins WHICH entries survived, not just
+        #     the count, so a reload that keeps the wrong (or zero) set fails.
+        assert reloaded_keys == persisted_keys[-expected_retained:], (
+            f"cycle {cycle}: survivors {reloaded_keys} are not the most-recent "
+            f"{expected_retained} persisted keys {persisted_keys[-expected_retained:]}"
+        )
+
         # A fresh opportunistic hybrid request this session.
         booted.store(
             list(range(1000 + cycle * 10, 1000 + cycle * 10 + 8)),
             _real_hybrid_cache(),
         )
-        # THE INVARIANT: the retained non-trimmable set never exceeds the bound,
-        # no matter how many restart cycles have accumulated on disk.
+        # THE INVARIANT after the fresh store: still bounded at N, never growing
+        # across accumulated restart cycles.
         retained = booted.get_stats()["non_trimmable_entries"]
-        assert retained <= n, (
-            f"cycle {cycle}: retained non-trimmable {retained} exceeds bound {n} "
+        assert retained == n, (
+            f"cycle {cycle}: retained non-trimmable {retained} != bound {n} "
             "— the startup-reload protected-set growth bug regressed"
         )
-        # Persist the live cache for the next boot (mirrors shutdown).
+        # Persist the live cache for the next boot (mirrors shutdown) and update
+        # the tracked persisted order to what actually got written.
         _snapshot_of_live_cache(booted, snap)
+        persisted_keys = _hybrid_keys(booted)
+
+
+def test_production_startup_wiring_passes_protected_import_false(tmp_path):
+    """#1111 codex r4 BLOCKING-1: pin the PRODUCTION startup wiring, not just
+    the ``load_from_disk`` primitive.
+
+    The growth-prevention guarantee only holds if the real startup entry point
+    ``runtime.cache.load_prefix_cache_from_disk()`` actually passes
+    ``protected_import=False`` down to the engine. The lower-level tests call
+    ``load_from_disk(..., protected_import=False)`` directly, so they stay green
+    even if ``runtime/cache.py`` stops passing ``False``. This test drives the
+    real production call site with a mocked engine and asserts the kwarg.
+
+    Mutation-kill: delete ``protected_import=False`` from
+    ``runtime/cache.py::load_prefix_cache_from_disk`` and this test FAILS.
+    """
+    from unittest.mock import MagicMock as _MagicMock
+    from unittest.mock import patch
+
+    import vllm_mlx.runtime.cache as runtime_cache
+
+    fake_engine = _MagicMock()
+    fake_engine.load_cache_from_disk.return_value = 0  # no entries; wiring only
+    fake_cfg = _MagicMock()
+    fake_cfg.engine = fake_engine
+
+    with (
+        patch.object(runtime_cache, "get_config", return_value=fake_cfg),
+        patch.object(runtime_cache, "get_cache_dir", return_value=str(tmp_path)),
+        # _load_radix_index_after_cache pokes the engine internals; the mock has
+        # no real scheduler, so stub it out — this test is about the load kwarg.
+        patch.object(runtime_cache, "_load_radix_index_after_cache"),
+    ):
+        runtime_cache.load_prefix_cache_from_disk()
+
+    fake_engine.load_cache_from_disk.assert_called_once()
+    _args, kwargs = fake_engine.load_cache_from_disk.call_args
+    assert kwargs.get("protected_import") is False, (
+        "startup auto-load must call load_cache_from_disk(protected_import=False) "
+        "— otherwise reloaded opportunistic entries are immortalized as protected "
+        "and the retention bound grows unbounded across restarts"
+    )
 
 
 def test_startup_reload_obeys_bound_while_explicit_import_pins(tmp_path):

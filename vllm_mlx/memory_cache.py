@@ -1014,15 +1014,21 @@ class _CacheEntry:
     # ``KVCacheBlock.ref_cnt`` (``vllm/v1/core/block_pool.py``), where a block
     # with ``ref_cnt > 0`` is excluded from the ``free_block_queue`` LRU.
     #
-    # Explicitly-loaded entries (``POST /v1/cache/import`` #476 AND
-    # process-restart auto-load-on-startup / radix persistence) are the
-    # DEGENERATE, persistent-lifetime case of that idiom: a lock held for the
-    # entry's whole life — the same way SGLang's ``host_ref_counter`` protects
-    # a persisted/offloaded entry across device-pressure eviction cycles. They
-    # carry ``protected=True`` and are exempt from the opportunistic hybrid
-    # retention enforcer at BOTH its call sites: the N=0 drop skips them and
-    # they do NOT count against the N>0 bound. The bound governs OPPORTUNISTIC
-    # (unprotected, live-store #1075) non-trimmable retention only.
+    # Protection is set by the CALLER and is NOT the same for the two disk-load
+    # entry points (#1111 codex r3 — they must NOT be treated identically):
+    #  * EXPLICIT ``POST /v1/cache/import`` (#476) → ``protected=True``: an
+    #    operator deliberately loading specific entries. This is the DEGENERATE,
+    #    persistent-lifetime case of the idiom — a lock held for the entry's
+    #    whole life, like SGLang's ``host_ref_counter`` on a persisted entry.
+    #    Exempt from the opportunistic hybrid retention enforcer at BOTH call
+    #    sites (N=0 drop skips them; they do NOT count against the N>0 bound).
+    #  * process-restart AUTO-LOAD-ON-STARTUP (radix persistence) →
+    #    ``protected=False``: ``save_to_disk`` persists ALL live entries incl.
+    #    opportunistic ones, so protecting reloaded entries every boot would
+    #    grow the protected set ~N per restart and defeat the cap. Reloaded
+    #    non-trimmable entries stay UNPROTECTED and obey the bound at commit.
+    # Live-STORE entries are always ``protected=False`` (the opportunistic path
+    # the bound governs). The bound governs OPPORTUNISTIC (unprotected) entries.
     protected: bool = False
 
     @classmethod
@@ -1032,7 +1038,8 @@ class _CacheEntry:
         Live-store entries are EVICTABLE (``protected=False``) — the
         opportunistic-store path the hybrid retention bound governs. Disk-load
         entries are constructed directly (see ``load_from_disk``) with
-        ``protected=True``.
+        ``protected=protected_import``: True for the explicit HTTP import (#476),
+        False for the process-restart startup auto-load.
         """
         memory = estimate_kv_cache_memory(cache)
         return cls(

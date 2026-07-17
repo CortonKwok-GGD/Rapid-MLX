@@ -392,37 +392,32 @@ class BaseEngine(ABC):
 
         from ..cache.protocol import LoadResult
 
-        accepts_replace = _callable_accepts_kwarg(
-            self.load_cache_from_disk, "replace", inspect
-        )
-        # #1111 codex r3: ``protected_import`` was added to load_cache_from_disk
-        # alongside ``replace``. Same backcompat dance — pass it only if the
-        # callee accepts it. A legacy override missing it simply loads with its
-        # own default (protected), which is safe for the explicit-import path
-        # this method serves; only the non-default ``protected_import=False``
-        # (startup auto-load) MUST reach a modern callee, and the startup path
-        # calls ``load_cache_from_disk`` directly (not this result wrapper), so
-        # it never depends on this fallback.
-        accepts_protected = _callable_accepts_kwarg(
-            self.load_cache_from_disk, "protected_import", inspect
-        )
-        if accepts_replace:
-            kwargs = {"replace": replace}
-            if accepts_protected:
-                kwargs["protected_import"] = protected_import
-            entries = self.load_cache_from_disk(cache_dir, **kwargs)
-        else:
-            if replace:
-                # The callee predates ``replace`` and cannot do an atomic
-                # clear-inside-load. Surface that instead of silently degrading
-                # a requested replace into a merge (which would leave stale
-                # entries the caller expected gone).
+        # #1111 codex r4: forward each optional kwarg INDEPENDENTLY — never gate
+        # one on another's acceptance. ``replace`` (default False) and
+        # ``protected_import`` (default True) were both added over time; a legacy
+        # override may accept neither, one, or both. For EACH kwarg:
+        #  * callee accepts it            → forward the caller's value.
+        #  * callee lacks it, caller left it at DEFAULT → drop silently (the
+        #    callee's own default matches the contract, nothing is lost).
+        #  * callee lacks it, caller passed a NON-DEFAULT → fail loudly, because
+        #    silently dropping it would degrade behavior the caller explicitly
+        #    requested (a replace silently downgraded to merge leaves stale
+        #    entries; a protected_import=False silently upgraded to protected
+        #    re-opens the restart-cycle growth bug).
+        kwargs: dict[str, object] = {}
+        for name, value, default in (
+            ("replace", replace, False),
+            ("protected_import", protected_import, True),
+        ):
+            if _callable_accepts_kwarg(self.load_cache_from_disk, name, inspect):
+                kwargs[name] = value
+            elif value != default:
                 raise TypeError(
                     f"{type(self).__name__}.load_cache_from_disk does not "
-                    "support replace=True (one-arg legacy signature); cannot "
-                    "honor merge_strategy='replace'"
+                    f"support {name}={value!r} (legacy signature); cannot honor "
+                    "the caller's non-default request"
                 )
-            entries = self.load_cache_from_disk(cache_dir)
+        entries = self.load_cache_from_disk(cache_dir, **kwargs)
         return LoadResult(entries=entries, bytes_loaded=0)
 
     def save_cache_to_disk(self, cache_dir: str, should_abort=None) -> bool:
