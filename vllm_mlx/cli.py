@@ -122,6 +122,28 @@ def _listen_fd_arg(value: str) -> int:
     return fd
 
 
+def non_negative_int(value: str) -> int:
+    """Argparse ``type`` callable: parse a ``>= 0`` integer.
+
+    Rejects a negative value at parse time so a bad ``--response-cache-
+    entries -5`` fails immediately with a clear argparse error, before any
+    model download or load. ``SchedulerConfig.__post_init__`` also rejects
+    negatives, but for ``serve`` that check runs only after the expensive
+    download/load, so the early argparse guard gives the user faster,
+    clearer feedback. The construction-time check stays as defense in
+    depth.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a non-negative integer, got {value!r}"
+        ) from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {n}")
+    return n
+
+
 def _apply_body_receive_timeout_env(server_mod, *, logger=None) -> None:
     """Resolve ``RAPID_MLX_BODY_RECEIVE_TIMEOUT_SECONDS`` onto
     ``server_mod._body_receive_timeout_seconds`` (H-14 / F-072
@@ -6841,7 +6863,7 @@ Examples:
     # top_k==1), doing zero GPU decode. Default 0 = fully disabled.
     serve_parser.add_argument(
         "--response-cache-entries",
-        type=int,
+        type=non_negative_int,
         default=0,
         help=(
             "Retain up to N fully-computed deterministic (greedy) chat "

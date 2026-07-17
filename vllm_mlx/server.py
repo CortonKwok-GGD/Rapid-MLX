@@ -1534,11 +1534,19 @@ def load_model(
     # stored completion is only valid for the exact model artifact that
     # produced it, but the key spans only the model id, so this (re)load
     # invalidation prevents serving completions from a previously-loaded
-    # model after a hot reload of changed weights under the same id.
+    # model after a reload of changed weights under the same id.
+    #
+    # load_model is boot-only: it is invoked once from serve_command before
+    # uvicorn begins accepting requests, and there is no runtime model-swap
+    # route. So the order in which the engine is published versus the cache
+    # invalidated cannot race with a live request — the epoch-versioned
+    # reconfigure is correctness-by-construction today, and defense-in-depth
+    # if a runtime reload endpoint is ever added.
+    #
     # Best-effort: a cache-config failure must never block model load — but
-    # on failure we must NOT leave the PREVIOUS cache live under the NEW
-    # model (that would serve stale cross-model output), so force the cache
-    # to a disabled + empty state before falling through.
+    # on failure the PREVIOUS cache must NOT stay live under the NEW model
+    # (that would serve stale cross-model output), so force the cache to a
+    # disabled + empty state before falling through.
     try:
         from .response_cache import configure_response_cache
 

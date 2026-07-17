@@ -3,8 +3,8 @@
 
 The response cache is a chat/serve feature: its lookup/store logic lives
 only in the chat route, and ``bench`` never consumes it — so the flag is
-registered on ``serve_parser`` ONLY (codex #1123 BLOCKING-2 removed the
-advertised-no-op bench flag).
+registered on ``serve_parser`` ONLY (the bench flag would have been an
+advertised no-op, so it is not registered there).
 
 This test drives the real ``main()`` parser + ``serve_command`` far enough
 to intercept the ACTUAL ``SchedulerConfig`` the serve path constructs, and
@@ -137,23 +137,53 @@ def test_serve_parser_response_cache_entries_defaults_to_zero():
     assert getattr(args, "response_cache_entries", None) == 0
 
 
-def test_serve_negative_response_cache_entries_rejected_by_scheduler_config():
-    """argparse does not clamp ``type=int``, so ``-1`` flows through the
-    serve plumbing unchanged; the REAL ``SchedulerConfig.__post_init__``
-    is what rejects it. Prove (1) it arrives unclamped at the serve
-    construction site, then (2) the real config construction raises."""
-    captured = _capture_serve_scheduler_config(
-        ["serve", "qwen3.5-4b-4bit", "--response-cache-entries", "-1"]
-    )
-    assert captured.get("response_cache_entries") == -1
+def test_serve_negative_response_cache_entries_rejected_at_parse_time():
+    """A negative ``--response-cache-entries`` is rejected up front by the
+    ``non_negative_int`` argparse ``type``, before any model download or
+    load — argparse exits 2 with a clear message. This runs the real
+    ``main()`` parser, so it fails if the ``type=`` guard is removed."""
+    with (
+        mock.patch.object(
+            sys,
+            "argv",
+            ["rapid-mlx", "serve", "qwen3.5-4b-4bit", "--response-cache-entries", "-1"],
+        ),
+        # If the guard were missing, parsing would succeed and dispatch to
+        # serve_command; patch it so a regression there does NOT boot a
+        # model (it would instead fail this test on the missing SystemExit).
+        mock.patch.object(cli, "serve_command", lambda args: None),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cli.main()
+    assert excinfo.value.code == 2
 
+
+def test_non_negative_int_helper_rejects_negative_and_non_int():
+    """The ``non_negative_int`` argparse ``type`` callable accepts ``>= 0``
+    and raises ``ArgumentTypeError`` on a negative or non-integer value."""
+    import argparse
+
+    from vllm_mlx.cli import non_negative_int
+
+    assert non_negative_int("0") == 0
+    assert non_negative_int("16") == 16
+    with pytest.raises(argparse.ArgumentTypeError):
+        non_negative_int("-1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        non_negative_int("abc")
+
+
+def test_scheduler_config_still_rejects_negative_as_defense_in_depth():
+    """The construction-time validation is kept even though argparse now
+    rejects negatives earlier — a programmatic caller that bypasses the CLI
+    still gets a clear error."""
     from vllm_mlx.scheduler import SchedulerConfig
 
     with pytest.raises(ValueError, match=r"response_cache_entries must be >= 0"):
-        SchedulerConfig(response_cache_entries=captured["response_cache_entries"])
+        SchedulerConfig(response_cache_entries=-1)
 
 
-# ── bench must NOT advertise the flag (codex #1123 BLOCKING-2) ─────────
+# ── bench must NOT advertise the flag ─────────────────────────────────
 
 
 def test_bench_does_not_register_response_cache_entries():

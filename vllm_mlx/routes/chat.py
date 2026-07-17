@@ -2317,10 +2317,13 @@ async def _create_chat_completion_impl(
     _response_cache = None
     _response_cache_key: str | None = None
     # Epoch captured ONCE at request start and threaded into BOTH the
-    # lookup and the later store. A model reload bumps the cache epoch; a
-    # request that began under the previous model keeps the old epoch, so
-    # its lookup can't consume a new-model entry and its store is dropped
-    # (no cross-model poisoning). See ResponseCache epoch versioning.
+    # lookup and the later store. Model load is boot-only today, so the
+    # epoch does not advance under live traffic; the capture-and-thread
+    # pattern is defense-in-depth for a hypothetical future reload path,
+    # where a request that began under the previous model would keep the
+    # old epoch, so its lookup can't consume a new-model entry and its
+    # store is dropped (no cross-model poisoning). See ResponseCache epoch
+    # versioning.
     _response_cache_epoch = 0
     _cacheable = (
         not request.stream
@@ -2331,20 +2334,30 @@ async def _create_chat_completion_impl(
     if _cacheable:
         _response_cache = get_response_cache()
         if _response_cache.enabled:
+            # The engine bound to this request does not change mid-request:
+            # model load is boot-only (see load_model in server.py), so
+            # capturing the cache epoch here is consistent with the engine
+            # that will actually generate. The epoch gate on get/put remains
+            # in place as protection for a hypothetical future concurrent
+            # reload.
             _response_cache_epoch = _response_cache.current_epoch()
-            # Key on the SAME inputs the engine's generation path consumes,
-            # NOT a second independent render. The engine renders the prompt
-            # internally from ``messages`` via ``_apply_chat_template`` at
-            # generation time, using ``tools`` / ``enable_thinking`` /
+            # Key on the exact canonical chat request the engine consumes —
+            # the messages plus the resolved ``chat_kwargs`` — NOT a second
+            # independent render. The engine renders the prompt internally
+            # from ``messages`` via ``_apply_chat_template`` at generation
+            # time, using ``tools`` / ``enable_thinking`` /
             # ``forced_assistant_prefix`` — all of which already live in
-            # ``chat_kwargs`` (the exact dict passed to generation). Calling
-            # ``build_prompt`` here to produce a key would render a SECOND
-            # time, and if the chat template were ever time/state-dependent
-            # the two renders — hence the key and the actually-generated-from
-            # prompt — could diverge, storing a completion under a key the
-            # engine never generated from. Keying on the raw messages plus
-            # ``chat_kwargs`` makes the key a pure function of what generation
-            # consumes, so there is no second render to drift.
+            # ``chat_kwargs`` (the exact dict passed to generation). This
+            # relies on chat templates being deterministic pure functions of
+            # that request — no wall-clock, RNG, or external state — which
+            # holds for every model this server runs, so the canonical
+            # request is a collision-free proxy for the rendered prompt.
+            # Calling ``build_prompt`` here to build the key would render a
+            # SECOND time; a state-dependent template could then make that
+            # render diverge from the engine's own, storing a completion
+            # under a key the engine never generated from. Keying on the
+            # canonical request instead means no second, driftable render is
+            # performed.
             #
             # ``extra`` carries output-shape-affecting request fields that
             # are NOT in chat_kwargs but change the response body (JSON
