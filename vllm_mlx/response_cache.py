@@ -25,17 +25,17 @@ shared PRNG state whose per-request split depends on scheduling
 neighbours, so "same seed" does not guarantee "same tokens" across runs
 here. Conservative by design — widen later with evidence, not hope.
 
-Correctness note (pre-empts the "epsilon recompute" objection)
---------------------------------------------------------------
+Correctness note
+----------------
 At ``temperature == 0`` MLX greedy decode is NOT bit-stable across runs:
 batched SDPA numerics diverge between ``q_len == 1`` and ``q_len >= 2``
 under quantized weights, so a *fresh recompute* of the same prompt may
 differ by a token. This does NOT break the response cache. The cache
 RETURNS A STORED VALID COMPLETION — it never recomputes. The contract is
 exactly OpenAI's prompt-caching contract: *"an identical deterministic
-request MAY return a previously-computed valid response."* Reviewers
-should not spiral on "but a fresh run might differ" — that is out of
-scope by construction.
+request MAY return a previously-computed valid response."* A fresh
+recompute possibly differing by a token is therefore irrelevant to
+correctness — the cache serves a valid prior response by design.
 
 Concurrency
 -----------
@@ -204,25 +204,56 @@ def is_deterministic(sampling_kwargs: dict[str, Any]) -> bool:
 
 # ── Cache key ─────────────────────────────────────────────────────────
 
+#: Sentinel returned by :func:`make_cache_key` when the request carries a
+#: value that cannot be canonicalized to a STABLE string. Any such request
+#: is treated as UNCACHEABLE: the caller must skip both lookup and store
+#: (see the chat route). This is deliberately NOT ``None`` so it can never
+#: be confused with a legitimately absent key and is identity-checkable
+#: with ``is``.
+UNCACHEABLE = object()
+
+
+class _UncanonicalizableError(Exception):
+    """Raised inside :func:`_json_default` for a value we cannot map to a
+    deterministic representation. Caught by :func:`make_cache_key`, which
+    converts it into the :data:`UNCACHEABLE` sentinel."""
+
 
 def _json_default(obj: Any) -> Any:
-    """Best-effort canonicalizer for non-JSON-native key components.
+    """Canonicalizer for non-JSON-native key components — SUPPORTED types
+    only.
 
-    Pydantic models (tools, response_format) expose ``model_dump``;
-    everything else falls back to ``repr`` so an unexpected type still
-    produces a STABLE, collision-resistant string rather than raising
-    (a raise here would 500 a request that merely can't be cached — we
-    prefer a deterministic fallback that simply keys distinctly).
+    ``json.dumps`` calls this only for values it can't serialize natively.
+    We canonicalize exactly two extra shapes:
+
+    * Pydantic-like models (tools, response_format) via ``model_dump`` —
+      a stable, field-ordered dict.
+    * ``set`` / ``frozenset`` — sorted so element order can't perturb the
+      key.
+
+    For ANYTHING ELSE we raise :class:`_UncanonicalizableError` rather than
+    falling back to ``repr(obj)``. A ``repr`` fallback embeds the object's
+    memory address (``<Foo object at 0x…>``) for most types, so two
+    otherwise-identical requests carrying fresh equivalent objects would
+    produce DIFFERENT keys — silent cache MISSES that defeat the whole
+    point of an exact-match deterministic cache. Raising here lets
+    :func:`make_cache_key` mark the request uncacheable instead of emitting
+    an unstable key (or a wrong hit). A ``model_dump`` that itself throws
+    is likewise treated as uncanonicalizable — we never guess.
     """
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
         try:
             return dump()
-        except Exception:  # pragma: no cover — defensive
-            return repr(obj)
+        except Exception as exc:
+            raise _UncanonicalizableError(
+                f"model_dump() failed on {type(obj).__name__}"
+            ) from exc
     if isinstance(obj, (set, frozenset)):
         return sorted(obj, key=repr)
-    return repr(obj)
+    raise _UncanonicalizableError(
+        f"unsupported cache-key component of type {type(obj).__name__}"
+    )
 
 
 def make_cache_key(
@@ -231,8 +262,13 @@ def make_cache_key(
     prompt: Any,
     sampling_kwargs: dict[str, Any],
     extra: dict[str, Any] | None = None,
-) -> str:
+) -> Any:
     """Build a stable sha256 over EVERY output-affecting input.
+
+    Returns the 64-char hex digest, or the :data:`UNCACHEABLE` sentinel
+    when any component cannot be canonicalized to a STABLE string (see
+    :func:`_json_default`). The caller MUST check ``is UNCACHEABLE`` and,
+    on a match, skip both lookup and store — never key an unstable request.
 
     A missing field would be a correctness bug (a wrong response served),
     so the key spans:
@@ -258,9 +294,9 @@ def make_cache_key(
 
     ``sort_keys=True`` + a compact separator make the JSON canonical
     (dict-order-independent). ``default=_json_default`` canonicalizes
-    pydantic / set components. ``ensure_ascii=False`` keeps CJK / emoji
-    from bloating the pre-hash string (the hash is over UTF-8 bytes
-    either way).
+    pydantic / set components (and raises for unsupported types →
+    UNCACHEABLE). ``ensure_ascii=False`` keeps CJK / emoji from bloating
+    the pre-hash string (the hash is over UTF-8 bytes either way).
     """
     payload = {
         "model": model,
@@ -268,13 +304,19 @@ def make_cache_key(
         "sampling": sampling_kwargs,
         "extra": extra or {},
     }
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=_json_default,
-    )
+    try:
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=_json_default,
+        )
+    except _UncanonicalizableError:
+        # A component can't be stably canonicalized — do NOT emit an
+        # unstable key. The request is uncacheable; the caller bypasses
+        # both store and lookup. This never raises out of make_cache_key.
+        return UNCACHEABLE
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

@@ -64,6 +64,7 @@ from ..config import get_config
 from ..engine import GenerationOutput
 from ..middleware.auth import check_rate_limit, verify_api_key
 from ..response_cache import (
+    UNCACHEABLE,
     get_response_cache,
     is_deterministic,
     make_cache_key,
@@ -2343,7 +2344,7 @@ async def _create_chat_completion_impl(
                 # (JSON coercion / logprobs field). A change in any yields
                 # a different key → miss → correct recompute.
                 _rf = request.response_format
-                _response_cache_key = make_cache_key(
+                _computed_key = make_cache_key(
                     model=_resolve_model_name(request.model),
                     prompt=_rendered_prompt,
                     sampling_kwargs=chat_kwargs,
@@ -2355,6 +2356,15 @@ async def _create_chat_completion_impl(
                         "top_logprobs": getattr(request, "top_logprobs", None),
                     },
                 )
+            # UNCACHEABLE (a key component can't be stably canonicalized):
+            # bypass BOTH lookup and store — leaving ``_response_cache_key``
+            # None means the store guard at the end of the request is a
+            # no-op. No ``.get()`` call means no spurious miss is ticked and
+            # no unstable key is ever hashed. The request runs the normal
+            # generation path, byte-for-byte identical to the cache-disabled
+            # path.
+            if _rendered_prompt is not None and _computed_key is not UNCACHEABLE:
+                _response_cache_key = _computed_key
                 _cached = _response_cache.get(_response_cache_key)
                 if _cached is not None:
                     # HIT — rebuild a fresh Response from the stored

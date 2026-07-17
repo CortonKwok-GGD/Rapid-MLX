@@ -13,8 +13,8 @@ Covers the invariants that guard correctness:
   cached, so sampling variety is preserved.
 * LRU bound — the (N+1)th distinct store evicts the LEAST-RECENTLY-USED
   entry, AND a HIT refreshes recency so eviction order is true LRU, not
-  FIFO (explicitly regression-tested — #1111 codex flagged a FIFO-vs-LRU
-  gap on the sibling hybrid-cache knob).
+  FIFO (explicitly regression-tested; the sibling hybrid-cache knob had a
+  FIFO-vs-LRU gap that this guards against).
 * N=0 fully disables — no store, no lookup, counters stay at zero, zero
   observable effect.
 * Concurrent access safety — many threads hammering get/put must not
@@ -31,6 +31,7 @@ import threading
 import pytest
 
 from vllm_mlx.response_cache import (
+    UNCACHEABLE,
     ResponseCache,
     configure_response_cache,
     get_response_cache,
@@ -257,8 +258,17 @@ def test_key_changes_on_model_prompt_and_extra():
 
 
 def test_key_handles_pydantic_like_components():
-    """Non-JSON-native key components (objects with model_dump) must be
-    canonicalized, not raise."""
+    """Non-JSON-native key components (objects with ``model_dump``) must be
+    canonicalized by ``_json_default`` via ``.model_dump()`` — NOT raise,
+    and NOT fall through to an unstable repr.
+
+    The instance is passed DIRECTLY in ``extra`` (not pre-``model_dump``-ed)
+    so ``json.dumps`` actually routes it through ``_json_default`` and
+    invokes ``.model_dump()``. Passing the already-dumped dict would bypass
+    the code path under test entirely (a dict is JSON-native), leaving the
+    ``model_dump`` branch unexercised — mutation-kill: deleting the
+    ``model_dump`` branch in ``_json_default`` MUST make this test fail.
+    """
 
     class _Fake:
         def model_dump(self):
@@ -268,9 +278,87 @@ def test_key_handles_pydantic_like_components():
         model="m",
         prompt="p",
         sampling_kwargs={"temperature": 0},
-        extra={"response_format": _Fake().model_dump()},
+        extra={"response_format": _Fake()},  # instance, so _json_default fires
     )
     assert isinstance(k, str) and len(k) == 64  # sha256 hexdigest
+
+    # The key must equal the one produced from the DUMPED dict directly:
+    # proves _json_default really invoked .model_dump() (not repr / some
+    # other fallback), so canonicalization is by VALUE, not object identity.
+    k_from_dict = make_cache_key(
+        model="m",
+        prompt="p",
+        sampling_kwargs={"temperature": 0},
+        extra={"response_format": _Fake().model_dump()},
+    )
+    assert k == k_from_dict
+
+    # And two FRESH _Fake() instances must produce the SAME key — the whole
+    # point of canonicalizing by value rather than repr (which would embed
+    # the object's memory address and silently miss).
+    k2 = make_cache_key(
+        model="m",
+        prompt="p",
+        sampling_kwargs={"temperature": 0},
+        extra={"response_format": _Fake()},
+    )
+    assert k == k2
+
+
+def test_uncacheable_when_component_cannot_be_canonicalized():
+    """A key component that is neither JSON-native, a set, nor a
+    ``model_dump``-carrying object cannot be mapped to a STABLE string.
+    ``make_cache_key`` must return the ``UNCACHEABLE`` sentinel (so the
+    caller skips store + lookup) rather than emit an unstable repr key —
+    and it must NOT raise.
+
+    A repr fallback would embed the object's memory address, so two
+    otherwise-identical requests carrying fresh equivalent objects would
+    key DIFFERENTLY → silent misses that defeat an exact-match cache.
+    Mutation-kill: replacing the ``raise _UncanonicalizableError`` in
+    ``_json_default`` with ``return repr(obj)`` MUST make this test fail
+    (the result would be a 64-char hex string, not the sentinel).
+    """
+
+    class _Opaque:
+        """No model_dump, not JSON-native, not a set."""
+
+    result = make_cache_key(
+        model="m",
+        prompt="p",
+        sampling_kwargs={"temperature": 0},
+        extra={"weird": _Opaque()},
+    )
+    assert result is UNCACHEABLE
+
+    # A model_dump that itself raises is likewise uncacheable, not a 500.
+    class _BadDump:
+        def model_dump(self):
+            raise RuntimeError("boom")
+
+    result2 = make_cache_key(
+        model="m",
+        prompt="p",
+        sampling_kwargs={"temperature": 0},
+        extra={"rf": _BadDump()},
+    )
+    assert result2 is UNCACHEABLE
+
+    # Two fresh opaque objects both yield the sentinel — no repr address
+    # leakage, no accidental distinct keys.
+    r_a = make_cache_key(
+        model="m",
+        prompt="p",
+        sampling_kwargs={"temperature": 0},
+        extra={"weird": _Opaque()},
+    )
+    r_b = make_cache_key(
+        model="m",
+        prompt="p",
+        sampling_kwargs={"temperature": 0},
+        extra={"weird": _Opaque()},
+    )
+    assert r_a is UNCACHEABLE and r_b is UNCACHEABLE
 
 
 # ── Concurrency safety ────────────────────────────────────────────────

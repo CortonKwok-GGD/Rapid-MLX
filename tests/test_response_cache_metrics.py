@@ -35,16 +35,25 @@ def metrics_client():
     reset_response_cache_for_tests()
 
 
+def _metric_lines(body: str) -> set[str]:
+    """Split the Prometheus payload into whole sample lines so a value can
+    be matched EXACTLY. Substring-matching ``... 2`` also accepts ``20`` /
+    ``200``; whole-line membership does not."""
+    return set(body.splitlines())
+
+
 def test_response_cache_counters_present_even_without_engine(metrics_client):
     """Both series render (at zero) even when the engine is not loaded —
     the counters are engine-independent module state."""
     metrics_client.cfg.engine = None
     body = metrics_client.client.get("/metrics").text
+    lines = _metric_lines(body)
     assert "rapid_mlx_response_cache_hits_total" in body
     assert "rapid_mlx_response_cache_misses_total" in body
-    # Disabled cache → both at zero.
-    assert "rapid_mlx_response_cache_hits_total 0" in body
-    assert "rapid_mlx_response_cache_misses_total 0" in body
+    # Disabled cache → both EXACTLY zero (whole-line match, so a future
+    # "...total 0.x" or "...total 10" cannot slip past).
+    assert "rapid_mlx_response_cache_hits_total 0" in lines
+    assert "rapid_mlx_response_cache_misses_total 0" in lines
 
 
 def test_response_cache_counters_reflect_singleton_state(metrics_client):
@@ -60,8 +69,15 @@ def test_response_cache_counters_reflect_singleton_state(metrics_client):
     c.get("miss-b")  # miss
 
     body = metrics_client.client.get("/metrics").text
-    assert "rapid_mlx_response_cache_hits_total 2" in body
-    assert "rapid_mlx_response_cache_misses_total 2" in body
+    lines = _metric_lines(body)
+    # EXACT whole-line match: substring "... 2" would also (wrongly) pass
+    # for a rendered value of 20 / 200. Whole-line membership rejects those.
+    assert "rapid_mlx_response_cache_hits_total 2" in lines
+    assert "rapid_mlx_response_cache_misses_total 2" in lines
+    # And prove the loose-substring trap would have been permissive here:
+    # the exact-2 lines are present, the 20/200 lines are NOT.
+    assert "rapid_mlx_response_cache_hits_total 20" not in lines
+    assert "rapid_mlx_response_cache_misses_total 20" not in lines
 
 
 def test_response_cache_counters_have_help_and_type_lines(metrics_client):

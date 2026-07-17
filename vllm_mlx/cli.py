@@ -4046,9 +4046,13 @@ def bench_command(args):
             # Bench path mirrors serve so hybrid-reuse effects show up in
             # `rapid-mlx bench` numbers too.
             hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
-            # Opt-in prompt-deterministic response cache. Bench mirrors serve
-            # so the knob is accepted on both parsers with identical semantics.
-            response_cache_entries=getattr(args, "response_cache_entries", 0),
+            # NOTE: the prompt-deterministic response cache is a chat/serve
+            # feature — its lookup/store logic lives ONLY in the chat route
+            # (vllm_mlx/routes/chat.py). `rapid-mlx bench` never consumes it,
+            # so the bench parser deliberately does NOT expose
+            # --response-cache-entries (codex #1123 BLOCKING-2: the bench
+            # flag was an advertised no-op). SchedulerConfig defaults it to 0
+            # here, keeping bench semantics unchanged.
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -7728,23 +7732,12 @@ Examples:
             "stable-system-prompt agent workloads on GatedDeltaNet/Mamba models."
         ),
     )
-    # Response cache — register on bench too so `rapid-mlx bench
-    # --response-cache-entries N` is accepted and the SchedulerConfig
-    # getattr below reads a real value instead of falling back to 0
-    # (mirrors the #1103 codex BLOCKING-2 fix for --hybrid-cache-entries,
-    # which was serve-only and rejected on bench).
-    bench_parser.add_argument(
-        "--response-cache-entries",
-        type=int,
-        default=0,
-        help=(
-            "Retain up to N fully-computed deterministic (greedy) chat "
-            "responses; a completely repeated request returns the stored "
-            "completion verbatim with zero GPU decode. 0 disables (default: 0). "
-            "Only temperature==0 / top_k==1 requests are cached — sampled "
-            "requests are never short-circuited."
-        ),
-    )
+    # NOTE: --response-cache-entries is intentionally NOT registered on the
+    # bench parser (codex #1123 BLOCKING-2). The prompt-deterministic response
+    # cache is a chat/serve feature whose lookup/store logic lives only in the
+    # chat route; `rapid-mlx bench` never consumes it, so exposing the flag
+    # here would advertise a no-op (and wiring bench to cache would change its
+    # measurement semantics). The flag stays serve-only.
     # Paged cache options (experimental)
     bench_parser.add_argument(
         "--use-paged-cache",

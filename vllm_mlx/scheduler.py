@@ -196,19 +196,6 @@ class SchedulerConfig:
     # positional ``SchedulerConfig(...)`` construction can silently rebind.
     hybrid_cache_entries: int = 0
 
-    # Opt-in prompt-deterministic RESPONSE CACHE (exact-match short-circuit).
-    # 0 (default) disables it entirely — no store, no lookup, zero behavior
-    # change. N > 0 LRU-bounds the cache to N fully-computed deterministic
-    # responses so a completely repeated greedy request returns the stored
-    # completion verbatim, zero GPU decode. Distinct from the prefix/KV cache
-    # (which reuses prefix STATE); this returns the whole stored completion.
-    # Consumed at the route layer (``vllm_mlx/response_cache.py`` singleton,
-    # configured at serve boot), not by the scheduler hot loop — kept on
-    # SchedulerConfig purely so the CLI plumbs it through the same
-    # construction sites as every other cache knob. Appended AFTER the
-    # pre-existing fields so no positional ``SchedulerConfig(...)`` rebinds.
-    response_cache_entries: int = 0
-
     # Speculative decoding selection. "none" is baseline decode; "mtp"
     # installs the vendored mlx-lm PR #990 MTP draft/verify path through
     # the common speculative-config frontend.
@@ -353,6 +340,26 @@ class SchedulerConfig:
     # the pre-PR-B fixed-K=1 chain-of-1 behavior (used for A/B benching).
     mtp_max_k: int = 3
     mtp_disable_auto_k: bool = False
+
+    # Opt-in prompt-deterministic RESPONSE CACHE (exact-match short-circuit).
+    # 0 (default) disables it entirely — no store, no lookup, zero behavior
+    # change. N > 0 LRU-bounds the cache to N fully-computed deterministic
+    # responses so a completely repeated greedy request returns the stored
+    # completion verbatim, zero GPU decode. Distinct from the prefix/KV cache
+    # (which reuses prefix STATE); this returns the whole stored completion.
+    # Consumed at the route layer (``vllm_mlx/response_cache.py`` singleton,
+    # configured at serve boot), not by the scheduler hot loop — kept on
+    # SchedulerConfig purely so the CLI plumbs it through the same
+    # construction sites as every other cache knob.
+    #
+    # Codex #1123 BLOCKING-1: this field lives at the VERY END of the
+    # dataclass (after every pre-existing field, including all the
+    # speculative-decoding fields) so no positional ``SchedulerConfig(...)``
+    # construction can silently rebind. Inserting it mid-list — as the
+    # original PR did, between ``hybrid_cache_entries`` and ``spec_decode`` —
+    # shifted every subsequent positional argument. Do NOT relocate it back
+    # into the middle.
+    response_cache_entries: int = 0
 
     def __post_init__(self) -> None:
         if self.response_cache_entries < 0:
