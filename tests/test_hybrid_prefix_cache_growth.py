@@ -691,53 +691,67 @@ def test_persistent_load_keeps_both_kinds_when_disabled(tmp_path):
     )
 
 
-def test_merge_load_evicts_opportunistic_not_imported(tmp_path):
-    """#1111 regression: merge-loading (replace=False) an imported entry into a
-    cache that already holds OPPORTUNISTIC entries AT the bound must evict the
-    OPPORTUNISTIC (unprotected) one, never the imported (protected) one, and
-    report ``loaded == 1``.
+def test_store_after_import_evicts_oldest_opportunistic_not_import(tmp_path):
+    """#1111 regression: with a protected import present, live-storing MORE
+    opportunistic hybrid entries than the bound allows must GENUINELY evict the
+    OLDEST opportunistic (unprotected) entry — never the protected import.
 
     Ports SGLang's protected/evictable split: the retention bound acts on the
-    evictable (opportunistic live-store #1075) set ONLY. The imported entry is
-    protected, so it survives; a pre-existing OPPORTUNISTIC entry above the
-    bound is the LRU victim. That eviction belongs to the destination, not this
-    import, so it must NOT be subtracted from the import's ``loaded`` tally (the
-    reconciliation loop only nets ``staged`` victims — and imports are never
-    victims).
+    evictable (opportunistic live-store #1075) set ONLY. This test forces real
+    eviction: under N=2 it stores THREE opportunistic entries, so the 3rd store
+    pushes the evictable set over the bound and the enforcer LRU-evicts the
+    oldest opportunistic entry. The protected import is excluded from the
+    candidate set (SGLang ``evictable_leaves`` skips ``lock_ref > 0`` nodes), so
+    it survives while the bound still holds at N=2 over opportunistic entries.
     """
-    # Snapshot on disk: a single NEW hybrid entry to import.
-    src_config = MemoryCacheConfig(
-        max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=9
+    # Snapshot on disk: a single NEW hybrid entry to import (becomes protected).
+    src = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=9
+        ),
     )
-    src = MemoryAwarePrefixCache(MagicMock(), src_config)
     assert src.store(list(range(7000, 7008)), _real_hybrid_cache()) is True
     cache_dir = str(tmp_path / "snap")
     assert src.save_to_disk(cache_dir) is True
 
-    # Destination already holds TWO pre-existing OPPORTUNISTIC (unprotected)
-    # hybrid entries under N=2, so it is FULL of evictable entries before the
-    # import. These were stored live, so ``protected`` is False.
-    dst_config = MemoryCacheConfig(
-        max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=2
+    dst = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=2
+        ),
     )
-    dst = MemoryAwarePrefixCache(MagicMock(), dst_config)
+    # Import first: the protected entry.
+    assert dst.load_from_disk(cache_dir, replace=False) == 1
+    import_key = tuple(range(7000, 7008))
+    assert dst._entries[import_key].protected
+
+    # Now store THREE opportunistic entries under the N=2 bound. Each store
+    # fires the enforcer; the 3rd store pushes the EVICTABLE set to 3 > 2, so
+    # the oldest opportunistic entry (9000) is genuinely LRU-evicted.
     assert dst.store(list(range(9000, 9008)), _real_hybrid_cache()) is True
     assert dst.store(list(range(9100, 9108)), _real_hybrid_cache()) is True
-    assert dst.get_stats()["non_trimmable_entries"] == 2
-    assert not dst._entries[tuple(range(9000, 9008))].protected
+    assert dst.store(list(range(9200, 9208)), _real_hybrid_cache()) is True
 
-    loaded = dst.load_from_disk(cache_dir, replace=False)
-
-    # The import is protected -> survives regardless of the bound. The bound's
-    # evictable set is now the 2 opportunistic entries (imports excluded);
-    # N=2 keeps both, so nothing is evicted and the import is purely additive.
-    assert loaded == 1, "Merge-load must count only the imported entry"
-    assert tuple(range(7000, 7008)) in dst._entries
-    assert dst._entries[tuple(range(7000, 7008))].protected
-    assert tuple(range(9000, 9008)) in dst._entries
+    # Eviction genuinely fired: the oldest opportunistic entry is GONE.
+    assert tuple(range(9000, 9008)) not in dst._entries, (
+        "the 3rd opportunistic store must LRU-evict the oldest one (bound=2)"
+    )
+    # The two newest opportunistic entries remain (bound=2 over evictable set).
     assert tuple(range(9100, 9108)) in dst._entries
-    # loaded_bytes ledger must stay coherent (non-negative, matches survivor).
-    assert dst._last_load_bytes > 0
+    assert tuple(range(9200, 9208)) in dst._entries
+    # The PROTECTED import survives the eviction that just fired.
+    assert import_key in dst._entries, (
+        "the protected import must NOT be evicted by an opportunistic store"
+    )
+    assert dst._entries[import_key].protected
+    # Bound is enforced over the EVICTABLE set only: 2 opportunistic + 1
+    # protected import = 3 non-trimmable total, but only 2 are evictable.
+    assert dst.get_stats()["non_trimmable_entries"] == 3
+    evictable = sum(
+        1 for e in dst._entries.values() if e.non_trimmable and not e.protected
+    )
+    assert evictable == 2
 
 
 def test_enforcer_never_evicts_protected_imports(tmp_path):
