@@ -365,7 +365,9 @@ class BaseEngine(ABC):
             return SaveOutcome(outcome="failed")
         return SaveOutcome(outcome="failed" if entry_count > 0 else "empty")
 
-    def load_cache_with_result(self, cache_dir: str, replace: bool = False):
+    def load_cache_with_result(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ):
         """Load the prefix cache and return a ``LoadResult`` (#1100 codex
         round 4 #2).
 
@@ -393,8 +395,22 @@ class BaseEngine(ABC):
         accepts_replace = _callable_accepts_kwarg(
             self.load_cache_from_disk, "replace", inspect
         )
+        # #1111 codex r3: ``protected_import`` was added to load_cache_from_disk
+        # alongside ``replace``. Same backcompat dance — pass it only if the
+        # callee accepts it. A legacy override missing it simply loads with its
+        # own default (protected), which is safe for the explicit-import path
+        # this method serves; only the non-default ``protected_import=False``
+        # (startup auto-load) MUST reach a modern callee, and the startup path
+        # calls ``load_cache_from_disk`` directly (not this result wrapper), so
+        # it never depends on this fallback.
+        accepts_protected = _callable_accepts_kwarg(
+            self.load_cache_from_disk, "protected_import", inspect
+        )
         if accepts_replace:
-            entries = self.load_cache_from_disk(cache_dir, replace=replace)
+            kwargs = {"replace": replace}
+            if accepts_protected:
+                kwargs["protected_import"] = protected_import
+            entries = self.load_cache_from_disk(cache_dir, **kwargs)
         else:
             if replace:
                 # The callee predates ``replace`` and cannot do an atomic
@@ -413,7 +429,9 @@ class BaseEngine(ABC):
         """Persist the prefix cache. Override in subclasses that have one."""
         return False
 
-    def load_cache_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+    def load_cache_from_disk(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ) -> int:
         """Hydrate the prefix cache. Override in subclasses that have one."""
         return 0
 

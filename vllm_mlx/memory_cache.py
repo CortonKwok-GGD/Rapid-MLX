@@ -2791,8 +2791,33 @@ class MemoryAwarePrefixCache:
         self._last_save_outcome = "committed" if committed else "failed"
         return committed
 
-    def load_from_disk(self, cache_dir: str, replace: bool = False) -> int:
+    def load_from_disk(
+        self, cache_dir: str, replace: bool = False, protected_import: bool = True
+    ) -> int:
         """Load cache entries from disk.
+
+        ``protected_import`` (#1111 regression follow-up, codex r3): marks the
+        loaded entries PROTECTED (exempt from the opportunistic hybrid retention
+        bound — SGLang ``lock_ref`` / vLLM ``ref_cnt`` idiom). It DISTINGUISHES
+        the two callers of this path, which must NOT be treated identically:
+
+        * ``True`` (default) — the EXPLICIT ``POST /v1/cache/import`` (#476): an
+          operator deliberately loading specific entries. They are pinned for
+          their lifetime, never opportunistically evicted.
+        * ``False`` — the process-restart STARTUP auto-load (radix persistence,
+          ``runtime/cache.py`` lifespan). Protection is a RUNTIME property of an
+          explicit operator action, not a persisted-and-immortalized attribute.
+          ``save_to_disk`` writes ALL live entries — including opportunistic
+          (unprotected) non-trimmable ones — so if startup reloaded them as
+          protected, the protected set would grow ~N per restart and defeat the
+          ``hybrid_reuse_max_entries`` cap (shutdown persists N opportunistic ->
+          boot reloads them protected -> new opportunistic added within the
+          bound -> persisted -> protected next boot -> unbounded). With
+          ``False``, reloaded non-trimmable entries are UNPROTECTED and obey the
+          bound at commit (N=0 default -> not retained, matching #1111's opt-in
+          design; N>0 -> bounded at N). Trimmable entries are untouched by the
+          enforcer either way. Mirrors SGLang/vLLM, where lock_ref / ref_cnt are
+          runtime refcounts, never immortal across a restart.
 
         ``replace=True`` implements the export/import "replace" merge
         strategy (#476) as an ATOMIC stage-then-swap on this thread: EVERY
@@ -3265,15 +3290,21 @@ class MemoryAwarePrefixCache:
                     # non_trimmable_entries gauge sees them the same as freshly
                     # stored ones.
                     non_trimmable=_cache_has_non_trimmable(cache),
-                    # #1111 regression fix: entries installed by a disk load are
-                    # EXPLICITLY persisted data being loaded — both the HTTP
-                    # ``POST /v1/cache/import`` (#476) and process-restart
-                    # auto-load-on-startup (radix persistence) reach here, and
-                    # the operator's decision is to treat them IDENTICALLY. Mark
-                    # them protected so the opportunistic hybrid retention bound
-                    # never evicts them (SGLang ``lock_ref`` / vLLM ``ref_cnt``
-                    # protected-set idiom, persistent-lifetime degenerate case).
-                    protected=True,
+                    # #1111 regression fix + codex r3: protection is set by the
+                    # CALLER, because the two callers of this load path are NOT
+                    # equivalent and must be treated DIFFERENTLY:
+                    #  * EXPLICIT ``POST /v1/cache/import`` (#476) ->
+                    #    ``protected_import=True``: an operator deliberately
+                    #    loading entries; pinned for their lifetime (SGLang
+                    #    ``lock_ref`` / vLLM ``ref_cnt`` protected-set idiom).
+                    #  * process-restart STARTUP auto-load ->
+                    #    ``protected_import=False``: reloaded entries stay
+                    #    UNPROTECTED and obey the retention bound. Marking them
+                    #    protected would make the protected set grow ~N per
+                    #    restart and defeat ``hybrid_reuse_max_entries`` (save
+                    #    persists opportunistic entries; see load_from_disk
+                    #    docstring for the full restart cycle).
+                    protected=protected_import,
                 )
                 staged[tokens_key] = entry
                 staged_memory += memory

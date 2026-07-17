@@ -863,3 +863,108 @@ def test_import_survives_a_later_unrelated_live_store(tmp_path):
     # Both survive: the protected import + the 1 opportunistic entry within N=1.
     assert dst.get_stats()["non_trimmable_entries"] == 2
     assert tuple(range(2000, 2008)) in dst._entries
+
+
+def test_startup_reload_cycle_does_not_grow_protected_set(tmp_path):
+    """#1111 codex r3 BLOCKING (restart-cycle growth) — mutation-kill.
+
+    The disk-load path is reached by BOTH the explicit HTTP import AND the
+    process-restart startup auto-load. ``save_to_disk`` persists ALL live
+    entries — including opportunistic (unprotected) non-trimmable ones. If the
+    startup reload marked them protected (as the first fix did unconditionally),
+    the protected set would grow ~N every restart and defeat the
+    ``hybrid_reuse_max_entries`` cap: shutdown persists N opportunistic -> boot
+    reloads them protected -> new opportunistic added within the bound ->
+    persisted -> protected next boot -> unbounded.
+
+    The fix threads ``protected_import`` and the STARTUP path passes ``False``,
+    so reloaded non-trimmable entries stay UNPROTECTED and obey the bound at
+    commit. This test simulates K shutdown/reload cycles under N and asserts the
+    retained non-trimmable set NEVER exceeds N.
+
+    Mutation-kill: revert the startup caller to ``protected_import=True`` (or
+    hardcode ``protected=True`` at the commit site) and the count blows past N.
+    """
+    n = 2
+    k_cycles = 5
+
+    def _snapshot_of_live_cache(cache, out_dir):
+        assert cache.save_to_disk(out_dir) is True
+
+    # Persist an initial snapshot of N opportunistic hybrid entries (stored
+    # under a generous bound so they all land on disk unprotected).
+    seed = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=200, max_entries=64, hybrid_reuse_max_entries=9
+        ),
+    )
+    for base in (100, 200):
+        assert seed.store(list(range(base, base + 8)), _real_hybrid_cache())
+    snap = str(tmp_path / "snap")
+    _snapshot_of_live_cache(seed, snap)
+
+    # Simulate restart cycles: each boot reloads the persisted snapshot as the
+    # STARTUP path does (protected_import=False), then live-stores one fresh
+    # opportunistic entry, then persists the whole live cache for the next boot.
+    for cycle in range(k_cycles):
+        booted = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(
+                max_memory_mb=200, max_entries=64, hybrid_reuse_max_entries=n
+            ),
+        )
+        # STARTUP auto-load — reloaded entries must be UNPROTECTED.
+        booted.load_from_disk(snap, replace=True, protected_import=False)
+        # No reloaded entry may be protected (they are opportunistic on disk).
+        assert not any(e.protected for e in booted._entries.values()), (
+            "startup-reloaded entries must be UNPROTECTED (protected_import=False)"
+        )
+        # A fresh opportunistic hybrid request this session.
+        booted.store(
+            list(range(1000 + cycle * 10, 1000 + cycle * 10 + 8)),
+            _real_hybrid_cache(),
+        )
+        # THE INVARIANT: the retained non-trimmable set never exceeds the bound,
+        # no matter how many restart cycles have accumulated on disk.
+        retained = booted.get_stats()["non_trimmable_entries"]
+        assert retained <= n, (
+            f"cycle {cycle}: retained non-trimmable {retained} exceeds bound {n} "
+            "— the startup-reload protected-set growth bug regressed"
+        )
+        # Persist the live cache for the next boot (mirrors shutdown).
+        _snapshot_of_live_cache(booted, snap)
+
+
+def test_startup_reload_obeys_bound_while_explicit_import_pins(tmp_path):
+    """#1111 codex r3: the two callers must be treated DIFFERENTLY.
+
+    Same on-disk snapshot of 3 hybrid entries:
+    * ``protected_import=False`` (startup) under N=1 -> reloaded non-trimmable
+      entries obey the bound -> at most 1 retained.
+    * ``protected_import=True`` (explicit #476 import) under the same N=1 ->
+      all 3 pinned, exempt from the bound.
+    """
+    cache_dir = _persist_three_hybrid_entries(tmp_path)
+
+    startup = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=1
+        ),
+    )
+    startup.load_from_disk(cache_dir, replace=True, protected_import=False)
+    assert startup.get_stats()["non_trimmable_entries"] <= 1, (
+        "startup auto-load must obey the retention bound"
+    )
+    assert not any(e.protected for e in startup._entries.values())
+
+    explicit = MemoryAwarePrefixCache(
+        MagicMock(),
+        MemoryCacheConfig(
+            max_memory_mb=100, max_entries=64, hybrid_reuse_max_entries=1
+        ),
+    )
+    assert explicit.load_from_disk(cache_dir, replace=True, protected_import=True) == 3
+    assert explicit.get_stats()["non_trimmable_entries"] == 3
+    assert all(e.protected for e in explicit._entries.values())
