@@ -23,6 +23,7 @@ import tempfile
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -42,19 +43,106 @@ VLM_EXTRA_INSTALL_HINT = (
 )
 
 
-def mlx_vlm_available() -> bool:
-    """Return True iff the optional ``mlx-vlm`` package can be imported.
+# Import-module → PyPI-distribution name for the runtime deps mlx-vlm
+# pulls. mlx-vlm imports Pillow as ``PIL`` but the installable package is
+# ``pillow``; naming the import module in a ``pip install`` line would 404.
+_MISSING_MODULE_PIP_NAME = {
+    "PIL": "pillow",
+}
 
-    Mirrors :func:`vllm_mlx.embedding.mlx_embeddings_available` so the
-    cli-side ``--mllm`` / vision-alias boot guard
-    (:func:`require_mlx_vlm_or_exit`) can probe presence without
-    actually importing the dependency at module top-level. ``mlx-vlm``
-    lives behind the ``[vision]`` extra; a plain
-    ``pip install rapid-mlx`` will not have it.
+
+def _pip_name_for_module(module: str) -> str:
+    """Map a missing *import* module name to its ``pip install`` target."""
+    return _MISSING_MODULE_PIP_NAME.get(module, module)
+
+
+class VisionRuntimeStatus(str, Enum):
+    """Tri-state health of the vision runtime (``mlx-vlm`` + its deps).
+
+    * ``OK`` — ``import mlx_vlm`` succeeds; vision paths are usable.
+    * ``ABSENT`` — ``mlx-vlm`` is not installed at all (plain
+      ``pip install rapid-mlx`` without the ``[vision]`` extra).
+    * ``BROKEN`` — ``mlx-vlm`` IS installed (dist metadata + import spec
+      present) but a runtime dependency it needs (e.g. Pillow / ``PIL``)
+      is missing, so the real ``import mlx_vlm`` raises. This is the
+      Homebrew ``pip install --no-deps mlx-vlm`` state that #1126 is
+      about: three separate metadata/spec-only checks answered "yes"
+      while ``import mlx_vlm`` crashed on ``from PIL import Image``.
     """
-    import importlib.util
 
-    return importlib.util.find_spec("mlx_vlm") is not None
+    OK = "ok"
+    ABSENT = "absent"
+    BROKEN = "broken"
+
+
+def vision_runtime_status() -> tuple[VisionRuntimeStatus, str | None]:
+    """Authoritative check of whether the vision runtime can actually load.
+
+    Single source of truth for "is vision usable?". Returns
+    ``(status, missing_module)`` where ``missing_module`` names the import
+    that failed (``None`` when ``OK``).
+
+    Unlike a bare ``find_spec`` / ``importlib.metadata.version`` probe,
+    this performs the REAL ``import mlx_vlm`` so a broken dependency chain
+    (mlx-vlm present, Pillow absent) is reported honestly — and so the
+    failure surfaces FAST at ``serve`` entry rather than deep inside the
+    FastAPI lifespan (#1126). We import first (rather than probe
+    ``find_spec``) because the actual import is the authoritative signal
+    and is robust to test harnesses that inject a stand-in ``mlx_vlm``
+    into ``sys.modules``; the raised ``ModuleNotFoundError``'s ``name``
+    then distinguishes "mlx-vlm itself missing" (``ABSENT``) from
+    "mlx-vlm present but a runtime dep like ``PIL`` missing" (``BROKEN``).
+    """
+    try:
+        import mlx_vlm  # noqa: F401
+    except ModuleNotFoundError as e:
+        name = e.name or ""
+        if not name or name == "mlx_vlm" or name.startswith("mlx_vlm"):
+            # mlx-vlm itself isn't importable → not installed.
+            return VisionRuntimeStatus.ABSENT, "mlx_vlm"
+        # mlx-vlm imports, but a runtime dependency it needs is missing
+        # (Homebrew ``pip install --no-deps mlx-vlm`` → no PIL).
+        return VisionRuntimeStatus.BROKEN, name
+    except ImportError as e:
+        # A non-ModuleNotFound import failure somewhere in the mlx-vlm
+        # chain (e.g. a masking meta-path finder in a test harness). If it
+        # names a specific missing sub-dependency, call it broken;
+        # otherwise treat a blocked/un-locatable top-level package as
+        # absent — the conservative choice that keeps the "install mlx-vlm"
+        # hint for the genuine not-installed case.
+        name = getattr(e, "name", None)
+        if name and name != "mlx_vlm" and not name.startswith("mlx_vlm"):
+            return VisionRuntimeStatus.BROKEN, name
+        return VisionRuntimeStatus.ABSENT, "mlx_vlm"
+    return VisionRuntimeStatus.OK, None
+
+
+def _vlm_broken_install_hint(missing: str) -> str:
+    """Install hint for the "mlx-vlm present but a runtime dep is missing"
+    case — names the full-stack fix AND the single missing piece."""
+    pip_name = _pip_name_for_module(missing)
+    return (
+        f"`mlx-vlm` is installed but its dependency {missing!r} is not, so "
+        f"the vision runtime cannot load. Install the full vision stack:\n"
+        f"    pip install 'rapid-mlx[vision]'\n"
+        f"or just the missing piece:\n"
+        f"    pip install {pip_name}"
+    )
+
+
+def mlx_vlm_available() -> bool:
+    """Return True iff the vision runtime can actually be imported.
+
+    Historically a bare ``find_spec('mlx_vlm')`` probe, which answered
+    True for the Homebrew ``pip install --no-deps mlx-vlm`` state where
+    mlx-vlm's spec exists but ``import mlx_vlm`` crashes on a missing
+    Pillow (#1126). It now reflects REAL importability so the boot guard
+    (:func:`require_mlx_vlm_or_exit`) fails fast with an honest message
+    instead of passing to a lifespan crash. Mirrors
+    :func:`vllm_mlx.embedding.mlx_embeddings_available`'s role as the
+    cli-side ``--mllm`` / vision-alias presence probe.
+    """
+    return vision_runtime_status()[0] is VisionRuntimeStatus.OK
 
 
 def require_mlx_vlm_or_exit(model_name: str) -> None:
@@ -70,34 +158,57 @@ def require_mlx_vlm_or_exit(model_name: str) -> None:
     message. Probe at flag-parse / serve_command entry instead and
     exit ``2`` (argparse usage-error code) with the same install hint
     on stderr — matches :func:`require_mlx_embeddings_or_exit` shape.
+
+    #1126: distinguish "mlx-vlm not installed" from "mlx-vlm installed
+    but its dependency (e.g. PIL) is missing" (Homebrew ``--no-deps``)
+    so the hint names the actually-missing piece rather than telling the
+    user to install a package they already have.
     """
     if mlx_vlm_available():
         return
-    print(
-        f"error: model {model_name!r} is a vision/multimodal alias and "
-        f"requires the optional `mlx-vlm` dependency (shipped with the "
-        f"[vision] extra).\n" + VLM_EXTRA_INSTALL_HINT,
-        file=sys.stderr,
-    )
+    status, missing = vision_runtime_status()
+    if status is VisionRuntimeStatus.BROKEN and missing:
+        print(
+            f"error: model {model_name!r} is a vision/multimodal alias, but "
+            f"the vision runtime cannot load.\n"
+            + _vlm_broken_install_hint(missing),
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"error: model {model_name!r} is a vision/multimodal alias and "
+            f"requires the optional `mlx-vlm` dependency (shipped with the "
+            f"[vision] extra).\n" + VLM_EXTRA_INSTALL_HINT,
+            file=sys.stderr,
+        )
     sys.exit(2)
 
 
 def _require_mlx_vlm() -> None:
-    """Verify mlx-vlm is installed; raise actionable error if not.
+    """Verify the vision runtime can load; raise actionable error if not.
 
     Engine-side last-line-of-defence: ``rapid-mlx serve`` is supposed
     to short-circuit at :func:`require_mlx_vlm_or_exit` before this
     runs, but library callers (``MLXMultimodalLM`` used directly,
     benchmark/eval harnesses) still need an actionable error if they
     skipped the CLI guard.
+
+    #1126: when mlx-vlm is installed but a runtime dep is missing
+    (Homebrew ``--no-deps`` → no PIL), name the missing module instead
+    of the misleading "install mlx-vlm" (which IS installed).
     """
-    try:
-        import mlx_vlm  # noqa: F401
-    except ImportError as e:
+    status, missing = vision_runtime_status()
+    if status is VisionRuntimeStatus.OK:
+        return
+    if status is VisionRuntimeStatus.BROKEN and missing:
         raise ImportError(
-            "Vision/multimodal models require the optional `mlx-vlm` "
-            "dependency.\n" + VLM_EXTRA_INSTALL_HINT
-        ) from e
+            "Vision/multimodal models cannot load the vision runtime.\n"
+            + _vlm_broken_install_hint(missing)
+        )
+    raise ImportError(
+        "Vision/multimodal models require the optional `mlx-vlm` "
+        "dependency.\n" + VLM_EXTRA_INSTALL_HINT
+    )
 
 
 class TempFileManager:

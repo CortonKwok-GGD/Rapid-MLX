@@ -425,6 +425,23 @@ def _safe_version(dist: str) -> str | None:
         return None
 
 
+def _pil_importable() -> bool:
+    """Lightweight probe: is Pillow (import name ``PIL``) importable?
+
+    mlx-vlm does ``from PIL import Image`` at module load, so a present
+    mlx-vlm with an absent PIL — the Homebrew ``pip install --no-deps
+    mlx-vlm`` state (#1126) — is a FALSE positive: metadata says
+    installed, but every vision path crashes on import. We probe via
+    ``find_spec`` (NOT a real ``import mlx_vlm``) to keep ``doctor`` fast
+    (≤5 s contract; a real vision import would pull torch)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("PIL") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def _version_at_least(ver: str, minimum: tuple[int, ...]) -> bool:
     """Compare a PEP 440 version string against a ``(major, minor, patch)``
     floor using leading-numeric tuple semantics.
@@ -479,6 +496,23 @@ def section_optional_packages() -> Section:
     for dist, label, hint in OPTIONAL_PACKAGES:
         ver = _safe_version(dist)
         if ver:
+            # #1126: mlx-vlm imports Pillow (PIL) at load. A present
+            # mlx-vlm with an absent PIL (Homebrew `pip install --no-deps
+            # mlx-vlm`) is a FALSE positive — metadata says "installed" but
+            # every vision path crashes on `from PIL import Image` deep in
+            # the FastAPI lifespan. Report it honestly and name the real
+            # gap so the user fixes the right thing.
+            if dist == "mlx-vlm" and not _pil_importable():
+                s.add(
+                    f"{label} {ver} present but Pillow (PIL) missing — "
+                    f"vision paths will fail (`{hint}`)",
+                    CheckStatus.WARN,
+                    detail=(
+                        f"distribution={dist} version={ver} pil=missing "
+                        f"hint={hint}"
+                    ),
+                )
+                continue
             s.add(
                 f"{label} {ver}",
                 CheckStatus.OK,
@@ -499,11 +533,25 @@ def section_optional_packages() -> Section:
     dflash_min = (0, 5, 0)
     vlm_ver = _safe_version("mlx-vlm")
     if vlm_ver and _version_at_least(vlm_ver, dflash_min):
-        s.add(
-            "mlx-vlm 0.5.0+ (dflash extras)",
-            CheckStatus.OK,
-            detail=f"distribution=mlx-vlm version={vlm_ver}",
-        )
+        # #1126: same PIL honesty as the vision row — a version-adequate
+        # mlx-vlm whose Pillow dep is missing can't actually run the
+        # dflash/vision runtime, so don't paint it green.
+        if not _pil_importable():
+            s.add(
+                "mlx-vlm 0.5.0+ (dflash extras) present but Pillow (PIL) "
+                "missing — dflash/vision paths will fail",
+                CheckStatus.WARN,
+                detail=(
+                    f"distribution=mlx-vlm version={vlm_ver} pil=missing "
+                    "hint=pip install 'rapid-mlx[vision]'"
+                ),
+            )
+        else:
+            s.add(
+                "mlx-vlm 0.5.0+ (dflash extras)",
+                CheckStatus.OK,
+                detail=f"distribution=mlx-vlm version={vlm_ver}",
+            )
     else:
         current = vlm_ver or "not installed"
         s.add(

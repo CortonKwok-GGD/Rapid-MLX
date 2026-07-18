@@ -1,0 +1,308 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Regression tests for #1126 (honest vision-runtime detection — the
+Homebrew ``pip install --no-deps mlx-vlm`` half).
+
+Root cause: Homebrew installs mlx-vlm with ``pip install --no-deps
+mlx-vlm``, so mlx-vlm's source + dist metadata exist but its runtime dep
+Pillow (PIL) does NOT. Three separate "is vision available?" checks all
+answered YES from metadata/spec:
+
+* ``importlib.metadata.version("mlx-vlm")`` returns a version (doctor's
+  ``_safe_version`` → green ``✓ mlx-vlm``),
+* ``importlib.util.find_spec("mlx_vlm")`` is not None
+  (``mlx_vlm_available`` → boot guard passes),
+
+while the REAL ``import mlx_vlm`` crashes on ``from PIL import Image``
+(mlx_vlm/utils.py) — deep inside FastAPI lifespan, with a message telling
+the user to install mlx-vlm (which IS installed).
+
+The invariant these tests pin: **when mlx-vlm's metadata/spec is present
+but its import chain is broken, every "is vision usable?" surface reports
+not-usable and names the actually-missing module (PIL), distinct from the
+"mlx-vlm truly absent" message.** They simulate the PIL-missing state via
+monkeypatch (find_spec present, ``import mlx_vlm`` raising
+``ModuleNotFoundError("No module named 'PIL'")``) so they run on a normal
+dev machine where mlx-vlm + PIL are actually installed.
+
+These assertions FAIL against the pre-fix code (find_spec-only /
+metadata-only checks report "available"/green) and PASS after.
+"""
+
+from __future__ import annotations
+
+import builtins
+import importlib.util as _ilu
+import sys
+
+import pytest
+
+# ─────────────────────────────────────────────────────────────────────────
+# Simulators
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _simulate_mlx_vlm_present_but_pil_missing(monkeypatch):
+    """Homebrew ``--no-deps`` state: ``find_spec('mlx_vlm')`` is not None
+    (dist present) but ``import mlx_vlm`` raises
+    ``ModuleNotFoundError("No module named 'PIL'")``."""
+    real_find_spec = _ilu.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "mlx_vlm":
+            # mlx-vlm's spec/metadata IS present (installed --no-deps).
+            spec = real_find_spec(name, *args, **kwargs)
+            return spec if spec is not None else object()
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(_ilu, "find_spec", fake_find_spec)
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "mlx_vlm" or name.startswith("mlx_vlm."):
+            # Mirror the real crash inside mlx_vlm/utils.py:
+            # ``from PIL import Image`` with PIL uninstalled.
+            raise ModuleNotFoundError("No module named 'PIL'", name="PIL")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    sys.modules.pop("mlx_vlm", None)
+
+
+def _simulate_mlx_vlm_absent(monkeypatch):
+    """Plain ``pip install rapid-mlx`` state: mlx-vlm not installed at all
+    (``find_spec`` None, import raises for the package itself)."""
+    real_find_spec = _ilu.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "mlx_vlm" or name.startswith("mlx_vlm."):
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(_ilu, "find_spec", fake_find_spec)
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "mlx_vlm" or name.startswith("mlx_vlm."):
+            raise ModuleNotFoundError("No module named 'mlx_vlm'", name="mlx_vlm")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    sys.modules.pop("mlx_vlm", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tri-state runtime status: the single source of truth.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_status_broken_when_pil_missing(monkeypatch):
+    """mlx-vlm present but PIL missing ⇒ status is the "present-but-broken"
+    state and names the missing module (PIL), NOT "absent"."""
+    from vllm_mlx.models.mllm import VisionRuntimeStatus, vision_runtime_status
+
+    _simulate_mlx_vlm_present_but_pil_missing(monkeypatch)
+
+    status, missing = vision_runtime_status()
+    assert status is VisionRuntimeStatus.BROKEN, (
+        f"expected BROKEN (metadata present, import chain broken), got {status}"
+    )
+    assert missing == "PIL", f"missing module should be PIL, got {missing!r}"
+
+
+def test_status_absent_when_mlx_vlm_missing(monkeypatch):
+    """mlx-vlm not installed at all ⇒ status is "absent" (distinct from
+    broken)."""
+    from vllm_mlx.models.mllm import VisionRuntimeStatus, vision_runtime_status
+
+    _simulate_mlx_vlm_absent(monkeypatch)
+
+    status, _missing = vision_runtime_status()
+    assert status is VisionRuntimeStatus.ABSENT, (
+        f"expected ABSENT (mlx-vlm not installed), got {status}"
+    )
+
+
+def test_mlx_vlm_available_false_when_pil_missing(monkeypatch):
+    """The boot-guard presence probe must be honest: metadata/spec present
+    but a broken import chain ⇒ NOT available. Pre-fix this returned True
+    (find_spec-only), so the boot guard passed and the crash surfaced deep
+    in FastAPI lifespan."""
+    from vllm_mlx.models.mllm import mlx_vlm_available
+
+    _simulate_mlx_vlm_present_but_pil_missing(monkeypatch)
+
+    assert mlx_vlm_available() is False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Engine-side guard: message names PIL, distinct from the absent message.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_require_mlx_vlm_message_names_pil_when_broken(monkeypatch):
+    """``_require_mlx_vlm`` (engine-side last line of defence) must raise an
+    ImportError that names the actually-missing module (PIL) rather than
+    telling the user to install mlx-vlm (which IS installed)."""
+    from vllm_mlx.models.mllm import _require_mlx_vlm
+
+    _simulate_mlx_vlm_present_but_pil_missing(monkeypatch)
+
+    with pytest.raises(ImportError) as exc_info:
+        _require_mlx_vlm()
+    msg = str(exc_info.value)
+    assert "PIL" in msg, f"broken-runtime message must name PIL, got: {msg!r}"
+
+
+def test_broken_and_absent_messages_are_distinct(monkeypatch):
+    """The two failure modes must NOT collapse into the same message: the
+    broken message names the missing runtime dep (PIL); the absent message
+    tells the user to install mlx-vlm. A user staring at 'install mlx-vlm'
+    while mlx-vlm IS installed is the exact #1126 confusion."""
+    from vllm_mlx.models.mllm import _require_mlx_vlm
+
+    _simulate_mlx_vlm_present_but_pil_missing(monkeypatch)
+    with pytest.raises(ImportError) as broken_exc:
+        _require_mlx_vlm()
+    broken_msg = str(broken_exc.value)
+
+    _simulate_mlx_vlm_absent(monkeypatch)
+    with pytest.raises(ImportError) as absent_exc:
+        _require_mlx_vlm()
+    absent_msg = str(absent_exc.value)
+
+    assert broken_msg != absent_msg, (
+        "broken and absent messages must differ so the user can tell "
+        "'install pillow' apart from 'install mlx-vlm'"
+    )
+    assert "PIL" in broken_msg and "PIL" not in absent_msg, (
+        f"only the broken message should name PIL. broken={broken_msg!r} "
+        f"absent={absent_msg!r}"
+    )
+
+
+def test_boot_guard_exit_message_names_pil_when_broken(monkeypatch, capsys):
+    """``require_mlx_vlm_or_exit`` must preserve its exit-code-2 shape AND
+    name PIL in the broken case so the operator sees the actionable hint on
+    stderr before any download starts."""
+    from vllm_mlx.models.mllm import require_mlx_vlm_or_exit
+
+    _simulate_mlx_vlm_present_but_pil_missing(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc_info:
+        require_mlx_vlm_or_exit("gemma-4-26b-a4b-it-4bit")
+    assert exc_info.value.code == 2
+
+    err = capsys.readouterr().err
+    assert "PIL" in err or "Pillow" in err, (
+        f"broken-runtime boot hint must name Pillow/PIL, got: {err!r}"
+    )
+    # Still points at the fix.
+    assert "rapid-mlx[vision]" in err or "pillow" in err.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Doctor: the vision + dflash rows must not be green when mlx-vlm metadata
+# is present but PIL is missing.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _find_row(section, *needles):
+    for check in section.checks:
+        low = check.label.lower()
+        if all(n.lower() in low for n in needles):
+            return check
+    return None
+
+
+def test_doctor_vision_row_not_ok_and_names_pil_when_pil_missing(monkeypatch):
+    """``rapid-mlx doctor`` must NOT show a green ``✓ mlx-vlm (vision
+    extras)`` when mlx-vlm metadata is present but the import chain is
+    broken (PIL missing). It must WARN/FAIL and name PIL/Pillow.
+
+    The check stays FAST (≤5 s doctor contract) — a lightweight
+    ``find_spec('PIL')`` probe, not a heavy ``import mlx_vlm`` that would
+    pull torch."""
+    from vllm_mlx.doctor import env_health
+    from vllm_mlx.doctor.env_health import CheckStatus
+
+    # mlx-vlm metadata present (Homebrew --no-deps), PIL not importable.
+    def fake_safe_version(dist):
+        if dist == "mlx-vlm":
+            return "0.6.5"
+        return None
+
+    monkeypatch.setattr(env_health, "_safe_version", fake_safe_version)
+    monkeypatch.setattr(env_health, "_pil_importable", lambda: False)
+
+    section = env_health.section_optional_packages()
+
+    vision_row = _find_row(section, "mlx-vlm", "vision")
+    assert vision_row is not None, "vision (mlx-vlm) row missing from doctor"
+    assert vision_row.status is not CheckStatus.OK, (
+        f"vision row must NOT be green when PIL is missing, got {vision_row.status}: "
+        f"{vision_row.label!r}"
+    )
+    assert "pil" in vision_row.label.lower() or "pillow" in vision_row.label.lower(), (
+        f"vision row must name PIL/Pillow so the user knows the real gap, "
+        f"got: {vision_row.label!r}"
+    )
+
+    dflash_row = _find_row(section, "dflash")
+    assert dflash_row is not None, "dflash row missing from doctor"
+    assert dflash_row.status is not CheckStatus.OK, (
+        f"dflash row must NOT be green when PIL missing, got {dflash_row.status}"
+    )
+    assert "pil" in dflash_row.label.lower() or "pillow" in dflash_row.label.lower(), (
+        f"dflash row must name PIL/Pillow, got: {dflash_row.label!r}"
+    )
+
+
+def test_doctor_vision_row_ok_when_pil_present(monkeypatch):
+    """Guard against over-warning: when BOTH mlx-vlm metadata AND PIL are
+    present the vision + dflash rows stay green — the honest-detection fix
+    must not turn a healthy vision install red."""
+    from vllm_mlx.doctor import env_health
+    from vllm_mlx.doctor.env_health import CheckStatus
+
+    def fake_safe_version(dist):
+        if dist == "mlx-vlm":
+            return "0.6.5"
+        return None
+
+    monkeypatch.setattr(env_health, "_safe_version", fake_safe_version)
+    monkeypatch.setattr(env_health, "_pil_importable", lambda: True)
+
+    section = env_health.section_optional_packages()
+    vision_row = _find_row(section, "mlx-vlm", "vision")
+    assert vision_row is not None
+    assert vision_row.status is CheckStatus.OK, (
+        f"vision row should be green when mlx-vlm + PIL both present, got "
+        f"{vision_row.status}: {vision_row.label!r}"
+    )
+    dflash_row = _find_row(section, "dflash")
+    assert dflash_row is not None
+    assert dflash_row.status is CheckStatus.OK
+
+
+def test_doctor_vision_row_warns_when_mlx_vlm_truly_absent(monkeypatch):
+    """The truly-absent path must still WARN as before (not silently pass,
+    not spuriously name PIL). Preserves the existing text-only install
+    messaging."""
+    from vllm_mlx.doctor import env_health
+    from vllm_mlx.doctor.env_health import CheckStatus
+
+    # mlx-vlm not installed at all.
+    monkeypatch.setattr(env_health, "_safe_version", lambda dist: None)
+    # PIL state is irrelevant when mlx-vlm itself is absent, but pin it
+    # present so a spurious PIL mention can't sneak in via the absent path.
+    monkeypatch.setattr(env_health, "_pil_importable", lambda: True)
+
+    section = env_health.section_optional_packages()
+    vision_row = _find_row(section, "mlx-vlm", "vision")
+    assert vision_row is not None
+    assert vision_row.status is CheckStatus.WARN, (
+        f"truly-absent mlx-vlm must WARN, got {vision_row.status}"
+    )
+    assert "not installed" in vision_row.label.lower()
