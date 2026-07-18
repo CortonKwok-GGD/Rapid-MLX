@@ -894,7 +894,7 @@ def is_mllm_model(model_name: str) -> bool:
     if config is not None:
         if not _config_indicates_vlm(config):
             return False
-        verdict = checkpoint_has_multimodal_weights(metadata.snapshot_dir)
+        verdict = checkpoint_has_multimodal_weights(metadata.snapshot_dir, config)
         if verdict is False:
             return False
         if profile is not None:

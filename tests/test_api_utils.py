@@ -380,6 +380,24 @@ class TestIsMllmModelWeightsPresenceOverride:
         )
         assert is_mllm_model(str(model_dir)) is True
 
+    def test_vision_config_with_unrecognised_vision_namespace_stays_vlm(self, tmp_path):
+        """An unknown encoder prefix is insufficient evidence to force text."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "repackaged-vlm",
+            {
+                "model_type": "qwen3_5_moe",
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.lm_head.weight",
+                "vision_encoder.blocks.0.weight",
+            ],
+        )
+
+        assert is_mllm_model(str(model_dir)) is True
+
     def test_audio_only_checkpoint_with_audio_weights(self, tmp_path):
         """Same principle but for the audio branch (audio_tower prefix)."""
         model_dir = self._make_model_dir(
@@ -513,7 +531,9 @@ class TestIsMllmModelCachedMetadata:
             ),
         )
         monkeypatch.setattr(
-            utils_mod, "checkpoint_has_multimodal_weights", lambda snapshot: True
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: True,
         )
         assert is_mllm_model("publisher/research-agent-mlx") is True
 
@@ -533,7 +553,9 @@ class TestIsMllmModelCachedMetadata:
             ),
         )
         monkeypatch.setattr(
-            utils_mod, "checkpoint_has_multimodal_weights", lambda snapshot: None
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: None,
         )
 
         assert is_mllm_model("publisher/text-only-repack") is False
@@ -552,7 +574,9 @@ class TestIsMllmModelCachedMetadata:
             ),
         )
         monkeypatch.setattr(
-            utils_mod, "checkpoint_has_multimodal_weights", lambda snapshot: True
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: True,
         )
 
         assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False

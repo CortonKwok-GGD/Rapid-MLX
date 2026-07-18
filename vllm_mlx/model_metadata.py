@@ -18,6 +18,10 @@ from typing import Any
 # anyway: a corrupt cache entry must not turn startup classification into an
 # unbounded allocation.
 MAX_METADATA_FILE_BYTES = 1 * 1024 * 1024
+# Checkpoint indexes enumerate every tensor in large sharded models, so they
+# legitimately exceed the config/template cap.  Keep their own bounded budget
+# rather than silently discarding modality evidence for production checkpoints.
+MAX_WEIGHT_INDEX_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -30,12 +34,14 @@ class ModelMetadata:
     is_local: bool = False
 
 
-def _read_json(path: Path | None) -> dict[str, Any] | None:
+def _read_json(
+    path: Path | None, *, max_bytes: int = MAX_METADATA_FILE_BYTES
+) -> dict[str, Any] | None:
     """Read one bounded JSON object, returning ``None`` on cache failures."""
     if path is None or not path.is_file():
         return None
     try:
-        if path.stat().st_size > MAX_METADATA_FILE_BYTES:
+        if path.stat().st_size > max_bytes:
             return None
         with path.open(encoding="utf-8") as f:
             value = json.load(f)
@@ -196,6 +202,8 @@ MULTIMODAL_TENSOR_PREFIXES = (
     "mm_projector",
     "patch_embed.",
 )
+_QWEN3_5_MOE_ARCHITECTURE = "qwen3_5moeforconditionalgeneration"
+_QWEN3_5_MOE_TEXT_TENSOR_PREFIX = "language_model."
 
 
 def config_indicates_multimodal(config: dict[str, Any]) -> bool:
@@ -217,6 +225,21 @@ def _contains_multimodal_weight_names(weight_names) -> bool:
         isinstance(name, str)
         and any(prefix in name for prefix in MULTIMODAL_TENSOR_PREFIXES)
         for name in weight_names
+    )
+
+
+def _known_text_only_weight_layout(weight_names, config: dict[str, Any] | None) -> bool:
+    """Recognise only an exhaustive architecture-specific text-only layout."""
+    architectures = config.get("architectures") if config else None
+    if not isinstance(architectures, list) or not any(
+        isinstance(architecture, str)
+        and architecture.lower() == _QWEN3_5_MOE_ARCHITECTURE
+        for architecture in architectures
+    ):
+        return False
+    names = tuple(name for name in weight_names if isinstance(name, str))
+    return bool(names) and all(
+        name.startswith(_QWEN3_5_MOE_TEXT_TENSOR_PREFIX) for name in names
     )
 
 
@@ -252,14 +275,26 @@ def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | Non
     return True if _contains_multimodal_weight_names(parsed) else None
 
 
-def checkpoint_has_multimodal_weights(snapshot_dir: Path | None) -> bool | None:
-    """Inspect a checkpoint index or single safetensors header for modality weights."""
+def checkpoint_has_multimodal_weights(
+    snapshot_dir: Path | None, config: dict[str, Any] | None = None
+) -> bool | None:
+    """Return positive modality proof or a schema-backed text-only verdict.
+
+    Unrecognised tensor namespaces are deliberately inconclusive.  A generic
+    prefix list cannot prove a checkpoint has no vision encoder; only a known
+    architecture's complete language-only layout may return ``False``.
+    """
     if snapshot_dir is None:
         return None
-    index = _read_json(snapshot_dir / "model.safetensors.index.json")
+    index = _read_json(
+        snapshot_dir / "model.safetensors.index.json",
+        max_bytes=MAX_WEIGHT_INDEX_BYTES,
+    )
     if index is None:
         return _single_safetensors_has_multimodal_weights(snapshot_dir)
     weights = index.get("weight_map")
     if not isinstance(weights, dict):
         return None
-    return _contains_multimodal_weight_names(weights)
+    if _contains_multimodal_weight_names(weights):
+        return True
+    return False if _known_text_only_weight_layout(weights, config) else None

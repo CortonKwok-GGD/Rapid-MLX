@@ -236,7 +236,14 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
         tmp_path / "model.safetensors.index.json",
         {"weight_map": {"language_model.layers.0.weight": "model.safetensors"}},
     )
-    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is False
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
+    assert (
+        metadata.checkpoint_has_multimodal_weights(
+            tmp_path,
+            {"architectures": ["Qwen3_5MoeForConditionalGeneration"]},
+        )
+        is False
+    )
 
     _write_json(tmp_path / "model.safetensors.index.json", {"weight_map": []})
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
@@ -257,6 +264,19 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
 
     _write_safetensors_header(safetensors, ["vision_encoder.blocks.0.weight"])
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
+
+
+def test_weight_index_has_independent_production_size_bound(tmp_path):
+    weight_map = {
+        "language_model." + "x" * metadata.MAX_METADATA_FILE_BYTES: "model.safetensors",
+        "vision_tower.blocks.0.weight": "model.safetensors",
+    }
+    _write_json(tmp_path / "model.safetensors.index.json", {"weight_map": weight_map})
+
+    assert (
+        tmp_path / "model.safetensors.index.json"
+    ).stat().st_size > metadata.MAX_METADATA_FILE_BYTES
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is True
 
 
 def test_single_safetensors_header_rejects_corrupt_or_unsupported_shapes(tmp_path):
