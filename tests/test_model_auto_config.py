@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from vllm_mlx import model_auto_config as auto_config_mod
 from vllm_mlx.model_auto_config import (
     ModelConfig,
     _deepseek_template_family,
@@ -15,6 +16,7 @@ from vllm_mlx.model_auto_config import (
     get_profile,
     warn_misbound_deepseek_v3_parser,
 )
+from vllm_mlx.model_metadata import ModelMetadata
 
 
 class TestDetectModelConfig:
@@ -2266,3 +2268,110 @@ class TestMistralFamilyToolParser:
             f"static _MISTRAL_ALIASES is {sorted(self._MISTRAL_ALIASES)}. "
             "Update both together."
         )
+
+
+class TestCheckpointMetadataFallback:
+    """Unknown HF names inherit only explicit checkpoint contracts."""
+
+    _XML_TOOLS = (
+        "{% if tools %}<tool_call><function=example><parameter=value>"
+        "x</parameter></function></tool_call>{% endif %}"
+    )
+
+    @staticmethod
+    def _metadata(config, template):
+        return ModelMetadata(
+            config=config,
+            chat_template=template,
+            snapshot_dir=None,
+        )
+
+    def test_repackaged_agents_a1_dense_routes_from_config_and_template(
+        self, monkeypatch
+    ):
+        """The #1121 4B shape needs no Agents-A1 name special case."""
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {"model_type": "qwen3_5_text"},
+                },
+                self._XML_TOOLS + "{% if enable_thinking %}<think>{% endif %}",
+            ),
+        )
+
+        config = detect_model_config("publisher/renamed-research-agent-4b")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser == "qwen3"
+        assert config.is_hybrid is False
+        assert config.is_hybrid_explicit is True
+        assert config.supports_spec_decode is False
+
+    def test_repackaged_agents_a1_moe_keeps_hybrid_safety_gates(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {"model_type": "qwen3_5_moe"}, self._XML_TOOLS
+            ),
+        )
+
+        config = detect_model_config("publisher/renamed-research-agent-moe")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+        assert config.is_hybrid is True
+        assert config.is_hybrid_explicit is True
+        assert config.is_moe is True
+        assert config.supports_spec_decode is False
+
+    def test_incomplete_template_is_not_advertised_as_native_tools(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, "<tool_call><function=example>"),
+        )
+
+        assert detect_model_config("publisher/unknown-tool-format") is None
+
+    def test_generic_xml_template_routes_tools_without_assuming_reasoning(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, self._XML_TOOLS),
+        )
+
+        config = detect_model_config("publisher/xml-tool-agent")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+
+    def test_known_family_has_priority_over_generic_template_fallback(
+        self, monkeypatch
+    ):
+        def unexpected_metadata_read(name):
+            raise AssertionError("known-family detection must not read metadata")
+
+        monkeypatch.setattr(auto_config_mod, "read_model_metadata", unexpected_metadata_read)
+
+        config = detect_model_config("Qwen/Qwen3-Coder-Next")
+
+        assert config is not None
+        assert config.tool_call_parser == "qwen3_coder_xml"
+
+    def test_cold_or_uncached_model_keeps_existing_no_profile_result(self, monkeypatch):
+        monkeypatch.setattr(auto_config_mod, "read_model_metadata", lambda name: None)
+
+        assert detect_model_config("publisher/unknown-model") is None

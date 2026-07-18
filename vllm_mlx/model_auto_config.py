@@ -5,12 +5,12 @@ parser, throttle, or optimization flag explicitly, this module infers
 the best configuration from the model name/path pattern, with optional
 runtime enrichment from the loaded model object.
 
-Two stages:
+Three stages:
 
-1. ``detect_model_config(model_path)`` — declarative, name-regex based.
-   Runs *before* model load. Returns ``ModelConfig`` with parser
-   defaults and capability gates (e.g. whether spec decoding is safe
-   for this arch).
+1. ``detect_model_config(model_path)`` — resolves an explicit alias, then
+   known model families, then an offline checkpoint-metadata fallback.  It
+   returns ``ModelConfig`` with parser defaults and capability gates (e.g.
+   whether spec decoding is safe for this arch).
 
 2. ``enrich_model_config(cfg, model)`` — runtime probe of the loaded
    model. Used as a safety net for unrecognized hybrid models — if the
@@ -28,6 +28,7 @@ from dataclasses import replace
 from typing import Any
 
 from .model_aliases import resolve_profile
+from .model_metadata import read_model_metadata
 from .model_profile import ModelProfile
 
 logger = logging.getLogger(__name__)
@@ -658,6 +659,98 @@ def _detect_mistral_family_config(model_path: str) -> ModelConfig | None:
     return None
 
 
+_PARAMETERIZED_XML_TOOL_MARKERS = (
+    "<tool_call>",
+    "<function=",
+    "<parameter=",
+)
+
+
+def _metadata_model_types(config: dict[str, Any]) -> frozenset[str]:
+    """Return top-level and text-backbone model types from a config."""
+    types: set[str] = set()
+    for candidate in (config, config.get("text_config")):
+        if not isinstance(candidate, dict):
+            continue
+        model_type = candidate.get("model_type")
+        if isinstance(model_type, str):
+            types.add(model_type.lower())
+    return frozenset(types)
+
+
+def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
+    """Recognise the public XML contract handled by ``HermesToolParser``."""
+    return template is not None and all(
+        marker in template for marker in _PARAMETERIZED_XML_TOOL_MARKERS
+    )
+
+
+def _template_injects_qwen_thinking(template: str | None) -> bool:
+    """Recognise Qwen's ``enable_thinking`` / ``<think>`` template contract."""
+    return template is not None and "enable_thinking" in template and "<think>" in template
+
+
+def _detect_metadata_config(model_path: str) -> ModelConfig | None:
+    """Infer a safe fallback profile from an already-downloaded checkpoint.
+
+    This is deliberately lower priority than an alias or a dedicated family
+    parser: those encode implementation-specific behavior that a generic
+    template cannot know.  For an otherwise unknown repackage, however, its
+    own template is the authoritative tool wire contract.  The probe is
+    offline-only, so detecting a profile never adds a Hub request to startup.
+    """
+    metadata = read_model_metadata(model_path)
+    if metadata is None:
+        return None
+
+    config = metadata.config or {}
+    model_types = _metadata_model_types(config)
+    settings: dict[str, Any] = {}
+    reasons: list[str] = []
+
+    if "qwen3_5_moe" in model_types:
+        settings.update(
+            is_hybrid=True,
+            is_hybrid_explicit=True,
+            is_moe=True,
+            supports_spec_decode=False,
+        )
+        reasons.append("Qwen3.5 MoE architecture")
+    elif "qwen3_5" in model_types:
+        # Dense Qwen3.5 caches contain linear-attention layers, but their
+        # hybrid scheduler path is known to wedge on Metal.  Pinning this
+        # from config matches the existing dense-Qwen aliases and prevents
+        # the runtime cache probe from silently promoting it back to hybrid.
+        settings.update(
+            is_hybrid=False,
+            is_hybrid_explicit=True,
+            supports_spec_decode=False,
+        )
+        reasons.append("dense Qwen3.5 architecture")
+
+    if _template_uses_parameterized_xml_tools(metadata.chat_template):
+        settings["tool_call_parser"] = "hermes"
+        reasons.append("parameterized XML tool template")
+        if (
+            any(model_type.startswith("qwen3") for model_type in model_types)
+            and _template_injects_qwen_thinking(metadata.chat_template)
+        ):
+            settings["reasoning_parser"] = "qwen3"
+            reasons.append("Qwen thinking template")
+
+    if not settings:
+        return None
+    profile = ModelConfig(**settings)
+    _log_resolution_once(
+        model_path,
+        "Auto-detected checkpoint metadata for "
+        f"'{model_path}' → tool_call_parser={profile.tool_call_parser}, "
+        f"reasoning_parser={profile.reasoning_parser}, "
+        f"is_hybrid={profile.is_hybrid} ({', '.join(reasons)})",
+    )
+    return profile
+
+
 def detect_model_config(model_path: str) -> ModelConfig | None:
     """Detect optimal parser config from model name/path.
 
@@ -667,9 +760,12 @@ def detect_model_config(model_path: str) -> ModelConfig | None:
        (``mlx-community/Qwen3.5-4B-MLX-4bit``), return that profile's
        config directly. This guarantees per-alias granularity for any
        optimization that varies by size/quant within a family.
-    2. **Regex fallback** (``_MODEL_PATTERNS``) — for non-aliased HF
+    2. **Known-family fallback** (``_MODEL_PATTERNS``) — for non-aliased HF
        paths the user serves directly. Coarser-grained: one pattern
        covers a whole family.
+    3. **Checkpoint metadata fallback** — for an otherwise unknown local
+       directory or already-cached HF path, infer only documented template
+       contracts and architecture safety gates.  The probe is offline-only.
 
     Args:
         model_path: Model name or path (e.g. "mlx-community/Qwen3.5-9B-4bit")
@@ -779,7 +875,7 @@ def detect_model_config(model_path: str) -> ModelConfig | None:
             f"supports_spec_decode={config.supports_spec_decode}",
         )
         return config
-    return None
+    return _detect_metadata_config(model_path)
 
 
 # DeepSeek V3-template wire-shape parsers, by the sub-family each one
