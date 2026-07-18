@@ -9,6 +9,7 @@ import re
 
 from ..model_aliases import resolve_profile
 from ..model_metadata import (
+    checkpoint_evidence_is_available,
     checkpoint_has_multimodal_weights,
     config_indicates_multimodal,
     read_cached_model_metadata,
@@ -897,6 +898,8 @@ def is_mllm_model(model_name: str) -> bool:
         verdict = checkpoint_has_multimodal_weights(metadata.snapshot_dir, config)
         if verdict is False:
             return False
+        if verdict is None and checkpoint_evidence_is_available(metadata.snapshot_dir):
+            return True
         if profile is not None:
             return _check_legacy_string_patterns(model_name)
         if verdict is True or metadata.is_local:

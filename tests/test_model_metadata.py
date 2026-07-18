@@ -91,6 +91,18 @@ def test_named_tokenizer_templates_prefer_tool_use_then_default():
         metadata._select_chat_template({"chat_template": {"a": "one", "b": "two"}})
         is None
     )
+    assert (
+        metadata._select_chat_template(
+            {
+                "chat_template": [
+                    {"name": "default", "template": "default"},
+                    {"name": "tool_use", "template": "tool-use"},
+                    {"name": 1, "template": "ignored"},
+                ]
+            }
+        )
+        == "tool-use"
+    )
 
 
 @pytest.mark.parametrize(

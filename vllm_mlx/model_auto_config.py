@@ -687,11 +687,29 @@ def _without_jinja_comments(template: str) -> str:
         cursor = comment_end + 2
 
 
+def _template_output_contract(
+    template: str | None,
+) -> tuple[str, frozenset[str]] | None:
+    """Return literal output text and declared variables from a Jinja template."""
+    if template is None:
+        return None
+    try:
+        from jinja2 import Environment, meta, nodes
+
+        parsed = Environment().parse(template)
+        output = "".join(node.data for node in parsed.find_all(nodes.TemplateData))
+        variables = frozenset(meta.find_undeclared_variables(parsed))
+    except Exception:
+        return None
+    return output, variables
+
+
 def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
     """Recognise one complete, nested XML tool contract for Hermes parsing."""
-    if template is None:
+    contract = _template_output_contract(template)
+    if contract is None:
         return False
-    source = _without_jinja_comments(template)
+    source, variables = contract
     tool_start = source.find("<tool_call>")
     function_start = source.find("<function=", tool_start + 1)
     parameter_start = source.find("<parameter=", function_start + 1)
@@ -699,7 +717,7 @@ def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
     function_end = source.find("</function>", parameter_end + 1)
     tool_end = source.find("</tool_call>", function_end + 1)
     return (
-        "tools" in source
+        "tools" in variables
         and tool_start != -1
         and function_start != -1
         and parameter_start != -1
@@ -711,10 +729,11 @@ def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
 
 def _template_injects_qwen_thinking(template: str | None) -> bool:
     """Recognise Qwen's ``enable_thinking`` / ``<think>`` template contract."""
-    if template is None:
+    contract = _template_output_contract(template)
+    if contract is None:
         return False
-    source = _without_jinja_comments(template)
-    return "enable_thinking" in source and "<think>" in source
+    source, variables = contract
+    return "enable_thinking" in variables and "<think>" in source
 
 
 def _detect_metadata_config(model_path: str) -> ModelConfig | None:

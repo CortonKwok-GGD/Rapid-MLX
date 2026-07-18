@@ -68,6 +68,14 @@ def _select_chat_template(tokenizer_config: dict[str, Any] | None) -> str | None
     candidate = tokenizer_config.get("chat_template") if tokenizer_config else None
     if isinstance(candidate, str):
         return candidate
+    if isinstance(candidate, list):
+        candidate = {
+            item["name"]: item["template"]
+            for item in candidate
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("template"), str)
+        }
     if not isinstance(candidate, dict):
         return None
     for name in ("tool_use", "default"):
@@ -298,3 +306,12 @@ def checkpoint_has_multimodal_weights(
     if _contains_multimodal_weight_names(weights):
         return True
     return False if _known_text_only_weight_layout(weights, config) else None
+
+
+def checkpoint_evidence_is_available(snapshot_dir: Path | None) -> bool:
+    """Return whether checkpoint metadata was available for inspection."""
+    if snapshot_dir is None:
+        return False
+    return (snapshot_dir / "model.safetensors.index.json").is_file() or any(
+        snapshot_dir.glob("*.safetensors")
+    )
