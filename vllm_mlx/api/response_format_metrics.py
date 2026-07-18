@@ -5,7 +5,7 @@ Two Prometheus counters expose how often clients ask for OpenAI
 ``response_format.type=json_schema`` with ``strict=true`` and how often
 the post-decode ``jsonschema.validate`` belt-and-braces check ever
 catches a schema violation. The expected violations rate is zero when
-the engine has the ``[guided]`` extra installed and outlines is doing
+the engine has the ``[guided]`` extra installed and llguidance is doing
 its job — anything above zero is a smoke-alarm signal that constrained
 decoding silently fell through to unconstrained tokens.
 
