@@ -221,7 +221,15 @@ def _contains_multimodal_weight_names(weight_names) -> bool:
 
 
 def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | None:
-    """Inspect one safetensors header without loading model tensor data."""
+    """Inspect one safetensors header without loading model tensor data.
+
+    The header is useful positive evidence: a known vision/audio prefix proves
+    that the checkpoint is multimodal.  It is *not* exhaustive negative
+    evidence, though.  Repackagers may name a vision encoder differently, and
+    the header does not declare an architecture-wide tensor schema.  Preserve
+    that uncertainty as ``None`` instead of routing such a VLM to the text
+    loader.
+    """
     files = tuple(snapshot_dir.glob("*.safetensors"))
     if len(files) != 1:
         return None
@@ -241,7 +249,7 @@ def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | Non
         return None
     if not isinstance(parsed, dict):
         return None
-    return _contains_multimodal_weight_names(parsed)
+    return True if _contains_multimodal_weight_names(parsed) else None
 
 
 def checkpoint_has_multimodal_weights(snapshot_dir: Path | None) -> bool | None:

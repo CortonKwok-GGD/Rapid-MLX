@@ -2349,6 +2349,20 @@ class TestCheckpointMetadataFallback:
 
         assert detect_model_config("publisher/comment-only-template") is None
 
+    def test_jinja_comment_cannot_enable_qwen_thinking(self, monkeypatch):
+        template = self._XML_TOOLS + "{# enable_thinking <think> #}"
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({"model_type": "qwen3_5"}, template),
+        )
+
+        config = detect_model_config("publisher/comment-only-thinking")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+
     def test_generic_xml_template_routes_tools_without_assuming_reasoning(
         self, monkeypatch
     ):

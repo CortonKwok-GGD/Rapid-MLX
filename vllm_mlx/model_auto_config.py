@@ -711,9 +711,10 @@ def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
 
 def _template_injects_qwen_thinking(template: str | None) -> bool:
     """Recognise Qwen's ``enable_thinking`` / ``<think>`` template contract."""
-    return (
-        template is not None and "enable_thinking" in template and "<think>" in template
-    )
+    if template is None:
+        return False
+    source = _without_jinja_comments(template)
+    return "enable_thinking" in source and "<think>" in source
 
 
 def _detect_metadata_config(model_path: str) -> ModelConfig | None:
