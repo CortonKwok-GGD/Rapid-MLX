@@ -7,6 +7,7 @@ import json
 import logging
 import re
 
+from ..model_aliases import resolve_profile
 from ..model_metadata import (
     checkpoint_has_multimodal_weights,
     config_indicates_multimodal,
@@ -850,9 +851,12 @@ def _check_legacy_string_patterns(model_name: str) -> bool:
 def is_mllm_model(model_name: str) -> bool:
     """Check if a model name or path indicates a multimodal language model.
 
-    Metadata is authoritative whenever it is available.  The shared offline
-    probe reads a local directory or an already-cached HF snapshot; it never
-    sends a network request.  It applies two checks in order:
+    An explicit ``is_text_only`` alias pin is authoritative.  Otherwise,
+    local metadata is authoritative for unaliased paths.  A cached HF
+    snapshot is promoted only after it supplies positive modality evidence;
+    this preserves text routing for a partial cache that contains an inherited
+    vision config but no vision weights.  The shared probe never sends a
+    network request.  It applies two checks in order:
 
     1. Config inspection: ``architectures`` / ``vision_config`` /
        ``audio_config`` declare whether the checkpoint is multimodal.
@@ -869,10 +873,11 @@ def is_mllm_model(model_name: str) -> bool:
        multimodal-capable, but the user's safetensors only contain
        language tensors).
 
-    If metadata is unavailable or malformed, the legacy name matcher remains
-    the conservative compatibility fallback.  This allows a re-packaged VLM
-    such as Agents-A1 to select the MLLM route based on its checkpoint rather
-    than an arbitrary repository name.
+    If cached metadata has no index/header evidence, the legacy name matcher
+    remains the compatibility fallback.  During ``serve``, model download has
+    already completed before this function runs, so a re-packaged VLM such as
+    Agents-A1 has its actual checkpoint evidence available rather than relying
+    on an arbitrary repository name.
 
     Args:
         model_name: HuggingFace repo ID or local filesystem path.
@@ -880,6 +885,10 @@ def is_mllm_model(model_name: str) -> bool:
     Returns:
         True if the model is detected as multimodal (MLLM/VLM).
     """
+    profile = resolve_profile(model_name)
+    if profile is not None and profile.is_text_only:
+        return False
+
     metadata = read_model_metadata(model_name)
     config = metadata.config if metadata is not None else None
     if config is not None:
@@ -888,10 +897,14 @@ def is_mllm_model(model_name: str) -> bool:
         verdict = checkpoint_has_multimodal_weights(metadata.snapshot_dir)
         if verdict is False:
             return False
-        # Verdict is True or None (unsharded / unavailable index).  Trust the
-        # config in both cases: wrong-True fails visibly on image use, while
-        # wrong-False would silently send a real VLM through the text lane.
-        return True
+        if profile is not None:
+            return _check_legacy_string_patterns(model_name)
+        if verdict is True or metadata.is_local:
+            return True
+        # The verdict is unavailable. Trust config for a local directory; a
+        # cached remote config can be a partial metadata download, so a name
+        # without legacy MLLM evidence stays on text until positive proof.
+        return _check_legacy_string_patterns(model_name)
 
     return _check_legacy_string_patterns(model_name)
 

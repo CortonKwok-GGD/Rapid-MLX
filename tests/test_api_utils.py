@@ -453,7 +453,7 @@ class TestIsMllmModelWeightsPresenceOverride:
 
 
 class TestIsMllmModelCachedMetadata:
-    """Cached checkpoint metadata is authoritative over mutable repo names."""
+    """Cached metadata needs actual modality evidence for a new VLM route."""
 
     @staticmethod
     def _metadata(config):
@@ -501,7 +501,7 @@ class TestIsMllmModelCachedMetadata:
         from vllm_mlx.api import utils as utils_mod
 
         # A re-packaged checkpoint need not contain a historical name marker.
-        # Its cached config declares the modality, so it is routed correctly.
+        # Its cached config plus real checkpoint evidence route it correctly.
         monkeypatch.setattr(
             utils_mod,
             "read_model_metadata",
@@ -512,7 +512,50 @@ class TestIsMllmModelCachedMetadata:
                 }
             ),
         )
+        monkeypatch.setattr(
+            utils_mod, "checkpoint_has_multimodal_weights", lambda snapshot: True
+        )
         assert is_mllm_model("publisher/research-agent-mlx") is True
+
+    def test_cached_inherited_vision_config_without_weights_stays_text(
+        self, monkeypatch
+    ):
+        from vllm_mlx.api import utils as utils_mod
+
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            utils_mod, "checkpoint_has_multimodal_weights", lambda snapshot: None
+        )
+
+        assert is_mllm_model("publisher/text-only-repack") is False
+
+    def test_registered_text_alias_beats_cached_vision_evidence(self, monkeypatch):
+        from vllm_mlx.api import utils as utils_mod
+
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            utils_mod, "checkpoint_has_multimodal_weights", lambda snapshot: True
+        )
+
+        assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False
 
     def test_hub_helper_rejects_local_path_lookalikes(self):
         from vllm_mlx.api.utils import _try_read_hub_config_json

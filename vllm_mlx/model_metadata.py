@@ -27,6 +27,7 @@ class ModelMetadata:
     config: dict[str, Any] | None
     chat_template: str | None
     snapshot_dir: Path | None
+    is_local: bool = False
 
 
 def _read_json(path: Path | None) -> dict[str, Any] | None:
@@ -56,6 +57,23 @@ def _read_text(path: Path | None) -> str | None:
         return None
 
 
+def _select_chat_template(tokenizer_config: dict[str, Any] | None) -> str | None:
+    """Select the template Transformers uses when tools are present."""
+    candidate = tokenizer_config.get("chat_template") if tokenizer_config else None
+    if isinstance(candidate, str):
+        return candidate
+    if not isinstance(candidate, dict):
+        return None
+    for name in ("tool_use", "default"):
+        template = candidate.get(name)
+        if isinstance(template, str):
+            return template
+    templates = [
+        template for template in candidate.values() if isinstance(template, str)
+    ]
+    return templates[0] if len(templates) == 1 else None
+
+
 def _chat_template(snapshot_dir: Path | None) -> str | None:
     """Load the template using Transformers' standalone-file precedence."""
     if snapshot_dir is None:
@@ -63,9 +81,7 @@ def _chat_template(snapshot_dir: Path | None) -> str | None:
     standalone = _read_text(snapshot_dir / "chat_template.jinja")
     if standalone is not None:
         return standalone
-    tokenizer_config = _read_json(snapshot_dir / "tokenizer_config.json")
-    template = tokenizer_config.get("chat_template") if tokenizer_config else None
-    return template if isinstance(template, str) else None
+    return _select_chat_template(_read_json(snapshot_dir / "tokenizer_config.json"))
 
 
 def read_local_model_metadata(model_path: str) -> ModelMetadata | None:
@@ -80,6 +96,7 @@ def read_local_model_metadata(model_path: str) -> ModelMetadata | None:
         config=_read_json(snapshot_dir / "config.json"),
         chat_template=_chat_template(snapshot_dir),
         snapshot_dir=snapshot_dir,
+        is_local=True,
     )
 
 
@@ -104,7 +121,11 @@ def _cached_file(model_name: str, filename: str) -> Path | None:
         cached = try_to_load_from_cache(model_name, filename)
     except Exception:
         return None
-    if cached is None or cached is _CACHED_NO_EXIST or not isinstance(cached, (str, os.PathLike)):
+    if (
+        cached is None
+        or cached is _CACHED_NO_EXIST
+        or not isinstance(cached, (str, os.PathLike))
+    ):
         return None
     return Path(cached)
 
@@ -112,26 +133,18 @@ def _cached_file(model_name: str, filename: str) -> Path | None:
 def read_cached_model_metadata(model_name: str) -> ModelMetadata | None:
     """Read metadata for a cached HF repository, never triggering download."""
     config_path = _cached_file(model_name, "config.json")
-    template_path = _cached_file(model_name, "chat_template.jinja")
-    tokenizer_path = _cached_file(model_name, "tokenizer_config.json")
-    snapshot_dir = next(
-        (
-            path.parent
-            for path in (config_path, template_path, tokenizer_path)
-            if path is not None
-        ),
-        None,
-    )
+    snapshot_dir = config_path.parent if config_path is not None else None
+    if snapshot_dir is None:
+        template_path = _cached_file(model_name, "chat_template.jinja")
+        snapshot_dir = template_path.parent if template_path is not None else None
+    if snapshot_dir is None:
+        tokenizer_path = _cached_file(model_name, "tokenizer_config.json")
+        snapshot_dir = tokenizer_path.parent if tokenizer_path is not None else None
     if snapshot_dir is None:
         return None
-    template = _read_text(template_path)
-    if template is None:
-        tokenizer_config = _read_json(tokenizer_path)
-        candidate = tokenizer_config.get("chat_template") if tokenizer_config else None
-        template = candidate if isinstance(candidate, str) else None
     return ModelMetadata(
-        config=_read_json(config_path),
-        chat_template=template,
+        config=_read_json(snapshot_dir / "config.json"),
+        chat_template=_chat_template(snapshot_dir),
         snapshot_dir=snapshot_dir,
     )
 
@@ -198,18 +211,47 @@ def config_indicates_multimodal(config: dict[str, Any]) -> bool:
     return any(key in config for key in VLM_CONFIG_KEYS)
 
 
+def _contains_multimodal_weight_names(weight_names) -> bool:
+    """Return whether an iterable of safetensors names has modality weights."""
+    return any(
+        isinstance(name, str)
+        and any(prefix in name for prefix in MULTIMODAL_TENSOR_PREFIXES)
+        for name in weight_names
+    )
+
+
+def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | None:
+    """Inspect one safetensors header without loading model tensor data."""
+    files = tuple(snapshot_dir.glob("*.safetensors"))
+    if len(files) != 1:
+        return None
+    try:
+        with files[0].open("rb") as f:
+            size_bytes = f.read(8)
+            if len(size_bytes) != 8:
+                return None
+            header_size = int.from_bytes(size_bytes, "little")
+            if header_size > MAX_METADATA_FILE_BYTES:
+                return None
+            header = f.read(header_size)
+        if len(header) != header_size:
+            return None
+        parsed = json.loads(header.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return _contains_multimodal_weight_names(parsed)
+
+
 def checkpoint_has_multimodal_weights(snapshot_dir: Path | None) -> bool | None:
-    """Inspect a sharded checkpoint index for actual vision/audio tensors."""
+    """Inspect a checkpoint index or single safetensors header for modality weights."""
     if snapshot_dir is None:
         return None
     index = _read_json(snapshot_dir / "model.safetensors.index.json")
     if index is None:
-        return None
+        return _single_safetensors_has_multimodal_weights(snapshot_dir)
     weights = index.get("weight_map")
     if not isinstance(weights, dict):
         return None
-    return any(
-        isinstance(name, str)
-        and any(prefix in name for prefix in MULTIMODAL_TENSOR_PREFIXES)
-        for name in weights
-    )
+    return _contains_multimodal_weight_names(weights)

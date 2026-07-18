@@ -659,13 +659,6 @@ def _detect_mistral_family_config(model_path: str) -> ModelConfig | None:
     return None
 
 
-_PARAMETERIZED_XML_TOOL_MARKERS = (
-    "<tool_call>",
-    "<function=",
-    "<parameter=",
-)
-
-
 def _metadata_model_types(config: dict[str, Any]) -> frozenset[str]:
     """Return top-level and text-backbone model types from a config."""
     types: set[str] = set()
@@ -678,16 +671,49 @@ def _metadata_model_types(config: dict[str, Any]) -> frozenset[str]:
     return frozenset(types)
 
 
+def _without_jinja_comments(template: str) -> str:
+    """Remove Jinja comments so documentation cannot advertise a protocol."""
+    visible: list[str] = []
+    cursor = 0
+    while True:
+        comment_start = template.find("{#", cursor)
+        if comment_start == -1:
+            visible.append(template[cursor:])
+            return "".join(visible)
+        visible.append(template[cursor:comment_start])
+        comment_end = template.find("#}", comment_start + 2)
+        if comment_end == -1:
+            return "".join(visible)
+        cursor = comment_end + 2
+
+
 def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
-    """Recognise the public XML contract handled by ``HermesToolParser``."""
-    return template is not None and all(
-        marker in template for marker in _PARAMETERIZED_XML_TOOL_MARKERS
+    """Recognise one complete, nested XML tool contract for Hermes parsing."""
+    if template is None:
+        return False
+    source = _without_jinja_comments(template)
+    tool_start = source.find("<tool_call>")
+    function_start = source.find("<function=", tool_start + 1)
+    parameter_start = source.find("<parameter=", function_start + 1)
+    parameter_end = source.find("</parameter>", parameter_start + 1)
+    function_end = source.find("</function>", parameter_end + 1)
+    tool_end = source.find("</tool_call>", function_end + 1)
+    return (
+        "tools" in source
+        and tool_start != -1
+        and function_start != -1
+        and parameter_start != -1
+        and parameter_end != -1
+        and function_end != -1
+        and tool_end != -1
     )
 
 
 def _template_injects_qwen_thinking(template: str | None) -> bool:
     """Recognise Qwen's ``enable_thinking`` / ``<think>`` template contract."""
-    return template is not None and "enable_thinking" in template and "<think>" in template
+    return (
+        template is not None and "enable_thinking" in template and "<think>" in template
+    )
 
 
 def _detect_metadata_config(model_path: str) -> ModelConfig | None:
@@ -731,10 +757,9 @@ def _detect_metadata_config(model_path: str) -> ModelConfig | None:
     if _template_uses_parameterized_xml_tools(metadata.chat_template):
         settings["tool_call_parser"] = "hermes"
         reasons.append("parameterized XML tool template")
-        if (
-            any(model_type.startswith("qwen3") for model_type in model_types)
-            and _template_injects_qwen_thinking(metadata.chat_template)
-        ):
+        if any(
+            model_type.startswith("qwen3") for model_type in model_types
+        ) and _template_injects_qwen_thinking(metadata.chat_template):
             settings["reasoning_parser"] = "qwen3"
             reasons.append("Qwen thinking template")
 

@@ -2311,15 +2311,11 @@ class TestCheckpointMetadataFallback:
         assert config.is_hybrid_explicit is True
         assert config.supports_spec_decode is False
 
-    def test_repackaged_agents_a1_moe_keeps_hybrid_safety_gates(
-        self, monkeypatch
-    ):
+    def test_repackaged_agents_a1_moe_keeps_hybrid_safety_gates(self, monkeypatch):
         monkeypatch.setattr(
             auto_config_mod,
             "read_model_metadata",
-            lambda name: self._metadata(
-                {"model_type": "qwen3_5_moe"}, self._XML_TOOLS
-            ),
+            lambda name: self._metadata({"model_type": "qwen3_5_moe"}, self._XML_TOOLS),
         )
 
         config = detect_model_config("publisher/renamed-research-agent-moe")
@@ -2332,16 +2328,26 @@ class TestCheckpointMetadataFallback:
         assert config.is_moe is True
         assert config.supports_spec_decode is False
 
-    def test_incomplete_template_is_not_advertised_as_native_tools(
-        self, monkeypatch
-    ):
+    def test_incomplete_template_is_not_advertised_as_native_tools(self, monkeypatch):
         monkeypatch.setattr(
             auto_config_mod,
             "read_model_metadata",
-            lambda name: self._metadata({}, "<tool_call><function=example>"),
+            lambda name: self._metadata(
+                {}, "{% if tools %}<tool_call><function=example><parameter=value>"
+            ),
         )
 
         assert detect_model_config("publisher/unknown-tool-format") is None
+
+    def test_jinja_comment_cannot_advertise_a_tool_protocol(self, monkeypatch):
+        comment = "{# tools " + self._XML_TOOLS + " #}"
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, comment),
+        )
+
+        assert detect_model_config("publisher/comment-only-template") is None
 
     def test_generic_xml_template_routes_tools_without_assuming_reasoning(
         self, monkeypatch
@@ -2364,7 +2370,9 @@ class TestCheckpointMetadataFallback:
         def unexpected_metadata_read(name):
             raise AssertionError("known-family detection must not read metadata")
 
-        monkeypatch.setattr(auto_config_mod, "read_model_metadata", unexpected_metadata_read)
+        monkeypatch.setattr(
+            auto_config_mod, "read_model_metadata", unexpected_metadata_read
+        )
 
         config = detect_model_config("Qwen/Qwen3-Coder-Next")
 

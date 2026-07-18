@@ -15,6 +15,11 @@ def _write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def _write_safetensors_header(path: Path, tensor_names) -> None:
+    header = json.dumps({name: {} for name in tensor_names}).encode("utf-8")
+    path.write_bytes(len(header).to_bytes(8, "little") + header)
+
+
 def test_readers_reject_missing_malformed_non_object_and_oversized_files(tmp_path):
     missing = tmp_path / "missing.json"
     assert metadata._read_json(None) is None
@@ -53,6 +58,7 @@ def test_local_metadata_prefers_standalone_template_then_tokenizer_fallback(tmp_
         config={"model_type": "qwen3"},
         chat_template="standalone",
         snapshot_dir=standalone,
+        is_local=True,
     )
 
     fallback = tmp_path / "fallback"
@@ -64,9 +70,27 @@ def test_local_metadata_prefers_standalone_template_then_tokenizer_fallback(tmp_
         config=None,
         chat_template="tokenizer",
         snapshot_dir=fallback,
+        is_local=True,
     )
     assert metadata._chat_template(None) is None
     assert metadata.read_local_model_metadata(object()) is None
+
+
+def test_named_tokenizer_templates_prefer_tool_use_then_default():
+    assert (
+        metadata._select_chat_template(
+            {"chat_template": {"default": "default", "tool_use": "tool-use"}}
+        )
+        == "tool-use"
+    )
+    assert (
+        metadata._select_chat_template({"chat_template": {"default": "default"}})
+        == "default"
+    )
+    assert (
+        metadata._select_chat_template({"chat_template": {"a": "one", "b": "two"}})
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -134,7 +158,9 @@ def test_cached_metadata_reads_standalone_template_and_tokenizer_fallback(
         "chat_template.jinja": standalone,
         "tokenizer_config.json": tokenizer,
     }
-    monkeypatch.setattr(metadata, "_cached_file", lambda name, filename: paths[filename])
+    monkeypatch.setattr(
+        metadata, "_cached_file", lambda name, filename: paths[filename]
+    )
 
     result = metadata.read_cached_model_metadata("publisher/model")
 
@@ -149,6 +175,34 @@ def test_cached_metadata_reads_standalone_template_and_tokenizer_fallback(
     result = metadata.read_cached_model_metadata("publisher/model")
     assert result is not None
     assert result.chat_template == "tokenizer"
+
+
+def test_cached_metadata_reads_one_snapshot_when_cache_refs_change(
+    monkeypatch, tmp_path
+):
+    snapshot = tmp_path / "snapshot"
+    stale = tmp_path / "stale"
+    snapshot.mkdir()
+    stale.mkdir()
+    _write_json(snapshot / "config.json", {"model_type": "qwen3"})
+    (snapshot / "chat_template.jinja").write_text("current", encoding="utf-8")
+    (stale / "chat_template.jinja").write_text("stale", encoding="utf-8")
+    calls = []
+
+    def cached_file(name, filename):
+        calls.append(filename)
+        if filename == "config.json":
+            return snapshot / filename
+        return stale / filename
+
+    monkeypatch.setattr(metadata, "_cached_file", cached_file)
+
+    result = metadata.read_cached_model_metadata("publisher/model")
+
+    assert result is not None
+    assert result.snapshot_dir == snapshot
+    assert result.chat_template == "current"
+    assert calls == ["config.json"]
 
 
 def test_cached_metadata_returns_none_without_any_cached_metadata(monkeypatch):
@@ -192,3 +246,31 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
         {"weight_map": {"vision_tower.blocks.0.weight": "model.safetensors"}},
     )
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is True
+
+    (tmp_path / "model.safetensors.index.json").unlink()
+    safetensors = tmp_path / "model.safetensors"
+    _write_safetensors_header(safetensors, ["language_model.layers.0.weight"])
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is False
+
+    _write_safetensors_header(safetensors, ["vision_tower.blocks.0.weight"])
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is True
+
+
+def test_single_safetensors_header_rejects_corrupt_or_unsupported_shapes(tmp_path):
+    model = tmp_path / "model.safetensors"
+
+    model.write_bytes(b"tiny")
+    assert metadata._single_safetensors_has_multimodal_weights(tmp_path) is None
+
+    model.write_bytes((metadata.MAX_METADATA_FILE_BYTES + 1).to_bytes(8, "little"))
+    assert metadata._single_safetensors_has_multimodal_weights(tmp_path) is None
+
+    model.write_bytes((8).to_bytes(8, "little") + b"{}")
+    assert metadata._single_safetensors_has_multimodal_weights(tmp_path) is None
+
+    model.write_bytes((1).to_bytes(8, "little") + b"[")
+    assert metadata._single_safetensors_has_multimodal_weights(tmp_path) is None
+
+    header = json.dumps(["not", "an", "object"]).encode("utf-8")
+    model.write_bytes(len(header).to_bytes(8, "little") + header)
+    assert metadata._single_safetensors_has_multimodal_weights(tmp_path) is None
