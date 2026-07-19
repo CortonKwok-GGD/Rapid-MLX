@@ -437,10 +437,20 @@ def _charge_json_scalar_bytes(value, budget: list[int]) -> None:
             raise _BoundsExceededError
         budget[0] -= len(json.dumps(value).encode("utf-8"))
     elif isinstance(value, int) and not isinstance(value, bool):
-        # O(1) reject: decimal digits >= bit_length/4 (a conservative lower
-        # bound), plus 1 for a possible sign. Reject a giant int before rendering.
-        min_digits = value.bit_length() // 4 + 1
-        if min_digits > budget[0]:
+        # O(1) reject a giant int before rendering its decimal string. A b-bit
+        # magnitude satisfies |v| >= 2**(b-1), so its decimal length is
+        #   >= floor((b-1) * log10(2)) + 1.
+        # ``(b - 1) * 3 // 10`` is a safe UNDER-estimate of ``(b-1)*log10(2)``
+        # (log10(2) ~= 0.30103 > 0.3), giving a TRUE lower bound on the digit
+        # count (codex #558-PR3 nit — ``bit_length // 4 + 1`` over-counts, e.g.
+        # 8 and 9 have bit_length 4 but only one digit, and could false-reject a
+        # schema that exactly fits). ``bit_length()`` is 0 only for ``value == 0``
+        # (one digit); the sign of a negative adds one byte.
+        bits = value.bit_length()
+        min_bytes = (1 if bits == 0 else ((bits - 1) * 3) // 10 + 1) + (
+            1 if value < 0 else 0
+        )
+        if min_bytes > budget[0]:
             raise _BoundsExceededError
         budget[0] -= len(json.dumps(value).encode("utf-8"))
     else:
@@ -771,11 +781,25 @@ async def _offload_tool_grammar_build(engine, cfg, request):
         return None
     fut.add_done_callback(lambda _f: _release_tool_grammar_build())
     try:
-        return await asyncio.wrap_future(fut)
+        # ``asyncio.shield`` wraps the ``wrap_future`` await so a CANCELLED caller
+        # (client disconnect) does NOT propagate the cancel into the underlying
+        # ``concurrent.futures.Future`` (codex #558-PR3 blocking). Without the
+        # shield, ``wrap_future`` calls ``fut.cancel()`` on caller cancellation:
+        # if the work item is still QUEUED (all workers busy), it is marked
+        # cancelled and the done-callback releases admission WHILE the (now-dead)
+        # ``_WorkItem`` still sits in the executor's unbounded internal queue —
+        # a submit/cancel flood could then grow that queue past the admission cap.
+        # Shielded, a cancelled caller unwinds the request (``CancelledError``
+        # still propagates out of ``shield``) but the compile runs to genuine
+        # completion and its slot is released — and its queue slot reclaimed —
+        # only when the work item actually finishes. Admission stays an accurate
+        # bound on in-flight + queued compiles under a disconnect flood.
+        return await asyncio.shield(asyncio.wrap_future(fut))
     except Exception:
         # A build error leaves the slot to the done-callback above; fall back to
         # free-form for this request. (``CancelledError`` is a ``BaseException``,
-        # so it is NOT swallowed here — it propagates to unwind the request.)
+        # so it is NOT swallowed here — it propagates to unwind the request while
+        # the shielded compile keeps running to release its slot on completion.)
         # Log it (codex #558-PR3 nit): the inner builder already swallows its own
         # exceptions, so anything surfacing HERE is unexpected and must not be
         # silently indistinguishable from an intentional free-form fallback.

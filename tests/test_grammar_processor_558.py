@@ -459,8 +459,12 @@ def test_charge_scalar_rejects_giant_int_without_rendering(monkeypatch):
 
     def _guard_dumps(obj, *a, **k):
         # The preflight must reject an over-budget int BEFORE dumps is called.
+        # Mirror production's conservative digit lower bound ``((b-1)*3)//10 + 1``
+        # (codex #558-PR3 round-6 nit — ``bit_length // 4 + 1`` over-counts).
         if isinstance(obj, int) and not isinstance(obj, bool):
-            if obj.bit_length() // 4 + 1 > _TOOL_GRAMMAR_MAX_SCHEMA_BYTES:
+            _b = obj.bit_length()
+            _min = (1 if _b == 0 else ((_b - 1) * 3) // 10 + 1) + (1 if obj < 0 else 0)
+            if _min > _TOOL_GRAMMAR_MAX_SCHEMA_BYTES:
                 raise AssertionError(
                     "json.dumps was called on an over-budget int — the "
                     "bit_length preflight failed to reject it first (codex "
@@ -498,6 +502,39 @@ def test_charge_scalar_rejects_giant_int_without_rendering(monkeypatch):
         },
     )
     assert _tools_within_grammar_bounds([ok]) is True
+
+
+def test_int_digit_lower_bound_does_not_over_reject_exactly_fitting_scalar():
+    # codex #558-PR3 round-6 nit: the O(1) int preflight must use a TRUE lower
+    # bound on decimal-digit count. ``bit_length // 4 + 1`` OVER-counts (8 and 9
+    # have bit_length 4 => it claims 2 digits though they are 1), so an int that
+    # exactly fits the remaining budget could be spuriously rejected. Prove the
+    # corrected ``((b-1)*3)//10 + 1`` bound accepts every single-digit int with a
+    # 1-byte budget, and never OVER-estimates any int's real decimal length.
+    from vllm_mlx.routes.chat import _BoundsExceededError, _charge_json_scalar_bytes
+
+    # 8 and 9 (bit_length 4) each fit a 1-byte budget — the old formula rejected.
+    for v in (0, 1, 7, 8, 9):
+        budget = [1]  # exactly one byte, the width of a single decimal digit
+        _charge_json_scalar_bytes(v, budget)  # must NOT raise
+        assert budget[0] == 0, f"{v} should consume exactly its 1 digit byte"
+
+    # The lower bound must never exceed the true decimal length for any int, so
+    # a value given a budget equal to its real rendered length always fits.
+    import json as _json
+
+    for v in (10, 99, 100, 128, 255, 999, -1, -8, -9, -100, 1 << 20, -(1 << 20)):
+        true_len = len(_json.dumps(v).encode("utf-8"))
+        budget = [true_len]
+        _charge_json_scalar_bytes(v, budget)  # exactly fits, must NOT raise
+        assert budget[0] == 0
+        # One byte short must reject (via the O(1) preflight for large ints, or
+        # the post-charge ``budget < 0`` check for small ones — never a false
+        # accept). The lower bound is conservative, so it never over-rejects the
+        # exact-fit case above but always catches a genuine overflow here.
+        tight = [true_len - 1]
+        with pytest.raises(_BoundsExceededError):
+            _charge_json_scalar_bytes(v, tight)
 
 
 def test_walker_charges_commas_between_not_before_first_member():
@@ -733,6 +770,19 @@ def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
         "the helper must await the submitted future via asyncio.wrap_future so a "
         "cancelled await does not pre-release the admission slot"
     )
+    # The wrapped future MUST be shielded (codex #558-PR3 round-6 blocking): a
+    # bare ``await asyncio.wrap_future(fut)`` propagates a cancelled caller into
+    # ``fut.cancel()``; if the work item is still QUEUED (all workers busy) the
+    # cancel succeeds, the done-callback releases admission, yet the dead
+    # ``_WorkItem`` still sits in the executor's unbounded queue — a submit/cancel
+    # flood grows that queue past the admission cap. ``asyncio.shield`` stops the
+    # cancel from reaching the underlying future so the compile runs (and its
+    # queue slot is reclaimed) before admission is released.
+    assert "asyncio.shield(" in src, (
+        "the helper must shield the wrapped future so a cancelled caller does not "
+        "cancel a still-queued compile and release its admission slot early "
+        "(codex #558-PR3 round-6 blocking)"
+    )
     # The dedicated pool exists and is bounded.
     ex = chat_mod._get_tool_grammar_build_executor()
     assert ex._max_workers == chat_mod._TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY
@@ -921,6 +971,114 @@ def test_admission_slot_not_released_until_compile_finishes_on_cancel():
             chat_mod._maybe_build_tool_grammar_processor = _orig_build
     finally:
         release_gate.set()
+        pool.shutdown(wait=True)
+        chat_mod._get_tool_grammar_build_executor = saved_ex_getter
+        chat_mod._tool_grammar_inflight = saved
+
+
+def test_cancelled_caller_does_not_cancel_a_queued_compile():
+    # codex #558-PR3 round-6 blocking (BEHAVIORAL): the round-6 bug is specific to
+    # a QUEUED work item — all workers busy, a second compile sits in the pool's
+    # internal queue. A bare ``await asyncio.wrap_future(fut)`` would, on caller
+    # cancel, call ``fut.cancel()``; for a still-queued future that SUCCEEDS,
+    # firing the done-callback (releasing admission) while the dead ``_WorkItem``
+    # lingers in the executor's unbounded queue. We drive the REAL helper with a
+    # 1-worker pool: worker A is blocked, request B is therefore QUEUED, we cancel
+    # B's coroutine, and assert B's underlying future was NOT cancelled (shielded)
+    # and B's admission slot stays held until B actually runs+finishes.
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    saved = chat_mod._tool_grammar_inflight
+    saved_ex_getter = chat_mod._get_tool_grammar_build_executor
+    saved_build = chat_mod._maybe_build_tool_grammar_processor
+    chat_mod._tool_grammar_inflight = 0
+
+    a_started = threading.Event()
+    a_gate = threading.Event()  # holds worker A (and thus the single worker) busy
+    b_ran = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1)  # forces B to QUEUE behind A
+    chat_mod._get_tool_grammar_build_executor = lambda: pool
+
+    def _build(engine, cfg, request):
+        # Distinguish A (first) from B (second) by a per-request marker.
+        if getattr(request, "_which", None) == "A":
+            a_started.set()
+            a_gate.wait(timeout=5)
+            return None
+        b_ran.set()
+        return None
+
+    async def _drive():
+        cfg = _CfgStub("hermes")
+        engine = _EngineStub(tokenizer=object())
+        req_a = _RequestStub([_FunctionTool("get_time")], "required")
+        req_a._which = "A"
+        req_b = _RequestStub([_FunctionTool("get_time")], "required")
+        req_b._which = "B"
+
+        task_a = asyncio.ensure_future(
+            chat_mod._offload_tool_grammar_build(engine, cfg, req_a)
+        )
+        for _ in range(600):
+            if a_started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert a_started.is_set(), "worker A never occupied the single pool slot"
+
+        # B is admitted + submitted, but the single worker is busy on A, so B's
+        # work item sits QUEUED. Both slots reserved.
+        task_b = asyncio.ensure_future(
+            chat_mod._offload_tool_grammar_build(engine, cfg, req_b)
+        )
+        await asyncio.sleep(0.05)
+        assert chat_mod._tool_grammar_inflight == 2, (
+            "both A (running) and B (queued) should hold admission slots"
+        )
+        assert not b_ran.is_set(), "B must still be QUEUED behind the busy worker"
+
+        # Client B disconnects: cancel B's coroutine while its compile is QUEUED.
+        task_b.cancel()
+        try:
+            await task_b
+        except asyncio.CancelledError:
+            pass
+        # THE BUG: without shield, B's queued future would be cancelled here and
+        # its slot released while the dead work item lingers in the queue. With
+        # shield, B's slot stays held and B still runs when the worker frees up.
+        assert chat_mod._tool_grammar_inflight == 2, (
+            "a cancelled caller must NOT release a still-queued compile's slot "
+            "(codex #558-PR3 round-6 blocking)"
+        )
+        assert not b_ran.is_set(), "B should not have run yet (A still blocks)"
+
+        # Release A; the single worker then drains the still-live B, whose done-
+        # callback releases BOTH slots. B genuinely ran (was not cancelled).
+        a_gate.set()
+        await task_a
+        for _ in range(600):
+            if chat_mod._tool_grammar_inflight == 0:
+                break
+            await asyncio.sleep(0.005)
+        assert b_ran.is_set(), (
+            "the shielded queued compile B must still run to completion, not be "
+            "cancelled out of the queue"
+        )
+        assert chat_mod._tool_grammar_inflight == 0, (
+            "both slots must be released once both compiles finish"
+        )
+
+    try:
+        chat_mod._maybe_build_tool_grammar_processor = _build
+        try:
+            asyncio.run(_drive())
+        finally:
+            chat_mod._maybe_build_tool_grammar_processor = saved_build
+    finally:
+        a_gate.set()
         pool.shutdown(wait=True)
         chat_mod._get_tool_grammar_build_executor = saved_ex_getter
         chat_mod._tool_grammar_inflight = saved
