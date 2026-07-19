@@ -9,7 +9,6 @@ import re
 
 from ..model_aliases import resolve_profile
 from ..model_metadata import (
-    checkpoint_evidence_is_available,
     checkpoint_has_multimodal_weights,
     config_indicates_multimodal,
     read_cached_model_metadata,
@@ -852,12 +851,19 @@ def _check_legacy_string_patterns(model_name: str) -> bool:
 def is_mllm_model(model_name: str) -> bool:
     """Check if a model name or path indicates a multimodal language model.
 
-    An explicit ``is_text_only`` alias pin is authoritative.  Otherwise,
-    local metadata is authoritative for unaliased paths.  A cached HF
-    snapshot is promoted only after it supplies positive modality evidence;
-    this preserves text routing for a partial cache that contains an inherited
-    vision config but no vision weights.  The shared probe never sends a
-    network request.  It applies two checks in order:
+    A curated alias that POSITIVELY declares text-only serving
+    (``is_text_only`` — the #393 state-pin) is authoritative and stays on the
+    text lane even against real vision weights: it is an operator decision, with
+    text-serve coverage, to run a vision-config checkpoint through the AR text
+    lane.  A bare alias that merely defaults to the ``text`` modality does NOT
+    override real vision weights — such a repackaged VLM still routes to the
+    MLLM lane via the checkpoint-evidence path (#1121).  Otherwise, local
+    metadata is authoritative for unaliased paths.  A cached HF snapshot is
+    promoted only after it supplies positive modality evidence; this preserves
+    text routing for a partial cache that contains an inherited vision config
+    but no vision weights, and an inconclusive verdict is NEVER promoted on the
+    bare existence of checkpoint files.  The shared probe never sends a network
+    request.  It applies two checks in order:
 
     1. Config inspection: ``architectures`` / ``vision_config`` /
        ``audio_config`` declare whether the checkpoint is multimodal.
@@ -887,6 +893,17 @@ def is_mllm_model(model_name: str) -> bool:
         True if the model is detected as multimodal (MLLM/VLM).
     """
     profile = resolve_profile(model_name)
+    # A curated alias that declares text-only serving (``is_text_only`` — the
+    # #393 state-pin) is authoritative and outranks the checkpoint's raw vision
+    # weights: it is a deliberate operator decision, with text-serve coverage,
+    # to run a vision-config checkpoint through the AR text lane.  Some upstream
+    # repackages of a Qwen3.5 text model still ship a ``vision_tower`` in the
+    # safetensors index, so the weight-evidence path below would (correctly, on
+    # the raw bytes) return True; the pin short-circuits BEFORE that path so the
+    # curated text modality wins.  A bare alias that merely defaults to the
+    # ``text`` modality is NOT short-circuited here — real vision weights still
+    # route it to the MLLM lane via the evidence path (#1121), so a repackaged
+    # VLM served under a text-family alias name is not misrouted to text.
     if profile is not None and profile.is_text_only:
         return False
 
@@ -906,8 +923,11 @@ def is_mllm_model(model_name: str) -> bool:
         # text-family name would be misrouted to the text engine (#1121).
         if verdict is True:
             return True
-        if verdict is None and checkpoint_evidence_is_available(metadata.snapshot_dir):
-            return True
+        # An inconclusive verdict (``None``) is NEVER promoted on the bare
+        # existence of checkpoint files: file presence is not modality
+        # evidence.  Fall through to the name/locality fallback below, which
+        # already handles inconclusive results correctly (name matcher for
+        # cached-remote, trust for a bare local VLM-config directory).
         # The verdict is unavailable (no index/header evidence). A registered
         # alias or a cached remote config can be a partial metadata download, so
         # a name without legacy MLLM evidence stays on text until positive proof.

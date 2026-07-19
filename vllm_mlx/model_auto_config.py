@@ -717,6 +717,110 @@ def _chat_template_environment():
     )
 
 
+# Cap on the number of distinct output paths enumerated per template.  Real
+# chat templates emit a tool contract inside a single ``if``/``for`` block, so
+# a small handful of paths cover every legitimate case.  If a pathological
+# template exceeds this, path enumeration stops growing: the effect is a
+# conservative "no native-tool contract detected" (safe text fallback), never a
+# fabricated cross-branch match.
+_MAX_TEMPLATE_OUTPUT_PATHS = 256
+
+
+def _node_output_paths(node) -> list[str]:
+    """Return the possible literal-output strings a single AST node can emit.
+
+    Each returned string is the concatenation of literals along ONE reachable
+    control-flow path through ``node``.  Mutually exclusive ``{% if %}`` /
+    ``{% elif %}`` / ``{% else %}`` branches become SEPARATE alternatives — the
+    opening fragment from one branch is never concatenated with the closing
+    fragment of a sibling branch.
+    """
+    from jinja2 import nodes
+
+    if isinstance(node, nodes.TemplateData):
+        return [node.data]
+    if isinstance(node, nodes.Output):
+        # ``Output.nodes`` interleaves literal ``TemplateData`` with printed
+        # expressions ``{{ ... }}``; only the literals are known statically.
+        return _sequence_output_paths(node.nodes)
+    if isinstance(node, nodes.If):
+        alternatives: list[str] = []
+        alternatives.extend(_sequence_output_paths(node.body))
+        # ``elif`` chains parse as nested ``If`` nodes hanging off ``elif_``.
+        for elif_node in node.elif_:
+            alternatives.extend(_node_output_paths(elif_node))
+        if node.else_:
+            alternatives.extend(_sequence_output_paths(node.else_))
+        else:
+            # No ``else`` → the "condition false, emit nothing" path is real.
+            alternatives.append("")
+        return alternatives or [""]
+    if isinstance(node, nodes.For):
+        # A loop body may execute (emit its contract) or the loop may be empty
+        # (emit only the ``else`` block, if any).  Both are reachable paths.
+        paths = list(_sequence_output_paths(node.body))
+        paths.extend(_sequence_output_paths(node.else_) if node.else_ else [""])
+        return paths or [""]
+    # Transparent wrapper blocks (``{% generation %}`` → ``CallBlock``, plus
+    # ``FilterBlock`` / ``Scope`` / ``ScopedEvalContextModifier`` / ``With`` /
+    # ``Block``): recurse into their body and pass the path structure through.
+    body = getattr(node, "body", None)
+    if isinstance(body, list):
+        return _sequence_output_paths(body)
+    # Statements with no literal output (Assign, Break, Continue, bare
+    # expressions, …) contribute the empty string on every path.
+    return [""]
+
+
+def _sequence_output_paths(node_list) -> list[str]:
+    """Cartesian concatenation of the per-node path sets for a node sequence.
+
+    Sequential nodes are concatenated; a branching node multiplies the number
+    of accumulated paths.  Growth is bounded by ``_MAX_TEMPLATE_OUTPUT_PATHS``
+    to keep pathological templates cheap (the cap can only DROP a would-be
+    match, never fabricate one).
+    """
+    paths = [""]
+    for child in node_list:
+        child_paths = _node_output_paths(child)
+        if not child_paths:
+            continue
+        combined: list[str] = []
+        for prefix in paths:
+            for suffix in child_paths:
+                combined.append(prefix + suffix)
+                if len(combined) >= _MAX_TEMPLATE_OUTPUT_PATHS:
+                    break
+            if len(combined) >= _MAX_TEMPLATE_OUTPUT_PATHS:
+                break
+        paths = combined
+    return paths
+
+
+def _template_output_paths(
+    template: str | None,
+) -> tuple[list[str], frozenset[str]] | None:
+    """Return per-reachable-path literal outputs and declared variables.
+
+    Unlike :func:`_template_output_contract` (which flattens every
+    ``TemplateData`` node across the whole AST), this walks the parsed AST and
+    keeps each ``{% if %}``/``{% else %}`` branch as a separate output path, so
+    a contract that only appears when fragments from mutually exclusive
+    branches are concatenated is NOT reported as present on any single path.
+    """
+    if template is None:
+        return None
+    try:
+        from jinja2 import meta
+
+        parsed = _chat_template_environment().parse(template)
+        paths = _sequence_output_paths(parsed.body)
+        variables = frozenset(meta.find_undeclared_variables(parsed))
+    except Exception:
+        return None
+    return paths, variables
+
+
 def _template_output_contract(
     template: str | None,
 ) -> tuple[str, frozenset[str]] | None:
@@ -724,7 +828,10 @@ def _template_output_contract(
 
     Uses a Transformers-compatible parsing environment so valid chat templates
     (``{% generation %}``, ``{% break %}``/``{% continue %}``) do not silently
-    disable inference by raising ``TemplateSyntaxError``.
+    disable inference by raising ``TemplateSyntaxError``.  The returned text is
+    the flattened concatenation of ALL literals (used for single-token presence
+    checks such as ``<think>``); branch-sensitive contract detection uses
+    :func:`_template_output_paths` instead.
     """
     if template is None:
         return None
@@ -739,12 +846,13 @@ def _template_output_contract(
     return output, variables
 
 
-def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
-    """Recognise one complete, nested XML tool contract for Hermes parsing."""
-    contract = _template_output_contract(template)
-    if contract is None:
-        return False
-    source, variables = contract
+def _path_has_nested_xml_tool_contract(source: str) -> bool:
+    """Return whether ONE output path contains the full nested XML tool contract.
+
+    The tags must appear in the exact opening→closing nesting order
+    ``<tool_call>`` → ``<function=`` → ``<parameter=`` → ``</parameter>`` →
+    ``</function>`` → ``</tool_call>`` within this single reachable path.
+    """
     tool_start = source.find("<tool_call>")
     function_start = source.find("<function=", tool_start + 1)
     parameter_start = source.find("<parameter=", function_start + 1)
@@ -752,13 +860,30 @@ def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
     function_end = source.find("</function>", parameter_end + 1)
     tool_end = source.find("</tool_call>", function_end + 1)
     return (
-        "tools" in variables
-        and tool_start != -1
+        tool_start != -1
         and function_start != -1
         and parameter_start != -1
         and parameter_end != -1
         and function_end != -1
         and tool_end != -1
+    )
+
+
+def _template_uses_parameterized_xml_tools(template: str | None) -> bool:
+    """Recognise one complete, nested XML tool contract for Hermes parsing.
+
+    The complete nested contract must appear on ONE reachable output path.  A
+    template that splits the contract across mutually exclusive
+    ``{% if %}``/``{% else %}`` branches (so no single path emits the whole
+    thing) is rejected — flattening the whole AST would fabricate a match that
+    the model never actually renders.
+    """
+    result = _template_output_paths(template)
+    if result is None:
+        return False
+    paths, variables = result
+    return "tools" in variables and any(
+        _path_has_nested_xml_tool_contract(path) for path in paths
     )
 
 

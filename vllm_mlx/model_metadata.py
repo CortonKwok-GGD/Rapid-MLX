@@ -255,7 +255,19 @@ MULTIMODAL_TENSOR_PREFIXES = (
     "patch_embed.",
 )
 _QWEN3_5_MOE_ARCHITECTURE = "qwen3_5moeforconditionalgeneration"
-_QWEN3_5_MOE_TEXT_TENSOR_PREFIX = "language_model."
+# Precise allowlist of the ``Qwen3_5MoeForConditionalGeneration`` TEXT-only
+# tensor namespace.  The text backbone lives under ``language_model.model.``
+# (embed_tokens / layers / norm) and the head under ``language_model.lm_head``.
+# A bare ``language_model.`` prefix is deliberately NOT trusted: a modality
+# subtree can nest under it (e.g. ``language_model.vision_encoder.blocks.*``)
+# and a bare-prefix ``all(...)`` check would wrongly classify such a VLM as
+# text-only.  Any tensor whose path is not covered by this precise allowlist
+# leaves the layout UNrecognised (inconclusive), never a false text verdict.
+_QWEN3_5_MOE_TEXT_TENSOR_ALLOWLIST = (
+    "language_model.model.",
+    "language_model.lm_head.",
+    "language_model.lm_head",
+)
 
 
 def config_indicates_multimodal(config: dict[str, Any]) -> bool:
@@ -280,8 +292,29 @@ def _contains_multimodal_weight_names(weight_names) -> bool:
     )
 
 
+def _is_qwen3_5_moe_text_tensor(name: str) -> bool:
+    """Return whether one tensor name is a known Qwen3.5-MoE text tensor.
+
+    Validated against a PRECISE allowlist of text submodule paths rather than
+    the bare ``language_model.`` prefix, so a modality subtree nested under
+    ``language_model.`` (e.g. ``language_model.vision_encoder.blocks.0.weight``)
+    is NOT accepted as text-only.
+    """
+    return name == "language_model.lm_head" or any(
+        name.startswith(prefix) for prefix in _QWEN3_5_MOE_TEXT_TENSOR_ALLOWLIST
+    )
+
+
 def _known_text_only_weight_layout(weight_names, config: dict[str, Any] | None) -> bool:
-    """Recognise only an exhaustive architecture-specific text-only layout."""
+    """Recognise only an exhaustive architecture-specific text-only layout.
+
+    Returns ``True`` ONLY when the architecture is the Qwen3.5-MoE conditional-
+    generation class AND every tensor name matches the precise text allowlist.
+    A single unrecognised name (any modality subtree nested under
+    ``language_model.``, or a foreign namespace) makes the layout unrecognised
+    → ``False`` here, so the overall verdict stays inconclusive (``None``)
+    rather than falsely declaring the checkpoint text-only.
+    """
     architectures = config.get("architectures") if config else None
     if not isinstance(architectures, list) or not any(
         isinstance(architecture, str)
@@ -290,9 +323,7 @@ def _known_text_only_weight_layout(weight_names, config: dict[str, Any] | None) 
     ):
         return False
     names = tuple(name for name in weight_names if isinstance(name, str))
-    return bool(names) and all(
-        name.startswith(_QWEN3_5_MOE_TEXT_TENSOR_PREFIX) for name in names
-    )
+    return bool(names) and all(_is_qwen3_5_moe_text_tensor(name) for name in names)
 
 
 def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | None:

@@ -2358,6 +2358,55 @@ class TestCheckpointMetadataFallback:
         )
         assert detect_model_config("publisher/unknown-tool-format") is None
 
+    def test_contract_split_across_exclusive_branches_is_not_detected(
+        self, monkeypatch
+    ):
+        # FIX 4: the opening XML fragments live in the ``{% if %}`` body and the
+        # closing fragments in the ``{% else %}`` — MUTUALLY EXCLUSIVE branches.
+        # No single reachable output path emits the full nested
+        # ``<tool_call>…</tool_call>`` contract, so flattening the whole AST
+        # (the pre-fix behaviour) would FABRICATE a match the model never
+        # renders.  Branch-local path detection must reject it.
+        split = (
+            "{% if tools %}<tool_call><function=example><parameter=value>"
+            "{% else %}</parameter></function></tool_call>{% endif %}"
+        )
+        # Sanity: the template PARSES (so rejection is about branch locality,
+        # not a syntax error), and the FLATTENED output DOES contain every tag
+        # (proving the old whole-AST flatten would have matched).
+        flat = auto_config_mod._template_output_contract(split)
+        assert flat is not None
+        flat_source = flat[0]
+        assert "<tool_call>" in flat_source and "</tool_call>" in flat_source
+
+        assert auto_config_mod._template_uses_parameterized_xml_tools(split) is False
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, split),
+        )
+        assert detect_model_config("publisher/split-branch-tools") is None
+
+    def test_full_contract_in_single_else_branch_is_detected(self, monkeypatch):
+        # FIX 4 counterpart: when ONE reachable branch emits the whole nested
+        # contract (here the ``{% else %}`` path), it must still be detected.
+        template = (
+            "{% if legacy %}plain text{% else %}"
+            "<tool_call><function=example><parameter=value>"
+            "x</parameter></function></tool_call>{% endif %}"
+            "{% if tools %}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(template) is True
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+        config = detect_model_config("publisher/else-branch-tools")
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
     def test_generation_block_template_still_routes_tools(self, monkeypatch):
         """A Transformers ``{% generation %}`` block around a valid
         parameterized-XML tool contract must still be recognised.

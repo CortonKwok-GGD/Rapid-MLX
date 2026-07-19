@@ -284,9 +284,20 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
     assert metadata.checkpoint_has_multimodal_weights(None) is None
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
 
+    # Real Qwen3.5-MoE text tensors live under ``language_model.model.*`` (the
+    # backbone) and ``language_model.lm_head`` (the head); the precise text
+    # allowlist recognises this exact layout as text-only.
     _write_json(
         tmp_path / "model.safetensors.index.json",
-        {"weight_map": {"language_model.layers.0.weight": "model.safetensors"}},
+        {
+            "weight_map": {
+                "language_model.model.layers.0.self_attn.q_proj.weight": (
+                    "model.safetensors"
+                ),
+                "language_model.model.embed_tokens.weight": "model.safetensors",
+                "language_model.lm_head.weight": "model.safetensors",
+            }
+        },
     )
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
     assert (
@@ -295,6 +306,26 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
             {"architectures": ["Qwen3_5MoeForConditionalGeneration"]},
         )
         is False
+    )
+    # A modality subtree nested under ``language_model.`` (a bare-prefix match
+    # that is NOT a real text tensor) must NOT be mistaken for text-only: the
+    # tightened allowlist leaves the verdict inconclusive (``None``) so a real
+    # VLM is never misrouted to the text loader.
+    _write_json(
+        tmp_path / "model.safetensors.index.json",
+        {
+            "weight_map": {
+                "language_model.model.embed_tokens.weight": "model.safetensors",
+                "language_model.vision_encoder.blocks.0.weight": "model.safetensors",
+            }
+        },
+    )
+    assert (
+        metadata.checkpoint_has_multimodal_weights(
+            tmp_path,
+            {"architectures": ["Qwen3_5MoeForConditionalGeneration"]},
+        )
+        is None
     )
 
     _write_json(tmp_path / "model.safetensors.index.json", {"weight_map": []})
@@ -316,6 +347,55 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
 
     _write_safetensors_header(safetensors, ["vision_encoder.blocks.0.weight"])
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
+
+
+def test_known_text_only_layout_rejects_modality_subtree_under_language_model():
+    """FIX 3: the text-only allowlist is validated against precise text tensor
+    paths, NOT the bare ``language_model.`` prefix.
+
+    A modality subtree nested under ``language_model.`` (e.g.
+    ``language_model.vision_encoder.blocks.0.weight``) must NOT be classified as
+    text-only, or a real VLM whose vision encoder is namespaced under
+    ``language_model.`` would be misrouted to the text loader.
+    """
+    cfg = {"architectures": ["Qwen3_5MoeForConditionalGeneration"]}
+
+    # Precise real text layout (backbone + head) -> recognised as text-only.
+    text_layout = {
+        "language_model.model.embed_tokens.weight": "s",
+        "language_model.model.layers.0.self_attn.q_proj.weight": "s",
+        "language_model.model.norm.weight": "s",
+        "language_model.lm_head.weight": "s",
+    }
+    assert metadata._known_text_only_weight_layout(text_layout, cfg) is True
+
+    # Tied-embedding checkpoint (no ``lm_head``) is still text-only.
+    tied_layout = {
+        "language_model.model.embed_tokens.weight": "s",
+        "language_model.model.layers.0.mlp.gate_proj.weight": "s",
+    }
+    assert metadata._known_text_only_weight_layout(tied_layout, cfg) is True
+
+    # A vision subtree nested under ``language_model.`` is NOT text-only.
+    nested_vision = {
+        "language_model.model.embed_tokens.weight": "s",
+        "language_model.vision_encoder.blocks.0.weight": "s",
+    }
+    assert metadata._known_text_only_weight_layout(nested_vision, cfg) is False
+
+    # The bare-prefix form the OLD code accepted (``language_model.layers.*``
+    # without the ``.model.`` segment) is not the real layout and is no longer
+    # blindly trusted as text-only.
+    bare_prefix = {"language_model.layers.0.weight": "s"}
+    assert metadata._known_text_only_weight_layout(bare_prefix, cfg) is False
+
+    # Wrong architecture -> never text-only regardless of tensor names.
+    assert (
+        metadata._known_text_only_weight_layout(
+            text_layout, {"architectures": ["SomeOtherForCausalLM"]}
+        )
+        is False
+    )
 
 
 def test_weight_index_has_independent_production_size_bound(tmp_path):
