@@ -381,7 +381,14 @@ def test_real_parser_lark_has_trigger_and_schema_region(family):
 # tokenizer exception) propagates and FAILS the test.
 # --------------------------------------------------------------------------
 def _offline_skip_exc_types():
-    """huggingface_hub / requests offline signals that are ALWAYS a skip."""
+    """Typed offline / connection exceptions that are ALWAYS a skip.
+
+    Covers every transport transformers/hub may use (codex r5): huggingface_hub
+    offline errors, `requests` AND `httpx` connection/timeout exceptions, and
+    the Python built-in connection errors (`ConnectionError` family, which
+    `ConnectionRefusedError` subclasses). Best-effort import — a transport not
+    installed is simply omitted.
+    """
     types: list[type[BaseException]] = []
     try:
         from huggingface_hub.errors import (
@@ -394,10 +401,23 @@ def _offline_skip_exc_types():
         pass
     try:
         from requests.exceptions import ConnectionError as _ReqConnErr
+        from requests.exceptions import Timeout as _ReqTimeout
 
-        types.append(_ReqConnErr)
+        types += [_ReqConnErr, _ReqTimeout]
     except Exception:  # pragma: no cover - requests not present
         pass
+    try:
+        import httpx as _httpx
+
+        # ConnectError/ConnectTimeout/ReadTimeout all subclass TransportError;
+        # use the broad base so any transport-level failure counts as offline.
+        types.append(_httpx.TransportError)
+    except Exception:  # pragma: no cover - httpx not present
+        pass
+    # Python built-in socket-level connection errors (ConnectionRefusedError,
+    # ConnectionResetError, ... all subclass ConnectionError). TimeoutError is a
+    # builtin too (socket timeouts raise it).
+    types += [ConnectionError, TimeoutError]
     return tuple(types)
 
 
@@ -430,8 +450,10 @@ def _is_offline_oserror(exc: BaseException) -> bool:
     (codex r4):
 
       * a TYPED connection exception anywhere in the ``__cause__``/``__context__``
-        chain (``requests.ConnectionError`` / ``huggingface_hub`` offline
-        errors) — the strongest signal, immune to message wording; OR
+        chain — ``requests``/``httpx`` transport errors, ``huggingface_hub``
+        offline errors, or the Python built-in ``ConnectionError``/
+        ``TimeoutError`` family (see ``_offline_skip_exc_types``) — the strongest
+        signal, immune to message wording; OR
       * a message containing an UNAMBIGUOUS connection-failure phrase (never
         emitted for a corrupt local file).
     """
@@ -461,13 +483,30 @@ def test_offline_oserror_classification():
     )
     assert _is_offline_oserror(offline_direct)
 
-    # Generic "Can't load…" wrapping a TYPED connection cause -> offline (skip).
+    # codex r5: prove the TYPED-cause path in isolation. The generic outer
+    # message and the cause message both carry NO offline marker, so this can
+    # only pass via typed-exception detection — deleting the isinstance branch
+    # would flip it red (unlike the old version, which passed on a "Max retries"
+    # string marker and left the typed path untested). ConnectionRefusedError
+    # subclasses the built-in ConnectionError, which is in _offline_skip_exc_types.
     generic_wrap = OSError("Can't load tokenizer for 'x'")
     try:
         try:
-            raise ConnectionError("Max retries exceeded with url: ...")
-        except ConnectionError as cause:
+            raise ConnectionRefusedError(61, "Connection refused")
+        except ConnectionRefusedError as cause:
             raise generic_wrap from cause
+    except OSError as raised:
+        assert _is_offline_oserror(raised)
+
+    # codex r5: an httpx transport error in the chain is also offline (transformers
+    # 5.x uses httpx). Marker-free message -> only the typed path can pass.
+    httpx = pytest.importorskip("httpx")
+    httpx_wrap = OSError("Can't load tokenizer for 'x'")
+    try:
+        try:
+            raise httpx.ConnectError("nope")
+        except httpx.ConnectError as cause:
+            raise httpx_wrap from cause
     except OSError as raised:
         assert _is_offline_oserror(raised)
 
