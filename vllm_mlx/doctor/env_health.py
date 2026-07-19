@@ -508,8 +508,7 @@ def section_optional_packages() -> Section:
                     f"vision paths will fail (`{hint}`)",
                     CheckStatus.WARN,
                     detail=(
-                        f"distribution={dist} version={ver} pil=missing "
-                        f"hint={hint}"
+                        f"distribution={dist} version={ver} pil=missing hint={hint}"
                     ),
                 )
                 continue

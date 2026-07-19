@@ -170,8 +170,7 @@ def require_mlx_vlm_or_exit(model_name: str) -> None:
     if status is VisionRuntimeStatus.BROKEN and missing:
         print(
             f"error: model {model_name!r} is a vision/multimodal alias, but "
-            f"the vision runtime cannot load.\n"
-            + _vlm_broken_install_hint(missing),
+            f"the vision runtime cannot load.\n" + _vlm_broken_install_hint(missing),
             file=sys.stderr,
         )
     else:
