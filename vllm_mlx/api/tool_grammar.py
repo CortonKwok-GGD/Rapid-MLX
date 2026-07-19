@@ -567,6 +567,15 @@ class GrammarLogitsProcessor:
         # consumed into the matcher so far.
         self._prompt_len: int | None = None
         self._committed = 0
+        # Fail-CLOSED abort latch (codex #558-PR3 nit, restored in PR-3b). If the
+        # matcher ever REJECTS an already-sampled+committed token, its internal
+        # state is desynced from the real output stream — continuing to compute a
+        # mask from that invalid state would emit garbage constraints. We latch
+        # ``_aborted`` and stop imposing the (now-invalid) mask, letting the
+        # request finish under the downstream free-form parser instead of masking
+        # from a broken matcher (the previous fail-OPEN kept masking from the
+        # desynced state).
+        self._aborted = False
 
     def is_broken(self) -> bool:
         """Whether the grammar failed to compile (masks nothing; use fallback)."""
@@ -586,7 +595,11 @@ class GrammarLogitsProcessor:
             self._reasoning_ended = True
 
     def __call__(self, token_ids: Any, logits: Any) -> Any:
-        if self._broken:
+        if self._broken or self._aborted:
+            # Broken (never compiled) or aborted (matcher rejected a committed
+            # token and is desynced): mask nothing so downstream free-form
+            # parsing owns the request rather than a garbage mask (codex
+            # #558-PR3).
             return logits
         # mlx-lm hands us the FULL cumulative sequence (prompt + generated) each
         # step. NEVER copy the whole thing (``list(token_ids)`` would be O(n) per
@@ -610,9 +623,28 @@ class GrammarLogitsProcessor:
                     continue
                 tok = int(t)
                 if not self._matcher.consume_token(tok):
-                    logger.debug(
-                        "tool-grammar: matcher rejected committed token %d", tok
+                    # FAIL-CLOSED (codex #558-PR3 nit): the matcher rejected a
+                    # token that was ALREADY sampled and committed to the output
+                    # stream, so its state no longer tracks the real stream.
+                    # Latch the abort and STOP consuming further tail tokens into
+                    # the now-invalid matcher; the mask branch below short-circuits
+                    # on ``_aborted`` and returns logits unchanged, so the request
+                    # finishes under the free-form parser instead of being masked
+                    # from a desynced grammar state (the old behavior only logged
+                    # and kept masking — fail-open).
+                    logger.warning(
+                        "tool-grammar: matcher rejected committed token %d; "
+                        "aborting grammar constraint (free-form fallback)",
+                        tok,
                     )
+                    self._aborted = True
+                    break
+
+        # Once aborted (this step or a prior one), never mask again — the matcher
+        # is desynced, so any bitmask it produces is garbage. Return logits
+        # unchanged so downstream free-form parsing owns the request.
+        if self._aborted:
+            return logits
 
         # Reasoning gate is checked AFTER committing this step's tokens. NOTE
         # (codex #558-PR3 nit, path B only): if a single multi-token update
@@ -668,6 +700,7 @@ class GrammarLogitsProcessor:
         self._prompt_len = None
         self._committed = 0
         self._reasoning_ended = self._reasoning_end_token is None
+        self._aborted = False
 
 
 def build_lltokenizer(tokenizer: Any) -> Any:

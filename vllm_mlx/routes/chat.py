@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -327,24 +328,185 @@ def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
     return None
 
 
+# Bound the client-controlled grammar compile (codex #558-PR3 blocking, restored
+# in PR-3b). The build runs a client-supplied JSON Schema through llguidance's
+# Lark compiler; an unbounded fan-out of many UNIQUE schemas (each bypassing the
+# compile LRU) could saturate CPU/memory and starve unrelated requests. TWO
+# defenses:
+#
+#   1. A STATELESS per-request bound on the COMPLETE flattened grammar input —
+#      tool count, tool names, AND parameter schemas (all compiled into the
+#      grammar), plus a nesting-depth cap, with an early abort so an oversized
+#      payload is never fully serialized.
+#   2. A DEDICATED thread pool for the compile itself with BOUNDED ADMISSION.
+#      We do NOT use ``asyncio.to_thread`` (its default executor's work queue is
+#      UNBOUNDED) and we do NOT use an ``asyncio.Semaphore`` (its permit is
+#      released the instant a disconnecting client cancels the await — while the
+#      worker keeps compiling — and it binds to a single event loop). A raw
+#      ``ThreadPoolExecutor`` still has an UNBOUNDED submission queue, so on top
+#      of the pool we track an in-flight COUNT (workers + admitted) under a lock
+#      and REJECT admission once it reaches the cap — an over-capacity request
+#      falls back to free-form immediately rather than queueing unbounded
+#      compile work or retaining whole request objects. The slot is released
+#      only when the compile ACTUALLY finishes, so admission survives client
+#      cancellation and is loop-agnostic.
+_TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY = 4  # dedicated compile-pool workers
+_TOOL_GRAMMAR_MAX_INFLIGHT = 8  # admitted (running + queued) cap before fallback
+_TOOL_GRAMMAR_MAX_SCHEMA_BYTES = 64 * 1024  # 64 KiB serialized per tools list
+_TOOL_GRAMMAR_MAX_SCHEMA_DEPTH = 32  # nested object/array nesting cap
+_TOOL_GRAMMAR_MAX_TOOLS = 256  # per-request tool-count cap (alternation width)
+_tool_grammar_build_executor = None
+_tool_grammar_inflight = 0
+_tool_grammar_inflight_lock = threading.Lock()
+
+
+def _get_tool_grammar_build_executor():
+    """Lazily create the dedicated bounded compile pool (loop-agnostic)."""
+    global _tool_grammar_build_executor
+    if _tool_grammar_build_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _tool_grammar_build_executor = ThreadPoolExecutor(
+            max_workers=_TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY,
+            thread_name_prefix="tool-grammar-build",
+        )
+    return _tool_grammar_build_executor
+
+
+def _try_admit_tool_grammar_build() -> bool:
+    """Reserve an in-flight slot for a compile, or refuse if at capacity.
+
+    Caps the number of ADMITTED (running + queued) compiles so the executor's
+    submission queue can never grow without bound (codex #558-PR3 blocking). A
+    refused request falls back to free-form. Pair every ``True`` with exactly
+    one :func:`_release_tool_grammar_build`.
+    """
+    global _tool_grammar_inflight
+    with _tool_grammar_inflight_lock:
+        if _tool_grammar_inflight >= _TOOL_GRAMMAR_MAX_INFLIGHT:
+            return False
+        _tool_grammar_inflight += 1
+        return True
+
+
+def _release_tool_grammar_build() -> None:
+    """Release a slot reserved by :func:`_try_admit_tool_grammar_build`."""
+    global _tool_grammar_inflight
+    with _tool_grammar_inflight_lock:
+        if _tool_grammar_inflight > 0:
+            _tool_grammar_inflight -= 1
+
+
+class _BoundsExceededError(Exception):
+    """Raised by the bounded walker when a size/depth cap is hit — early abort."""
+
+
+def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
+    """Estimate serialized size + nesting depth, aborting the INSTANT a cap trips.
+
+    Walks a JSON-like object accumulating an APPROXIMATE serialized byte count
+    into ``budget[0]`` (decremented) and checking nesting ``depth``. It NEVER
+    materializes the serialized string — it raises ``_BoundsExceededError`` as
+    soon as the running total would exceed the budget or the depth cap, so a
+    pathologically large/deep attacker payload is rejected after touching only a
+    bounded prefix of it (codex #558-PR3 blocking). Estimates are deliberately
+    conservative (>= real JSON length) so the cap is never under-counted.
+    """
+    if depth > _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH:
+        raise _BoundsExceededError
+    if isinstance(obj, dict):
+        budget[0] -= 2  # {}
+        if budget[0] < 0:
+            raise _BoundsExceededError
+        for k, v in obj.items():
+            budget[0] -= len(str(k)) + 4  # "key": ,
+            if budget[0] < 0:
+                raise _BoundsExceededError
+            _walk_size_and_depth(v, budget, depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        budget[0] -= 2  # []
+        if budget[0] < 0:
+            raise _BoundsExceededError
+        for v in obj:
+            budget[0] -= 1  # ,
+            if budget[0] < 0:
+                raise _BoundsExceededError
+            _walk_size_and_depth(v, budget, depth + 1)
+    else:
+        # Scalar: string / number / bool / None. ``str`` length is an upper
+        # bound on the JSON token length for all of these.
+        budget[0] -= len(str(obj)) + 2  # + possible quotes
+        if budget[0] < 0:
+            raise _BoundsExceededError
+
+
+def _tools_within_grammar_bounds(tools) -> bool:
+    """True iff the client tools list is small/shallow enough to compile safely.
+
+    Bounds the COMPLETE flattened grammar input — tool COUNT, tool NAMES, and
+    parameter SCHEMAS — since all three are compiled into the Lark grammar; a
+    prior version measured only ``parameters`` and let oversized names/counts
+    bypass the cap (codex #558-PR3 blocking). Uses a BOUNDED WALKER that aborts
+    the instant the running size or nesting exceeds the caps WITHOUT ever
+    building the full serialized string, so a hostile/pathological request
+    (even one giant single tool) is rejected after touching only a bounded
+    prefix. A rejected request falls back to free-form (never hard-fails) — the
+    grammar constraint is best-effort, so refusing to compile a giant schema
+    simply loses the structural guarantee, not the request.
+    """
+    tools = tools or ()
+    if len(tools) > _TOOL_GRAMMAR_MAX_TOOLS:
+        logger.warning(
+            "tool-grammar: %d tools exceeds %d-tool cap; free-form",
+            len(tools),
+            _TOOL_GRAMMAR_MAX_TOOLS,
+        )
+        return False
+    # One shared byte budget across ALL tools so the cap bounds the total
+    # flattened input, not each tool independently.
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    try:
+        for t in tools:
+            fn = t.function if hasattr(t, "function") else t.get("function", t)
+            if isinstance(fn, dict):
+                name = fn.get("name")
+                params = fn.get("parameters")
+            else:
+                name = getattr(fn, "name", None)
+                params = getattr(fn, "parameters", None)
+            _walk_size_and_depth({"name": name, "parameters": params}, budget, 0)
+    except _BoundsExceededError:
+        logger.warning(
+            "tool-grammar: tools input exceeds %d-byte / depth-%d cap; free-form",
+            _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+            _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH,
+        )
+        return False
+    except Exception:
+        # Un-walkable tools can't reach the builder cleanly anyway — treat as
+        # out-of-bounds and fall back to free-form.
+        return False
+    return True
+
+
 def _tool_grammar_eligible(cfg, request) -> bool:
     """Cheap synchronous gate: could this request possibly get a grammar?
 
     Runs the trivial checks (env opt-in, tools present, a family parser
-    configured, and ``tool_choice`` in the PR-3a constrained set) with NO heavy
-    imports and NO grammar/tokenizer construction. The route calls this on the
-    event loop so the vast majority of traffic — requests without tools, and
-    ``"auto"``/``"none"`` choices — short-circuits WITHOUT ever entering the
-    thread offload. Only an eligible request pays the ``asyncio.to_thread``
-    offload for the actual (possibly ~1s cold) build (codex #558-PR3).
+    configured, ``tool_choice`` in the PR-3a constrained set, and a schema
+    size/depth/count bound) with NO heavy imports and NO grammar/tokenizer
+    construction. The route calls this on the event loop so the vast majority of
+    traffic — requests without tools, and ``"auto"``/``"none"`` choices —
+    short-circuits WITHOUT ever entering the thread pool. Only an eligible
+    request pays the ``run_in_executor`` offload for the actual (possibly ~1s
+    cold) build (codex #558-PR3).
 
-    OPT-IN (PR-3a scope): ``RAPID_MLX_CONSTRAIN_TOOLS`` defaults to OFF. PR-3a
-    ships the runtime WITHOUT the client-schema size/depth/count DoS caps and
-    the bounded compile-pool admission (those are resource-hardening, split to
-    PR-3b). Because the compile runs on client-controlled schema input, we do
-    NOT enable it by default until that hardening lands — an operator opts in
+    OPT-IN: ``RAPID_MLX_CONSTRAIN_TOOLS`` defaults to OFF. PR-3b restores the
+    client-schema size/depth/count DoS caps and the bounded compile-pool
+    admission (resource-hardening). Because the compile still runs on
+    client-controlled schema input, the default stays OFF — an operator opts in
     explicitly (``RAPID_MLX_CONSTRAIN_TOOLS=1``/``on``/``true``). Flipping the
-    default to on is gated on PR-3b (and the auto path on PR-5).
+    default to on remains gated on PR-5 (with the auto path).
     """
     if os.environ.get("RAPID_MLX_CONSTRAIN_TOOLS", "0") not in ("1", "on", "true"):
         return False
@@ -352,10 +514,15 @@ def _tool_grammar_eligible(cfg, request) -> bool:
         cfg, "tool_call_parser", None
     ):
         return False
-    return (
+    if (
         _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
-        is not None
-    )
+        is None
+    ):
+        return False
+    # Reject an oversized/over-nested/over-count client schema before it can
+    # drive an unbounded compile on the shared executor (codex #558-PR3 blocking,
+    # restored in PR-3b). A rejected request falls back to free-form.
+    return _tools_within_grammar_bounds(getattr(request, "tools", None))
 
 
 def _maybe_build_tool_grammar_processor(engine, cfg, request):
@@ -2244,13 +2411,14 @@ async def _create_chat_completion_impl(
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
-    # Grammar-constrained tool calling (#558 PR-3a). When the request carries
+    # Grammar-constrained tool calling (#558 PR-3). When the request carries
     # ``tools``, a family parser that declares a ``structure_info``, and an
     # EXPLICIT ``tool_choice`` of ``"required"`` or a named function, build a
     # per-request ``GrammarLogitsProcessor`` that structurally constrains a
     # completed tool call to name a real tool and satisfy its JSON schema in the
-    # family wire format. OPT-IN via env ``RAPID_MLX_CONSTRAIN_TOOLS``
-    # (defaults OFF; set to 1/on/true — client-schema DoS-hardening is PR-3b).
+    # family wire format. OPT-IN via env ``RAPID_MLX_CONSTRAIN_TOOLS`` (defaults
+    # OFF; set to 1/on/true). PR-3b hardens the opt-in path with client-schema
+    # size/depth/count DoS caps + a bounded compile pool with admission control.
     # ``tool_choice="auto"`` stays UNCONSTRAINED (the auto-path grammar is PR-5,
     # paused). Falls back to today's free-form-then-parse when opted out, the
     # parser opts out (returns None), or llguidance/tokenizer is unavailable —
@@ -2268,20 +2436,34 @@ async def _create_chat_completion_impl(
     #
     # The cheap eligibility gate runs SYNCHRONOUSLY on the loop so the vast
     # majority of traffic (no tools, ``"auto"``/``"none"`` choices) never enters
-    # the thread offload (codex #558-PR3). Only an eligible request pays the
-    # off-loop build via ``asyncio.to_thread`` — it compiles a client-controlled
-    # grammar and, on the FIRST request for a tokenizer, does the documented ~1s
-    # ``LLTokenizer`` build; running that inline would block the event loop for
-    # every other in-flight request. The Lark->llguidance grammar compile is
-    # already ``lru_cache``d (``_compile_lark_cached``) and the tokenizer is
-    # memoized (``get_lltokenizer``), so steady-state cost is small — but the
-    # cold path and per-request ``LLMatcher`` construction still belong off-loop.
-    # (Bounded compile-pool admission + client-schema DoS caps are PR-3b.)
+    # the thread pool (codex #558-PR3). Only an eligible request pays the
+    # off-loop build — it compiles a client-controlled grammar and, on the FIRST
+    # request for a tokenizer, does the documented ~1s ``LLTokenizer`` build;
+    # running that inline would block the event loop for every other in-flight
+    # request. The Lark->llguidance grammar compile is already ``lru_cache``d
+    # (``_compile_lark_cached``) and the tokenizer is memoized
+    # (``get_lltokenizer``), so steady-state cost is small — but the cold path
+    # and per-request ``LLMatcher`` construction still belong off-loop.
     _glp = None
-    if _tool_grammar_eligible(cfg, request):
-        _glp = await asyncio.to_thread(
-            _maybe_build_tool_grammar_processor, engine, cfg, request
-        )
+    if _tool_grammar_eligible(cfg, request) and _try_admit_tool_grammar_build():
+        # Run on the DEDICATED compile pool with BOUNDED ADMISSION (not the
+        # default executor, whose work queue is unbounded — codex #558-PR3
+        # blocking). Admission is reserved above and released in ``finally`` when
+        # the compile actually finishes; over-capacity requests skip the offload
+        # (``_try_admit`` returned False) and fall back to free-form rather than
+        # queueing unbounded work. The eligibility gate already bounded each
+        # build's cost (tool count / size / nesting).
+        try:
+            loop = asyncio.get_running_loop()
+            _glp = await loop.run_in_executor(
+                _get_tool_grammar_build_executor(),
+                _maybe_build_tool_grammar_processor,
+                engine,
+                cfg,
+                request,
+            )
+        finally:
+            _release_tool_grammar_build()
     if _glp is not None:
         chat_kwargs["grammar_logits_processor"] = _glp
 

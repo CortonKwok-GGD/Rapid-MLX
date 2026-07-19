@@ -368,7 +368,8 @@ def test_eligible_false_by_default_when_env_unset(monkeypatch):
 
 def test_eligible_true_for_reasonable_schema():
     # A normal-sized, shallow schema is eligible (opt-in enabled by the module
-    # autouse fixture). PR-3a applies no size/depth cap (that is PR-3b).
+    # autouse fixture). The PR-3b size/depth/count caps must NOT reject ordinary
+    # tools.
     from vllm_mlx.routes.chat import _tool_grammar_eligible
 
     ok = _FunctionTool(
@@ -382,6 +383,77 @@ def test_eligible_true_for_reasonable_schema():
     cfg = _CfgStub("hermes")
     req = _RequestStub(tools=[ok], tool_choice="required")
     assert _tool_grammar_eligible(cfg, req) is True
+
+
+def test_eligible_false_for_oversized_schema():
+    # codex #558-PR3 blocking (restored in PR-3b): a pathologically LARGE client
+    # schema must be rejected before it can drive an unbounded compile on the
+    # shared executor.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _tool_grammar_eligible,
+    )
+
+    # A schema whose serialized size blows past the cap.
+    big_props = {
+        f"field_{i}": {"type": "string", "description": "x" * 64}
+        for i in range(_TOOL_GRAMMAR_MAX_SCHEMA_BYTES // 32)
+    }
+    huge = _FunctionTool(
+        "bloat",
+        parameters={"type": "object", "properties": big_props},
+    )
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[huge], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_eligible_false_for_overdeep_schema():
+    # codex #558-PR3 blocking (restored in PR-3b): a pathologically DEEP nested
+    # schema is rejected.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH,
+        _tool_grammar_eligible,
+    )
+
+    # Build a schema nested well past the depth cap.
+    node: dict = {"type": "string"}
+    for _ in range(_TOOL_GRAMMAR_MAX_SCHEMA_DEPTH + 5):
+        node = {"type": "object", "properties": {"inner": node}}
+    deep = _FunctionTool("deep", parameters=node)
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[deep], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_eligible_false_for_oversized_tool_name():
+    # codex #558-PR3 blocking (restored in PR-3b): the bound must include tool
+    # NAMES, not just parameters — an oversized name is compiled into the grammar
+    # too and must count against the byte cap.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _tool_grammar_eligible,
+    )
+
+    huge_name = "x" * (_TOOL_GRAMMAR_MAX_SCHEMA_BYTES + 10)
+    tool = _FunctionTool(huge_name, parameters={"type": "object", "properties": {}})
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[tool], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_eligible_false_for_too_many_tools():
+    # codex #558-PR3 blocking (restored in PR-3b): a pathological tool COUNT
+    # (huge alternation width) must be rejected before the compile.
+    from vllm_mlx.routes.chat import _TOOL_GRAMMAR_MAX_TOOLS, _tool_grammar_eligible
+
+    tools = [
+        _FunctionTool(f"tool_{i}", parameters={"type": "object", "properties": {}})
+        for i in range(_TOOL_GRAMMAR_MAX_TOOLS + 1)
+    ]
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=tools, tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
 
 
 def test_offline_skip_classifies_http_status():
@@ -436,21 +508,80 @@ def test_offline_skip_classifies_http_status():
 
 def test_route_offload_gated_on_eligibility_in_source():
     # The route must run the cheap gate SYNCHRONOUSLY before the off-loop
-    # compile, so no-tools / auto traffic never enters the thread offload
+    # compile, so no-tools / auto traffic never enters the thread pool
     # (codex #558-PR3). Source-position tripwire — the BEHAVIORAL guarantee is
     # proven by ``test_ineligible_request_never_enters_heavy_build_path``.
-    # PR-3a uses a simple ``asyncio.to_thread`` offload (the bounded compile
-    # pool is PR-3b).
+    # PR-3b offloads via ``loop.run_in_executor`` onto the dedicated bounded pool.
     import inspect
 
     from vllm_mlx.routes import chat as chat_mod
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
     gate = src.find("_tool_grammar_eligible(cfg, request)")
-    offload = src.find("asyncio.to_thread(")
+    offload = src.find("run_in_executor(")
     assert gate != -1, "route must gate the offload on _tool_grammar_eligible"
-    assert offload != -1, "route must offload the build via asyncio.to_thread"
+    assert offload != -1, "route must offload the build via loop.run_in_executor"
     assert gate < offload, "the eligibility gate must precede the off-loop compile"
+
+
+def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
+    # codex #558-PR3 blocking (restored in PR-3b): the compile must run on a
+    # DEDICATED bounded pool (slot held until the compile finishes, survives
+    # cancel, loop-agnostic) — NOT the default executor (unbounded queue) and
+    # NOT an asyncio semaphore (permit leaks on cancel, binds to one loop).
+    # Assert the structural guarantee in the route source + module surface.
+    import inspect
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    src = inspect.getsource(chat_mod._create_chat_completion_impl)
+    assert "_get_tool_grammar_build_executor()" in src, (
+        "the route must dispatch the compile onto the dedicated bounded pool"
+    )
+    assert "run_in_executor" in src, "the route must use loop.run_in_executor"
+    assert "asyncio.to_thread" not in src, (
+        "the route must NOT use asyncio.to_thread (unbounded default-executor "
+        "queue — codex #558-PR3)"
+    )
+    assert "_get_tool_grammar_build_semaphore" not in src, (
+        "the route must NOT gate the offload on an event-loop-bound semaphore "
+        "(codex #558-PR3: permit leaks on cancel, binds to one loop)"
+    )
+    assert not hasattr(chat_mod, "_get_tool_grammar_build_semaphore"), (
+        "the loop-bound build semaphore must not exist"
+    )
+    # The dedicated pool exists and is bounded.
+    ex = chat_mod._get_tool_grammar_build_executor()
+    assert ex._max_workers == chat_mod._TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY
+
+
+def test_bounded_admission_rejects_at_capacity():
+    # codex #558-PR3 blocking (restored in PR-3b): admission caps in-flight
+    # (running + queued) compiles so the executor's submission queue can't grow
+    # unbounded. Past the cap, admission is refused (request falls back to
+    # free-form).
+    from vllm_mlx.routes import chat as chat_mod
+
+    # Snapshot + reset the module counter so the test is order-independent.
+    saved = chat_mod._tool_grammar_inflight
+    chat_mod._tool_grammar_inflight = 0
+    try:
+        cap = chat_mod._TOOL_GRAMMAR_MAX_INFLIGHT
+        for _ in range(cap):
+            assert chat_mod._try_admit_tool_grammar_build() is True
+        # At capacity: further admission refused.
+        assert chat_mod._try_admit_tool_grammar_build() is False
+        # Release one -> a slot frees -> admission succeeds again.
+        chat_mod._release_tool_grammar_build()
+        assert chat_mod._try_admit_tool_grammar_build() is True
+        # Release everything we hold.
+        for _ in range(cap):
+            chat_mod._release_tool_grammar_build()
+        # Release is floored at 0 (never negative).
+        chat_mod._release_tool_grammar_build()
+        assert chat_mod._tool_grammar_inflight == 0
+    finally:
+        chat_mod._tool_grammar_inflight = saved
 
 
 @pytest.mark.parametrize(
@@ -1124,6 +1255,112 @@ def test_broken_processor_reports_is_broken_and_masks_nothing():
     finally:
         tg.LLMatcher = orig_matcher
         tg.allocate_token_bitmask = orig_alloc
+
+
+def test_rejected_committed_token_fails_closed_and_stops_masking():
+    # codex #558-PR3 nit (restored in PR-3b): a matcher that REJECTS an
+    # already-sampled+committed token is desynced from the real output stream.
+    # The processor must FAIL-CLOSED — latch ``_aborted``, stop consuming into
+    # the invalid matcher, and stop imposing a (garbage) mask — rather than the
+    # old fail-OPEN behavior that only logged and kept masking from the desynced
+    # state. Uses a fake matcher so no real llguidance internals are needed.
+    import importlib.util
+
+    if importlib.util.find_spec("llguidance") is None:
+        pytest.skip("llguidance ([guided] extra) not installed")
+
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _RejectingMatcher:
+        """Accepts the first committed token, then rejects everything after."""
+
+        def __init__(self, *a, **k):
+            self.n_consumed = 0
+            self.n_fills = 0
+
+        def get_error(self):
+            return None  # compiled fine
+
+        def consume_token(self, tok_id):
+            self.n_consumed += 1
+            # Accept the first generated token, reject the second (simulating a
+            # matcher that desyncs from an already-committed token).
+            return self.n_consumed <= 1
+
+        def is_stopped(self):
+            return False
+
+        def reset(self):
+            self.n_consumed = 0
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    import vllm_mlx.api.tool_grammar as tg
+
+    orig_matcher = tg.LLMatcher
+    orig_alloc = tg.allocate_token_bitmask
+    orig_fill = tg.fill_next_token_bitmask
+    orig_apply = tg.apply_token_bitmask
+
+    fills = {"n": 0}
+
+    def _spy_fill(matcher, bitmask, row):
+        fills["n"] += 1
+
+    def _mask_all(logits, bitmask):
+        # A "real" mask would zero out most tokens; return a sentinel that is
+        # clearly different from the unchanged logits so we can prove masking
+        # did NOT run after the abort.
+        return mx.full(logits.shape, -1.0, dtype=logits.dtype)
+
+    tg.LLMatcher = _RejectingMatcher
+    tg.allocate_token_bitmask = lambda n, v: None
+    tg.fill_next_token_bitmask = _spy_fill
+    tg.apply_token_bitmask = _mask_all
+    try:
+        proc = GrammarLogitsProcessor(_FakeLLTok(), "ok-grammar", tokenizer=None)
+        assert proc.is_broken() is False
+
+        # Step 1: baseline the prompt (1 token), then feed the first generated
+        # token — accepted, matcher masks (fill runs, mask applied).
+        proc(mx.array([1]), mx.zeros((1, 8)))  # prompt baseline
+        out1 = proc(mx.array([1, 2]), mx.zeros((1, 8)))
+        assert proc._aborted is False, "first committed token was wrongly rejected"
+        assert np.array_equal(np.array(out1), np.full((1, 8), -1.0)), (
+            "an accepted token must still be masked (constraint active)"
+        )
+        fills_before_abort = fills["n"]
+
+        # Step 2: feed the second generated token — the matcher rejects it, so
+        # the processor must latch ``_aborted`` and return logits UNCHANGED.
+        logits2 = mx.zeros((1, 8))
+        out2 = proc(mx.array([1, 2, 3]), logits2)
+        assert proc._aborted is True, "rejected committed token must latch _aborted"
+        assert np.array_equal(np.array(out2), np.array(logits2)), (
+            "after abort, the mask must NOT be applied (logits unchanged)"
+        )
+        # No new fill happened on the aborting step (short-circuit before mask).
+        assert fills["n"] == fills_before_abort, (
+            "the mask branch must be skipped once aborted"
+        )
+
+        # Step 3: any subsequent call also stays fail-closed (logits unchanged).
+        logits3 = mx.zeros((1, 8))
+        out3 = proc(mx.array([1, 2, 3, 4]), logits3)
+        assert np.array_equal(np.array(out3), np.array(logits3))
+
+        # reset() clears the abort latch so the processor can be reused.
+        proc.reset()
+        assert proc._aborted is False
+    finally:
+        tg.LLMatcher = orig_matcher
+        tg.allocate_token_bitmask = orig_alloc
+        tg.fill_next_token_bitmask = orig_fill
+        tg.apply_token_bitmask = orig_apply
 
 
 def test_forced_prefix_block_is_gated_on_grammar_absence():
