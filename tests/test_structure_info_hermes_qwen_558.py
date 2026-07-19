@@ -8,10 +8,14 @@ stub. PR-2 lands the concrete per-family overrides on the REAL
 ``<tool_call>…</tool_call>`` JSON-body wire). These tests therefore drive the
 grammar path through the ACTUAL shipped parsers — not a stub — to prove:
 
-  * each real parser's ``structure_info()`` returns a ``name -> StructureInfo``
-    factory whose wire triple is the hermes ``<tool_call>`` JSON body, with the
+  * each real parser's ``structure_info()`` is TOKENIZER-AWARE: it opts into
+    grammar constraint (returns a ``name -> StructureInfo`` factory whose wire
+    triple is the hermes ``<tool_call>`` JSON body, with the
     ``<tool_call>``/``</tool_call>`` single special tokens declared as
-    ``sentinels`` (ground-truth correction #1);
+    ``sentinels`` — ground-truth correction #1) ONLY when the model's tokenizer
+    proves both sentinels are single tokens, and OPTS OUT (returns ``None`` ->
+    free-form fallback) otherwise (no tokenizer, or a Llama-based Hermes
+    tokenizer that encodes ``<tool_call>`` as ordinary multi-token text);
   * feeding a real parser through ``build_tool_grammar`` yields a Lark with the
     ``<tool_call>`` bare special-token trigger + a ``%json`` schema-constraint
     region for the ``arguments`` object;
@@ -90,6 +94,34 @@ _PARSER_IMPORTS = {
 }
 
 
+class _FakeSingleTokenizer:
+    """Minimal tokenizer stub whose declared strings encode to ONE token each.
+
+    ``structure_info()`` opts into grammar constraint only when the model's
+    tokenizer proves ``<tool_call>``/``</tool_call>`` are single tokens (the
+    hermes parser is also routed to Llama tokenizers where they are NOT). The
+    pure-Python triple/Lark tests must therefore hand the parser a tokenizer
+    that satisfies the guard — this stub does so WITHOUT a network fetch, so
+    those tests stay hermetic and never skip. Any string not in ``_single`` is
+    reported as multi-token (length 2) so the opt-out path is exercisable too.
+    """
+
+    def __init__(self, single=("<tool_call>", "</tool_call>")):
+        self._single = set(single)
+
+    def encode(self, text, add_special_tokens=False):
+        return [0] if text in self._single else [0, 1]
+
+
+class _MultiTokenTokenizer(_FakeSingleTokenizer):
+    """Tokenizer stub where NO sentinel is a single token (a Llama-Hermes-like
+    tokenizer). Every ``encode`` returns two ids -> the guard fails -> the
+    parser opts out of grammar constraint (``structure_info() -> None``)."""
+
+    def __init__(self):
+        super().__init__(single=())
+
+
 def _make_parser(family: str, tokenizer=None):
     import importlib
 
@@ -98,15 +130,53 @@ def _make_parser(family: str, tokenizer=None):
     return cls(tokenizer=tokenizer)
 
 
+def _make_optin_parser(family: str):
+    """A real parser whose tokenizer satisfies the single-special-token guard,
+    so ``structure_info()`` opts in — used by the hermetic triple/Lark tests."""
+    return _make_parser(family, tokenizer=_FakeSingleTokenizer())
+
+
 # --------------------------------------------------------------------------
-# structure_info() wire triple (pure Python, always runs — no tokenizer,
-# no llguidance: structure_info() is stateless w.r.t. the tokenizer).
+# Tokenizer-aware opt-in/opt-out guard (pure Python, always runs). This is the
+# load-bearing correctness contract: the hermes wire's <tool_call> sentinels
+# are single special tokens ONLY on some tokenizers (Qwen3), NOT universally
+# (Llama-based Hermes). A parser must opt out where the tokenizer can't prove
+# single-token sentinels, else it would build an unenforceable grammar.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("family", ["hermes", "qwen"])
+def test_structure_info_opts_out_without_tokenizer(family):
+    # No tokenizer -> cannot prove single-token sentinels -> opt out (None),
+    # so the builder falls back to free-form. NON-BREAKING for tokenizer-less
+    # construction paths.
+    assert _make_parser(family, tokenizer=None).structure_info() is None
+
+
+@pytest.mark.parametrize("family", ["hermes", "qwen"])
+def test_structure_info_opts_out_on_multitoken_tokenizer(family):
+    # A tokenizer where <tool_call> is ordinary multi-token text (Llama-based
+    # Hermes) -> opt out. Declaring a special-token sentinel there would build a
+    # grammar the model's tokenizer can never satisfy — the exact bug this guard
+    # prevents.
+    parser = _make_parser(family, tokenizer=_MultiTokenTokenizer())
+    assert parser.structure_info() is None
+
+
+@pytest.mark.parametrize("family", ["hermes", "qwen"])
+def test_structure_info_opts_in_on_single_token_tokenizer(family):
+    # A tokenizer where both sentinels ARE single tokens (Qwen3-like) -> opt in.
+    parser = _make_parser(family, tokenizer=_FakeSingleTokenizer())
+    assert parser.structure_info() is not None
+
+
+# --------------------------------------------------------------------------
+# structure_info() wire triple (pure Python, always runs — hermetic tokenizer
+# stub so no network is needed to exercise the opt-in path).
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("family", ["hermes", "qwen"])
 def test_structure_info_returns_hermes_wire_triple(family):
     from vllm_mlx.api.tool_grammar import StructureInfo
 
-    parser = _make_parser(family)
+    parser = _make_optin_parser(family)
     get_info = parser.structure_info()
     # PR-2 opt-in: the override returns a name->StructureInfo factory, not None.
     assert callable(get_info), f"{family}.structure_info() must return a callable"
@@ -131,7 +201,7 @@ def test_structure_info_returns_hermes_wire_triple(family):
 def test_structure_info_substitutes_each_tool_name(family):
     # The factory substitutes whatever concrete name it is given — one triple
     # per tool, so a multi-tool request constrains each tool to ITS own schema.
-    parser = _make_parser(family)
+    parser = _make_optin_parser(family)
     get_info = parser.structure_info()
     for name in ("get_weather", "get_time", "any_other_name"):
         si = get_info(name)
@@ -143,8 +213,8 @@ def test_hermes_and_qwen_share_identical_wire(family):
     # hermes and qwen intentionally emit the SAME wire triple (both are the
     # <tool_call> JSON body). Assert byte-identical triples so the two overrides
     # can never silently diverge.
-    hermes_si = _make_parser("hermes").structure_info()("get_weather")
-    other_si = _make_parser(family).structure_info()("get_weather")
+    hermes_si = _make_optin_parser("hermes").structure_info()("get_weather")
+    other_si = _make_optin_parser(family).structure_info()("get_weather")
     assert other_si == hermes_si
 
 
@@ -159,20 +229,21 @@ def test_real_parser_builds_grammar(family, tool_choice):
     # compiled grammar (non-None) for both required and auto.
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
-    parser = _make_parser(family)
+    parser = _make_optin_parser(family)
     assert build_tool_grammar(TOOLS, tool_choice, parser) is not None
 
 
-@_requires_llguidance
 @pytest.mark.parametrize("family", ["hermes", "qwen"])
 def test_real_parser_lark_has_trigger_and_schema_region(family):
     # Assemble the Lark from the REAL parser's structure_info and assert the
     # load-bearing structure: <tool_call> as a BARE special-token ref (not a
     # quoted byte literal the single <tool_call> token could never satisfy),
     # </tool_call> bare closing ref, and a %json schema-constraint region.
+    # Pure ``build_tool_lark`` (string assembly) — needs NO llguidance, so this
+    # test always runs (it does not compile the grammar).
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
-    get_info = _make_parser(family).structure_info()
+    get_info = _make_optin_parser(family).structure_info()
     infos = [get_info(t["name"]) for t in TOOLS]
     lark = build_tool_lark(TOOLS, "required", infos)
 
@@ -297,7 +368,7 @@ def test_valid_call_is_accepted_and_terminates(family, tok, lltok):
     # AND is a terminal/accepting state (a complete valid derivation).
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
-    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family))
+    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family, tok))
     assert grammar is not None
     accepted, total, accepting = _consume(
         grammar,
@@ -317,7 +388,7 @@ def test_valid_enum_value_is_accepted(family, tok, lltok):
     # because the grammar forbids the optional `unit` property entirely.
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
-    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family))
+    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family, tok))
     accepted, total, accepting = _consume(
         grammar,
         lltok,
@@ -335,7 +406,7 @@ def test_valid_enum_value_is_accepted(family, tok, lltok):
 def test_hallucinated_tool_name_is_rejected(family, tok, lltok):
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
-    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family))
+    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family, tok))
     accepted, total, _ = _consume(
         grammar, lltok, tok, '<tool_call>\n{"name": "get_stockquote'
     )
@@ -348,7 +419,7 @@ def test_off_schema_argument_is_rejected(family, tok, lltok):
     # `city` must be a string; an integer must be forbidden.
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
-    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family))
+    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family, tok))
     accepted, total, _ = _consume(
         grammar,
         lltok,
@@ -364,7 +435,7 @@ def test_bad_enum_value_is_rejected(family, tok, lltok):
     # `unit` enum is {c, f}; "kelvin" must be forbidden.
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
-    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family))
+    grammar = build_tool_grammar(TOOLS, "required", _make_parser(family, tok))
     accepted, total, _ = _consume(
         grammar,
         lltok,

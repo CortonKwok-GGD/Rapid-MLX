@@ -74,6 +74,43 @@ class StructureInfo:
     sentinels: tuple[str, ...] = field(default=())
 
 
+def are_single_special_tokens(tokenizer: Any, candidates: tuple[str, ...]) -> bool:
+    """True iff EVERY candidate encodes to exactly one token on ``tokenizer``.
+
+    A per-family ``structure_info()`` declares its ``<...>`` sentinels as
+    special-token refs (see ``StructureInfo.sentinels``) ONLY when the model's
+    tokenizer actually encodes each one as a single token — this is the
+    ground-truth-correction-#1 assumption (``<tool_call>``/``</tool_call>`` are
+    single special tokens in Qwen3/Hermes tokenizers). It is NOT universal: the
+    same ``hermes`` wire on a Llama-based Hermes tokenizer encodes
+    ``<tool_call>`` as ordinary multi-token text, where declaring it a
+    special-token sentinel would build an UNENFORCEABLE grammar (the model has
+    no single ``<tool_call>`` token to satisfy the ref). A family that cannot
+    prove single-token sentinels must OPT OUT (``structure_info() -> None``) and
+    fall back to today's free-form-then-parse behavior rather than emit a
+    grammar its tokenizer can never satisfy.
+
+    Returns ``False`` (conservative: caller opts out) when the tokenizer is
+    absent or lacks ``encode`` / raises — grammar constraint is a best-effort
+    opt-in, never a hard requirement, so an unknown tokenizer degrades safely.
+    """
+    if tokenizer is None:
+        return False
+    encode = getattr(tokenizer, "encode", None)
+    if encode is None:
+        return False
+    for tok_str in candidates:
+        try:
+            ids = encode(tok_str, add_special_tokens=False)
+        except Exception:
+            # A tokenizer that rejects the probe cannot prove single-token
+            # status -> conservatively report False so the family opts out.
+            return False
+        if len(ids) != 1:
+            return False
+    return True
+
+
 def _lark_escape(s: str) -> str:
     """Render ``s`` as a Lark double-quoted string literal (JSON-escaped)."""
     if not s:

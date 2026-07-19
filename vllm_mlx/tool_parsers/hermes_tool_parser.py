@@ -308,6 +308,8 @@ class HermesToolParser(ToolParser):
             return None
         return None
 
+    _GRAMMAR_SENTINELS = ("<tool_call>", "</tool_call>")
+
     def structure_info(self):
         """Grammar-constraint wire triple for the hermes ``<tool_call>`` JSON
         body (#558). ``<tool_call>`` / ``</tool_call>`` are single special
@@ -317,8 +319,24 @@ class HermesToolParser(ToolParser):
         Schema via ``%json`` (injected by ``build_tool_lark``).
 
         Wire: ``<tool_call>\n{"name": "NAME", "arguments": <schema>}\n</tool_call>``
+
+        The ``hermes`` parser is routed to families with DIFFERENT tokenizers
+        (Qwen3, Nous-Hermes-on-Llama, Phi, Gemma, Granite, …). The
+        single-special-token assumption only holds where the tokenizer actually
+        encodes ``<tool_call>``/``</tool_call>`` as one token each (e.g. Qwen3).
+        On a Llama-based Hermes tokenizer they are ordinary multi-token text, so
+        a special-token sentinel would build an UNENFORCEABLE grammar. We
+        therefore OPT OUT (return ``None`` -> free-form-then-parse fallback)
+        unless the model's tokenizer proves both sentinels are single tokens.
+        Grammar constraint is a best-effort opt-in, never a hard requirement.
         """
-        from vllm_mlx.api.tool_grammar import StructureInfo
+        from vllm_mlx.api.tool_grammar import (
+            StructureInfo,
+            are_single_special_tokens,
+        )
+
+        if not are_single_special_tokens(self.model_tokenizer, self._GRAMMAR_SENTINELS):
+            return None
 
         def _info(name: str):
             begin = f'<tool_call>\n{{"name": "{name}", "arguments": '
@@ -327,7 +345,7 @@ class HermesToolParser(ToolParser):
                 begin=begin,
                 end=end,
                 trigger="<tool_call>",
-                sentinels=("<tool_call>", "</tool_call>"),
+                sentinels=self._GRAMMAR_SENTINELS,
             )
 
         return _info
