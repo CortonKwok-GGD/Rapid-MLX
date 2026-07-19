@@ -128,9 +128,12 @@ def build_tool_lark(
     tag_end``) but with special-token-aware begin/end rendering (see module
     docstring). ``tool_choice`` selects the repetition quantifier:
 
-      * ``auto``     -> ``(...)*``  (may emit zero calls; at_least_one=false)
-      * anything else (``required`` / a specific function name) -> ``(...)+``
-        (design R1: at least one call forced)
+      * ``auto``                        -> ``(...)*``  (may emit zero calls)
+      * ``required`` / a function name  -> ``(...)+``  (design R1: ≥1 forced)
+
+    ``"none"`` must NOT reach this function — ``none`` produces no grammar at
+    all (the model sees no tools, design §4); passing it here is a caller
+    bug and raises ``ValueError`` rather than silently forcing a call.
 
     The grammar is built over exactly the ``tools`` passed in — one ``tag_i``
     alternative per tool. For a NAMED ``tool_choice`` the caller narrows
@@ -142,6 +145,11 @@ def build_tool_lark(
     Every tag is: ``TAG_TEXT <trigger-and-begin> %json <schema> <end>``.
     ``TAG_TEXT`` is the lazy free prefix that swallows reasoning/prose until
     the trigger — this is also the reasoning-aware delay (design §5 path A).
+    LIMITATION (design §7 open-Q1, deferred to the PR-5 auto path): for the
+    ``auto`` (``*``) branch the trigger MUST be a single special token so the
+    lazy ``TAG_TEXT`` prefix cannot swallow it. We therefore require every
+    trigger to be declared as a ``sentinel`` — a text (multi-token) trigger
+    is rejected here rather than silently producing an unenforceable grammar.
     """
     if not tools:
         raise ValueError("build_tool_lark: tools must not be empty")
@@ -149,6 +157,11 @@ def build_tool_lark(
         raise ValueError(
             "build_tool_lark: tools and structure_infos length mismatch "
             f"({len(tools)} != {len(structure_infos)})"
+        )
+    if tool_choice == "none":
+        raise ValueError(
+            "build_tool_lark: tool_choice='none' must not build a grammar "
+            "(none produces no constraint at all — caller bug)"
         )
     for si in structure_infos:
         # StructTag invariant: begin must start with trigger. Enforce it so a
@@ -159,7 +172,15 @@ def build_tool_lark(
                 "build_tool_lark: StructureInfo.begin must start with its "
                 f"trigger (trigger={si.trigger!r}, begin={si.begin!r})"
             )
+        # The trigger must be a special-token sentinel (see LIMITATION above),
+        # otherwise the lazy TAG_TEXT prefix could swallow it in the auto path.
+        if si.trigger and si.trigger not in si.sentinels:
+            raise ValueError(
+                "build_tool_lark: trigger must be declared as a special-token "
+                f"sentinel (trigger={si.trigger!r}, sentinels={si.sentinels!r})"
+            )
 
+    # auto -> zero-or-more (may emit no call); everything else forces ≥1.
     quant = "*" if tool_choice == "auto" else "+"
     tag_names = " | ".join(f"tag_{i}" for i in range(len(tools)))
     lark = (
@@ -170,7 +191,14 @@ def build_tool_lark(
         "\n"
     )
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
-        params = tool.get("parameters") or {"type": "object", "properties": {}}
+        # Only substitute the permissive default when ``parameters`` is ABSENT.
+        # A falsy-but-present schema ({} = allow-any, false = allow-none) is a
+        # deliberate, meaningful JSON Schema and must be preserved verbatim —
+        # ``tool.get("parameters") or default`` would silently clobber it.
+        if "parameters" in tool and tool["parameters"] is not None:
+            params = tool["parameters"]
+        else:
+            params = {"type": "object", "properties": {}}
         schema = json.dumps(params)
         begin_body = _emit_literal_with_sentinels(si.begin, si.sentinels)
         end_body = _emit_literal_with_sentinels(si.end, si.sentinels)
@@ -202,9 +230,11 @@ def build_tool_grammar(
 ) -> str | None:
     """Public entry: (tools, tool_choice, parser) -> compiled llguidance grammar.
 
-    Returns ``None`` when the parser declares no ``structure_info`` (family
-    not yet supported -> caller falls back to today's free-form behavior) or
-    when llguidance is unavailable / compilation fails.
+    Returns ``None`` when ``tool_choice`` is ``"none"`` (no constraint at
+    all), when the parser declares no ``structure_info`` (family not yet
+    supported -> caller falls back to today's free-form behavior), or when
+    llguidance is unavailable / a per-family factory raises / compilation
+    fails. Any of these paths degrades safely to today's free-form behavior.
 
     NOTE (PR-1): this function has NO call sites in the request path yet.
     ``chat.py`` / ``scheduler.py`` routing is deliberately not wired here —
@@ -212,6 +242,9 @@ def build_tool_grammar(
     scaffolding and cannot change tool-call behavior.
     """
     if not HAS_LLGUIDANCE or not tools:
+        return None
+    if tool_choice == "none":
+        # ``none`` means the model sees no tools -> no grammar (design §4).
         return None
     info_fn = getattr(parser, "structure_info", None)
     if info_fn is None:
@@ -229,10 +262,22 @@ def build_tool_grammar(
         name = tool.get("name")
         if not name:
             return None
-        si = get_info(name)
+        # Mirror the structure_info() guard: a per-family factory that raises
+        # on a specific tool name must degrade to free-form, not crash the
+        # request (codex round-2 nit — consistent fallback policy).
+        try:
+            si = get_info(name)
+        except Exception:
+            logger.exception("tool-grammar: structure_info factory raised")
+            return None
         if si is None:
             return None
         structure_infos.append(si)
 
-    lark = build_tool_lark(tools, tool_choice, structure_infos)
+    try:
+        lark = build_tool_lark(tools, tool_choice, structure_infos)
+    except ValueError:
+        # Malformed structure_info / unsupported tool_choice -> free-form.
+        logger.exception("tool-grammar: build_tool_lark rejected inputs")
+        return None
     return _compile_lark_cached(lark)

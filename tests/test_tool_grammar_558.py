@@ -113,9 +113,12 @@ def test_abc_structure_info_defaults_to_none():
     assert _Dummy(tokenizer=None).structure_info() is None
 
 
+@_requires_llguidance
 def test_build_tool_grammar_none_when_parser_opts_out():
     # A parser whose structure_info() returns None -> builder returns None
-    # (free-form fallback), NOT a grammar.
+    # (free-form fallback), NOT a grammar. Requires llguidance so the opt-out
+    # branch is reached rather than the ``HAS_LLGUIDANCE`` short-circuit
+    # (which would make this pass for the wrong reason).
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
     class _OptOut:
@@ -125,10 +128,37 @@ def test_build_tool_grammar_none_when_parser_opts_out():
     assert build_tool_grammar(TOOLS, "required", _OptOut()) is None
 
 
+@_requires_llguidance
 def test_build_tool_grammar_none_on_empty_tools():
+    # Empty tools -> None. Requires llguidance so the empty-tools guard is the
+    # reason for None, not the availability short-circuit.
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
     assert build_tool_grammar([], "required", _HermesStubParser()) is None
+
+
+@_requires_llguidance
+def test_build_tool_grammar_none_for_tool_choice_none():
+    # tool_choice="none" -> no grammar at all (design §4), never a forced call.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    assert build_tool_grammar(TOOLS, "none", _HermesStubParser()) is None
+
+
+@_requires_llguidance
+def test_build_tool_grammar_degrades_when_factory_raises():
+    # A per-family structure_info() factory that raises on a tool name must
+    # degrade to free-form (None), not crash the request.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    class _Raises:
+        def structure_info(self):
+            def _boom(name):
+                raise RuntimeError("boom")
+
+            return _boom
+
+    assert build_tool_grammar(TOOLS, "required", _Raises()) is None
 
 
 # --------------------------------------------------------------------------
@@ -182,15 +212,50 @@ def test_build_tool_lark_rejects_bad_inputs():
     # rather than asserting.
     from vllm_mlx.api.tool_grammar import StructureInfo, build_tool_lark
 
+    good = _hermes_structure_info()("get_weather")
     with pytest.raises(ValueError):
         build_tool_lark([], "required", [])
     with pytest.raises(ValueError):
         # length mismatch
-        build_tool_lark(TOOLS, "required", [_hermes_structure_info()("get_weather")])
+        build_tool_lark(TOOLS, "required", [good])
+    with pytest.raises(ValueError):
+        # tool_choice="none" must never build a grammar
+        build_tool_lark([TOOLS[0]], "none", [good])
     with pytest.raises(ValueError):
         # begin does not start with trigger -> invariant violation
-        bad = StructureInfo(begin="oops", end="", trigger="<tool_call>")
+        bad = StructureInfo(
+            begin="oops", end="", trigger="<tool_call>", sentinels=("<tool_call>",)
+        )
         build_tool_lark([TOOLS[0]], "required", [bad])
+    with pytest.raises(ValueError):
+        # trigger not declared as a special-token sentinel -> rejected
+        bad = StructureInfo(begin="<x>go", end="", trigger="<x>", sentinels=())
+        build_tool_lark([TOOLS[0]], "required", [bad])
+
+
+def test_build_tool_lark_preserves_falsy_schemas():
+    # A present-but-falsy JSON Schema ({} = allow-any, false = allow-none) is
+    # meaningful and must be embedded verbatim, NOT replaced by the permissive
+    # default (the ``... or default`` bug codex flagged).
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    info = _hermes_structure_info()("get_weather")
+    tool_empty = {"name": "get_weather", "parameters": {}}
+    lark = build_tool_lark([tool_empty], "required", [info])
+    assert "%json {}" in lark  # empty schema preserved, not defaulted
+
+    tool_false = {"name": "get_weather", "parameters": False}
+    lark = build_tool_lark([tool_false], "required", [info])
+    assert "%json false" in lark  # false schema preserved verbatim
+
+
+def test_build_tool_lark_defaults_only_when_parameters_absent():
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    info = _hermes_structure_info()("get_weather")
+    tool_missing = {"name": "get_weather"}  # no "parameters" key
+    lark = build_tool_lark([tool_missing], "required", [info])
+    assert '%json {"type": "object", "properties": {}}' in lark
 
 
 # --------------------------------------------------------------------------
