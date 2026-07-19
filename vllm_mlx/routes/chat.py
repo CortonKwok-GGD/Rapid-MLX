@@ -356,20 +356,29 @@ _TOOL_GRAMMAR_MAX_SCHEMA_BYTES = 64 * 1024  # 64 KiB serialized per tools list
 _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH = 32  # nested object/array nesting cap
 _TOOL_GRAMMAR_MAX_TOOLS = 256  # per-request tool-count cap (alternation width)
 _tool_grammar_build_executor = None
+_tool_grammar_executor_init_lock = threading.Lock()
 _tool_grammar_inflight = 0
 _tool_grammar_inflight_lock = threading.Lock()
 
 
 def _get_tool_grammar_build_executor():
-    """Lazily create the dedicated bounded compile pool (loop-agnostic)."""
+    """Lazily create the dedicated bounded compile pool (loop-agnostic).
+
+    Double-checked locking (codex #558-PR3 nit): the FastAPI route can run on
+    multiple event-loop threads, so an unsynchronized lazy init could construct
+    two pools and blow past the four-worker concurrency cap. The lock + second
+    ``None`` check make the singleton construction atomic.
+    """
     global _tool_grammar_build_executor
     if _tool_grammar_build_executor is None:
         from concurrent.futures import ThreadPoolExecutor
 
-        _tool_grammar_build_executor = ThreadPoolExecutor(
-            max_workers=_TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY,
-            thread_name_prefix="tool-grammar-build",
-        )
+        with _tool_grammar_executor_init_lock:
+            if _tool_grammar_build_executor is None:
+                _tool_grammar_build_executor = ThreadPoolExecutor(
+                    max_workers=_TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY,
+                    thread_name_prefix="tool-grammar-build",
+                )
     return _tool_grammar_build_executor
 
 
@@ -406,11 +415,21 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
 
     Walks a JSON-like object accumulating an APPROXIMATE serialized byte count
     into ``budget[0]`` (decremented) and checking nesting ``depth``. It NEVER
-    materializes the serialized string — it raises ``_BoundsExceededError`` as
-    soon as the running total would exceed the budget or the depth cap, so a
+    materializes the WHOLE serialized string — it raises ``_BoundsExceededError``
+    as soon as the running total would exceed the budget or the depth cap, so a
     pathologically large/deep attacker payload is rejected after touching only a
-    bounded prefix of it (codex #558-PR3 blocking). Estimates are deliberately
-    conservative (>= real JSON length) so the cap is never under-counted.
+    bounded prefix of it (codex #558-PR3 blocking).
+
+    Keys/scalars are charged their TRUE serialized byte cost via
+    ``json.dumps`` (codex #558-PR3 blocking): ``len(str(...))`` under-counts —
+    a Unicode/JSON-escaped char (e.g. an emoji, or ``"`` -> ``\\"``) can occupy
+    several bytes/chars per source code point, which would let a schema larger
+    than the byte cap slip past. ``json.dumps`` (default ``ensure_ascii=True``,
+    ``str.encode`` for the byte length) yields the actual escaped
+    representation the Lark compiler ingests, so the estimate is a true UPPER
+    bound and the cap is never under-counted. Each ``dumps`` is on ONE scalar
+    key/value (never the whole tree), so the early-abort bounded-prefix
+    guarantee holds.
     """
     if depth > _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH:
         raise _BoundsExceededError
@@ -419,7 +438,9 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
         if budget[0] < 0:
             raise _BoundsExceededError
         for k, v in obj.items():
-            budget[0] -= len(str(k)) + 4  # "key": ,
+            # ``"key":`` plus a trailing separator, keyed on the TRUE escaped
+            # byte length of the (possibly non-string / Unicode) key.
+            budget[0] -= len(json.dumps(k).encode("utf-8")) + 2
             if budget[0] < 0:
                 raise _BoundsExceededError
             _walk_size_and_depth(v, budget, depth + 1)
@@ -433,9 +454,9 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
                 raise _BoundsExceededError
             _walk_size_and_depth(v, budget, depth + 1)
     else:
-        # Scalar: string / number / bool / None. ``str`` length is an upper
-        # bound on the JSON token length for all of these.
-        budget[0] -= len(str(obj)) + 2  # + possible quotes
+        # Scalar: string / number / bool / None. Charge the TRUE escaped UTF-8
+        # byte length so Unicode / JSON-escaped content cannot under-count.
+        budget[0] -= len(json.dumps(obj).encode("utf-8"))
         if budget[0] < 0:
             raise _BoundsExceededError
 
@@ -2448,21 +2469,41 @@ async def _create_chat_completion_impl(
     if _tool_grammar_eligible(cfg, request) and _try_admit_tool_grammar_build():
         # Run on the DEDICATED compile pool with BOUNDED ADMISSION (not the
         # default executor, whose work queue is unbounded — codex #558-PR3
-        # blocking). Admission is reserved above and released in ``finally`` when
-        # the compile actually finishes; over-capacity requests skip the offload
-        # (``_try_admit`` returned False) and fall back to free-form rather than
-        # queueing unbounded work. The eligibility gate already bounded each
-        # build's cost (tool count / size / nesting).
+        # blocking). Over-capacity requests skip the offload (``_try_admit``
+        # returned False) and fall back to free-form rather than queueing
+        # unbounded work. The eligibility gate already bounded each build's cost
+        # (tool count / size / nesting).
+        #
+        # The slot is released via ``add_done_callback`` on the UNDERLYING
+        # ``concurrent.futures.Future`` — NOT a ``try/finally`` around the await
+        # (codex #558-PR3 blocking). A ``finally`` fires the instant the AWAIT is
+        # cancelled (client disconnect), but the worker thread keeps compiling;
+        # a disconnect flood would then release slots early and let more than the
+        # cap run concurrently. The done-callback fires only when the compile
+        # ACTUALLY finishes (success, error, or cancel), so admission stays
+        # accurate under cancellation.
+        released = False
         try:
-            loop = asyncio.get_running_loop()
-            _glp = await loop.run_in_executor(
-                _get_tool_grammar_build_executor(),
-                _maybe_build_tool_grammar_processor,
-                engine,
-                cfg,
-                request,
+            fut = _get_tool_grammar_build_executor().submit(
+                _maybe_build_tool_grammar_processor, engine, cfg, request
             )
-        finally:
+        except Exception:
+            # Submission itself failed (e.g. pool shut down): the compile never
+            # ran, so release the reserved slot synchronously and fall back.
+            _release_tool_grammar_build()
+            released = True
+            logger.exception("tool-grammar: compile submission failed; free-form")
+            fut = None
+        if fut is not None:
+            fut.add_done_callback(lambda _f: _release_tool_grammar_build())
+            try:
+                _glp = await asyncio.wrap_future(fut)
+            except Exception:
+                # A cancelled await (client disconnect) or a build error leaves
+                # the slot to the done-callback above; just fall back to
+                # free-form for this request.
+                _glp = None
+        elif not released:  # pragma: no cover - defensive
             _release_tool_grammar_build()
     if _glp is not None:
         chat_kwargs["grammar_logits_processor"] = _glp

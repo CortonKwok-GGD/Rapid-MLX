@@ -408,6 +408,37 @@ def test_eligible_false_for_oversized_schema():
     assert _tool_grammar_eligible(cfg, req) is False
 
 
+def test_eligible_false_for_unicode_escaped_oversized_schema():
+    # codex #558-PR3 blocking (round-2): ``len(str(...))`` under-counts — a
+    # Unicode / JSON-escaped char occupies more BYTES than source code points, so
+    # a schema whose CODE-POINT length is under the cap but whose escaped-byte
+    # length is over it must still be rejected. Use emoji (1 code point ->
+    # ``😀`` = 12 escaped chars) so a source that is well under the cap
+    # by ``len(str())`` blows past it by true serialized bytes.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _tool_grammar_eligible,
+        _tools_within_grammar_bounds,
+    )
+
+    # ~1/6 of the cap in code points, but each emoji escapes to 12 chars -> ~2x
+    # the byte cap once serialized. A naive ``len(str())`` walker would PASS this.
+    emoji_blob = "\U0001f600" * (_TOOL_GRAMMAR_MAX_SCHEMA_BYTES // 6)
+    assert len(emoji_blob) < _TOOL_GRAMMAR_MAX_SCHEMA_BYTES, (
+        "test setup: code-point length must be under the cap so only true-byte "
+        "counting rejects it"
+    )
+    tool = _FunctionTool(
+        "u",
+        parameters={"type": "object", "description": emoji_blob, "properties": {}},
+    )
+    # Direct walker + full eligibility both reject it on true serialized bytes.
+    assert _tools_within_grammar_bounds([tool]) is False
+    cfg = _CfgStub("hermes")
+    req = _RequestStub(tools=[tool], tool_choice="required")
+    assert _tool_grammar_eligible(cfg, req) is False
+
+
 def test_eligible_false_for_overdeep_schema():
     # codex #558-PR3 blocking (restored in PR-3b): a pathologically DEEP nested
     # schema is rejected.
@@ -511,16 +542,19 @@ def test_route_offload_gated_on_eligibility_in_source():
     # compile, so no-tools / auto traffic never enters the thread pool
     # (codex #558-PR3). Source-position tripwire — the BEHAVIORAL guarantee is
     # proven by ``test_ineligible_request_never_enters_heavy_build_path``.
-    # PR-3b offloads via ``loop.run_in_executor`` onto the dedicated bounded pool.
+    # PR-3b offloads by submitting to the dedicated bounded pool and awaiting
+    # the future via ``asyncio.wrap_future``.
     import inspect
 
     from vllm_mlx.routes import chat as chat_mod
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
     gate = src.find("_tool_grammar_eligible(cfg, request)")
-    offload = src.find("run_in_executor(")
+    offload = src.find("_get_tool_grammar_build_executor().submit(")
     assert gate != -1, "route must gate the offload on _tool_grammar_eligible"
-    assert offload != -1, "route must offload the build via loop.run_in_executor"
+    assert offload != -1, (
+        "route must offload the build by submitting to the dedicated bounded pool"
+    )
     assert gate < offload, "the eligibility gate must precede the off-loop compile"
 
 
@@ -538,7 +572,6 @@ def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
     assert "_get_tool_grammar_build_executor()" in src, (
         "the route must dispatch the compile onto the dedicated bounded pool"
     )
-    assert "run_in_executor" in src, "the route must use loop.run_in_executor"
     assert "asyncio.to_thread" not in src, (
         "the route must NOT use asyncio.to_thread (unbounded default-executor "
         "queue — codex #558-PR3)"
@@ -549,6 +582,21 @@ def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
     )
     assert not hasattr(chat_mod, "_get_tool_grammar_build_semaphore"), (
         "the loop-bound build semaphore must not exist"
+    )
+    # The slot must be released via the underlying future's done-callback, NOT a
+    # try/finally around the await (which fires on cancel while the worker still
+    # compiles — codex #558-PR3 blocking). Assert the submit + done-callback +
+    # wrap_future shape.
+    assert (
+        "add_done_callback(lambda" in src and "_release_tool_grammar_build()" in src
+    ), (
+        "the route must release the admission slot via the future's "
+        "add_done_callback (fires only when the compile actually finishes), not "
+        "a try/finally around the await"
+    )
+    assert "asyncio.wrap_future(" in src, (
+        "the route must await the submitted future via asyncio.wrap_future so a "
+        "cancelled await does not pre-release the admission slot"
     )
     # The dedicated pool exists and is bounded.
     ex = chat_mod._get_tool_grammar_build_executor()
@@ -581,6 +629,73 @@ def test_bounded_admission_rejects_at_capacity():
         chat_mod._release_tool_grammar_build()
         assert chat_mod._tool_grammar_inflight == 0
     finally:
+        chat_mod._tool_grammar_inflight = saved
+
+
+def test_admission_slot_not_released_until_compile_finishes_on_cancel():
+    # codex #558-PR3 blocking (round-2): a cancelled AWAIT (client disconnect)
+    # must NOT release the admission slot while the worker thread is still
+    # compiling — otherwise a disconnect flood releases slots early and more than
+    # the cap run at once. The route releases via the future's
+    # ``add_done_callback``, so cancelling the wrap_future await leaves the slot
+    # held until the (still-running) compile actually finishes. Reproduce that
+    # mechanism directly.
+    import asyncio
+    import threading
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    saved = chat_mod._tool_grammar_inflight
+    chat_mod._tool_grammar_inflight = 0
+    release_gate = threading.Event()  # blocks the "compile" until we let it end
+    started = threading.Event()
+
+    def _slow_compile():
+        started.set()
+        # Simulate an in-flight compile that outlives the cancelled await.
+        release_gate.wait(timeout=5)
+        return "GRAMMAR"
+
+    async def _drive():
+        # Reserve a slot exactly as the route does.
+        assert chat_mod._try_admit_tool_grammar_build() is True
+        assert chat_mod._tool_grammar_inflight == 1
+        fut = chat_mod._get_tool_grammar_build_executor().submit(_slow_compile)
+        fut.add_done_callback(lambda _f: chat_mod._release_tool_grammar_build())
+        wrapped = asyncio.wrap_future(fut)
+        # Wait until the worker has actually started, then CANCEL the await
+        # (simulating a client disconnect mid-compile).
+        await asyncio.sleep(0)
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert started.is_set(), "compile worker did not start"
+        wrapped.cancel()
+        try:
+            await wrapped
+        except asyncio.CancelledError:
+            pass
+        # Await returned (cancelled) but the compile is STILL running: the slot
+        # must still be held (not pre-released by the cancelled await).
+        assert chat_mod._tool_grammar_inflight == 1, (
+            "admission slot was released on cancel while the compile was still "
+            "running — a disconnect flood would bypass the cap"
+        )
+        # Now let the compile finish; the done-callback releases the slot.
+        release_gate.set()
+        for _ in range(500):
+            if chat_mod._tool_grammar_inflight == 0:
+                break
+            await asyncio.sleep(0.005)
+        assert chat_mod._tool_grammar_inflight == 0, (
+            "the done-callback must release the slot once the compile finishes"
+        )
+
+    try:
+        asyncio.run(_drive())
+    finally:
+        release_gate.set()
         chat_mod._tool_grammar_inflight = saved
 
 
