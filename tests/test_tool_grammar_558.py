@@ -179,6 +179,21 @@ def test_build_tool_grammar_named_choice_unknown_name_degrades():
 
 
 @_requires_llguidance
+def test_build_tool_grammar_openai_request_shape_degrades_safely():
+    # The builder's input contract is the NORMALIZED shape
+    # ({"name","parameters"}). A raw OpenAI request-shaped tool
+    # ({"type":"function","function":{...}}) has no top-level "name", so the
+    # builder degrades to free-form (None) — safely, not a crash. Un-wrapping
+    # request shapes is the PR-3 routing caller's job, not this builder's.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    openai_shaped = [
+        {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+    ]
+    assert build_tool_grammar(openai_shaped, "required", _HermesStubParser()) is None
+
+
+@_requires_llguidance
 def test_build_tool_grammar_degrades_when_factory_raises():
     # A per-family structure_info() factory that raises on a tool name must
     # degrade to free-form (None), not crash the request.
@@ -328,6 +343,35 @@ def test_build_tool_lark_defaults_only_when_parameters_absent():
 # tokenizer exception) propagates and FAILS the test, so a green run of these
 # tests always means enforcement was actually exercised.
 # --------------------------------------------------------------------------
+def _offline_skip_exc_types():
+    """Only genuine network/cache-miss errors are a sanctioned skip.
+
+    A corrupt tokenizer artifact, an invalid revision, or a
+    tokenizer/config incompatibility must FAIL the enforcement test, not
+    silently skip it (codex round-5 #2). So we skip ONLY on the specific
+    huggingface_hub offline/cache-miss signals (and a raw connection error),
+    letting every other exception — including generic ``OSError`` from a
+    corrupt local file — propagate as a real failure.
+    """
+    types: list[type[BaseException]] = []
+    try:
+        from huggingface_hub.errors import (
+            LocalEntryNotFoundError,
+            OfflineModeIsEnabled,
+        )
+
+        types += [LocalEntryNotFoundError, OfflineModeIsEnabled]
+    except Exception:  # pragma: no cover - old hub without these names
+        pass
+    try:
+        from requests.exceptions import ConnectionError as _ReqConnErr
+
+        types.append(_ReqConnErr)
+    except Exception:  # pragma: no cover - requests not present
+        pass
+    return tuple(types) or (OSError,)
+
+
 @pytest.fixture(scope="module")
 def tok():
     transformers = pytest.importorskip("transformers")
@@ -335,7 +379,7 @@ def tok():
         return transformers.AutoTokenizer.from_pretrained(
             _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
         )
-    except OSError:  # pragma: no cover - offline & uncached
+    except _offline_skip_exc_types():  # pragma: no cover - offline & uncached
         pytest.skip(
             f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not "
             "cached and no network — enforcement tests require it"

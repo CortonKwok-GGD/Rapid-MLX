@@ -235,11 +235,28 @@ def build_tool_grammar(
 ) -> str | None:
     """Public entry: (tools, tool_choice, parser) -> compiled llguidance grammar.
 
+    INPUT CONTRACT (NORMALIZED — not raw OpenAI request shapes): ``tools`` is
+    a list of ``{"name": str, "parameters": <json-schema>}`` dicts and
+    ``tool_choice`` is a resolved string — ``"auto"`` / ``"required"`` /
+    ``"none"`` / a concrete function name. Un-wrapping the OpenAI request
+    shapes (``{"type":"function","function":{"name":...,"parameters":...}}``
+    for tools; ``{"type":"function","function":{"name":...}}`` for a named
+    choice) is the CALLER's job — it happens in the PR-3 chat.py routing that
+    wires this builder in. This function deliberately does NOT normalize
+    request objects; that responsibility lives with the routing PR so the
+    builder stays a small, pure, request-shape-agnostic unit. An unexpected
+    shape degrades safely to ``None`` (free-form) rather than crashing.
+
     Returns ``None`` when ``tool_choice`` is ``"none"`` (no constraint at
     all), when the parser declares no ``structure_info`` (family not yet
     supported -> caller falls back to today's free-form behavior), or when
     llguidance is unavailable / a per-family factory raises / compilation
     fails. Any of these paths degrades safely to today's free-form behavior.
+    (PR-3 note: this collapses "constraint unavailable" and "requested
+    constraint malformed" into the same ``None``; the routing PR that adds a
+    real caller decides whether a malformed *required/named* constraint
+    should hard-fail instead of falling open — PR-1 has no caller to make
+    that policy call, so it uniformly fails open.)
 
     NOTE (PR-1): this function has NO call sites in the request path yet.
     ``chat.py`` / ``scheduler.py`` routing is deliberately not wired here —
