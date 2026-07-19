@@ -2641,6 +2641,81 @@ class TestCheckpointMetadataFallback:
         )
         assert auto_config_mod._template_uses_parameterized_xml_tools(filtered) is False
 
+    def test_set_capture_body_filter_block_is_not_resolved(self):
+        # codex round-1 BLOCKING #2: a ``{% filter upper %}`` wrapper INSIDE the
+        # capture TRANSFORMS the literal output (the rendered capture is
+        # ``<TOOL_CALL>``), so scanning the raw body for ``<tool_call>`` would be a
+        # false positive.  Output-transforming wrappers make the capture unbounded
+        # → fail-safe text routing.
+        filter_block = (
+            "{% set wire %}{% filter upper %}"
+            + self._RAW_XML
+            + "{% endfilter %}{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_output_contract(filter_block) is not None
+        )  # parses, no crash
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(filter_block)
+            is False
+        )
+
+    def test_set_capture_body_autoescape_is_not_resolved(self):
+        # codex round-1 BLOCKING #2: ``{% autoescape true %}`` HTML-escapes the
+        # captured body (rendered ``&lt;tool_call&gt;``), so it is output-
+        # transforming and must NOT be resolved as bounded literal.
+        autoescape = (
+            "{% set wire %}{% autoescape true %}"
+            + self._RAW_XML
+            + "{% endautoescape %}{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(autoescape) is False
+        )
+
+    def test_set_capture_output_preserving_wrapper_is_resolved(self):
+        # True-positive guard for BLOCKING #2's fix: a genuinely output-preserving
+        # wrapper (``{% with %}``) inside the capture emits its body verbatim, so
+        # the bounded-literal contract IS still detected (the allowlist must not
+        # over-exclude).
+        with_wrapper = (
+            "{% set wire %}{% with x=1 %}"
+            + self._RAW_XML
+            + "{% endwith %}{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(with_wrapper) is True
+        )
+
+    def test_branch_local_set_capture_is_not_lifted_to_global(self):
+        # codex round-1 BLOCKING #1: a capture defined inside a conditional is
+        # BRANCH-LOCAL; it must NOT be lifted to a global name and substituted at
+        # an unrelated ``{{ wire }}`` site.  Only MODULE-scope (unconditional)
+        # captures are collected, so this routes to text (fail-safe).
+        branch_local = (
+            "{% if x %}{% set wire %}"
+            + self._RAW_XML
+            + "{% endset %}{% endif %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(branch_local)
+            is False
+        )
+
+    def test_shadowed_set_capture_is_dropped(self):
+        # codex round-1 BLOCKING #1: a name captured MORE THAN ONCE at module
+        # scope has an ambiguous binding (statement-order dependent), so it is
+        # dropped entirely rather than resolved via "last-definition-wins" — a
+        # later benign redefinition must not let the earlier tool XML leak, and
+        # vice versa.
+        shadowed = (
+            "{% set wire %}"
+            + self._RAW_XML
+            + "{% endset %}{% set wire %}safe{% endset %}"
+            "{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(shadowed) is False
+
     def test_path_enumeration_bounded_by_cumulative_byte_budget(self):
         # FIX #5: a template whose path COUNT stays under the cap but whose
         # cumulative path BYTES would blow up must be bounded by the byte budget

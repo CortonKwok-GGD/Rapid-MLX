@@ -787,21 +787,56 @@ def _collect_macro_bodies(node) -> dict:
     return macros
 
 
+def _output_preserving_wrapper_types():
+    """Return the jinja2 wrapper node types that emit their body VERBATIM.
+
+    A set-capture body is only bounded-literal if every wrapper it nests renders
+    its inner literals BYTE-FOR-BYTE into the capture (so a static ``<tool_call>``
+    substring in the AST equals a ``<tool_call>`` substring in the rendered
+    capture).  Codex round-1 BLOCKING #2: the earlier "any node with a ``body``
+    that is not For/If/Macro/AssignBlock is transparent" heuristic WRONGLY
+    accepted output-TRANSFORMING wrappers — ``{% filter upper %}``
+    (``FilterBlock``) uppercases and ``{% autoescape true %}``
+    (``ScopedEvalContextModifier``) HTML-escapes the body, so the rendered
+    capture is ``<TOOL_CALL>`` / ``&lt;tool_call&gt;`` yet the raw-body scan still
+    matched ``<tool_call>`` (false positive).  So we ALLOWLIST only the genuinely
+    output-preserving wrappers; every other block-with-a-``body`` (filter,
+    autoescape, loop, conditional, macro/set definition, or any unknown future
+    tag) makes the capture UNBOUNDED → fail-safe text routing.
+
+    Allowed: ``{% with %}`` (``With``), ``{% block %}`` (``Block``),
+    ``{% generation %}`` (our extension's ``CallBlock``), and the bare scope
+    wrappers ``Scope`` / ``OverlayScope`` — none of which transform emitted text.
+    (An ``{% autoescape %}`` parses as ``Scope`` → ``ScopedEvalContextModifier``,
+    and the inner modifier is NOT allowlisted, so autoescape is still rejected.)
+    """
+    from jinja2 import nodes
+
+    allowed = [nodes.With, nodes.Block, nodes.CallBlock, nodes.Scope]
+    overlay = getattr(nodes, "OverlayScope", None)
+    if overlay is not None:
+        allowed.append(overlay)
+    return tuple(allowed)
+
+
 def _is_bounded_literal_body(body) -> bool:
     """Return whether a set-capture body is BOUNDED literal content.
 
     Mirrors the discipline of the called-macro resolution: only a capture whose
     rendered output is statically enumerable from literals is resolved.  A body
     is bounded-literal when every node is either a ``TemplateData`` literal, an
-    ``Output`` of such literals / nested capture ``Name`` loads, or a transparent
-    wrapper block whose own body is (recursively) bounded-literal.
+    ``Output`` of such literals / nested capture ``Name`` loads, or an
+    OUTPUT-PRESERVING wrapper block (``_output_preserving_wrapper_types``) whose
+    own body is (recursively) bounded-literal.
 
-    Any ``{% for %}`` / ``{% if %}`` (runtime-data branching), a printed
-    expression other than a bare ``Name`` load (``{{ x.attr }}`` / ``{{ f() }}``
-    / filters), or a nested ``Macro`` / ``AssignBlock`` definition makes the body
+    Any ``{% for %}`` / ``{% if %}`` (runtime-data branching), an
+    output-TRANSFORMING wrapper (``{% filter %}`` / ``{% autoescape %}`` — codex
+    round-1 BLOCKING #2), a printed expression other than a bare ``Name`` load
+    (``{{ x.attr }}`` / ``{{ f() }}`` / filters), a nested ``Macro`` /
+    ``AssignBlock`` definition, or any unrecognised block makes the body
     UNBOUNDED — it is NOT resolved, so the capture keeps the fail-safe text
-    routing (never crash, never fabricate a contract from runtime-dependent
-    output).
+    routing (never crash, never fabricate a contract from transformed or
+    runtime-dependent output).
     """
     from jinja2 import nodes
 
@@ -816,39 +851,88 @@ def _is_bounded_literal_body(body) -> bool:
                     continue
                 return False
             continue
-        # Transparent wrapper blocks (``{% filter %}`` / ``{% with %}`` /
-        # ``{% block %}`` / ``{% generation %}`` → ``CallBlock`` …) render their
-        # body through; accept only if that body is itself bounded-literal.
-        inner = getattr(child, "body", None)
-        if isinstance(inner, list) and not isinstance(
-            child, (nodes.For, nodes.If, nodes.Macro, nodes.AssignBlock)
-        ):
-            if not _is_bounded_literal_body(inner):
-                return False
-            continue
+        # Only ALLOWLISTED output-preserving wrappers render their body verbatim;
+        # accept them iff that body is itself bounded-literal.  Everything else
+        # (transforming wrappers, control flow, definitions, unknown tags) →
+        # unbounded.
+        if isinstance(child, _output_preserving_wrapper_types()):
+            inner = getattr(child, "body", None)
+            if isinstance(inner, list) and _is_bounded_literal_body(inner):
+                continue
+            return False
         return False
     return True
 
 
-def _collect_set_captures(node) -> dict:
-    """Map every bounded-literal ``{% set name %}...{% endset %}`` to its body.
+def _walk_module_scope_assign_blocks(node_list, out: list) -> None:
+    """Collect ``AssignBlock`` nodes reachable at MODULE (unconditional) scope.
 
-    Walks the WHOLE parsed AST via ``find_all`` (block-set captures may be
-    defined anywhere) and records only captures whose body is BOUNDED literal
-    content (``_is_bounded_literal_body``).  A runtime-dependent capture (loop /
-    conditional / dynamic expression over ``tools`` etc.) is intentionally
-    OMITTED, so a ``{{ name }}`` output of it resolves to nothing and the
-    template keeps the fail-safe text routing.  Last definition wins, mirroring
-    jinja2's runtime rebinding semantics.
+    Descends only through OUTPUT-PRESERVING wrappers (``_output_preserving_
+    wrapper_types``), which execute unconditionally exactly once, so a capture
+    inside them shares the module-scope statement order.  It deliberately does
+    NOT descend into ``If`` / ``For`` (branch/loop-local), ``Macro`` (call-local
+    namespace), or the body of another ``AssignBlock`` (a NESTED capture is not a
+    module binding).  This keeps ``_collect_set_captures`` from lifting a
+    branch-/macro-local capture to a global name (codex round-1 BLOCKING #1).
     """
     from jinja2 import nodes
 
+    wrappers = _output_preserving_wrapper_types()
+    for child in node_list:
+        if isinstance(child, nodes.AssignBlock):
+            out.append(child)
+            continue
+        if isinstance(child, wrappers):
+            inner = getattr(child, "body", None)
+            if isinstance(inner, list):
+                _walk_module_scope_assign_blocks(inner, out)
+
+
+def _collect_set_captures(node) -> dict:
+    """Map a MODULE-scope, single-definition ``{% set name %}...{% endset %}``
+    capture to its body, but only when its body is BOUNDED literal content.
+
+    Codex round-1 BLOCKING #1: an earlier form used ``find_all`` +
+    "last-definition-wins" over the WHOLE AST, ignoring Jinja lexical scope and
+    statement order — a branch-local, macro-local, or shadowed capture could be
+    substituted at an unrelated earlier ``{{ name }}`` site.  This form is
+    deliberately conservative — resolution is a soundness-sensitive routing
+    input, so we only substitute a capture whose global binding is unambiguous:
+
+    * it is defined at MODULE scope (unconditional; ``_walk_module_scope_
+      assign_blocks`` skips ``If`` / ``For`` / ``Macro`` / nested-capture
+      scopes), AND
+    * its name is captured EXACTLY ONCE in that scope (any shadowing /
+      reassignment drops the name entirely), AND
+    * it carries no ``{% set x | filter %}`` and its body is bounded literal
+      content (``_is_bounded_literal_body``).
+
+    Anything failing these is simply absent from the map, so a ``{{ name }}``
+    output of it resolves to nothing and the template keeps the fail-safe text
+    routing.  Under-resolving only costs a (rare) missed true-positive that falls
+    back to safe text; it never mis-substitutes.
+    """
+    from jinja2 import nodes
+
+    module_assigns: list = []
+    _walk_module_scope_assign_blocks(node.body, module_assigns)
+
+    # Count module-scope definitions per name so we can drop any that is
+    # captured more than once (shadowing / reassignment → ambiguous binding).
+    definition_counts: dict = {}
+    for assign in module_assigns:
+        target = assign.target
+        if isinstance(target, nodes.Name):
+            definition_counts[target.name] = definition_counts.get(target.name, 0) + 1
+
     captures: dict = {}
-    for assign in node.find_all(nodes.AssignBlock):
+    for assign in module_assigns:
         target = assign.target
         if not isinstance(target, nodes.Name):
             continue
-        # A ``{% set x %}...{% endset | filter %}`` applies a runtime filter to
+        if definition_counts[target.name] != 1:
+            continue
+        # A ``{% set x | filter %}...{% endset %}`` applies a runtime filter to
         # the captured text; its output is not statically knowable, so skip it.
         if getattr(assign, "filter", None) is not None:
             continue
