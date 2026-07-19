@@ -566,30 +566,41 @@ _REASONING_SENTINELS = ("<think>", "</think>")
 
 
 def test_reasoning_prefix_lark_has_balanced_block_rules():
-    """With a reasoning (open, close) pair the free prefix becomes ``prefix:
-    opened? TAG_TEXT (reasoning_block TAG_TEXT)*`` — a BALANCED, PREFILL-tolerant
-    rule-level block, not an unordered alternation."""
+    """With a reasoning (open, close) pair the free prefix splits into a one-time
+    ``lead: opened? bal_prefix`` (single optional prefilled-close) and a
+    BALANCED-only ``bal_prefix: TAG_TEXT (reasoning_block TAG_TEXT)*`` reused by
+    every tag / tag_end — a BALANCED, PREFILL-tolerant, globally-at-most-one
+    rule-level block, not an unordered alternation (codex #558-PR4 round-5)."""
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
     lark = build_tool_lark(
         TOOLS, "required", infos, reasoning_sentinels=_REASONING_SENTINELS
     )
-    # The free prefix is the reasoning-tolerant ``prefix`` nonterminal with a
-    # BALANCED block (open must be closed) plus an OPTIONAL leading close
-    # (``opened?``) for prefilled-<think> models — NOT the unordered ``<think> |
-    # </think>`` alternation (which accepted an unclosed opener).
-    assert "prefix: opened? TAG_TEXT (reasoning_block TAG_TEXT)*" in lark
+    # ``start`` consumes the one-time ``lead`` before the calls. ``lead`` permits
+    # a SINGLE optional leading close (``opened?``) modelling a prompt-prefilled
+    # ``<think>``, then a BALANCED-only ``bal_prefix`` — NOT the unordered
+    # ``<think> | </think>`` alternation (which accepted an unclosed opener).
+    assert "start: lead (tag_0 | tag_1)+ tag_end" in lark
+    assert "lead: opened? bal_prefix" in lark
     assert "opened: TAG_TEXT </think>" in lark
+    assert "bal_prefix: TAG_TEXT (reasoning_block TAG_TEXT)*" in lark
     assert "reasoning_block: <think> TAG_TEXT </think>" in lark
     assert "rtok:" not in lark  # the old unordered alternation is gone
     # Reasoning refs are bare token references, NOT quoted byte literals.
     assert '"<think>"' not in lark
     assert '"</think>"' not in lark
-    # Both the tag body and the trailing tag_end consume the reasoning-tolerant
-    # prefix (so reasoning may appear before the trigger and after the call).
-    assert "tag_end: prefix" in lark
-    assert "tag_0: prefix <tool_call>" in lark
+    # Every tag body and the trailing tag_end consume the BALANCED-ONLY
+    # ``bal_prefix`` (the one-time prefilled-close tolerance lives ONLY in
+    # ``lead``, so a stray close before a later call / after the final call is
+    # rejected — globally at-most-one).
+    assert "tag_end: bal_prefix" in lark
+    assert "tag_0: bal_prefix <tool_call>" in lark
+    # ``opened?`` must NOT be reused per-tag (that would allow a stray leading
+    # close at every call position — codex round-5 blocking).
+    assert "tag_0: prefix" not in lark
+    assert "tag_0: lead" not in lark
+    assert "tag_0: opened" not in lark
 
 
 # The exact grammar PR-3 emits for ``TOOLS`` at ``tool_choice="required"``. This
@@ -631,7 +642,9 @@ def test_non_reasoning_lark_is_unchanged_from_pr3():
     assert explicit_empty == _PR3_GOLDEN_LARK
     # No reasoning machinery leaks into the non-reasoning grammar (redundant with
     # the golden, kept as a readable intent assertion).
-    assert "prefix:" not in default
+    assert "lead:" not in default
+    assert "bal_prefix:" not in default
+    assert "reasoning_block:" not in default
     assert "rtok:" not in default
 
 
@@ -661,7 +674,8 @@ def test_single_reasoning_marker_degrades_to_bare_prefix():
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
     lark = build_tool_lark(TOOLS, "required", infos, reasoning_sentinels=("<think>",))
     assert "reasoning_block:" not in lark
-    assert "prefix:" not in lark
+    assert "lead:" not in lark
+    assert "bal_prefix:" not in lark
     assert "tag_end: TAG_TEXT" in lark
 
 
@@ -692,7 +706,8 @@ def test_malformed_reasoning_sentinel_is_dropped_not_emitted():
     lark_all_bad = build_tool_lark(
         TOOLS, "required", infos, reasoning_sentinels=("[THINK]", "<a b>")
     )
-    assert "prefix:" not in lark_all_bad
+    assert "lead:" not in lark_all_bad
+    assert "bal_prefix:" not in lark_all_bad
     assert "reasoning_block:" not in lark_all_bad
     assert "tag_end: TAG_TEXT" in lark_all_bad
 
@@ -1006,12 +1021,59 @@ def test_two_leading_closes_are_rejected(tok, lltok):
     )
 
 
+@_requires_llguidance
+def test_stray_close_after_call_is_rejected(tok, lltok):
+    """GLOBALLY-AT-MOST-ONE PROOF (codex #558-PR4 round-5 blocking #2): the
+    trailing ``tag_end`` consumes the BALANCED-only ``bal_prefix``, NOT the
+    prefill-tolerant ``lead``. So a stray unmatched ``</think>`` AFTER the call
+    (with no leading close to consume the one-time tolerance) is rejected — the
+    prefilled-close tolerance is a one-time initial-prefix allowance, not a free
+    stray close at every position. A prefix that reused ``opened?`` everywhere
+    would wrongly accept this."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # A balanced reasoning block + a valid call, then a STRAY unmatched </think>
+    # in the tag_end region. tag_end uses bal_prefix (no leading-close tolerance),
+    # so the trailing stray close must be rejected.
+    accepted, total, _ = _consume(
+        grammar,
+        lltok,
+        tok,
+        "<think>reasoning</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>trailing</think>",
+    )
+    assert accepted < total, (
+        "a stray </think> AFTER the call was accepted — tag_end must consume the "
+        "balanced-only bal_prefix, not the prefill-tolerant lead (the leading-"
+        "close tolerance is one-time, globally at most one)"
+    )
+
+
 # DeepSeek-R1 uses the ``deepseek_r1`` reasoning parser and, like Qwen3, prefills
 # ``<think>`` in its chat template. Test against the ACTUAL formatted DeepSeek
 # prompt (codex #558-PR4 round-4) to prove the prefill tolerance is not
-# Qwen-specific. Cached locally as ``DeepSeek-R1-Distill-Qwen-32B-4bit``; skips
-# only on genuine unavailability.
+# Qwen-specific.
 _DEEPSEEK_MODEL = "mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit"
+# Pin the revision (codex #558-PR4 round-5 nit) so this prefill proof runs
+# against an IMMUTABLE artifact, mirroring the Qwen fixture: the chat-template
+# ``<think>`` prefill and the ``<tool_call>``/``<think>`` single-special-token
+# layout are fixed at this commit. Combined with ``local_files_only=True`` the
+# test uses ONLY the locally-cached snapshot — it never fetches from the Hub and
+# a different upstream revision cannot silently change what is exercised. It
+# skips (never fails) when this exact revision is not in the local cache.
+_DEEPSEEK_REVISION = "4e0d3848a0ad8f9fb54638891e4928f04fcca978"
 
 
 @_requires_llguidance
@@ -1023,9 +1085,16 @@ def test_deepseek_r1_prefilled_think_template_is_tolerated(lltok):
     a hand-written string (codex #558-PR4 round-4)."""
     transformers = pytest.importorskip("transformers")
     try:
-        ds_tok = transformers.AutoTokenizer.from_pretrained(_DEEPSEEK_MODEL)
-    except _offline_skip_exc_types():  # pragma: no cover - offline & uncached
-        pytest.skip(f"{_DEEPSEEK_MODEL} not cached and no network")
+        ds_tok = transformers.AutoTokenizer.from_pretrained(
+            _DEEPSEEK_MODEL,
+            revision=_DEEPSEEK_REVISION,
+            local_files_only=True,
+        )
+    except _offline_skip_exc_types():  # pragma: no cover - uncached revision
+        pytest.skip(
+            f"{_DEEPSEEK_MODEL}@{_DEEPSEEK_REVISION[:8]} not in local cache — "
+            "prefill proof requires the pinned revision cached locally"
+        )
 
     from vllm_mlx.api.tool_grammar import (
         are_single_special_tokens,
