@@ -415,23 +415,36 @@ def _charge_json_scalar_bytes(value, budget: list[int]) -> None:
 
     Charges the exact ``json.dumps`` escaped-UTF-8 byte length, but NEVER
     serializes a value already known to exceed the remaining budget (codex
-    #558-PR3 blocking): serializing an attacker-sized string first would
-    allocate an amplified escaped copy and block the event loop before the
-    reject. For a ``str``, ``len(s)`` (code points) is a strict LOWER bound on
-    its escaped byte length, so if ``len(s)`` already exceeds the remaining
-    budget we reject via that O(1) precheck WITHOUT serializing. Only a string
-    already proven to fit is serialized to recover the exact (possibly larger,
-    due to escaping) cost. Non-string scalars (number/bool/None) have a tiny
-    bounded repr, so their ``json.dumps`` is cheap and unconditional.
+    #558-PR3 blocking): serializing an attacker-sized value first would allocate
+    an amplified copy and block the event loop before the reject.
+
+    Two O(1) preflights before any ``json.dumps``:
+
+    * ``str`` — ``len(s)`` (code points) is a strict LOWER bound on the escaped
+      byte length, so ``len(s) > budget`` rejects WITHOUT serializing.
+    * ``int`` — Python ints are ARBITRARY precision, so ``json.dumps(huge_int)``
+      would render an attacker-sized decimal string (codex #558-PR3 blocking).
+      ``bit_length()`` is O(1); the decimal digit count is ``>= bit_length/4``
+      (log10(2) > 0.3), a safe LOWER bound, so an int whose minimum digit count
+      exceeds the budget is rejected WITHOUT rendering.
+
+    Values proven to fit are serialized for the exact cost. ``float`` / ``bool``
+    / ``None`` have a tiny bounded repr, so their ``json.dumps`` is cheap.
     """
     if isinstance(value, str):
-        # O(1) reject: escaped bytes >= code-point length. A huge string is
-        # refused here without ever being serialized.
+        # O(1) reject: escaped bytes >= code-point length.
         if len(value) > budget[0]:
             raise _BoundsExceededError
         budget[0] -= len(json.dumps(value).encode("utf-8"))
+    elif isinstance(value, int) and not isinstance(value, bool):
+        # O(1) reject: decimal digits >= bit_length/4 (a conservative lower
+        # bound), plus 1 for a possible sign. Reject a giant int before rendering.
+        min_digits = value.bit_length() // 4 + 1
+        if min_digits > budget[0]:
+            raise _BoundsExceededError
+        budget[0] -= len(json.dumps(value).encode("utf-8"))
     else:
-        # number / bool / None — bounded small repr, safe to serialize.
+        # float / bool / None — bounded small repr, safe to serialize.
         budget[0] -= len(json.dumps(value).encode("utf-8"))
     if budget[0] < 0:
         raise _BoundsExceededError
@@ -507,8 +520,13 @@ def _tools_within_grammar_bounds(tools) -> bool:
         )
         return False
     # One shared byte budget across ALL tools so the cap bounds the total
-    # flattened input, not each tool independently.
-    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    # flattened input, not each tool independently. Charge the enclosing
+    # tools-list ``[]`` + one inter-tool separator per tool up front so the cap
+    # bounds the ACTUAL serialized envelope, not just the tool bodies (codex
+    # #558-PR3 nit — previously omitted, leaking up to len(tools)+1 bytes).
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES - (2 + len(tools))]
+    if budget[0] < 0:
+        return False
     try:
         for t in tools:
             fn = t.function if hasattr(t, "function") else t.get("function", t)

@@ -439,6 +439,61 @@ def test_eligible_false_for_unicode_escaped_oversized_schema():
     assert _tool_grammar_eligible(cfg, req) is False
 
 
+def test_charge_scalar_rejects_giant_int_without_rendering():
+    # codex #558-PR3 blocking (round-3): Python ints are ARBITRARY precision, so
+    # ``json.dumps(huge_int)`` renders an attacker-sized decimal string BEFORE
+    # the budget check — an event-loop-blocking allocation. The O(1)
+    # ``bit_length`` preflight must reject a giant int WITHOUT rendering it, and
+    # fast.
+    import time
+
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _BoundsExceededError,
+        _charge_json_scalar_bytes,
+        _tools_within_grammar_bounds,
+    )
+
+    # An int with ~10M decimal digits: rendering it would be very slow / large.
+    giant = 10**10_000_000
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    t = time.time()
+    raised = False
+    try:
+        _charge_json_scalar_bytes(giant, budget)
+    except _BoundsExceededError:
+        raised = True
+    dt = time.time() - t
+    assert raised, "a giant int must be rejected by the bounds check"
+    assert dt < 0.5, (
+        f"giant-int reject took {dt:.3f}s — the bit_length preflight must reject "
+        "WITHOUT rendering the decimal string (codex #558-PR3)"
+    )
+
+    # And end-to-end through the tools walker: a schema carrying a giant int
+    # default is rejected (free-form fallback), also fast.
+    tool = _FunctionTool(
+        "n",
+        parameters={
+            "type": "object",
+            "properties": {"x": {"type": "integer", "default": giant}},
+        },
+    )
+    t = time.time()
+    assert _tools_within_grammar_bounds([tool]) is False
+    assert time.time() - t < 0.5, "walker must reject the giant int fast"
+
+    # A small int is charged normally and stays within bounds.
+    ok = _FunctionTool(
+        "n",
+        parameters={
+            "type": "object",
+            "properties": {"x": {"type": "integer", "default": 42}},
+        },
+    )
+    assert _tools_within_grammar_bounds([ok]) is True
+
+
 def test_eligible_false_for_overdeep_schema():
     # codex #558-PR3 blocking (restored in PR-3b): a pathologically DEEP nested
     # schema is rejected.
@@ -716,58 +771,72 @@ def test_bounded_admission_rejects_at_capacity():
 
 
 def test_admission_slot_not_released_until_compile_finishes_on_cancel():
-    # codex #558-PR3 blocking (round-2): a cancelled AWAIT (client disconnect)
-    # must NOT release the admission slot while the worker thread is still
-    # compiling — otherwise a disconnect flood releases slots early and more than
-    # the cap run at once. The route releases via the future's
-    # ``add_done_callback``, so cancelling the wrap_future await leaves the slot
-    # held until the (still-running) compile actually finishes. Reproduce that
-    # mechanism directly.
+    # codex #558-PR3 blocking (round-2/3, BEHAVIORAL against the REAL helper): a
+    # cancelled AWAIT (client disconnect) must NOT release the admission slot
+    # while the worker thread is still compiling — otherwise a disconnect flood
+    # releases slots early and more than the cap run at once. We drive the ACTUAL
+    # ``_offload_tool_grammar_build`` (not a hand-rolled copy of its mechanism):
+    # a real bounded pool runs a BLOCKED build, we cancel the coroutine
+    # mid-compile, and assert the slot stays held until the (still-running)
+    # compile finishes. If production regressed to an ``await``-level
+    # ``try/finally`` release, this test would go red.
     import asyncio
     import threading
+    from concurrent.futures import ThreadPoolExecutor
 
     from vllm_mlx.routes import chat as chat_mod
 
     saved = chat_mod._tool_grammar_inflight
+    saved_ex_getter = chat_mod._get_tool_grammar_build_executor
     chat_mod._tool_grammar_inflight = 0
     release_gate = threading.Event()  # blocks the "compile" until we let it end
     started = threading.Event()
+    finished = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1)
 
-    def _slow_compile():
+    # Make the REAL helper's build block: it submits _maybe_build_tool_grammar_
+    # processor to the pool, so patch that to a blocking function. The done-
+    # callback (attached by the helper) releases the slot when this returns.
+    def _blocking_build(engine, cfg, request):
         started.set()
-        # Simulate an in-flight compile that outlives the cancelled await.
         release_gate.wait(timeout=5)
-        return "GRAMMAR"
+        finished.set()
+        return None  # free-form result; we only care about the slot lifecycle
+
+    chat_mod._get_tool_grammar_build_executor = lambda: pool
 
     async def _drive():
-        # Reserve a slot exactly as the route does.
-        assert chat_mod._try_admit_tool_grammar_build() is True
-        assert chat_mod._tool_grammar_inflight == 1
-        fut = chat_mod._get_tool_grammar_build_executor().submit(_slow_compile)
-        fut.add_done_callback(lambda _f: chat_mod._release_tool_grammar_build())
-        wrapped = asyncio.wrap_future(fut)
-        # Wait until the worker has actually started, then CANCEL the await
-        # (simulating a client disconnect mid-compile).
-        await asyncio.sleep(0)
-        for _ in range(500):
+        cfg = _CfgStub("hermes")
+        engine = _EngineStub(tokenizer=object())
+        request = _RequestStub([_FunctionTool("get_time")], "required")
+        # Launch the REAL helper as a task, then cancel it mid-compile.
+        task = asyncio.ensure_future(
+            chat_mod._offload_tool_grammar_build(engine, cfg, request)
+        )
+        for _ in range(600):
             if started.is_set():
                 break
             await asyncio.sleep(0.005)
-        assert started.is_set(), "compile worker did not start"
-        wrapped.cancel()
+        assert started.is_set(), "the real helper never submitted the compile"
+        # A slot is reserved for the in-flight compile.
+        assert chat_mod._tool_grammar_inflight == 1
+        # Cancel the helper coroutine (client disconnect) WHILE the compile runs.
+        task.cancel()
         try:
-            await wrapped
+            await task
         except asyncio.CancelledError:
             pass
-        # Await returned (cancelled) but the compile is STILL running: the slot
-        # must still be held (not pre-released by the cancelled await).
+        # The compile is STILL running (release_gate not set): the slot must
+        # still be held — a cancelled await must NOT pre-release it.
+        assert not finished.is_set(), "test setup: compile finished too early"
         assert chat_mod._tool_grammar_inflight == 1, (
             "admission slot was released on cancel while the compile was still "
-            "running — a disconnect flood would bypass the cap"
+            "running — production must release via the future's done-callback, "
+            "not an await-level try/finally"
         )
-        # Now let the compile finish; the done-callback releases the slot.
+        # Let the compile finish; the done-callback releases the slot.
         release_gate.set()
-        for _ in range(500):
+        for _ in range(600):
             if chat_mod._tool_grammar_inflight == 0:
                 break
             await asyncio.sleep(0.005)
@@ -776,9 +845,17 @@ def test_admission_slot_not_released_until_compile_finishes_on_cancel():
         )
 
     try:
-        asyncio.run(_drive())
+        # Patch the build fn the helper submits so it blocks.
+        _orig_build = chat_mod._maybe_build_tool_grammar_processor
+        chat_mod._maybe_build_tool_grammar_processor = _blocking_build
+        try:
+            asyncio.run(_drive())
+        finally:
+            chat_mod._maybe_build_tool_grammar_processor = _orig_build
     finally:
         release_gate.set()
+        pool.shutdown(wait=True)
+        chat_mod._get_tool_grammar_build_executor = saved_ex_getter
         chat_mod._tool_grammar_inflight = saved
 
 

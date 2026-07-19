@@ -567,14 +567,20 @@ class GrammarLogitsProcessor:
         # consumed into the matcher so far.
         self._prompt_len: int | None = None
         self._committed = 0
-        # Fail-CLOSED abort latch (codex #558-PR3 nit, restored in PR-3b). If the
-        # matcher ever REJECTS an already-sampled+committed token, its internal
-        # state is desynced from the real output stream — continuing to compute a
-        # mask from that invalid state would emit garbage constraints. We latch
-        # ``_aborted`` and stop imposing the (now-invalid) mask, letting the
-        # request finish under the downstream free-form parser instead of masking
-        # from a broken matcher (the previous fail-OPEN kept masking from the
-        # desynced state).
+        # Desync abort latch (codex #558-PR3). If the matcher ever REJECTS an
+        # already-sampled+committed token, its internal state is desynced from
+        # the real output stream — every subsequent mask it computes is garbage.
+        # HONESTY (codex #558-PR3 nit): this is a controlled FAIL-OPEN fallback,
+        # NOT fail-closed — on desync we DROP the constraint and let the request
+        # finish under the downstream free-form parser, rather than terminating
+        # it with an error. We choose free-form-fallback over hard-error because
+        # (a) the grammar constraint is best-effort throughout this module (a
+        # missing ``[guided]`` extra, an uncompilable grammar, and an unsupported
+        # tokenizer all already degrade to free-form, never a 500), and (b)
+        # continuing to mask from a desynced matcher — the previous behavior —
+        # would emit garbage constraints, strictly worse than dropping it. A
+        # desync should be unreachable in practice (the matcher is fed exactly
+        # the tokens it produced masks for), so the latch is defense-in-depth.
         self._aborted = False
 
     def is_broken(self) -> bool:
@@ -623,18 +629,18 @@ class GrammarLogitsProcessor:
                     continue
                 tok = int(t)
                 if not self._matcher.consume_token(tok):
-                    # FAIL-CLOSED (codex #558-PR3 nit): the matcher rejected a
+                    # DESYNC FALLBACK (codex #558-PR3): the matcher rejected a
                     # token that was ALREADY sampled and committed to the output
-                    # stream, so its state no longer tracks the real stream.
-                    # Latch the abort and STOP consuming further tail tokens into
-                    # the now-invalid matcher; the mask branch below short-circuits
-                    # on ``_aborted`` and returns logits unchanged, so the request
-                    # finishes under the free-form parser instead of being masked
-                    # from a desynced grammar state (the old behavior only logged
-                    # and kept masking — fail-open).
+                    # stream, so its state no longer tracks the real stream. Latch
+                    # the abort and STOP consuming further tail tokens into the
+                    # now-invalid matcher; the mask branch below short-circuits on
+                    # ``_aborted`` and returns logits unchanged. This is a
+                    # controlled FAIL-OPEN — we DROP the constraint and finish
+                    # under the free-form parser rather than mask from a desynced
+                    # matcher (which the old behavior did — strictly worse).
                     logger.warning(
                         "tool-grammar: matcher rejected committed token %d; "
-                        "aborting grammar constraint (free-form fallback)",
+                        "dropping grammar constraint (free-form fallback)",
                         tok,
                     )
                     self._aborted = True
