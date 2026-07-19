@@ -339,7 +339,11 @@ class HermesToolParser(ToolParser):
             return None
 
         def _info(name: str):
-            begin = f'<tool_call>\n{{"name": "{name}", "arguments": '
+            # JSON-encode ``name`` so a name containing ``"`` or ``\`` yields a
+            # well-formed JSON string literal in the wire, not a broken one
+            # (json.dumps adds the surrounding quotes and escapes). ``begin``
+            # still starts with the ``<tool_call>`` trigger (builder invariant).
+            begin = f'<tool_call>\n{{"name": {json.dumps(name)}, "arguments": '
             end = "}\n</tool_call>"
             return StructureInfo(
                 begin=begin,

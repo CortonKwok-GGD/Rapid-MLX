@@ -305,6 +305,25 @@ def test_structure_info_substitutes_each_tool_name(family):
 
 
 @pytest.mark.parametrize("family", ["hermes", "qwen"])
+def test_structure_info_json_escapes_tool_name(family):
+    # codex r4 nit: a name containing " or \ must be JSON-escaped so the wire is
+    # well-formed JSON, not broken. json.dumps handles the quoting + escaping.
+    import json
+
+    parser = _make_optin_parser(family)
+    get_info = parser.structure_info()
+    weird = 'weird"na\\me'
+    si = get_info(weird)
+    assert si.begin == f'<tool_call>\n{{"name": {json.dumps(weird)}, "arguments": '
+    # The name region round-trips as valid JSON (extract the "name": <...> part).
+    body = si.begin[len("<tool_call>\n") :]  # {"name": "...", "arguments":
+    name_json = body[len('{"name": ') : body.index(', "arguments": ')]
+    assert json.loads(name_json) == weird
+    # begin still starts with the trigger (builder invariant preserved).
+    assert si.begin.startswith("<tool_call>")
+
+
+@pytest.mark.parametrize("family", ["hermes", "qwen"])
 def test_hermes_and_qwen_share_identical_wire(family):
     # hermes and qwen intentionally emit the SAME wire triple (both are the
     # <tool_call> JSON body). Assert byte-identical triples so the two overrides
@@ -382,34 +401,47 @@ def _offline_skip_exc_types():
     return tuple(types)
 
 
-# Substrings transformers/hub embed in an OSError message when a model is not
-# cached AND the network is unavailable (offline / connection failure). These
-# indicate genuine UNAVAILABILITY -> a sanctioned skip. A corrupt-artifact
-# OSError (bad JSON, truncated file, checksum) carries none of these and must
-# still FAIL the test.
+# Phrases that UNAMBIGUOUSLY mean network/connection failure (offline). We
+# deliberately EXCLUDE transformers' generic "Can't load ... for X" / "look for
+# the file" wording (codex r4): those also front corrupt / incompatible /
+# incomplete artifact errors, so matching them would silently SKIP a real
+# regression. A genuine offline failure says it could not CONNECT — that
+# phrasing never appears for a corrupt local file.
 _OFFLINE_OSERROR_MARKERS = (
     "offline",
     "couldn't connect",
-    "can't load",
-    "cannot find the requested files",
-    "look for the file",
-    "connection error",
-    "not a local folder and is not a valid model identifier",
     "we couldn't connect",
+    "connection error",
     "max retries exceeded",
+    "failed to establish a new connection",
     "failed to connect",
+    "name or service not known",
+    "temporary failure in name resolution",
 )
 
 
 def _is_offline_oserror(exc: BaseException) -> bool:
     """True iff ``exc`` (a bare ``OSError`` from transformers) is an offline /
-    cache-miss wrap rather than a corrupt-artifact error — by inspecting the
-    message and the exception chain (transformers wraps the hub error as
-    ``__cause__``)."""
+    connection-failure wrap rather than a corrupt-artifact error.
+
+    Two independent signals, either sufficient — both narrowly scoped so a
+    corrupt/incompatible tokenizer artifact (which transformers ALSO raises as a
+    generic ``OSError`` with "Can't load…" wording) still FAILS, not skips
+    (codex r4):
+
+      * a TYPED connection exception anywhere in the ``__cause__``/``__context__``
+        chain (``requests.ConnectionError`` / ``huggingface_hub`` offline
+        errors) — the strongest signal, immune to message wording; OR
+      * a message containing an UNAMBIGUOUS connection-failure phrase (never
+        emitted for a corrupt local file).
+    """
+    typed_offline = _offline_skip_exc_types()
     seen = set()
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
+        if typed_offline and isinstance(cur, typed_offline):
+            return True
         msg = str(cur).lower()
         if any(marker in msg for marker in _OFFLINE_OSERROR_MARKERS):
             return True
@@ -418,26 +450,38 @@ def _is_offline_oserror(exc: BaseException) -> bool:
 
 
 def test_offline_oserror_classification():
-    # codex r3: transformers wraps an offline cache-miss as a bare OSError. The
-    # `tok` fixture must SKIP on that (offline) but FAIL on a corrupt-artifact
-    # OSError. Directly exercise the classifier both ways, incl. the chained
-    # `__cause__` transformers actually sets.
+    # codex r3/r4: transformers wraps an offline cache-miss as a bare OSError.
+    # The `tok` fixture must SKIP on that (offline) but FAIL on a corrupt/
+    # incompatible-artifact OSError — including transformers' GENERIC "Can't
+    # load tokenizer for X" wording, which fronts BOTH offline and corrupt cases
+    # (so message wording alone is insufficient; a typed connection cause is
+    # the load-bearing signal).
     offline_direct = OSError(
         "We couldn't connect to 'https://huggingface.co' to load this file"
     )
     assert _is_offline_oserror(offline_direct)
 
-    # Offline signal buried in the chained cause (how transformers wraps it).
-    chained = OSError("Can't load tokenizer for 'x'")
+    # Generic "Can't load…" wrapping a TYPED connection cause -> offline (skip).
+    generic_wrap = OSError("Can't load tokenizer for 'x'")
     try:
         try:
             raise ConnectionError("Max retries exceeded with url: ...")
         except ConnectionError as cause:
-            raise chained from cause
+            raise generic_wrap from cause
     except OSError as raised:
         assert _is_offline_oserror(raised)
 
-    # A corrupt-artifact OSError carries NO offline marker -> must NOT skip.
+    # codex r4: the SAME generic "Can't load…" wording with NO connection cause
+    # is a corrupt/incompatible artifact -> must NOT skip (must fail). This is
+    # the regression the over-broad "can't load" marker would have wrongly
+    # skipped.
+    corrupt_generic = OSError(
+        "Can't load tokenizer for 'x'. Make sure it is a correct model "
+        "identifier or the tokenizer files are not corrupted."
+    )
+    assert not _is_offline_oserror(corrupt_generic)
+
+    # A corrupt-artifact OSError with unrelated wording -> must NOT skip.
     corrupt = OSError("Unable to load weights: file is not a valid JSON document")
     assert not _is_offline_oserror(corrupt)
 
