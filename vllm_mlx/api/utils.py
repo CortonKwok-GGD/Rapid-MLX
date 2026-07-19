@@ -923,15 +923,31 @@ def is_mllm_model(model_name: str) -> bool:
         # text-family name would be misrouted to the text engine (#1121).
         if verdict is True:
             return True
-        # An inconclusive verdict (``None``) is NEVER promoted on the bare
-        # existence of checkpoint files: file presence is not modality
-        # evidence.  Fall through to the name/locality fallback below, which
-        # already handles inconclusive results correctly (name matcher for
-        # cached-remote, trust for a bare local VLM-config directory).
-        # The verdict is unavailable (no index/header evidence). A registered
-        # alias or a cached remote config can be a partial metadata download, so
-        # a name without legacy MLLM evidence stays on text until positive proof.
-        # A bare local directory with a VLM config and no index is trusted.
+        # An inconclusive verdict (``None`` — the checkpoint was inspected but
+        # its tensor layout is unrecognised, or there is no index/header
+        # evidence at all) routes to the NAME/LOCALITY fallback below, NOT to a
+        # forced-multimodal verdict.
+        #
+        # DELIBERATE OVERRIDE of codex round-3 #1, which asked to PRESERVE the
+        # multimodal route on an inspected-but-unknown layout.  That reverses
+        # codex round-2 #1, which demanded we "never promote an inconclusive
+        # result based solely on file existence" — the author complied and
+        # removed exactly that promotion.  Honouring round-3 #1 would
+        # re-introduce what round-2 #1 rejected (codex oscillated between the two
+        # rounds).  Both misroute directions are harmful: force-VLM crashes a
+        # text-only fork in the MLLM batched engine on a missing vision tower
+        # (#393), while force-text starves a genuine VLM of its vision path.
+        # With genuinely ambiguous evidence there is no evidentiary basis to
+        # prefer either, so the name/locality heuristic — the established
+        # rapid-mlx default — is used as the NEUTRAL tie-breaker: it decides on
+        # the repo-name signal rather than on the bare presence of files.  This
+        # note is left so a future reviewer sees the round-2↔round-3 oscillation
+        # and the reasoned choice rather than re-litigating it.
+        #
+        # The fallback itself: a registered alias or a cached remote config can
+        # be a partial metadata download, so a name without legacy MLLM evidence
+        # stays on text until positive proof.  A bare local directory with a VLM
+        # config and no index is trusted as multimodal.
         if profile is not None:
             return _check_legacy_string_patterns(model_name)
         if metadata.is_local:

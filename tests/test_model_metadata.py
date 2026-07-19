@@ -398,6 +398,82 @@ def test_known_text_only_layout_rejects_modality_subtree_under_language_model():
     )
 
 
+def test_qwen3_5_moe_text_tensor_allowlist_rejects_deep_modality_subtree():
+    """codex #2: the qwen3.5-moe text allowlist enumerates the ACTUAL backbone
+    children (``embed_tokens`` / ``layers`` / ``norm`` under
+    ``language_model.model.``) + ``language_model.lm_head``, NOT the bare
+    ``language_model.model.`` prefix.
+
+    A modality subtree nested ONE LEVEL DEEPER — ``language_model.model
+    .vision_encoder.*`` — matches the bare ``language_model.model.`` prefix the
+    OLD code trusted and would let a genuine VLM reach an authoritative
+    text-only verdict.  The tightened allowlist must reject it (inconclusive),
+    while every real text tensor is still accepted.
+
+    Tensor names are derived from mlx-lm ``models/qwen3_5.py``
+    (``Qwen3_5TextModel`` → ``embed_tokens`` / ``layers`` / ``norm``; wrapper
+    ``TextModel`` → ``lm_head``) — not invented.
+    """
+    # The exact codex #2 concern: deep vision subtree under ``.model.``.
+    assert (
+        metadata._is_qwen3_5_moe_text_tensor(
+            "language_model.model.vision_encoder.blocks.0.weight"
+        )
+        is False
+    )
+    # Any other unknown modality subtree under ``.model.`` is likewise rejected.
+    assert (
+        metadata._is_qwen3_5_moe_text_tensor(
+            "language_model.model.audio_tower.0.weight"
+        )
+        is False
+    )
+
+    # The real text tensors ARE still accepted.
+    assert metadata._is_qwen3_5_moe_text_tensor(
+        "language_model.model.embed_tokens.weight"
+    )
+    assert metadata._is_qwen3_5_moe_text_tensor(
+        "language_model.model.layers.0.self_attn.q_proj.weight"
+    )
+    assert metadata._is_qwen3_5_moe_text_tensor("language_model.model.norm.weight")
+    assert metadata._is_qwen3_5_moe_text_tensor("language_model.lm_head.weight")
+    # MoE expert tensors (the sanitizer emits ``...mlp.switch_mlp.*``) live
+    # under ``language_model.model.layers.*`` and are still recognised.
+    assert metadata._is_qwen3_5_moe_text_tensor(
+        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+    )
+
+    # A whole checkpoint whose vision encoder nests under ``.model.`` is NOT a
+    # text-only layout — the verdict must stay inconclusive (never text).
+    cfg = {"architectures": ["Qwen3_5MoeForConditionalGeneration"]}
+    deep_vision_layout = {
+        "language_model.model.embed_tokens.weight": "s",
+        "language_model.model.layers.0.self_attn.q_proj.weight": "s",
+        "language_model.model.vision_encoder.blocks.0.weight": "s",
+    }
+    assert metadata._known_text_only_weight_layout(deep_vision_layout, cfg) is False
+
+
+def test_single_safetensors_glob_oserror_is_inconclusive(tmp_path, monkeypatch):
+    """codex #5: file enumeration (``snapshot_dir.glob``) is inside the
+    exception handler, so a permission error / stale mount / cache race yields
+    the documented inconclusive result (``None``) instead of crashing routing.
+    """
+    from pathlib import Path
+
+    def _boom(self, *args, **kwargs):
+        raise OSError("stale mount / permission denied")
+
+    monkeypatch.setattr(Path, "glob", _boom)
+
+    # Direct helper: must not raise, returns inconclusive.
+    assert metadata._single_safetensors_has_multimodal_weights(tmp_path) is None
+    # Higher-level entry point (no index → falls through to the single-file
+    # header path) must also stay inconclusive rather than crash.
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path, None) is None
+
+
 def test_weight_index_has_independent_production_size_bound(tmp_path):
     weight_map = {
         "language_model." + "x" * metadata.MAX_METADATA_FILE_BYTES: "model.safetensors",

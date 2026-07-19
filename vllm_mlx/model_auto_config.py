@@ -761,9 +761,28 @@ def _node_output_paths(node) -> list[str]:
         paths = list(_sequence_output_paths(node.body))
         paths.extend(_sequence_output_paths(node.else_) if node.else_ else [""])
         return paths or [""]
-    # Transparent wrapper blocks (``{% generation %}`` → ``CallBlock``, plus
-    # ``FilterBlock`` / ``Scope`` / ``ScopedEvalContextModifier`` / ``With`` /
-    # ``Block``): recurse into their body and pass the path structure through.
+    if isinstance(node, (nodes.Macro, nodes.AssignBlock)):
+        # A ``{% macro %}...{% endmacro %}`` definition and a capture-only
+        # ``{% set x %}...{% endset %}`` (jinja2 ``AssignBlock``) BOTH carry a
+        # ``body`` list, but NEITHER renders that body into the output stream at
+        # this site — a ``Macro`` emits nothing until it is *called*, and an
+        # ``AssignBlock`` captures its body into a variable rather than printing
+        # it (verified: ``env.from_string("{% macro m() %}X{% endmacro %}")
+        # .render() == ""`` and the same for ``{% set x %}X{% endset %}``).
+        # Recursing into their body (as the generic ``body`` fallthrough below
+        # would) falsely enables the Hermes tool parser whenever helper macros /
+        # captures contain tool XML — a common real-template shape.  So these
+        # emit an EMPTY output path at their definition site (codex #3).  The
+        # tool XML would only reach output through a genuinely reachable
+        # ``If``/``For``/``Output`` path, which the branches above still detect.
+        return [""]
+    # Transparent wrapper blocks that DO render their body into the output
+    # stream at this site: ``{% generation %}`` → ``CallBlock`` (our extension's
+    # ``_noop`` caller returns ``caller()``), ``{% filter %}`` → ``FilterBlock``,
+    # ``{% with %}`` → ``With``, ``{% block %}`` → ``Block``, plus ``Scope`` /
+    # ``OverlayScope`` / ``ScopedEvalContextModifier``.  Recurse into their body
+    # and pass the path structure through.  (``Macro`` / ``AssignBlock`` are
+    # handled above precisely because they do NOT render-through.)
     body = getattr(node, "body", None)
     if isinstance(body, list):
         return _sequence_output_paths(body)
@@ -779,6 +798,22 @@ def _sequence_output_paths(node_list) -> list[str]:
     of accumulated paths.  Growth is bounded by ``_MAX_TEMPLATE_OUTPUT_PATHS``
     to keep pathological templates cheap (the cap can only DROP a would-be
     match, never fabricate one).
+
+    The Cartesian enumeration here is intentionally STRUCTURAL — it models
+    per-node reachability (each ``If``/``For`` alternative is a real path) but
+    does NOT track branch *predicates*.  In principle two independent top-level
+    ``{% if tools %}`` / ``{% if not tools %}`` blocks could Cartesian-combine a
+    tool-call opening fragment from one with a closing fragment from the other
+    into a spuriously "reachable" contract (codex #4).  We deliberately do NOT
+    thread correlated-predicate tracking through here: no real chat template
+    splits a single tool-call wire contract across two mutually exclusive
+    top-level conditionals, and either carrying predicates or conservatively
+    rejecting cross-conditional contracts would risk FALSE NEGATIVES on genuine
+    templates that legitimately span sequential blocks.  The realistic
+    false-positive vector — tool XML in an uncalled ``{% macro %}`` or a
+    ``{% set x %}...{% endset %}`` capture — is already removed at the node
+    level in ``_node_output_paths`` (FIX A).  Predicate correlation is treated
+    as over-engineering for a template shape that does not occur in practice.
     """
     paths = [""]
     for child in node_list:

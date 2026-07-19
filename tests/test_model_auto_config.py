@@ -2407,6 +2407,81 @@ class TestCheckpointMetadataFallback:
         assert config is not None
         assert config.tool_call_parser == "hermes"
 
+    def test_tool_xml_in_uncalled_macro_is_not_detected(self, monkeypatch):
+        # FIX A (codex #3): a ``{% macro %}...{% endmacro %}`` definition emits
+        # NO output at its definition site (a macro renders only when CALLED).
+        # Tool XML inside an UNCALLED helper macro must therefore NOT enable the
+        # Hermes parser — real chat templates commonly define helper macros.
+        macro_template = (
+            "{% macro render_tools() %}"
+            "<tool_call><function=example><parameter=value>"
+            "x</parameter></function></tool_call>"
+            "{% endmacro %}Hello"
+        )
+        # Sanity: the template PARSES (rejection is about macro non-rendering,
+        # not a syntax error) and the FLATTENED whole-AST output DOES contain
+        # the full contract (proving the pre-fix ``body``-recursion would have
+        # fabricated a match).
+        flat = auto_config_mod._template_output_contract(macro_template)
+        assert flat is not None
+        assert "<tool_call>" in flat[0] and "</tool_call>" in flat[0]
+
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(macro_template)
+            is False
+        )
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, macro_template),
+        )
+        assert detect_model_config("publisher/macro-only-tools") is None
+
+    def test_tool_xml_in_set_capture_block_is_not_detected(self, monkeypatch):
+        # FIX A (codex #3): a capture-only ``{% set x %}...{% endset %}`` block
+        # (jinja2 ``AssignBlock``) captures its body INTO a variable rather than
+        # rendering it into the output stream at that site.  Tool XML inside such
+        # a capture must NOT enable the Hermes parser.
+        set_template = (
+            "{% set captured %}"
+            "<tool_call><function=example><parameter=value>"
+            "x</parameter></function></tool_call>"
+            "{% endset %}Hello"
+        )
+        # Sanity: parses cleanly and the flattened whole-AST output contains the
+        # full contract (pre-fix ``body`` recursion would have matched it).
+        flat = auto_config_mod._template_output_contract(set_template)
+        assert flat is not None
+        assert "<tool_call>" in flat[0] and "</tool_call>" in flat[0]
+
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(set_template)
+            is False
+        )
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, set_template),
+        )
+        assert detect_model_config("publisher/set-capture-tools") is None
+
+    def test_tool_xml_on_reachable_path_still_detected_after_macro_set_fix(
+        self, monkeypatch
+    ):
+        # FIX A true-positive guard: tool XML on a genuinely reachable render
+        # path (inside a rendered ``{% if tools %}``) must STILL be detected
+        # after the macro/set-capture exclusion — the fix must not over-exclude.
+        template = self._XML_TOOLS
+        assert auto_config_mod._template_uses_parameterized_xml_tools(template) is True
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+        config = detect_model_config("publisher/reachable-if-tools")
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
     def test_generation_block_template_still_routes_tools(self, monkeypatch):
         """A Transformers ``{% generation %}`` block around a valid
         parameterized-XML tool contract must still be recognised.

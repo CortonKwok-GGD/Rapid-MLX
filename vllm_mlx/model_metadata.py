@@ -256,17 +256,31 @@ MULTIMODAL_TENSOR_PREFIXES = (
 )
 _QWEN3_5_MOE_ARCHITECTURE = "qwen3_5moeforconditionalgeneration"
 # Precise allowlist of the ``Qwen3_5MoeForConditionalGeneration`` TEXT-only
-# tensor namespace.  The text backbone lives under ``language_model.model.``
-# (embed_tokens / layers / norm) and the head under ``language_model.lm_head``.
-# A bare ``language_model.`` prefix is deliberately NOT trusted: a modality
-# subtree can nest under it (e.g. ``language_model.vision_encoder.blocks.*``)
-# and a bare-prefix ``all(...)`` check would wrongly classify such a VLM as
-# text-only.  Any tensor whose path is not covered by this precise allowlist
-# leaves the layout UNrecognised (inconclusive), never a false text verdict.
+# tensor namespace.  Derived from the ACTUAL module tree of the text backbone,
+# NOT invented: ``mlx_lm.models.qwen3_5.Qwen3_5TextModel`` defines exactly
+# ``embed_tokens`` / ``layers`` / ``norm`` as its children, its wrapper
+# ``TextModel`` adds ``model`` (that backbone) + optional ``lm_head``, and the
+# top-level ``Model`` wraps it under ``language_model`` (mlx-lm
+# ``models/qwen3_5.py`` lines 243-297, 367-372; the MoE sanitizer in
+# ``models/qwen3_5_moe.py`` emits ``language_model.model.layers.{l}.mlp.*``).
+# So the ONLY recognised text tensors are the specific backbone children under
+# ``language_model.model.`` (``embed_tokens`` / ``layers`` / ``norm``) plus the
+# head ``language_model.lm_head``.
+#
+# A bare ``language_model.model.`` prefix is deliberately NOT trusted (codex
+# #2): a modality subtree can nest one level DEEPER under it — e.g.
+# ``language_model.model.vision_encoder.blocks.*`` — and a bare-prefix
+# ``startswith`` check would wrongly classify such a VLM as text-only, letting a
+# genuine multimodal checkpoint reach an authoritative text-only verdict.
+# Enumerating the specific backbone children rejects any unrecognised
+# descendant (``vision_encoder``, ``audio_tower``, …) as inconclusive.  Any
+# tensor whose path is not covered by this precise allowlist leaves the layout
+# UNrecognised (inconclusive), never a false text verdict.
 _QWEN3_5_MOE_TEXT_TENSOR_ALLOWLIST = (
-    "language_model.model.",
+    "language_model.model.embed_tokens.",
+    "language_model.model.layers.",
+    "language_model.model.norm.",
     "language_model.lm_head.",
-    "language_model.lm_head",
 )
 
 
@@ -295,14 +309,16 @@ def _contains_multimodal_weight_names(weight_names) -> bool:
 def _is_qwen3_5_moe_text_tensor(name: str) -> bool:
     """Return whether one tensor name is a known Qwen3.5-MoE text tensor.
 
-    Validated against a PRECISE allowlist of text submodule paths rather than
-    the bare ``language_model.`` prefix, so a modality subtree nested under
-    ``language_model.`` (e.g. ``language_model.vision_encoder.blocks.0.weight``)
-    is NOT accepted as text-only.
+    Validated against a PRECISE allowlist of the ACTUAL backbone submodule paths
+    (``language_model.model.{embed_tokens,layers,norm}`` + ``language_model
+    .lm_head``) rather than the bare ``language_model.model.`` prefix, so a
+    modality subtree nested one level deeper under the backbone (e.g.
+    ``language_model.model.vision_encoder.blocks.0.weight``) is NOT accepted as
+    text-only (codex #2).  Only the recognised text children match; every
+    unrecognised descendant leaves the tensor UNrecognised (→ inconclusive
+    layout verdict, never a false text-only verdict).
     """
-    return name == "language_model.lm_head" or any(
-        name.startswith(prefix) for prefix in _QWEN3_5_MOE_TEXT_TENSOR_ALLOWLIST
-    )
+    return any(name.startswith(prefix) for prefix in _QWEN3_5_MOE_TEXT_TENSOR_ALLOWLIST)
 
 
 def _known_text_only_weight_layout(weight_names, config: dict[str, Any] | None) -> bool:
@@ -336,10 +352,16 @@ def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | Non
     that uncertainty as ``None`` instead of routing such a VLM to the text
     loader.
     """
-    files = tuple(snapshot_dir.glob("*.safetensors"))
-    if len(files) != 1:
-        return None
     try:
+        # ``glob`` file enumeration is INSIDE the try (codex #5): a permission
+        # error, stale/unmounted network share, or cache race during directory
+        # scan must yield the documented inconclusive result (``None``), not
+        # crash the routing path.  ``Path.glob`` can raise ``OSError`` at the
+        # first directory read, so it belongs under the same handler as the
+        # header read below.
+        files = tuple(snapshot_dir.glob("*.safetensors"))
+        if len(files) != 1:
+            return None
         with files[0].open("rb") as f:
             size_bytes = f.read(8)
             if len(size_bytes) != 8:
