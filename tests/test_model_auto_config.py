@@ -2482,6 +2482,97 @@ class TestCheckpointMetadataFallback:
         assert config is not None
         assert config.tool_call_parser == "hermes"
 
+    # Raw nested XML contract (no ``{% if %}`` wrapper) for the macro tests.
+    _RAW_XML = (
+        "<tool_call><function=example><parameter=value>"
+        "x</parameter></function></tool_call>"
+    )
+
+    def test_tool_xml_in_called_macro_is_detected(self, monkeypatch):
+        # FIX #3: a macro that defines tool XML and is CALLED on a reachable
+        # render path (``{% if tools %}{{ emit() }}{% endif %}``) DOES render
+        # that XML — the round-4 uncalled-macro exclusion wrongly suppressed it,
+        # leaking unparsed tool calls.  Bounded macro-call resolution must
+        # substitute the macro body's output paths so the contract is detected.
+        called = (
+            "{% macro emit() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% if tools %}{{ emit() }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(called) is True
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, called),
+        )
+        config = detect_model_config("publisher/called-macro-tools")
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
+    def test_tool_xml_in_uncalled_macro_still_not_detected(self):
+        # FIX #3 must PRESERVE the round-4 exclusion: a macro that is DEFINED
+        # but never CALLED emits nothing, so its tool XML must NOT enable the
+        # parser.
+        uncalled = (
+            "{% macro emit() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% if tools %}Hi{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(uncalled) is False
+
+    def test_nested_called_macro_is_detected(self):
+        # A macro that calls another macro (both reachable) resolves through the
+        # chain up to the recursion cap.
+        nested = (
+            "{% macro inner() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% macro outer() %}{{ inner() }}{% endmacro %}"
+            "{% if tools %}{{ outer() }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(nested) is True
+
+    def test_recursive_macro_does_not_hang(self):
+        # A (self-)recursive macro must terminate via the cycle guard, not loop.
+        recursive = (
+            "{% macro rec() %}"
+            + self._RAW_XML
+            + "{{ rec() }}{% endmacro %}{% if tools %}{{ rec() }}{% endif %}"
+        )
+        # Detected (the body's XML is on the first expansion) and terminates.
+        assert auto_config_mod._template_uses_parameterized_xml_tools(recursive) is True
+
+    def test_attribute_call_is_not_resolved_as_local_macro(self):
+        # ``{{ x.emit() }}`` is an attribute call, NOT a bare call to a
+        # locally-defined macro, so it must not be resolved (no false positive).
+        attr = (
+            "{% macro emit() %}"
+            + self._RAW_XML
+            + "{% endmacro %}{% if tools %}{{ x.emit() }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(attr) is False
+
+    def test_path_enumeration_bounded_by_cumulative_byte_budget(self):
+        # FIX #5: a template whose path COUNT stays under the cap but whose
+        # cumulative path BYTES would blow up must be bounded by the byte budget
+        # (enumeration aborts, total retained bytes stay within budget) and must
+        # not hang.
+        import time
+
+        big = "Z" * 4096
+        parts = [
+            "{% if a" + str(i) + " %}" + big + "{% else %}" + big + "{% endif %}"
+            for i in range(400)
+        ]
+        template = "".join(parts)
+        start = time.time()
+        result = auto_config_mod._template_output_paths(template)
+        elapsed = time.time() - start
+        assert result is not None
+        paths, _ = result
+        total = sum(len(p) for p in paths)
+        assert total <= auto_config_mod._MAX_TEMPLATE_OUTPUT_BYTES
+        assert elapsed < 5.0  # generous ceiling; real runs are ~0.1s
+
     def test_generation_block_template_still_routes_tools(self, monkeypatch):
         """A Transformers ``{% generation %}`` block around a valid
         parameterized-XML tool contract must still be recognised.

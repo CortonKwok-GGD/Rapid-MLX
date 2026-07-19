@@ -459,6 +459,104 @@ class TestIsMllmModelWeightsPresenceOverride:
         )
         assert is_mllm_model(str(model_dir)) is False
 
+    def test_non_qwen_text_only_fork_is_text_architecture_agnostic(self, tmp_path):
+        """Round-5 REGRESSION repro (the origin/main regression).
+
+        A text-only fork of a NON-Qwen VLM architecture (Gemma3) — config
+        declares ``vision_config`` but the weight index ships only language
+        tensors — must route as TEXT (``False``).  The round-3/4 code returned
+        ``None`` here (because the text-only detector recognised ONLY
+        Qwen3.5-MoE), and the local-dir fallback then force-routed it to the
+        MLLM engine, crashing on a missing vision tower.  The architecture-
+        agnostic weight-evidence rule (no vision tensors → text) restores
+        origin/main for EVERY architecture, not just Qwen.
+        """
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "Gemma3-Research-Text-Fork",
+            {
+                "model_type": "gemma3",
+                "architectures": ["Gemma3ForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+                "language_model.model.norm.weight",
+                "lm_head.weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is False
+
+    def test_non_qwen_repackaged_vlm_with_vision_weights_is_vlm(self, tmp_path):
+        """Round-5 #1121 guard: the SAME non-Qwen config, but the weight index
+        DOES ship vision tensors → must route as VLM (``True``).  Distinguishes
+        the two opposite failure modes purely by weight evidence."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "Gemma3-Real-VLM",
+            {
+                "model_type": "gemma3",
+                "architectures": ["Gemma3ForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+                "multi_modal_projector.mm_input_projection_weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_gemma4_vision_embedder_family_is_vlm(self, tmp_path):
+        """Round-5 prefix-audit guard: gemma-4-12B ships its vision stack as
+        ``vision_embedder`` / ``embed_vision`` / ``embed_audio`` (NOT
+        ``vision_tower``).  These prefixes were MISSING from the pre-round-5
+        list, so the architecture-agnostic "absent → text" rule would have
+        misrouted this real VLM to text.  The expanded
+        ``MULTIMODAL_TENSOR_PREFIXES`` must catch it (True)."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "gemma-4-12B-it",
+            {
+                "model_type": "gemma4",
+                "architectures": ["Gemma4ForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "vision_embedder.patch_dense.weight",
+                "embed_vision.embedding_projection.weight",
+                "embed_audio.embedding_projection.weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_qwen35_moe_text_fork_still_text(self, tmp_path):
+        """Round-3 behaviour preserved: a Qwen3.5-MoE text fork (no vision
+        tensors) stays TEXT under the general rule (the former Qwen-specific
+        special-case is now subsumed)."""
+        model_dir = self._make_model_dir(
+            tmp_path,
+            "Qwen3.5-MoE-Text-Fork",
+            {
+                "model_type": "qwen3_5_moe",
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1152},
+            },
+            weight_names=[
+                "language_model.model.embed_tokens.weight",
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+                "language_model.model.norm.weight",
+            ],
+        )
+        assert is_mllm_model(str(model_dir)) is False
+
+    def test_qwen35_4b_alias_pin_still_text_only(self):
+        """The aliases.json ``is_text_only`` pin on qwen3.5-4b short-circuits
+        BEFORE weight inspection and must keep returning text (round-3 fix)."""
+        assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False
+
     def test_legacy_weights_probe_wrapper_delegates_to_shared_metadata(self, tmp_path):
         model_dir = self._make_model_dir(
             tmp_path,

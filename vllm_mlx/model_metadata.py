@@ -245,14 +245,49 @@ VLM_ARCHITECTURE_KEYWORDS = (
     "Gemma3ForConditional",
     "Gemma4ForConditional",
 )
+# Tensor-name substrings that indicate ACTUAL vision/audio weights ship in the
+# checkpoint.  This list is LOAD-BEARING: ``checkpoint_has_multimodal_weights``
+# now returns a text-only verdict (``False``) — architecture-agnostic — for any
+# weight index that contains NONE of these substrings, so the list must
+# comprehensively catch real modality tensors across every supported VLM family
+# or a genuine VLM whose vision tensors are not listed here would be misrouted
+# to the text engine (re-opening #1121).  Every entry below was DERIVED from the
+# top-level tensor namespaces of real cached VLM checkpoints (not invented):
+#
+#   vision_tower              gemma-3/4, Qwen2.5/3-VL, Bonsai-27B, most VLMs
+#   vision_model              InternVL3, SmolVLM2
+#   vision_embedder           gemma-4-12B (SigLIP-style patch embedder)
+#   embed_vision              gemma-4 family + DiffusionGemma (vision embedder)
+#   embed_audio               gemma-4-12B (audio modality)
+#   multi_modal_projector     gemma-3 (image->text projector) — was MISSING pre-fix
+#   connector.                SmolVLM2 (vision->text connector)
+#   visual.                   raw-HF Qwen-VL naming (mlx-vlm renames it to
+#                             vision_tower, but the HF checkpoint index keeps it)
+#   mm_projector / patch_embed. / vision_encoder / audio_tower / audio_model /
+#   audio_encoder / image_newline / resampler   other real VLM families
+#
+# Matching is SUBSTRING (``prefix in name``), so a nested occurrence anywhere in
+# the tensor path counts.  ``embed_vision`` / ``embed_audio`` are unambiguous —
+# the text token embedding is ``embed_tokens``, never ``embed_vision``, so these
+# never false-positive on a text-only checkpoint (verified against the local HF
+# cache: zero pure-text checkpoints match any entry).
 MULTIMODAL_TENSOR_PREFIXES = (
     "vision_tower",
     "vision_model",
+    "vision_embedder",
+    "vision_encoder",
     "visual.",
+    "embed_vision",
     "audio_tower",
     "audio_model",
+    "audio_encoder",
+    "embed_audio",
+    "multi_modal_projector",
     "mm_projector",
     "patch_embed.",
+    "image_newline",
+    "resampler",
+    "connector.",
 )
 _QWEN3_5_MOE_ARCHITECTURE = "qwen3_5moeforconditionalgeneration"
 # Precise allowlist of the ``Qwen3_5MoeForConditionalGeneration`` TEXT-only
@@ -345,12 +380,14 @@ def _known_text_only_weight_layout(weight_names, config: dict[str, Any] | None) 
 def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | None:
     """Inspect one safetensors header without loading model tensor data.
 
-    The header is useful positive evidence: a known vision/audio prefix proves
-    that the checkpoint is multimodal.  It is *not* exhaustive negative
-    evidence, though.  Repackagers may name a vision encoder differently, and
-    the header does not declare an architecture-wide tensor schema.  Preserve
-    that uncertainty as ``None`` instead of routing such a VLM to the text
-    loader.
+    Applies the SAME architecture-agnostic weight-evidence rule as
+    ``checkpoint_has_multimodal_weights``: the header lists every tensor in the
+    single-file checkpoint, so a known vision/audio name → ``True`` (VLM) and a
+    fully-read header with NONE of those names → ``False`` (text-only fork —
+    #393/#2).  ``None`` is reserved for genuinely UNREADABLE evidence (not
+    exactly one ``*.safetensors`` file, truncated/oversized/corrupt header, or
+    an ``OSError`` during enumeration/read) so the caller falls back to config /
+    name heuristics rather than flipping a verdict on absent evidence.
     """
     try:
         # ``glob`` file enumeration is INSIDE the try (codex #5): a permission
@@ -377,17 +414,40 @@ def _single_safetensors_has_multimodal_weights(snapshot_dir: Path) -> bool | Non
         return None
     if not isinstance(parsed, dict):
         return None
-    return True if _contains_multimodal_weight_names(parsed) else None
+    # Fully-read header: vision/audio tensor present -> VLM (True); absent ->
+    # text-only (False), architecture-agnostic (matches the multi-file index
+    # path and origin/main's negative detection).
+    return _contains_multimodal_weight_names(parsed)
 
 
 def checkpoint_has_multimodal_weights(
     snapshot_dir: Path | None, config: dict[str, Any] | None = None
 ) -> bool | None:
-    """Return positive modality proof or a schema-backed text-only verdict.
+    """Return a modality verdict from the checkpoint's own tensor names.
 
-    Unrecognised tensor namespaces are deliberately inconclusive.  A generic
-    prefix list cannot prove a checkpoint has no vision encoder; only a known
-    architecture's complete language-only layout may return ``False``.
+    The rule is ARCHITECTURE-AGNOSTIC and driven purely by WEIGHT EVIDENCE
+    (restoring origin/main's ``_local_checkpoint_has_multimodal_weights`` after
+    the round-3/4 regression):
+
+    * A weight index that CONTAINS a known vision/audio tensor
+      (``MULTIMODAL_TENSOR_PREFIXES``) → ``True`` (genuine / repackaged VLM;
+      satisfies #1121 — a renamed VLM whose safetensors ship ``vision_tower.*``
+      routes to the MLLM lane).
+    * A readable weight index that contains NONE of those tensors → ``False``
+      (text-only fork of a VLM-capable architecture; satisfies codex #2 / #393 —
+      config.json may declare ``vision_config`` but the safetensors are
+      language-only, so it must route to the text engine, NOT crash the MLLM
+      batched path on a missing vision tower).  This holds for EVERY
+      architecture, not just Qwen3.5-MoE.
+    * Only genuinely UNREADABLE evidence (missing/oversized/corrupt index, no
+      files) stays ``None`` so the caller falls back to config/name heuristics.
+
+    #2 and #1121 are OPPOSITE failure modes distinguished solely by whether
+    vision tensors are present; this single evidence rule resolves both.  The
+    ``config`` argument is retained for signature/back-compat but the verdict no
+    longer depends on the declared architecture (the former Qwen3.5-MoE
+    ``_known_text_only_weight_layout`` special-case is now subsumed by the
+    general "no vision tensors -> text" path and kept only as documentation).
     """
     if snapshot_dir is None:
         return None
@@ -400,9 +460,11 @@ def checkpoint_has_multimodal_weights(
     weights = index.get("weight_map")
     if not isinstance(weights, dict):
         return None
-    if _contains_multimodal_weight_names(weights):
-        return True
-    return False if _known_text_only_weight_layout(weights, config) else None
+    # Architecture-agnostic weight-evidence verdict: vision tensors present ->
+    # VLM (True); absent (readable index, zero modality tensors) -> text-only
+    # (False), for ANY architecture.  This restores origin/main and is the
+    # negative branch #2 needs (a text-only fork of any VLM architecture).
+    return _contains_multimodal_weight_names(weights)
 
 
 def checkpoint_evidence_is_available(snapshot_dir: Path | None) -> bool:

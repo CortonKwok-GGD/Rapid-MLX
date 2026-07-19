@@ -725,8 +725,94 @@ def _chat_template_environment():
 # fabricated cross-branch match.
 _MAX_TEMPLATE_OUTPUT_PATHS = 256
 
+# Cumulative byte budget for path enumeration (codex #5).  The path-COUNT cap
+# above bounds the number of alternatives but NOT the total work: a large
+# template could retain up to ``_MAX_TEMPLATE_OUTPUT_PATHS`` paths each many KiB
+# long, so the concatenated material is O(paths × template_size).  Once the
+# summed length of all accumulated paths crosses this budget, enumeration
+# aborts and fails SAFE (an empty path set → "no native-tool contract
+# detected" → text fallback).  8 MiB is far above any real chat template
+# (largest observed ≈ tens of KiB) yet caps a pathological input's work.  This
+# is defensive against trusted load-time input only.
+_MAX_TEMPLATE_OUTPUT_BYTES = 8 * 1024 * 1024
 
-def _node_output_paths(node) -> list[str]:
+# Bound on macro-call resolution (FIX #3).  Reachable ``{{ macro() }}`` calls to
+# locally-defined macros are expanded so tool XML defined in a macro body and
+# CALLED on a render path is still detected — but recursion is capped to avoid
+# blowups from deep or (mutually) recursive macro chains.
+_MAX_MACRO_RESOLUTION_DEPTH = 8
+
+
+class _MacroCtx:
+    """Resolution context threaded through path analysis (FIX #3).
+
+    ``macros`` maps a locally-defined macro name to its body node list.
+    ``active`` is the set of macro names currently being expanded on this call
+    stack (cycle guard).  ``depth`` bounds total expansion nesting.  A default
+    (empty-``macros``) context makes macro resolution a no-op, so callers that
+    do not pre-collect macros keep the pre-FIX-#3 behaviour.
+    """
+
+    __slots__ = ("macros", "active", "depth")
+
+    def __init__(self, macros=None, active=None, depth=0):
+        self.macros = macros or {}
+        self.active = active or frozenset()
+        self.depth = depth
+
+
+_EMPTY_MACRO_CTX = _MacroCtx()
+
+
+def _collect_macro_bodies(node) -> dict:
+    """Map every locally-defined ``{% macro name %}`` to its body node list.
+
+    Walks the WHOLE parsed AST (macros may be defined anywhere, including inside
+    blocks) via ``find_all`` so a call reachable on a render path can be
+    resolved regardless of where the macro was declared.
+    """
+    from jinja2 import nodes
+
+    macros: dict = {}
+    for macro in node.find_all(nodes.Macro):
+        # Last definition wins, mirroring jinja2's runtime rebinding semantics.
+        macros[macro.name] = macro.body
+    return macros
+
+
+def _resolve_macro_call(node, ctx: "_MacroCtx"):
+    """If ``node`` is a bare call to a locally-defined macro, return its body's
+    output paths (bounded); otherwise return ``None``.
+
+    Recognises the reachable-call shape ``{{ emit(...) }}`` → jinja2 ``Call``
+    whose ``.node`` is a ``Name`` (``ctx='load'``) bound to a collected macro.
+    Attribute/dynamic callees (``{{ x.emit() }}``) are intentionally NOT
+    resolved — they are not locally-defined macros in the template namespace.
+    """
+    from jinja2 import nodes
+
+    if not isinstance(node, nodes.Call):
+        return None
+    callee = node.node
+    if not isinstance(callee, nodes.Name):
+        return None
+    name = callee.name
+    body = ctx.macros.get(name)
+    if body is None:
+        return None
+    # Cycle / depth guard: a macro that (transitively) calls itself, or a chain
+    # deeper than the cap, contributes an empty path rather than looping.
+    if name in ctx.active or ctx.depth >= _MAX_MACRO_RESOLUTION_DEPTH:
+        return [""]
+    child_ctx = _MacroCtx(
+        macros=ctx.macros,
+        active=ctx.active | {name},
+        depth=ctx.depth + 1,
+    )
+    return _sequence_output_paths(body, child_ctx)
+
+
+def _node_output_paths(node, ctx: "_MacroCtx" = _EMPTY_MACRO_CTX) -> list[str]:
     """Return the possible literal-output strings a single AST node can emit.
 
     Each returned string is the concatenation of literals along ONE reachable
@@ -734,6 +820,9 @@ def _node_output_paths(node) -> list[str]:
     ``{% elif %}`` / ``{% else %}`` branches become SEPARATE alternatives — the
     opening fragment from one branch is never concatenated with the closing
     fragment of a sibling branch.
+
+    ``ctx`` carries the macro-resolution state (FIX #3); the default empty
+    context makes macro-call resolution a no-op.
     """
     from jinja2 import nodes
 
@@ -742,15 +831,23 @@ def _node_output_paths(node) -> list[str]:
     if isinstance(node, nodes.Output):
         # ``Output.nodes`` interleaves literal ``TemplateData`` with printed
         # expressions ``{{ ... }}``; only the literals are known statically.
-        return _sequence_output_paths(node.nodes)
+        return _sequence_output_paths(node.nodes, ctx)
+    # A reachable ``{{ macro() }}`` call to a locally-defined macro renders that
+    # macro's body INTO the output stream at this site (FIX #3).  Resolve it to
+    # the macro body's output paths so tool XML defined in a called macro is
+    # still detected.  (Uncalled macro DEFINITIONS remain empty — see the
+    # ``Macro`` branch below.)
+    resolved = _resolve_macro_call(node, ctx)
+    if resolved is not None:
+        return resolved
     if isinstance(node, nodes.If):
         alternatives: list[str] = []
-        alternatives.extend(_sequence_output_paths(node.body))
+        alternatives.extend(_sequence_output_paths(node.body, ctx))
         # ``elif`` chains parse as nested ``If`` nodes hanging off ``elif_``.
         for elif_node in node.elif_:
-            alternatives.extend(_node_output_paths(elif_node))
+            alternatives.extend(_node_output_paths(elif_node, ctx))
         if node.else_:
-            alternatives.extend(_sequence_output_paths(node.else_))
+            alternatives.extend(_sequence_output_paths(node.else_, ctx))
         else:
             # No ``else`` → the "condition false, emit nothing" path is real.
             alternatives.append("")
@@ -758,8 +855,8 @@ def _node_output_paths(node) -> list[str]:
     if isinstance(node, nodes.For):
         # A loop body may execute (emit its contract) or the loop may be empty
         # (emit only the ``else`` block, if any).  Both are reachable paths.
-        paths = list(_sequence_output_paths(node.body))
-        paths.extend(_sequence_output_paths(node.else_) if node.else_ else [""])
+        paths = list(_sequence_output_paths(node.body, ctx))
+        paths.extend(_sequence_output_paths(node.else_, ctx) if node.else_ else [""])
         return paths or [""]
     if isinstance(node, (nodes.Macro, nodes.AssignBlock)):
         # A ``{% macro %}...{% endmacro %}`` definition and a capture-only
@@ -772,9 +869,10 @@ def _node_output_paths(node) -> list[str]:
         # Recursing into their body (as the generic ``body`` fallthrough below
         # would) falsely enables the Hermes tool parser whenever helper macros /
         # captures contain tool XML — a common real-template shape.  So these
-        # emit an EMPTY output path at their definition site (codex #3).  The
-        # tool XML would only reach output through a genuinely reachable
-        # ``If``/``For``/``Output`` path, which the branches above still detect.
+        # emit an EMPTY output path at their definition site (codex #3).  A
+        # macro's body IS accounted for when the macro is CALLED on a render
+        # path (``_resolve_macro_call`` above, FIX #3); the exclusion here only
+        # suppresses the UNCALLED definition site.
         return [""]
     # Transparent wrapper blocks that DO render their body into the output
     # stream at this site: ``{% generation %}`` → ``CallBlock`` (our extension's
@@ -785,19 +883,20 @@ def _node_output_paths(node) -> list[str]:
     # handled above precisely because they do NOT render-through.)
     body = getattr(node, "body", None)
     if isinstance(body, list):
-        return _sequence_output_paths(body)
+        return _sequence_output_paths(body, ctx)
     # Statements with no literal output (Assign, Break, Continue, bare
     # expressions, …) contribute the empty string on every path.
     return [""]
 
 
-def _sequence_output_paths(node_list) -> list[str]:
+def _sequence_output_paths(node_list, ctx: "_MacroCtx" = _EMPTY_MACRO_CTX) -> list[str]:
     """Cartesian concatenation of the per-node path sets for a node sequence.
 
     Sequential nodes are concatenated; a branching node multiplies the number
     of accumulated paths.  Growth is bounded by ``_MAX_TEMPLATE_OUTPUT_PATHS``
-    to keep pathological templates cheap (the cap can only DROP a would-be
-    match, never fabricate one).
+    (path count) AND ``_MAX_TEMPLATE_OUTPUT_BYTES`` (cumulative length, codex
+    #5) to keep pathological templates cheap; either cap can only DROP a
+    would-be match, never fabricate one.
 
     The Cartesian enumeration here is intentionally STRUCTURAL — it models
     per-node reachability (each ``If``/``For`` alternative is a real path) but
@@ -817,18 +916,29 @@ def _sequence_output_paths(node_list) -> list[str]:
     """
     paths = [""]
     for child in node_list:
-        child_paths = _node_output_paths(child)
+        child_paths = _node_output_paths(child, ctx)
         if not child_paths:
             continue
         combined: list[str] = []
+        total_bytes = 0
+        capped = False
         for prefix in paths:
             for suffix in child_paths:
-                combined.append(prefix + suffix)
-                if len(combined) >= _MAX_TEMPLATE_OUTPUT_PATHS:
+                combined_path = prefix + suffix
+                combined.append(combined_path)
+                total_bytes += len(combined_path)
+                # codex #5: abort on cumulative byte budget as well as count.
+                if (
+                    len(combined) >= _MAX_TEMPLATE_OUTPUT_PATHS
+                    or total_bytes >= _MAX_TEMPLATE_OUTPUT_BYTES
+                ):
+                    capped = True
                     break
-            if len(combined) >= _MAX_TEMPLATE_OUTPUT_PATHS:
+            if capped:
                 break
         paths = combined
+        if capped:
+            break
     return paths
 
 
@@ -849,7 +959,10 @@ def _template_output_paths(
         from jinja2 import meta
 
         parsed = _chat_template_environment().parse(template)
-        paths = _sequence_output_paths(parsed.body)
+        # Pre-collect locally-defined macros so reachable ``{{ macro() }}`` calls
+        # can be resolved to their bodies during path analysis (FIX #3).
+        ctx = _MacroCtx(macros=_collect_macro_bodies(parsed))
+        paths = _sequence_output_paths(parsed.body, ctx)
         variables = frozenset(meta.find_undeclared_variables(parsed))
     except Exception:
         return None

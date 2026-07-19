@@ -284,9 +284,10 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
     assert metadata.checkpoint_has_multimodal_weights(None) is None
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
 
-    # Real Qwen3.5-MoE text tensors live under ``language_model.model.*`` (the
-    # backbone) and ``language_model.lm_head`` (the head); the precise text
-    # allowlist recognises this exact layout as text-only.
+    # ARCHITECTURE-AGNOSTIC weight-evidence rule (round-5 regression fix,
+    # restoring origin/main): a readable weight index with NO multimodal tensors
+    # is a text-only verdict (``False``) for EVERY architecture, not just
+    # Qwen3.5-MoE.  A language-only backbone (no vision/audio tensors) → text.
     _write_json(
         tmp_path / "model.safetensors.index.json",
         {
@@ -299,7 +300,10 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
             }
         },
     )
-    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
+    # No config, no vision tensors → text-only (False), architecture-agnostic.
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is False
+    # Same with a VLM-capable arch declared: still text-only, because the
+    # WEIGHTS carry no vision tensors (the #393 / codex #2 text-only-fork case).
     assert (
         metadata.checkpoint_has_multimodal_weights(
             tmp_path,
@@ -307,10 +311,10 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
         )
         is False
     )
-    # A modality subtree nested under ``language_model.`` (a bare-prefix match
-    # that is NOT a real text tensor) must NOT be mistaken for text-only: the
-    # tightened allowlist leaves the verdict inconclusive (``None``) so a real
-    # VLM is never misrouted to the text loader.
+    # A real vision tensor (``vision_encoder``) nested under ``language_model.``
+    # is POSITIVE modality evidence → VLM (True).  Weight evidence, not the
+    # namespace prefix, decides: a checkpoint that actually ships vision weights
+    # is multimodal regardless of where they are nested.
     _write_json(
         tmp_path / "model.safetensors.index.json",
         {
@@ -325,11 +329,18 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
             tmp_path,
             {"architectures": ["Qwen3_5MoeForConditionalGeneration"]},
         )
-        is None
+        is True
     )
 
+    # A malformed weight_map (a list, not a dict) is unreadable evidence →
+    # inconclusive (None), so the caller falls back to config/name heuristics.
     _write_json(tmp_path / "model.safetensors.index.json", {"weight_map": []})
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
+
+    # An EMPTY-but-well-formed weight_map ({}) is a readable index with no
+    # vision tensors → text-only (False), architecture-agnostic.
+    _write_json(tmp_path / "model.safetensors.index.json", {"weight_map": {}})
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is False
 
     _write_json(
         tmp_path / "model.safetensors.index.json",
@@ -337,16 +348,18 @@ def test_multimodal_config_and_sharded_weight_detection(tmp_path):
     )
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is True
 
+    # Single-file safetensors header path applies the SAME architecture-agnostic
+    # rule: language-only header → text (False); vision tensor → VLM (True).
     (tmp_path / "model.safetensors.index.json").unlink()
     safetensors = tmp_path / "model.safetensors"
     _write_safetensors_header(safetensors, ["language_model.layers.0.weight"])
-    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is False
 
     _write_safetensors_header(safetensors, ["vision_tower.blocks.0.weight"])
     assert metadata.checkpoint_has_multimodal_weights(tmp_path) is True
 
     _write_safetensors_header(safetensors, ["vision_encoder.blocks.0.weight"])
-    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is None
+    assert metadata.checkpoint_has_multimodal_weights(tmp_path) is True
 
 
 def test_known_text_only_layout_rejects_modality_subtree_under_language_model():
