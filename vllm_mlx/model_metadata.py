@@ -88,13 +88,57 @@ def _select_chat_template(tokenizer_config: dict[str, Any] | None) -> str | None
     return templates[0] if len(templates) == 1 else None
 
 
+# Transformers stores extra (named) chat templates under this directory, one
+# ``<name>.jinja`` per template, with ``chat_template.jinja`` acting as the
+# ``default``.  Mirrors ``transformers.utils.hub.CHAT_TEMPLATE_DIR``.
+CHAT_TEMPLATE_DIR = "additional_chat_templates"
+
+
+def _read_named_chat_templates(snapshot_dir: Path) -> dict[str, str]:
+    """Read named templates from the ``additional_chat_templates/`` directory.
+
+    Mirrors ``PreTrainedTokenizerBase._from_pretrained`` (tokenization_utils_base):
+    each ``<name>.jinja`` under ``additional_chat_templates/`` becomes a
+    ``chat_templates[name]`` entry, with ``name = filename.removesuffix(".jinja")``.
+    """
+    template_dir = snapshot_dir / CHAT_TEMPLATE_DIR
+    if not template_dir.is_dir():
+        return {}
+    named: dict[str, str] = {}
+    try:
+        template_files = sorted(template_dir.glob("*.jinja"))
+    except OSError:
+        return {}
+    for template_file in template_files:
+        template = _read_text(template_file)
+        if template is not None:
+            named[template_file.name.removesuffix(".jinja")] = template
+    return named
+
+
 def _chat_template(snapshot_dir: Path | None) -> str | None:
-    """Load the template using Transformers' standalone-file precedence."""
+    """Load the template using Transformers' standalone-file precedence.
+
+    Mirrors ``PreTrainedTokenizerBase._from_pretrained`` (tokenization_utils_base
+    ~lines 1665-1808): independent chat-template files take priority over the
+    ``tokenizer_config.json`` entry.  ``chat_template.jinja`` supplies the
+    ``default`` template, while every ``<name>.jinja`` under
+    ``additional_chat_templates/`` contributes a named template.  Transformers
+    collapses a lone ``default`` to a single string and otherwise keeps a
+    ``{name: template}`` dict; we then apply the SAME ``tool_use`` → ``default``
+    selection used for the tokenizer-config form via ``_select_chat_template``.
+    """
     if snapshot_dir is None:
         return None
+    templates = _read_named_chat_templates(snapshot_dir)
     standalone = _read_text(snapshot_dir / "chat_template.jinja")
     if standalone is not None:
-        return standalone
+        templates["default"] = standalone
+    if templates:
+        # Transformers flattens a lone ``default`` to a bare string.
+        if len(templates) == 1 and "default" in templates:
+            return templates["default"]
+        return _select_chat_template({"chat_template": templates})
     return _select_chat_template(_read_json(snapshot_dir / "tokenizer_config.json"))
 
 

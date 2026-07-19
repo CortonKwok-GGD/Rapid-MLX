@@ -671,32 +671,67 @@ def _metadata_model_types(config: dict[str, Any]) -> frozenset[str]:
     return frozenset(types)
 
 
-def _without_jinja_comments(template: str) -> str:
-    """Remove Jinja comments so documentation cannot advertise a protocol."""
-    visible: list[str] = []
-    cursor = 0
-    while True:
-        comment_start = template.find("{#", cursor)
-        if comment_start == -1:
-            visible.append(template[cursor:])
-            return "".join(visible)
-        visible.append(template[cursor:comment_start])
-        comment_end = template.find("#}", comment_start + 2)
-        if comment_end == -1:
-            return "".join(visible)
-        cursor = comment_end + 2
+def _chat_template_environment():
+    """Build a Jinja environment that PARSES Transformers chat templates.
+
+    Transformers compiles chat templates with a specific environment (see
+    ``transformers.utils.chat_template_utils._cached_compile_jinja_template``):
+    an ``ImmutableSandboxedEnvironment`` with ``trim_blocks``/``lstrip_blocks``
+    and ``extensions=[AssistantTracker, jinja2.ext.loopcontrols]``. Valid
+    templates therefore use constructs a bare ``jinja2.Environment`` rejects at
+    parse time — the ``{% generation %}...{% endgeneration %}`` block (a custom
+    ``generation`` tag registered by ``AssistantTracker``) and loop-control
+    statements (``{% break %}`` / ``{% continue %}``). We only ever ``.parse()``
+    the template (to extract ``TemplateData`` literals and undeclared
+    variables); we never render it. So we mirror the SAME extension set that
+    makes those constructs parse, but need not replicate the sandbox or the
+    runtime rendering hooks.
+
+    The ``_GenerationExtension`` below ports the parse behaviour of
+    Transformers' ``AssistantTracker`` (``tags = {"generation"}``; consumes the
+    block up to ``endgeneration``) so ``{% generation %}`` parses identically.
+    """
+    import jinja2
+    import jinja2.ext
+
+    class _GenerationExtension(jinja2.ext.Extension):
+        # Mirror transformers.utils.chat_template_utils.AssistantTracker: the
+        # ``generation`` tag brackets assistant-generated spans. We only need
+        # its PARSE behaviour (consume the body up to ``endgeneration``) so a
+        # template that uses it does not raise TemplateSyntaxError; the tracked
+        # output is a rendering concern we never reach.
+        tags = {"generation"}
+
+        def parse(self, parser):
+            lineno = next(parser.stream).lineno
+            body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+            return jinja2.nodes.CallBlock(
+                self.call_method("_noop"), [], [], body
+            ).set_lineno(lineno)
+
+        def _noop(self, caller):  # pragma: no cover - never rendered
+            return caller()
+
+    return jinja2.Environment(
+        extensions=[_GenerationExtension, jinja2.ext.loopcontrols]
+    )
 
 
 def _template_output_contract(
     template: str | None,
 ) -> tuple[str, frozenset[str]] | None:
-    """Return literal output text and declared variables from a Jinja template."""
+    """Return literal output text and declared variables from a Jinja template.
+
+    Uses a Transformers-compatible parsing environment so valid chat templates
+    (``{% generation %}``, ``{% break %}``/``{% continue %}``) do not silently
+    disable inference by raising ``TemplateSyntaxError``.
+    """
     if template is None:
         return None
     try:
-        from jinja2 import Environment, meta, nodes
+        from jinja2 import meta, nodes
 
-        parsed = Environment().parse(template)
+        parsed = _chat_template_environment().parse(template)
         output = "".join(node.data for node in parsed.find_all(nodes.TemplateData))
         variables = frozenset(meta.find_undeclared_variables(parsed))
     except Exception:

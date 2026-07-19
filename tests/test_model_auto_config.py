@@ -2329,15 +2329,93 @@ class TestCheckpointMetadataFallback:
         assert config.supports_spec_decode is False
 
     def test_incomplete_template_is_not_advertised_as_native_tools(self, monkeypatch):
+        # The template PARSES successfully (``{% endif %}`` is present), but the
+        # XML tool contract is genuinely INCOMPLETE: it opens
+        # ``<tool_call><function=…><parameter=…>`` and never emits the closing
+        # ``</parameter></function></tool_call>`` tags. This exercises the
+        # XML closing-tag nesting checks in ``_template_uses_parameterized_xml_tools``
+        # rather than passing via a parse failure (see the assertion below that
+        # the template parses cleanly).
+        incomplete = (
+            "{% if tools %}<tool_call><function=example><parameter=value>x{% endif %}"
+        )
+        # Sanity guard: this template must PARSE (so the test is not
+        # tautologically satisfied by ``_template_output_contract`` returning
+        # None on a syntax error). If it did not parse, the missing-closing-tag
+        # logic below would never be reached.
+        assert auto_config_mod._template_output_contract(incomplete) is not None
+
         monkeypatch.setattr(
             auto_config_mod,
             "read_model_metadata",
-            lambda name: self._metadata(
-                {}, "{% if tools %}<tool_call><function=example><parameter=value>"
-            ),
+            lambda name: self._metadata({}, incomplete),
         )
 
+        # The routing helper must reject it because the closing XML tags are
+        # absent — not because parsing failed.
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(incomplete) is False
+        )
         assert detect_model_config("publisher/unknown-tool-format") is None
+
+    def test_generation_block_template_still_routes_tools(self, monkeypatch):
+        """A Transformers ``{% generation %}`` block around a valid
+        parameterized-XML tool contract must still be recognised.
+
+        A bare ``jinja2.Environment().parse()`` raises ``TemplateSyntaxError``
+        on the custom ``generation`` tag (registered by Transformers'
+        ``AssistantTracker`` extension), which would silently disable inference
+        (``_template_output_contract`` → None). The Transformers-compatible
+        parsing environment must accept it.
+        """
+        template = (
+            "{% if tools %}{% generation %}"
+            + self._XML_TOOLS.removeprefix("{% if tools %}").removesuffix("{% endif %}")
+            + "{% endgeneration %}{% endif %}"
+        )
+        # The bare-jinja env would reject this template; confirm the fixture is
+        # actually exercising the extension path.
+        import jinja2
+
+        with pytest.raises(jinja2.exceptions.TemplateSyntaxError):
+            jinja2.Environment().parse(template)
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+
+        config = detect_model_config("publisher/generation-block-agent")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+        assert config.reasoning_parser is None
+
+    def test_loop_control_template_still_routes_tools(self, monkeypatch):
+        """Loop-control statements (``{% break %}``) — enabled in Transformers
+        via ``jinja2.ext.loopcontrols`` — must also parse without disabling
+        tool routing."""
+        template = (
+            "{% for t in tools %}<tool_call><function=example>"
+            "<parameter=value>x</parameter></function></tool_call>"
+            "{% break %}{% endfor %}"
+        )
+        import jinja2
+
+        with pytest.raises(jinja2.exceptions.TemplateSyntaxError):
+            jinja2.Environment().parse(template)
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, template),
+        )
+
+        config = detect_model_config("publisher/loop-control-agent")
+
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
 
     def test_jinja_comment_cannot_advertise_a_tool_protocol(self, monkeypatch):
         comment = "{# tools " + self._XML_TOOLS + " #}"

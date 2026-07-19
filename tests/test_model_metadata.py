@@ -76,6 +76,46 @@ def test_local_metadata_prefers_standalone_template_then_tokenizer_fallback(tmp_
     assert metadata.read_local_model_metadata(object()) is None
 
 
+def test_named_template_directory_selects_tool_use_over_default(tmp_path):
+    """A snapshot with named templates under ``additional_chat_templates/``
+    (Transformers' modern layout) selects ``tool_use`` over ``default``.
+
+    Mirrors ``PreTrainedTokenizerBase._from_pretrained``: ``chat_template.jinja``
+    supplies the ``default`` template, and each ``<name>.jinja`` under
+    ``additional_chat_templates/`` contributes a named template; ``tool_use``
+    then wins over ``default`` for tool-carrying requests.
+    """
+    snap = tmp_path / "named-templates"
+    snap.mkdir()
+    _write_json(snap / "config.json", {"model_type": "qwen3"})
+    # ``default`` comes from chat_template.jinja; the tokenizer_config entry must
+    # NOT win (standalone files take priority in Transformers).
+    _write_json(snap / "tokenizer_config.json", {"chat_template": "TOKENIZER_CONF"})
+    (snap / "chat_template.jinja").write_text("DEFAULT_BODY", encoding="utf-8")
+    template_dir = snap / "additional_chat_templates"
+    template_dir.mkdir()
+    (template_dir / "tool_use.jinja").write_text("TOOL_USE_BODY", encoding="utf-8")
+    (template_dir / "rag.jinja").write_text("RAG_BODY", encoding="utf-8")
+
+    result = metadata.read_local_model_metadata(str(snap))
+
+    assert result is not None
+    assert result.chat_template == "TOOL_USE_BODY"
+
+
+def test_named_template_directory_default_only_flattens_to_string(tmp_path):
+    """A lone ``default.jinja`` under the named directory (no ``tool_use``)
+    flattens to that single template, matching Transformers' collapse of a
+    lone ``default`` to a bare string."""
+    snap = tmp_path / "default-only"
+    snap.mkdir()
+    template_dir = snap / "additional_chat_templates"
+    template_dir.mkdir()
+    (template_dir / "default.jinja").write_text("ONLY_DEFAULT", encoding="utf-8")
+
+    assert metadata._chat_template(snap) == "ONLY_DEFAULT"
+
+
 def test_named_tokenizer_templates_prefer_tool_use_then_default():
     assert (
         metadata._select_chat_template(

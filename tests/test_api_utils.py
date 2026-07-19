@@ -560,9 +560,22 @@ class TestIsMllmModelCachedMetadata:
 
         assert is_mllm_model("publisher/text-only-repack") is False
 
-    def test_registered_text_alias_beats_cached_vision_evidence(self, monkeypatch):
+    def test_text_only_alias_beats_cached_vision_evidence(self, monkeypatch):
+        """An alias that POSITIVELY declares ``is_text_only`` short-circuits
+        even against positive checkpoint evidence — the operator pin is
+        authoritative for a checkpoint we deliberately serve text-only."""
         from vllm_mlx.api import utils as utils_mod
+        from vllm_mlx.model_profile import ModelProfile
 
+        text_only_profile = ModelProfile(
+            hf_path="publisher/vision-config-served-text",
+            is_text_only=True,
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "resolve_profile",
+            lambda name: text_only_profile,
+        )
         monkeypatch.setattr(
             utils_mod,
             "read_model_metadata",
@@ -579,7 +592,54 @@ class TestIsMllmModelCachedMetadata:
             lambda snapshot, config: True,
         )
 
-        assert is_mllm_model("mlx-community/Qwen3.5-4B-MLX-4bit") is False
+        assert is_mllm_model("publisher/vision-config-served-text") is False
+
+    def test_registered_non_text_alias_yields_to_positive_vision_weights(
+        self, monkeypatch
+    ):
+        """Regression for the #1121 routing-order bug: a registered alias that
+        is NOT ``is_text_only`` and whose name carries NO legacy VLM substring
+        must still route as multimodal once the checkpoint supplies positive
+        vision weights. The bare alias entry must not override real evidence.
+
+        Before the reorder, ``if profile is not None`` short-circuited to the
+        (False) legacy name matcher BEFORE the ``verdict is True`` branch, so
+        this repackaged VLM was misrouted to the text engine. This test fails
+        against the old order and passes after evidence-priority routing.
+        """
+        from vllm_mlx.api import utils as utils_mod
+        from vllm_mlx.model_profile import ModelProfile
+
+        # A registered non-text alias (e.g. a text-family entry someone
+        # repackaged a VLM under). ``is_text_only`` is False, and the alias
+        # name has NO legacy VLM marker (``_check_legacy_string_patterns`` False).
+        non_text_profile = ModelProfile(
+            hf_path="publisher/research-agent-4b",
+            is_text_only=False,
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "resolve_profile",
+            lambda name: non_text_profile,
+        )
+        assert _check_legacy_string_patterns("publisher/research-agent-4b") is False
+        monkeypatch.setattr(
+            utils_mod,
+            "read_model_metadata",
+            lambda name: self._metadata(
+                {
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"hidden_size": 1024},
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            utils_mod,
+            "checkpoint_has_multimodal_weights",
+            lambda snapshot, config: True,
+        )
+
+        assert is_mllm_model("publisher/research-agent-4b") is True
 
     def test_hub_helper_rejects_local_path_lookalikes(self):
         from vllm_mlx.api.utils import _try_read_hub_config_json

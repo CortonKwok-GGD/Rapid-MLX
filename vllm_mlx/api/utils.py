@@ -898,15 +898,24 @@ def is_mllm_model(model_name: str) -> bool:
         verdict = checkpoint_has_multimodal_weights(metadata.snapshot_dir, config)
         if verdict is False:
             return False
+        # Positive checkpoint evidence is authoritative and must win over any
+        # repository-name pattern.  A registered alias only short-circuits when
+        # it POSITIVELY declares text-only (handled above via
+        # ``profile.is_text_only``); a bare alias entry must never override real
+        # vision weights, or a renamed/repackaged VLM served under an aliased
+        # text-family name would be misrouted to the text engine (#1121).
+        if verdict is True:
+            return True
         if verdict is None and checkpoint_evidence_is_available(metadata.snapshot_dir):
             return True
+        # The verdict is unavailable (no index/header evidence). A registered
+        # alias or a cached remote config can be a partial metadata download, so
+        # a name without legacy MLLM evidence stays on text until positive proof.
+        # A bare local directory with a VLM config and no index is trusted.
         if profile is not None:
             return _check_legacy_string_patterns(model_name)
-        if verdict is True or metadata.is_local:
+        if metadata.is_local:
             return True
-        # The verdict is unavailable. Trust config for a local directory; a
-        # cached remote config can be a partial metadata download, so a name
-        # without legacy MLLM evidence stays on text until positive proof.
         return _check_legacy_string_patterns(model_name)
 
     return _check_legacy_string_patterns(model_name)
