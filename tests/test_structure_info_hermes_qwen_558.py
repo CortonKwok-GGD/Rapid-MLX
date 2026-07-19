@@ -94,32 +94,68 @@ _PARSER_IMPORTS = {
 }
 
 
-class _FakeSingleTokenizer:
-    """Minimal tokenizer stub whose declared strings encode to ONE token each.
+class _FakeTokenizer:
+    """Minimal tokenizer stub modeling the surfaces the guard probes.
 
     ``structure_info()`` opts into grammar constraint only when the model's
-    tokenizer proves ``<tool_call>``/``</tool_call>`` are single tokens (the
-    hermes parser is also routed to Llama tokenizers where they are NOT). The
-    pure-Python triple/Lark tests must therefore hand the parser a tokenizer
-    that satisfies the guard — this stub does so WITHOUT a network fetch, so
-    those tests stay hermetic and never skip. Any string not in ``_single`` is
-    reported as multi-token (length 2) so the opt-out path is exercisable too.
+    tokenizer proves ``<tool_call>``/``</tool_call>`` are DISTINCT single
+    REGISTERED special tokens (the hermes parser is also routed to Llama
+    tokenizers where they are NOT). The guard checks: ``len(encode(s)) == 1``,
+    ``decode([id]) == s`` (round-trip), the id is in ``added_tokens_decoder``
+    (registered special), and distinct ids across sentinels. This stub lets the
+    pure-Python tests exercise every opt-in/opt-out branch WITHOUT a network
+    fetch, so they stay hermetic and never skip.
+
+    ``specials`` maps each special string to its single id (registered special,
+    round-trips). Any other string encodes as multi-token (opt-out path).
+    ``ordinary`` maps a string to a single id that round-trips but is NOT a
+    registered special (ordinary-vocab opt-out case). ``collapse`` maps strings
+    to a shared single id that does NOT round-trip (``[UNK]`` collapse case).
     """
 
-    def __init__(self, single=("<tool_call>", "</tool_call>")):
-        self._single = set(single)
+    def __init__(self, specials=None, ordinary=None, collapse=None):
+        self._specials = dict(specials or {})
+        self._ordinary = dict(ordinary or {})
+        self._collapse = dict(collapse or {})
+        # id -> source string, for round-trip decode of specials + ordinary.
+        self._id_to_str = {i: s for s, i in self._specials.items()}
+        self._id_to_str.update({i: s for s, i in self._ordinary.items()})
+        # added_tokens_decoder: only the registered specials.
+        self.added_tokens_decoder = {i: object() for i in self._specials.values()}
 
     def encode(self, text, add_special_tokens=False):
-        return [0] if text in self._single else [0, 1]
+        if text in self._specials:
+            return [self._specials[text]]
+        if text in self._ordinary:
+            return [self._ordinary[text]]
+        if text in self._collapse:
+            return [self._collapse[text]]
+        return [0, 1]  # ordinary multi-token text
+
+    def decode(self, ids):
+        return "".join(self._id_to_str.get(i, "<unk>") for i in ids)
 
 
-class _MultiTokenTokenizer(_FakeSingleTokenizer):
-    """Tokenizer stub where NO sentinel is a single token (a Llama-Hermes-like
-    tokenizer). Every ``encode`` returns two ids -> the guard fails -> the
-    parser opts out of grammar constraint (``structure_info() -> None``)."""
+def _single_token_tokenizer():
+    """Qwen3-like: both sentinels are distinct single registered specials."""
+    return _FakeTokenizer(specials={"<tool_call>": 100, "</tool_call>": 101})
 
-    def __init__(self):
-        super().__init__(single=())
+
+def _multitoken_tokenizer():
+    """Llama-Hermes-like: neither sentinel is a single token -> opt out."""
+    return _FakeTokenizer(specials={})
+
+
+def _ordinary_vocab_tokenizer():
+    """Both sentinels are single tokens that round-trip but are NOT registered
+    special tokens -> opt out (special-ref semantics would not match)."""
+    return _FakeTokenizer(ordinary={"<tool_call>": 100, "</tool_call>": 101})
+
+
+def _unk_collapse_tokenizer():
+    """Both sentinels collapse to the SAME single [UNK] id that does not
+    round-trip -> opt out (distinct-id + round-trip both fail)."""
+    return _FakeTokenizer(collapse={"<tool_call>": 3, "</tool_call>": 3})
 
 
 def _make_parser(family: str, tokenizer=None):
@@ -133,7 +169,7 @@ def _make_parser(family: str, tokenizer=None):
 def _make_optin_parser(family: str):
     """A real parser whose tokenizer satisfies the single-special-token guard,
     so ``structure_info()`` opts in — used by the hermetic triple/Lark tests."""
-    return _make_parser(family, tokenizer=_FakeSingleTokenizer())
+    return _make_parser(family, tokenizer=_single_token_tokenizer())
 
 
 # --------------------------------------------------------------------------
@@ -141,7 +177,8 @@ def _make_optin_parser(family: str):
 # load-bearing correctness contract: the hermes wire's <tool_call> sentinels
 # are single special tokens ONLY on some tokenizers (Qwen3), NOT universally
 # (Llama-based Hermes). A parser must opt out where the tokenizer can't prove
-# single-token sentinels, else it would build an unenforceable grammar.
+# DISTINCT single REGISTERED special sentinels, else it would build an
+# unenforceable grammar.
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("family", ["hermes", "qwen"])
 def test_structure_info_opts_out_without_tokenizer(family):
@@ -157,14 +194,33 @@ def test_structure_info_opts_out_on_multitoken_tokenizer(family):
     # Hermes) -> opt out. Declaring a special-token sentinel there would build a
     # grammar the model's tokenizer can never satisfy — the exact bug this guard
     # prevents.
-    parser = _make_parser(family, tokenizer=_MultiTokenTokenizer())
+    parser = _make_parser(family, tokenizer=_multitoken_tokenizer())
+    assert parser.structure_info() is None
+
+
+@pytest.mark.parametrize("family", ["hermes", "qwen"])
+def test_structure_info_opts_out_on_ordinary_vocab_token(family):
+    # Both sentinels are single tokens that round-trip but are NOT registered
+    # special tokens -> opt out. A single ORDINARY vocab token cannot back a
+    # special-token Lark ref, so len==1 alone must not opt in (codex round-2).
+    parser = _make_parser(family, tokenizer=_ordinary_vocab_tokenizer())
+    assert parser.structure_info() is None
+
+
+@pytest.mark.parametrize("family", ["hermes", "qwen"])
+def test_structure_info_opts_out_on_unk_collapse(family):
+    # Both sentinels collapse to the SAME single [UNK] id that does not
+    # round-trip -> opt out. len==1 for each would otherwise falsely opt into an
+    # unenforceable grammar where open/close are indistinguishable (codex r2).
+    parser = _make_parser(family, tokenizer=_unk_collapse_tokenizer())
     assert parser.structure_info() is None
 
 
 @pytest.mark.parametrize("family", ["hermes", "qwen"])
 def test_structure_info_opts_in_on_single_token_tokenizer(family):
-    # A tokenizer where both sentinels ARE single tokens (Qwen3-like) -> opt in.
-    parser = _make_parser(family, tokenizer=_FakeSingleTokenizer())
+    # A tokenizer where both sentinels ARE distinct single registered specials
+    # (Qwen3-like) -> opt in.
+    parser = _make_parser(family, tokenizer=_single_token_tokenizer())
     assert parser.structure_info() is not None
 
 

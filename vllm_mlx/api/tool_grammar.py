@@ -74,12 +74,40 @@ class StructureInfo:
     sentinels: tuple[str, ...] = field(default=())
 
 
+def _is_registered_special(tokenizer: Any, tok_id: int) -> bool:
+    """True iff ``tok_id`` is a REGISTERED special/added token on ``tokenizer``.
+
+    ``len(encode(s)) == 1`` is necessary but NOT sufficient to render ``s`` as a
+    Lark special-token ref: an ordinary single vocabulary token is not a special
+    token, and an unknown string may collapse to a single ``[UNK]`` id. The
+    grammar builder emits ``<s>`` as a special-token reference, whose semantics
+    only match a token the tokenizer treats as special. So we additionally
+    require the id to appear in the tokenizer's added/special-token registry.
+
+    Probes the HF fast-tokenizer surfaces in order, degrading to ``False``
+    (conservative: caller opts out) if none are available or any raises — a
+    tokenizer that cannot prove special registration must not opt in.
+    """
+    # transformers fast tokenizers expose ``added_tokens_decoder``: {id: AddedToken}.
+    decoder = getattr(tokenizer, "added_tokens_decoder", None)
+    if isinstance(decoder, dict):
+        return tok_id in decoder
+    # Fallback: all_special_ids (covers slow tokenizers / older transformers).
+    try:
+        special_ids = getattr(tokenizer, "all_special_ids", None)
+        if special_ids is not None:
+            return tok_id in set(special_ids)
+    except Exception:
+        pass
+    return False
+
+
 def are_single_special_tokens(tokenizer: Any, candidates: tuple[str, ...]) -> bool:
-    """True iff EVERY candidate encodes to exactly one token on ``tokenizer``.
+    """True iff EVERY candidate is a DISTINCT single registered special token.
 
     A per-family ``structure_info()`` declares its ``<...>`` sentinels as
     special-token refs (see ``StructureInfo.sentinels``) ONLY when the model's
-    tokenizer actually encodes each one as a single token — this is the
+    tokenizer actually encodes each one as a single special token — this is the
     ground-truth-correction-#1 assumption (``<tool_call>``/``</tool_call>`` are
     single special tokens in Qwen3/Hermes tokenizers). It is NOT universal: the
     same ``hermes`` wire on a Llama-based Hermes tokenizer encodes
@@ -90,15 +118,31 @@ def are_single_special_tokens(tokenizer: Any, candidates: tuple[str, ...]) -> bo
     fall back to today's free-form-then-parse behavior rather than emit a
     grammar its tokenizer can never satisfy.
 
+    ``len(encode(s)) == 1`` alone is NOT enough (codex review): it also accepts
+    a string that collapses to a single ``[UNK]`` id or resolves to an ordinary
+    (non-special) vocabulary token, either of which yields an unenforceable
+    special-token grammar. So each candidate must ALSO:
+
+      * round-trip: ``decode([id]) == s`` (rejects ``[UNK]`` collapse / lossy
+        normalization — an unknown sentinel decoding to ``"<unk>"`` fails here);
+      * be a REGISTERED special/added token (rejects an ordinary single vocab
+        token whose special-ref semantics would not match);
+      * resolve to an id DISTINCT from every other candidate (rejects two
+        sentinels collapsing to the same id — e.g. both to ``[UNK]`` — which
+        would make the open/close tags grammar-indistinguishable).
+
     Returns ``False`` (conservative: caller opts out) when the tokenizer is
-    absent or lacks ``encode`` / raises — grammar constraint is a best-effort
-    opt-in, never a hard requirement, so an unknown tokenizer degrades safely.
+    absent or lacks ``encode``/``decode`` / raises — grammar constraint is a
+    best-effort opt-in, never a hard requirement, so an unknown or partially
+    featured tokenizer degrades safely to free-form.
     """
     if tokenizer is None:
         return False
     encode = getattr(tokenizer, "encode", None)
-    if encode is None:
+    decode = getattr(tokenizer, "decode", None)
+    if encode is None or decode is None:
         return False
+    seen_ids: set[int] = set()
     for tok_str in candidates:
         try:
             ids = encode(tok_str, add_special_tokens=False)
@@ -107,6 +151,20 @@ def are_single_special_tokens(tokenizer: Any, candidates: tuple[str, ...]) -> bo
             # status -> conservatively report False so the family opts out.
             return False
         if len(ids) != 1:
+            return False
+        tok_id = ids[0]
+        if tok_id in seen_ids:
+            return False  # two sentinels collapsed to the same id (e.g. [UNK])
+        seen_ids.add(tok_id)
+        # Round-trip: the single id must decode back to the exact candidate.
+        # Rejects [UNK] collapse and any lossy normalization.
+        try:
+            if decode([tok_id]) != tok_str:
+                return False
+        except Exception:
+            return False
+        # Must be a registered special/added token, not an ordinary vocab token.
+        if not _is_registered_special(tokenizer, tok_id):
             return False
     return True
 
