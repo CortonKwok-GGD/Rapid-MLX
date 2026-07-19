@@ -538,24 +538,36 @@ def test_offline_skip_classifies_http_status():
 
 
 def test_route_offload_gated_on_eligibility_in_source():
-    # The route must run the cheap gate SYNCHRONOUSLY before the off-loop
-    # compile, so no-tools / auto traffic never enters the thread pool
-    # (codex #558-PR3). Source-position tripwire — the BEHAVIORAL guarantee is
-    # proven by ``test_ineligible_request_never_enters_heavy_build_path``.
-    # PR-3b offloads by submitting to the dedicated bounded pool and awaiting
-    # the future via ``asyncio.wrap_future``.
+    # The off-loop build helper must run the cheap gate + admission SYNCHRONOUSLY
+    # before submitting, so no-tools / auto traffic and at-capacity floods never
+    # enter the thread pool (codex #558-PR3). Source-position tripwire — the
+    # BEHAVIORAL guarantees are proven by
+    # ``test_ineligible_request_never_enters_heavy_build_path``,
+    # ``test_offload_at_capacity_never_submits`` and
+    # ``test_admission_slot_not_released_until_compile_finishes_on_cancel``.
+    # The route delegates the whole thing to ``_offload_tool_grammar_build``.
     import inspect
 
     from vllm_mlx.routes import chat as chat_mod
 
-    src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    gate = src.find("_tool_grammar_eligible(cfg, request)")
-    offload = src.find("_get_tool_grammar_build_executor().submit(")
-    assert gate != -1, "route must gate the offload on _tool_grammar_eligible"
-    assert offload != -1, (
-        "route must offload the build by submitting to the dedicated bounded pool"
+    # The route calls the extracted helper (which owns the gate + admission).
+    route_src = inspect.getsource(chat_mod._create_chat_completion_impl)
+    assert "_offload_tool_grammar_build(engine, cfg, request)" in route_src, (
+        "the route must delegate the off-loop build to _offload_tool_grammar_build"
     )
-    assert gate < offload, "the eligibility gate must precede the off-loop compile"
+
+    src = inspect.getsource(chat_mod._offload_tool_grammar_build)
+    gate = src.find("_tool_grammar_eligible(cfg, request)")
+    admit = src.find("_try_admit_tool_grammar_build()")
+    offload = src.find("_get_tool_grammar_build_executor().submit(")
+    assert gate != -1, "helper must gate the offload on _tool_grammar_eligible"
+    assert admit != -1, "helper must reserve admission via _try_admit before submit"
+    assert offload != -1, (
+        "helper must offload the build by submitting to the dedicated bounded pool"
+    )
+    assert gate < admit < offload, (
+        "eligibility gate then admission must precede the off-loop submit"
+    )
 
 
 def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
@@ -563,21 +575,22 @@ def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
     # DEDICATED bounded pool (slot held until the compile finishes, survives
     # cancel, loop-agnostic) — NOT the default executor (unbounded queue) and
     # NOT an asyncio semaphore (permit leaks on cancel, binds to one loop).
-    # Assert the structural guarantee in the route source + module surface.
+    # Assert the structural guarantee in the offload-helper source + module
+    # surface.
     import inspect
 
     from vllm_mlx.routes import chat as chat_mod
 
-    src = inspect.getsource(chat_mod._create_chat_completion_impl)
+    src = inspect.getsource(chat_mod._offload_tool_grammar_build)
     assert "_get_tool_grammar_build_executor()" in src, (
-        "the route must dispatch the compile onto the dedicated bounded pool"
+        "the helper must dispatch the compile onto the dedicated bounded pool"
     )
     assert "asyncio.to_thread" not in src, (
-        "the route must NOT use asyncio.to_thread (unbounded default-executor "
+        "the helper must NOT use asyncio.to_thread (unbounded default-executor "
         "queue — codex #558-PR3)"
     )
     assert "_get_tool_grammar_build_semaphore" not in src, (
-        "the route must NOT gate the offload on an event-loop-bound semaphore "
+        "the helper must NOT gate the offload on an event-loop-bound semaphore "
         "(codex #558-PR3: permit leaks on cancel, binds to one loop)"
     )
     assert not hasattr(chat_mod, "_get_tool_grammar_build_semaphore"), (
@@ -590,17 +603,87 @@ def test_route_offload_uses_dedicated_bounded_pool_not_semaphore_in_source():
     assert (
         "add_done_callback(lambda" in src and "_release_tool_grammar_build()" in src
     ), (
-        "the route must release the admission slot via the future's "
+        "the helper must release the admission slot via the future's "
         "add_done_callback (fires only when the compile actually finishes), not "
         "a try/finally around the await"
     )
     assert "asyncio.wrap_future(" in src, (
-        "the route must await the submitted future via asyncio.wrap_future so a "
+        "the helper must await the submitted future via asyncio.wrap_future so a "
         "cancelled await does not pre-release the admission slot"
     )
     # The dedicated pool exists and is bounded.
     ex = chat_mod._get_tool_grammar_build_executor()
     assert ex._max_workers == chat_mod._TOOL_GRAMMAR_MAX_BUILD_CONCURRENCY
+
+
+def test_offload_at_capacity_never_submits():
+    # codex #558-PR3 blocking (round-2, BEHAVIORAL): the off-loop build MUST gate
+    # ``submit`` on ``_try_admit_tool_grammar_build`` — at capacity, no compile is
+    # submitted to the executor (so the unbounded submission queue can never
+    # fill), and the request falls back to free-form (None). Drive the REAL
+    # ``_offload_tool_grammar_build`` with a mock executor and assert submit is
+    # not called at capacity but IS called under capacity.
+    import asyncio
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    class _MockFuture:
+        def add_done_callback(self, _cb):
+            # Invoke immediately so the admission slot is released like a real
+            # instantly-finishing compile (keeps the counter balanced).
+            _cb(self)
+
+        def result(self):
+            return None
+
+    class _MockExecutor:
+        def __init__(self):
+            self.submit_calls = 0
+
+        def submit(self, *a, **k):
+            self.submit_calls += 1
+            return _MockFuture()
+
+    mock_ex = _MockExecutor()
+    saved_ex_getter = chat_mod._get_tool_grammar_build_executor
+    saved_inflight = chat_mod._tool_grammar_inflight
+    # Patch the executor getter + the build fn (so the mock future's None result
+    # path is exercised without a real compile) and asyncio.wrap_future.
+    chat_mod._get_tool_grammar_build_executor = lambda: mock_ex
+    saved_wrap = asyncio.wrap_future
+
+    async def _fake_wrap(fut):
+        return fut.result()
+
+    cfg = _CfgStub("hermes")
+    engine = _EngineStub(tokenizer=object())
+    request = _RequestStub([_FunctionTool("get_time")], "required")
+    try:
+        asyncio.wrap_future = _fake_wrap  # type: ignore[assignment]
+
+        # AT CAPACITY: pre-fill in-flight to the cap so _try_admit refuses.
+        chat_mod._tool_grammar_inflight = chat_mod._TOOL_GRAMMAR_MAX_INFLIGHT
+        result = asyncio.run(chat_mod._offload_tool_grammar_build(engine, cfg, request))
+        assert result is None, "at capacity the offload must fall back to free-form"
+        assert mock_ex.submit_calls == 0, (
+            "at capacity the route must NOT submit to the executor — its "
+            "submission queue would otherwise grow unbounded (codex #558-PR3)"
+        )
+
+        # UNDER CAPACITY: _try_admit succeeds -> submit IS called exactly once.
+        chat_mod._tool_grammar_inflight = 0
+        asyncio.run(chat_mod._offload_tool_grammar_build(engine, cfg, request))
+        assert mock_ex.submit_calls == 1, (
+            "under capacity the eligible request must be submitted exactly once"
+        )
+        # The done-callback fired synchronously, so the slot is released.
+        assert chat_mod._tool_grammar_inflight == 0, (
+            "admission slot must be released once the compile finishes"
+        )
+    finally:
+        chat_mod._get_tool_grammar_build_executor = saved_ex_getter
+        asyncio.wrap_future = saved_wrap  # type: ignore[assignment]
+        chat_mod._tool_grammar_inflight = saved_inflight
 
 
 def test_bounded_admission_rejects_at_capacity():
@@ -1491,7 +1574,7 @@ def test_forced_prefix_block_is_gated_on_grammar_absence():
     from vllm_mlx.routes import chat as chat_mod
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    glp_pos = src.find("_maybe_build_tool_grammar_processor")
+    glp_pos = src.find("_glp = await _offload_tool_grammar_build(")
     prefix_gate = src.find("if _glp is None and request.tools")
     assert glp_pos != -1, "grammar processor build call not found in route"
     assert prefix_gate != -1, (

@@ -410,6 +410,33 @@ class _BoundsExceededError(Exception):
     """Raised by the bounded walker when a size/depth cap is hit — early abort."""
 
 
+def _charge_json_scalar_bytes(value, budget: list[int]) -> None:
+    """Subtract a scalar's TRUE escaped JSON byte cost from ``budget``, O(1)-safe.
+
+    Charges the exact ``json.dumps`` escaped-UTF-8 byte length, but NEVER
+    serializes a value already known to exceed the remaining budget (codex
+    #558-PR3 blocking): serializing an attacker-sized string first would
+    allocate an amplified escaped copy and block the event loop before the
+    reject. For a ``str``, ``len(s)`` (code points) is a strict LOWER bound on
+    its escaped byte length, so if ``len(s)`` already exceeds the remaining
+    budget we reject via that O(1) precheck WITHOUT serializing. Only a string
+    already proven to fit is serialized to recover the exact (possibly larger,
+    due to escaping) cost. Non-string scalars (number/bool/None) have a tiny
+    bounded repr, so their ``json.dumps`` is cheap and unconditional.
+    """
+    if isinstance(value, str):
+        # O(1) reject: escaped bytes >= code-point length. A huge string is
+        # refused here without ever being serialized.
+        if len(value) > budget[0]:
+            raise _BoundsExceededError
+        budget[0] -= len(json.dumps(value).encode("utf-8"))
+    else:
+        # number / bool / None — bounded small repr, safe to serialize.
+        budget[0] -= len(json.dumps(value).encode("utf-8"))
+    if budget[0] < 0:
+        raise _BoundsExceededError
+
+
 def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
     """Estimate serialized size + nesting depth, aborting the INSTANT a cap trips.
 
@@ -420,16 +447,15 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
     pathologically large/deep attacker payload is rejected after touching only a
     bounded prefix of it (codex #558-PR3 blocking).
 
-    Keys/scalars are charged their TRUE serialized byte cost via
-    ``json.dumps`` (codex #558-PR3 blocking): ``len(str(...))`` under-counts —
-    a Unicode/JSON-escaped char (e.g. an emoji, or ``"`` -> ``\\"``) can occupy
-    several bytes/chars per source code point, which would let a schema larger
-    than the byte cap slip past. ``json.dumps`` (default ``ensure_ascii=True``,
-    ``str.encode`` for the byte length) yields the actual escaped
-    representation the Lark compiler ingests, so the estimate is a true UPPER
-    bound and the cap is never under-counted. Each ``dumps`` is on ONE scalar
-    key/value (never the whole tree), so the early-abort bounded-prefix
-    guarantee holds.
+    Keys/scalars are charged their TRUE escaped-UTF-8 byte cost, but via
+    :func:`_charge_json_scalar_bytes`, which O(1)-rejects an oversized string
+    BEFORE serializing it (codex #558-PR3 blocking) so an attacker-sized name /
+    description cannot allocate an amplified escaped copy and block the loop.
+    ``len(str(...))`` alone under-counts (a Unicode/JSON-escaped char occupies
+    more bytes than its one source code point), so a value proven small is then
+    serialized for the exact cost; a value already over budget is refused by the
+    length precheck. The walk never materializes the WHOLE serialized tree, so
+    the early-abort bounded-prefix guarantee holds.
     """
     if depth > _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH:
         raise _BoundsExceededError
@@ -438,11 +464,11 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
         if budget[0] < 0:
             raise _BoundsExceededError
         for k, v in obj.items():
-            # ``"key":`` plus a trailing separator, keyed on the TRUE escaped
-            # byte length of the (possibly non-string / Unicode) key.
-            budget[0] -= len(json.dumps(k).encode("utf-8")) + 2
+            budget[0] -= 2  # ``:`` + a separator (``,``) per member
             if budget[0] < 0:
                 raise _BoundsExceededError
+            # ``"key"`` — O(1)-safe charge of the (possibly Unicode) key.
+            _charge_json_scalar_bytes(k if isinstance(k, str) else str(k), budget)
             _walk_size_and_depth(v, budget, depth + 1)
     elif isinstance(obj, (list, tuple)):
         budget[0] -= 2  # []
@@ -454,11 +480,8 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
                 raise _BoundsExceededError
             _walk_size_and_depth(v, budget, depth + 1)
     else:
-        # Scalar: string / number / bool / None. Charge the TRUE escaped UTF-8
-        # byte length so Unicode / JSON-escaped content cannot under-count.
-        budget[0] -= len(json.dumps(obj).encode("utf-8"))
-        if budget[0] < 0:
-            raise _BoundsExceededError
+        # Scalar: string / number / bool / None. O(1)-safe true-byte charge.
+        _charge_json_scalar_bytes(obj, budget)
 
 
 def _tools_within_grammar_bounds(tools) -> bool:
@@ -678,6 +701,57 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         return processor
     except Exception:
         logger.exception("tool-grammar: failed to build processor; free-form fallback")
+        return None
+
+
+async def _offload_tool_grammar_build(engine, cfg, request):
+    """Off-loop, admission-gated build of a ``GrammarLogitsProcessor`` (or None).
+
+    Extracted from the chat route so the admission gate is directly testable
+    (codex #558-PR3 blocking): the eligibility gate + ``_try_admit`` MUST run
+    before any ``submit`` so a compile flood past the cap never queues unbounded
+    work. Returns ``None`` (free-form fallback) when the request is ineligible,
+    admission is refused (at capacity), submission fails, or the build errors /
+    is cancelled.
+
+    The cheap eligibility gate runs SYNCHRONOUSLY so the vast majority of traffic
+    (no tools, ``"auto"``/``"none"``) never enters the thread pool. Only an
+    eligible+admitted request pays the off-loop build — it compiles a
+    client-controlled grammar and, on the first request for a tokenizer, does the
+    ~1s ``LLTokenizer`` build; running that inline would block the event loop.
+
+    Admission is released via ``add_done_callback`` on the UNDERLYING
+    ``concurrent.futures.Future`` — NOT a ``try/finally`` around the await
+    (codex #558-PR3 blocking). A ``finally`` fires the instant the AWAIT is
+    cancelled (client disconnect) while the worker keeps compiling; a disconnect
+    flood would then release slots early and let more than the cap run at once.
+    The done-callback fires only when the compile ACTUALLY finishes (success,
+    error, or cancel), so admission stays accurate under cancellation.
+    """
+    # Eligibility (env / tools / parser / choice / schema bounds) THEN admission
+    # — both must pass before we submit. Refused admission (at capacity) skips
+    # the offload and falls back to free-form rather than queueing unbounded work.
+    if not _tool_grammar_eligible(cfg, request):
+        return None
+    if not _try_admit_tool_grammar_build():
+        return None
+    try:
+        fut = _get_tool_grammar_build_executor().submit(
+            _maybe_build_tool_grammar_processor, engine, cfg, request
+        )
+    except Exception:
+        # Submission itself failed (e.g. pool shut down): the compile never ran,
+        # so release the reserved slot synchronously and fall back.
+        _release_tool_grammar_build()
+        logger.exception("tool-grammar: compile submission failed; free-form")
+        return None
+    fut.add_done_callback(lambda _f: _release_tool_grammar_build())
+    try:
+        return await asyncio.wrap_future(fut)
+    except Exception:
+        # A build error leaves the slot to the done-callback above; fall back to
+        # free-form for this request. (``CancelledError`` is a ``BaseException``,
+        # so it is NOT swallowed here — it propagates to unwind the request.)
         return None
 
 
@@ -2455,56 +2529,13 @@ async def _create_chat_completion_impl(
     # argument-schema enforcement or producing a duplicate opener. So we skip
     # the forced prefix entirely whenever the grammar is active.
     #
-    # The cheap eligibility gate runs SYNCHRONOUSLY on the loop so the vast
-    # majority of traffic (no tools, ``"auto"``/``"none"`` choices) never enters
-    # the thread pool (codex #558-PR3). Only an eligible request pays the
-    # off-loop build — it compiles a client-controlled grammar and, on the FIRST
-    # request for a tokenizer, does the documented ~1s ``LLTokenizer`` build;
-    # running that inline would block the event loop for every other in-flight
-    # request. The Lark->llguidance grammar compile is already ``lru_cache``d
-    # (``_compile_lark_cached``) and the tokenizer is memoized
-    # (``get_lltokenizer``), so steady-state cost is small — but the cold path
-    # and per-request ``LLMatcher`` construction still belong off-loop.
-    _glp = None
-    if _tool_grammar_eligible(cfg, request) and _try_admit_tool_grammar_build():
-        # Run on the DEDICATED compile pool with BOUNDED ADMISSION (not the
-        # default executor, whose work queue is unbounded — codex #558-PR3
-        # blocking). Over-capacity requests skip the offload (``_try_admit``
-        # returned False) and fall back to free-form rather than queueing
-        # unbounded work. The eligibility gate already bounded each build's cost
-        # (tool count / size / nesting).
-        #
-        # The slot is released via ``add_done_callback`` on the UNDERLYING
-        # ``concurrent.futures.Future`` — NOT a ``try/finally`` around the await
-        # (codex #558-PR3 blocking). A ``finally`` fires the instant the AWAIT is
-        # cancelled (client disconnect), but the worker thread keeps compiling;
-        # a disconnect flood would then release slots early and let more than the
-        # cap run concurrently. The done-callback fires only when the compile
-        # ACTUALLY finishes (success, error, or cancel), so admission stays
-        # accurate under cancellation.
-        released = False
-        try:
-            fut = _get_tool_grammar_build_executor().submit(
-                _maybe_build_tool_grammar_processor, engine, cfg, request
-            )
-        except Exception:
-            # Submission itself failed (e.g. pool shut down): the compile never
-            # ran, so release the reserved slot synchronously and fall back.
-            _release_tool_grammar_build()
-            released = True
-            logger.exception("tool-grammar: compile submission failed; free-form")
-            fut = None
-        if fut is not None:
-            fut.add_done_callback(lambda _f: _release_tool_grammar_build())
-            try:
-                _glp = await asyncio.wrap_future(fut)
-            except Exception:
-                # A cancelled await (client disconnect) or a build error leaves
-                # the slot to the done-callback above; just fall back to
-                # free-form for this request.
-                _glp = None
-        elif not released:  # pragma: no cover - defensive
-            _release_tool_grammar_build()
+    # Grammar-constrained tool calling (#558 PR-3): admission-gated, off-loop
+    # build. All the DoS-hardening (eligibility + schema-size/depth/count caps +
+    # bounded compile pool with in-flight admission + cancel-safe slot release)
+    # lives in ``_offload_tool_grammar_build`` so the admission gate is directly
+    # testable (codex #558-PR3). Returns ``None`` (free-form fallback) whenever
+    # the request is ineligible, admission is at capacity, or the build fails.
+    _glp = await _offload_tool_grammar_build(engine, cfg, request)
     if _glp is not None:
         chat_kwargs["grammar_logits_processor"] = _glp
 
