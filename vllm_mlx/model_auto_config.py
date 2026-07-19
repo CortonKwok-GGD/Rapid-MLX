@@ -736,27 +736,34 @@ _MAX_TEMPLATE_OUTPUT_PATHS = 256
 # is defensive against trusted load-time input only.
 _MAX_TEMPLATE_OUTPUT_BYTES = 8 * 1024 * 1024
 
-# Bound on macro-call resolution (FIX #3).  Reachable ``{{ macro() }}`` calls to
-# locally-defined macros are expanded so tool XML defined in a macro body and
-# CALLED on a render path is still detected — but recursion is capped to avoid
-# blowups from deep or (mutually) recursive macro chains.
+# Bound on macro-call AND set-capture resolution (FIX #3 + set-capture
+# fast-follow).  Reachable ``{{ macro() }}`` calls to locally-defined macros —
+# and reachable ``{{ name }}`` outputs of a bounded-literal
+# ``{% set name %}...{% endset %}`` capture — are expanded so tool XML defined in
+# a macro body or captured in a block-set and EMITTED on a render path is still
+# detected.  Recursion reuses this SINGLE depth cap (no divergent limits) to
+# avoid blowups from deep or (mutually) recursive macro / capture chains.
 _MAX_MACRO_RESOLUTION_DEPTH = 8
 
 
 class _MacroCtx:
-    """Resolution context threaded through path analysis (FIX #3).
+    """Resolution context threaded through path analysis (FIX #3 + set-capture).
 
     ``macros`` maps a locally-defined macro name to its body node list.
-    ``active`` is the set of macro names currently being expanded on this call
-    stack (cycle guard).  ``depth`` bounds total expansion nesting.  A default
-    (empty-``macros``) context makes macro resolution a no-op, so callers that
-    do not pre-collect macros keep the pre-FIX-#3 behaviour.
+    ``captures`` maps a bounded-literal block-set capture name
+    (``{% set name %}...{% endset %}``) to its body node list.  ``active`` is the
+    set of macro / capture names currently being expanded on this call stack
+    (shared cycle guard).  ``depth`` bounds total expansion nesting (shared
+    budget across both resolution kinds).  A default (empty) context makes both
+    macro and set-capture resolution a no-op, so callers that do not pre-collect
+    keep the pre-resolution behaviour.
     """
 
-    __slots__ = ("macros", "active", "depth")
+    __slots__ = ("macros", "captures", "active", "depth")
 
-    def __init__(self, macros=None, active=None, depth=0):
+    def __init__(self, macros=None, captures=None, active=None, depth=0):
         self.macros = macros or {}
+        self.captures = captures or {}
         self.active = active or frozenset()
         self.depth = depth
 
@@ -778,6 +785,76 @@ def _collect_macro_bodies(node) -> dict:
         # Last definition wins, mirroring jinja2's runtime rebinding semantics.
         macros[macro.name] = macro.body
     return macros
+
+
+def _is_bounded_literal_body(body) -> bool:
+    """Return whether a set-capture body is BOUNDED literal content.
+
+    Mirrors the discipline of the called-macro resolution: only a capture whose
+    rendered output is statically enumerable from literals is resolved.  A body
+    is bounded-literal when every node is either a ``TemplateData`` literal, an
+    ``Output`` of such literals / nested capture ``Name`` loads, or a transparent
+    wrapper block whose own body is (recursively) bounded-literal.
+
+    Any ``{% for %}`` / ``{% if %}`` (runtime-data branching), a printed
+    expression other than a bare ``Name`` load (``{{ x.attr }}`` / ``{{ f() }}``
+    / filters), or a nested ``Macro`` / ``AssignBlock`` definition makes the body
+    UNBOUNDED — it is NOT resolved, so the capture keeps the fail-safe text
+    routing (never crash, never fabricate a contract from runtime-dependent
+    output).
+    """
+    from jinja2 import nodes
+
+    for child in body:
+        if isinstance(child, nodes.TemplateData):
+            continue
+        if isinstance(child, nodes.Output):
+            for out in child.nodes:
+                # A bare ``Name`` load (``{{ inner }}``) may reference another
+                # bounded capture — resolved later under the depth/cycle guard.
+                if isinstance(out, (nodes.TemplateData, nodes.Name)):
+                    continue
+                return False
+            continue
+        # Transparent wrapper blocks (``{% filter %}`` / ``{% with %}`` /
+        # ``{% block %}`` / ``{% generation %}`` → ``CallBlock`` …) render their
+        # body through; accept only if that body is itself bounded-literal.
+        inner = getattr(child, "body", None)
+        if isinstance(inner, list) and not isinstance(
+            child, (nodes.For, nodes.If, nodes.Macro, nodes.AssignBlock)
+        ):
+            if not _is_bounded_literal_body(inner):
+                return False
+            continue
+        return False
+    return True
+
+
+def _collect_set_captures(node) -> dict:
+    """Map every bounded-literal ``{% set name %}...{% endset %}`` to its body.
+
+    Walks the WHOLE parsed AST via ``find_all`` (block-set captures may be
+    defined anywhere) and records only captures whose body is BOUNDED literal
+    content (``_is_bounded_literal_body``).  A runtime-dependent capture (loop /
+    conditional / dynamic expression over ``tools`` etc.) is intentionally
+    OMITTED, so a ``{{ name }}`` output of it resolves to nothing and the
+    template keeps the fail-safe text routing.  Last definition wins, mirroring
+    jinja2's runtime rebinding semantics.
+    """
+    from jinja2 import nodes
+
+    captures: dict = {}
+    for assign in node.find_all(nodes.AssignBlock):
+        target = assign.target
+        if not isinstance(target, nodes.Name):
+            continue
+        # A ``{% set x %}...{% endset | filter %}`` applies a runtime filter to
+        # the captured text; its output is not statically knowable, so skip it.
+        if getattr(assign, "filter", None) is not None:
+            continue
+        if _is_bounded_literal_body(assign.body):
+            captures[target.name] = assign.body
+    return captures
 
 
 def _resolve_macro_call(node, ctx: "_MacroCtx"):
@@ -806,6 +883,40 @@ def _resolve_macro_call(node, ctx: "_MacroCtx"):
         return [""]
     child_ctx = _MacroCtx(
         macros=ctx.macros,
+        captures=ctx.captures,
+        active=ctx.active | {name},
+        depth=ctx.depth + 1,
+    )
+    return _sequence_output_paths(body, child_ctx)
+
+
+def _resolve_set_capture(node, ctx: "_MacroCtx"):
+    """If ``node`` is a bare ``{{ name }}`` output of a bounded-literal block-set
+    capture, return that capture body's output paths (bounded); else ``None``.
+
+    Recognises the reachable-output shape ``{{ wire }}`` → jinja2 ``Name``
+    (``ctx='load'``) bound to a capture collected by ``_collect_set_captures``.
+    Mirrors ``_resolve_macro_call`` exactly — same shared cycle guard
+    (``ctx.active``), same shared depth cap (``_MAX_MACRO_RESOLUTION_DEPTH``),
+    and the resolved body flows back through ``_sequence_output_paths`` so the
+    same cumulative-byte budget applies.  A stored/attribute/dynamic name is not
+    a bounded local capture and is not resolved.
+    """
+    from jinja2 import nodes
+
+    if not isinstance(node, nodes.Name) or node.ctx != "load":
+        return None
+    name = node.name
+    body = ctx.captures.get(name)
+    if body is None:
+        return None
+    # Cycle / depth guard: a capture that (transitively) references itself, or a
+    # chain deeper than the cap, contributes an empty path rather than looping.
+    if name in ctx.active or ctx.depth >= _MAX_MACRO_RESOLUTION_DEPTH:
+        return [""]
+    child_ctx = _MacroCtx(
+        macros=ctx.macros,
+        captures=ctx.captures,
         active=ctx.active | {name},
         depth=ctx.depth + 1,
     )
@@ -821,16 +932,26 @@ def _node_output_paths(node, ctx: "_MacroCtx" = _EMPTY_MACRO_CTX) -> list[str]:
     opening fragment from one branch is never concatenated with the closing
     fragment of a sibling branch.
 
-    ``ctx`` carries the macro-resolution state (FIX #3); the default empty
-    context makes macro-call resolution a no-op.
+    ``ctx`` carries the macro-resolution AND set-capture state (FIX #3 +
+    set-capture fast-follow); the default empty context makes both a no-op.
     """
     from jinja2 import nodes
 
     if isinstance(node, nodes.TemplateData):
         return [node.data]
+    # A reachable ``{{ name }}`` output of a bounded-literal block-set capture
+    # renders that capture's body INTO the output stream at this site.  Resolve
+    # it BEFORE the ``Output`` recursion so tool XML captured in
+    # ``{% set wire %}...{% endset %}`` and emitted via ``{{ wire }}`` is still
+    # detected.  (A bare ``Name`` load is the only node this matches; ordinary
+    # ``Output`` literals fall through to the recursion below.)
+    resolved = _resolve_set_capture(node, ctx)
+    if resolved is not None:
+        return resolved
     if isinstance(node, nodes.Output):
         # ``Output.nodes`` interleaves literal ``TemplateData`` with printed
-        # expressions ``{{ ... }}``; only the literals are known statically.
+        # expressions ``{{ ... }}``; only the literals — and bounded set-capture
+        # ``Name`` loads (resolved per-node above) — are known statically.
         return _sequence_output_paths(node.nodes, ctx)
     # A reachable ``{{ macro() }}`` call to a locally-defined macro renders that
     # macro's body INTO the output stream at this site (FIX #3).  Resolve it to
@@ -862,17 +983,19 @@ def _node_output_paths(node, ctx: "_MacroCtx" = _EMPTY_MACRO_CTX) -> list[str]:
         # A ``{% macro %}...{% endmacro %}`` definition and a capture-only
         # ``{% set x %}...{% endset %}`` (jinja2 ``AssignBlock``) BOTH carry a
         # ``body`` list, but NEITHER renders that body into the output stream at
-        # this site — a ``Macro`` emits nothing until it is *called*, and an
-        # ``AssignBlock`` captures its body into a variable rather than printing
-        # it (verified: ``env.from_string("{% macro m() %}X{% endmacro %}")
-        # .render() == ""`` and the same for ``{% set x %}X{% endset %}``).
+        # this DEFINITION site — a ``Macro`` emits nothing until it is *called*,
+        # and an ``AssignBlock`` captures its body into a variable rather than
+        # printing it (verified: ``env.from_string("{% macro m() %}X{% endmacro
+        # %}").render() == ""`` and the same for ``{% set x %}X{% endset %}``).
         # Recursing into their body (as the generic ``body`` fallthrough below
         # would) falsely enables the Hermes tool parser whenever helper macros /
         # captures contain tool XML — a common real-template shape.  So these
-        # emit an EMPTY output path at their definition site (codex #3).  A
-        # macro's body IS accounted for when the macro is CALLED on a render
-        # path (``_resolve_macro_call`` above, FIX #3); the exclusion here only
-        # suppresses the UNCALLED definition site.
+        # emit an EMPTY output path at their definition site (codex #3).  Each
+        # body IS accounted for at the EMIT site: a macro's body when the macro
+        # is CALLED (``_resolve_macro_call``, FIX #3), and a bounded-literal
+        # capture's body when its name is OUTPUT ``{{ x }}``
+        # (``_resolve_set_capture``); the exclusion here only suppresses the
+        # UNEMITTED definition site.
         return [""]
     # Transparent wrapper blocks that DO render their body into the output
     # stream at this site: ``{% generation %}`` → ``CallBlock`` (our extension's
@@ -909,10 +1032,13 @@ def _sequence_output_paths(node_list, ctx: "_MacroCtx" = _EMPTY_MACRO_CTX) -> li
     top-level conditionals, and either carrying predicates or conservatively
     rejecting cross-conditional contracts would risk FALSE NEGATIVES on genuine
     templates that legitimately span sequential blocks.  The realistic
-    false-positive vector — tool XML in an uncalled ``{% macro %}`` or a
-    ``{% set x %}...{% endset %}`` capture — is already removed at the node
-    level in ``_node_output_paths`` (FIX A).  Predicate correlation is treated
-    as over-engineering for a template shape that does not occur in practice.
+    false-positive vector — tool XML in an UNCALLED ``{% macro %}`` or an
+    UNEMITTED ``{% set x %}...{% endset %}`` capture — is already removed at the
+    node level in ``_node_output_paths`` (FIX A); the complementary true-positive
+    (tool XML in a CALLED macro / an EMITTED bounded-literal capture) is restored
+    there via ``_resolve_macro_call`` / ``_resolve_set_capture``.  Predicate
+    correlation is treated as over-engineering for a template shape that does not
+    occur in practice.
     """
     paths = [""]
     for child in node_list:
@@ -959,9 +1085,14 @@ def _template_output_paths(
         from jinja2 import meta
 
         parsed = _chat_template_environment().parse(template)
-        # Pre-collect locally-defined macros so reachable ``{{ macro() }}`` calls
-        # can be resolved to their bodies during path analysis (FIX #3).
-        ctx = _MacroCtx(macros=_collect_macro_bodies(parsed))
+        # Pre-collect locally-defined macros AND bounded-literal block-set
+        # captures so reachable ``{{ macro() }}`` calls (FIX #3) and ``{{ name }}``
+        # capture outputs (set-capture fast-follow) resolve to their bodies
+        # during path analysis.
+        ctx = _MacroCtx(
+            macros=_collect_macro_bodies(parsed),
+            captures=_collect_set_captures(parsed),
+        )
         paths = _sequence_output_paths(parsed.body, ctx)
         variables = frozenset(meta.find_undeclared_variables(parsed))
     except Exception:

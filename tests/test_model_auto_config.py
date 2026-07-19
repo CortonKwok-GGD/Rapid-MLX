@@ -2437,11 +2437,14 @@ class TestCheckpointMetadataFallback:
         )
         assert detect_model_config("publisher/macro-only-tools") is None
 
-    def test_tool_xml_in_set_capture_block_is_not_detected(self, monkeypatch):
-        # FIX A (codex #3): a capture-only ``{% set x %}...{% endset %}`` block
-        # (jinja2 ``AssignBlock``) captures its body INTO a variable rather than
-        # rendering it into the output stream at that site.  Tool XML inside such
-        # a capture must NOT enable the Hermes parser.
+    def test_tool_xml_in_unemitted_set_capture_block_is_not_detected(self, monkeypatch):
+        # FIX A (codex #3) regression guard: a capture-only
+        # ``{% set x %}...{% endset %}`` block (jinja2 ``AssignBlock``) whose name
+        # is NEVER output captures its body into a variable rather than rendering
+        # it into the output stream.  Tool XML inside such an UNEMITTED capture
+        # must NOT enable the Hermes parser.  (The set-capture fast-follow only
+        # resolves a capture at its ``{{ x }}`` EMIT site — see the emitted-case
+        # tests below — so an unemitted capture stays fail-safe.)
         set_template = (
             "{% set captured %}"
             "<tool_call><function=example><parameter=value>"
@@ -2550,6 +2553,93 @@ class TestCheckpointMetadataFallback:
             + "{% endmacro %}{% if tools %}{{ x.emit() }}{% endif %}"
         )
         assert auto_config_mod._template_uses_parameterized_xml_tools(attr) is False
+
+    def test_tool_xml_in_emitted_set_capture_is_detected(self, monkeypatch):
+        # Set-capture fast-follow (a): a bounded-literal
+        # ``{% set wire %}<tool_call>...{% endset %}`` whose name is OUTPUT
+        # ``{{ wire }}`` on a reachable render path DOES render that XML — the
+        # captured literal must be substituted into the analyzed path so the
+        # nested XML tool contract is detected (routes to hermes, not text).
+        emitted = (
+            "{% set wire %}"
+            + self._RAW_XML
+            + "{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(emitted) is True
+        monkeypatch.setattr(
+            auto_config_mod,
+            "read_model_metadata",
+            lambda name: self._metadata({}, emitted),
+        )
+        config = detect_model_config("publisher/emitted-set-capture-tools")
+        assert config is not None
+        assert config.tool_call_parser == "hermes"
+
+    def test_tool_xml_in_runtime_dependent_set_capture_is_not_detected(self):
+        # Set-capture fast-follow (b): a capture whose body branches over RUNTIME
+        # data (``{% for t in tools %}``) is UNBOUNDED — its rendered text is not
+        # statically knowable, so it is NOT resolved and the template keeps the
+        # fail-safe text routing (no crash, no fabricated contract).
+        runtime = (
+            "{% set wire %}{% for t in tools %}"
+            + self._RAW_XML
+            + "{% endfor %}{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        # Parses cleanly (no crash) and is NOT advertised as native tools.
+        assert auto_config_mod._template_output_contract(runtime) is not None
+        assert auto_config_mod._template_uses_parameterized_xml_tools(runtime) is False
+
+    def test_nested_set_capture_within_depth_cap_is_detected(self):
+        # Set-capture fast-follow (c, within cap): a capture that outputs another
+        # bounded-literal capture (``{% set outer %}{{ inner }}{% endset %}``)
+        # resolves through the chain up to the shared recursion cap.
+        nested = (
+            "{% set inner %}"
+            + self._RAW_XML
+            + "{% endset %}{% set outer %}{{ inner }}{% endset %}"
+            "{% if tools %}{{ outer }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(nested) is True
+
+    def test_deep_set_capture_chain_beyond_cap_is_not_detected(self):
+        # Set-capture fast-follow (c, beyond cap): a capture chain deeper than
+        # ``_MAX_MACRO_RESOLUTION_DEPTH`` stops resolving at the cap (contributes
+        # an empty path), so the XML at the chain's root is NOT reached and the
+        # template fails SAFE to text routing rather than looping / crashing.
+        depth = auto_config_mod._MAX_MACRO_RESOLUTION_DEPTH
+        links = [("{% set c0 %}" + self._RAW_XML + "{% endset %}")]
+        for i in range(1, depth + 4):
+            links.append(
+                "{% set c" + str(i) + " %}{{ c" + str(i - 1) + " }}{% endset %}"
+            )
+        chain = (
+            "".join(links) + "{% if tools %}{{ c" + str(depth + 3) + " }}{% endif %}"
+        )
+        # Beyond the cap → not detected, but MUST terminate (no hang / recursion).
+        assert auto_config_mod._template_uses_parameterized_xml_tools(chain) is False
+
+    def test_recursive_set_capture_does_not_hang(self):
+        # A (self-)referential capture must terminate via the shared cycle guard,
+        # not loop.  ``{% set c %}...{{ c }}{% endset %}`` references itself; the
+        # first expansion still carries the root XML so it is detected AND
+        # terminates.
+        recursive = (
+            "{% set c %}"
+            + self._RAW_XML
+            + "{{ c }}{% endset %}{% if tools %}{{ c }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(recursive) is True
+
+    def test_filtered_set_capture_is_not_resolved(self):
+        # ``{% set x | upper %}...{% endset %}`` applies a runtime filter to the
+        # captured text; the output is not statically knowable, so it is NOT
+        # resolved (fail-safe text routing, no crash).
+        filtered = (
+            "{% set wire | upper %}"
+            + self._RAW_XML
+            + "{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert auto_config_mod._template_uses_parameterized_xml_tools(filtered) is False
 
     def test_path_enumeration_bounded_by_cumulative_byte_budget(self):
         # FIX #5: a template whose path COUNT stays under the cap but whose
