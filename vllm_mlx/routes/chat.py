@@ -281,6 +281,106 @@ def _forced_tool_call_prefix(parser_name: str | None, function_name: str) -> str
     return None
 
 
+def _normalize_tool_choice_for_grammar(tool_choice) -> str | None:
+    """Map an OpenAI ``tool_choice`` to the grammar builder's mode string.
+
+    Returns ``"required"`` / ``"named"`` / ``"auto"`` or ``None`` to skip
+    (``"none"`` — no constraint; the model does not see the tools).
+    """
+    if tool_choice is None or tool_choice == "auto":
+        return "auto"
+    if tool_choice == "required":
+        return "required"
+    if tool_choice == "none":
+        return None
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        # A named function is a single-tool forced call.
+        return "named"
+    return "auto"
+
+
+def _maybe_build_tool_grammar_processor(engine, cfg, request):
+    """Build a per-request ``GrammarLogitsProcessor`` for #558, or ``None``.
+
+    Non-breaking: returns ``None`` (free-form fallback) when constraint is
+    disabled by env, the parser opts out (no ``structure_info``), llguidance
+    is unavailable, or the tokenizer cannot back an ``LLTokenizer``.
+    """
+    import os
+
+    if os.environ.get("RAPID_MLX_CONSTRAIN_TOOLS", "1") in ("0", "off", "false"):
+        return None
+    if not getattr(request, "tools", None) or not getattr(cfg, "tool_call_parser", None):
+        return None
+
+    mode = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
+    if mode is None:
+        return None
+    if mode == "auto" and os.environ.get(
+        "RAPID_MLX_CONSTRAIN_AUTO", "1"
+    ) in ("0", "off", "false"):
+        return None
+
+    try:
+        from ..api.tool_grammar import (
+            GrammarLogitsProcessor,
+            build_lltokenizer,
+            build_tool_grammar,
+        )
+        from ..tool_parsers import ToolParserManager
+
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is None:
+            return None
+        parser_cls = ToolParserManager.get_tool_parser(cfg.tool_call_parser)
+        parser = parser_cls(tokenizer=tokenizer)
+
+        # Flatten OpenAI tools -> [{name, parameters}] for the grammar builder.
+        flat_tools = []
+        for t in request.tools:
+            fn = t.function if hasattr(t, "function") else t.get("function", t)
+            name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            params = (
+                fn.get("parameters")
+                if isinstance(fn, dict)
+                else getattr(fn, "parameters", None)
+            )
+            if not name:
+                return None
+            flat_tools.append({"name": name, "parameters": params or {"type": "object"}})
+
+        # For a named choice, constrain to only the target tool.
+        if mode == "named":
+            target = (request.tool_choice.get("function") or {}).get("name")
+            flat_tools = [t for t in flat_tools if t["name"] == target] or flat_tools
+
+        grammar = build_tool_grammar(flat_tools, mode, parser)
+        if grammar is None:
+            return None
+        lltok = build_lltokenizer(tokenizer)
+        if lltok is None:
+            return None
+
+        # Reasoning-aware delay (design §5). We rely on PATH A: the grammar's
+        # own lazy ``TAG_TEXT`` free prefix naturally swallows any
+        # ``<think>...</think>`` block before the trigger, so reasoning flows
+        # unconstrained WITHOUT a runtime gate. The runtime gate (path B) is a
+        # ground-truth-corrected FOOTGUN here: a model that emits NO reasoning
+        # (no ``</think>``) would keep the mask OFF forever and defeat the
+        # constraint entirely (observed on qwen3.5 tool_choice=required). So we
+        # pass ``reasoning_end_token=None`` — path A alone is correct for
+        # triggered structural tags (matches vLLM's same-step exception).
+        return GrammarLogitsProcessor(
+            lltok,
+            grammar,
+            reasoning_end_token=None,
+            tokenizer=tokenizer,
+        )
+    except Exception:
+        logger.exception("tool-grammar: failed to build processor; free-form fallback")
+        return None
+
+
 def _recover_partial_tool_args(
     raw_text: str | None, expected_name: str | None = None
 ) -> str | None:
@@ -2060,6 +2160,19 @@ async def _create_chat_completion_impl(
             )
     if _forced_prefix:
         chat_kwargs["forced_assistant_prefix"] = _forced_prefix
+
+    # Grammar-constrained tool calling (#558). When the request carries
+    # ``tools`` and a family parser that declares a ``structure_info``, build
+    # a per-request ``GrammarLogitsProcessor`` that STRUCTURALLY guarantees
+    # every emitted tool call names a real tool and satisfies its JSON schema
+    # in the family wire format. Opt-in for the pilot via env
+    # ``RAPID_MLX_CONSTRAIN_TOOLS`` (default on for required/named; auto
+    # additionally gated by ``RAPID_MLX_CONSTRAIN_AUTO``). Falls back to
+    # today's free-form-then-parse when the parser opts out (returns None) or
+    # llguidance is unavailable — non-breaking.
+    _glp = _maybe_build_tool_grammar_processor(engine, cfg, request)
+    if _glp is not None:
+        chat_kwargs["grammar_logits_processor"] = _glp
 
     # PFlash routing (#287): structured-output prompts are
     # prompt-integrity-sensitive — lossy compression would corrupt the

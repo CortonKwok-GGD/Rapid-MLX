@@ -4250,6 +4250,13 @@ class Scheduler:
                 processor = self._tool_logits_processor_factory()
                 if processor is not None:
                     request_processors.append(processor)
+            # Grammar-constrained tool calling (#558): a per-request
+            # ``GrammarLogitsProcessor`` set on the Request masks decoding to
+            # the tool-call grammar. Same per-token slot as the (unused today)
+            # MiniMax soft-bias factory above, so it composes with penalties.
+            _glp = getattr(request, "grammar_logits_processor", None)
+            if _glp is not None:
+                request_processors.append(_glp)
             # Penalty knobs (#355) — only add the processor when at least
             # one penalty is non-default. mlx-lm's make_logits_processors
             # returns an empty list when all knobs are at defaults, but

@@ -308,6 +308,31 @@ class HermesToolParser(ToolParser):
             return None
         return None
 
+
+    def structure_info(self):
+        """Grammar-constraint wire triple for the hermes ``<tool_call>`` JSON
+        body (#558). ``<tool_call>`` / ``</tool_call>`` are single special
+        tokens in Qwen3/Hermes tokenizers, so they are declared as
+        ``sentinels`` and rendered as Lark special-token refs by the grammar
+        builder. The arguments object is constrained by the tool's JSON
+        Schema via ``%json`` (injected by ``build_tool_lark``).
+
+        Wire: ``<tool_call>\n{"name": "NAME", "arguments": <schema>}\n</tool_call>``
+        """
+        from vllm_mlx.api.tool_grammar import StructureInfo
+
+        def _info(name: str):
+            begin = '<tool_call>\n{"name": "%s", "arguments": ' % name
+            end = "}\n</tool_call>"
+            return StructureInfo(
+                begin=begin,
+                end=end,
+                trigger="<tool_call>",
+                sentinels=("<tool_call>", "</tool_call>"),
+            )
+
+        return _info
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
