@@ -53,6 +53,31 @@ class QwenToolParser(ToolParser):
     # Pattern for bracket-style: [Calling tool: func_name({...})]
     BRACKET_PATTERN = re.compile(r"\[Calling tool:\s*(\w+)\((\{.*?\})\)\]", re.DOTALL)
 
+    def structure_info(self):
+        """Grammar-constraint wire triple for the qwen ``<tool_call>`` JSON
+        body (#558). Qwen shares the hermes ``<tool_call>…</tool_call>`` wire:
+        ``<tool_call>`` / ``</tool_call>`` are single special tokens in
+        Qwen3/Hermes tokenizers, so they are declared as ``sentinels`` and
+        rendered as Lark special-token refs by the grammar builder. The
+        arguments object is constrained by the tool's JSON Schema via ``%json``
+        (injected by ``build_tool_lark``).
+
+        Wire: ``<tool_call>\n{"name": "NAME", "arguments": <schema>}\n</tool_call>``
+        """
+        from vllm_mlx.api.tool_grammar import StructureInfo
+
+        def _info(name: str):
+            begin = f'<tool_call>\n{{"name": "{name}", "arguments": '
+            end = "}\n</tool_call>"
+            return StructureInfo(
+                begin=begin,
+                end=end,
+                trigger="<tool_call>",
+                sentinels=("<tool_call>", "</tool_call>"),
+            )
+
+        return _info
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
