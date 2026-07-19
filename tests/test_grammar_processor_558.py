@@ -500,6 +500,67 @@ def test_charge_scalar_rejects_giant_int_without_rendering(monkeypatch):
     assert _tools_within_grammar_bounds([ok]) is True
 
 
+def test_walker_charges_commas_between_not_before_first_member():
+    # codex #558-PR3 nit: the walker must charge a ``,`` only BETWEEN members
+    # (N members => N-1 commas), matching the compact ``json.dumps`` envelope, so
+    # a schema materially under 64 KiB is not spuriously rejected. Verify the
+    # estimate never UNDER-counts real compact bytes (safe) and does not
+    # OVER-count by more than the fixed key-quote overhead (tight).
+    import json
+
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
+        _BoundsExceededError,
+        _walk_size_and_depth,
+    )
+
+    # A representative multi-member object with nested list + dict.
+    obj = {
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "unit": {"type": "string", "enum": ["c", "f", "k"]},
+            },
+            "required": ["city"],
+        },
+    }
+    compact_bytes = len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+    # Charged cost = starting budget minus what remains after the walk.
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    _walk_size_and_depth(obj, budget, 0)
+    charged = _TOOL_GRAMMAR_MAX_SCHEMA_BYTES - budget[0]
+
+    # The estimate must be a safe UPPER bound (>= real compact bytes) — never
+    # under-count, or an oversized schema could slip the cap.
+    assert charged >= compact_bytes, (
+        f"walker under-counted: charged {charged} < compact {compact_bytes}"
+    )
+    # ...but must be TIGHT: the only slack is the per-key ``"`` quotes the
+    # compact form also has, so the overshoot is small and bounded, NOT the
+    # old per-member phantom comma (which grew with member count).
+    assert charged - compact_bytes <= 8, (
+        f"walker over-counts by {charged - compact_bytes} — a phantom "
+        "first-member comma inflates the estimate (codex #558-PR3)"
+    )
+
+    # Exact-boundary: a single scalar just at the cap is accepted; one byte over
+    # is rejected. Build a string whose ASCII escaped length is the budget.
+    from vllm_mlx.routes.chat import _charge_json_scalar_bytes
+
+    # ``json.dumps("a"*n)`` == n + 2 (surrounding quotes). Pick n so it exactly
+    # consumes the whole budget.
+    n = _TOOL_GRAMMAR_MAX_SCHEMA_BYTES - 2
+    at_cap = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    _charge_json_scalar_bytes("a" * n, at_cap)  # exactly fits
+    assert at_cap[0] == 0
+    over = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    with pytest.raises(_BoundsExceededError):
+        _charge_json_scalar_bytes("a" * (n + 1), over)  # one byte over
+
+
 def test_eligible_false_for_overdeep_schema():
     # codex #558-PR3 blocking (restored in PR-3b): a pathologically DEEP nested
     # schema is rejected.
@@ -1547,13 +1608,10 @@ def test_rejected_committed_token_drops_constraint_and_stops_masking():
     # request. This is deliberately fail-open, NOT fail-closed: masking from a
     # desynced matcher would be strictly worse, and this whole module is
     # best-effort (missing extra / bad grammar / unsupported tokenizer all
-    # degrade to free-form, never an error). Uses a fake matcher so no real
-    # llguidance internals are needed.
-    import importlib.util
-
-    if importlib.util.find_spec("llguidance") is None:
-        pytest.skip("llguidance ([guided] extra) not installed")
-
+    # degrade to free-form, never an error). Uses fakes for EVERY llguidance
+    # primitive the processor touches (LLMatcher + the three bitmask fns), so it
+    # runs UNCONDITIONALLY in base CI — no ``llguidance`` extra required (codex
+    # #558-PR3 nit).
     import mlx.core as mx
     import numpy as np
 

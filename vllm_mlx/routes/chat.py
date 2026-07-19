@@ -476,8 +476,12 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
         budget[0] -= 2  # {}
         if budget[0] < 0:
             raise _BoundsExceededError
-        for k, v in obj.items():
-            budget[0] -= 2  # ``:`` + a separator (``,``) per member
+        for i, (k, v) in enumerate(obj.items()):
+            # ``:`` for every member; a ``,`` separator only BETWEEN members
+            # (N members => N-1 commas), so the estimate matches the compact
+            # ``json.dumps`` envelope exactly (codex #558-PR3 nit — previously
+            # charged a comma for the first member too).
+            budget[0] -= 1 if i == 0 else 2
             if budget[0] < 0:
                 raise _BoundsExceededError
             # ``"key"`` — O(1)-safe charge of the (possibly Unicode) key.
@@ -487,10 +491,11 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
         budget[0] -= 2  # []
         if budget[0] < 0:
             raise _BoundsExceededError
-        for v in obj:
-            budget[0] -= 1  # ,
-            if budget[0] < 0:
-                raise _BoundsExceededError
+        for i, v in enumerate(obj):
+            if i > 0:
+                budget[0] -= 1  # ``,`` only BETWEEN elements
+                if budget[0] < 0:
+                    raise _BoundsExceededError
             _walk_size_and_depth(v, budget, depth + 1)
     else:
         # Scalar: string / number / bool / None. O(1)-safe true-byte charge.
@@ -521,10 +526,11 @@ def _tools_within_grammar_bounds(tools) -> bool:
         return False
     # One shared byte budget across ALL tools so the cap bounds the total
     # flattened input, not each tool independently. Charge the enclosing
-    # tools-list ``[]`` + one inter-tool separator per tool up front so the cap
-    # bounds the ACTUAL serialized envelope, not just the tool bodies (codex
-    # #558-PR3 nit — previously omitted, leaking up to len(tools)+1 bytes).
-    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES - (2 + len(tools))]
+    # tools-list ``[]`` (2 bytes) + the inter-tool ``,`` separators (N-1 for N
+    # tools) up front so the cap bounds the ACTUAL serialized envelope exactly,
+    # not just the tool bodies (codex #558-PR3 nit — charge N-1 commas, not N).
+    envelope = 2 + max(0, len(tools) - 1)
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES - envelope]
     if budget[0] < 0:
         return False
     try:
