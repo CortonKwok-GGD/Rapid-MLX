@@ -283,6 +283,33 @@ def resolve_reasoning_sentinels(
     return kept
 
 
+def _is_lark_special_token_ref(s: str) -> bool:
+    """True iff ``s`` is safe to emit as a BARE llguidance special-token ref.
+
+    llguidance Lark treats a bare ``<name>`` as a special-token reference, so a
+    reasoning sentinel is interpolated verbatim into the grammar source. Being a
+    single special token on the tokenizer does NOT guarantee the string is valid
+    Lark rule syntax when interpolated raw — e.g. a hypothetical ``[THINK]``
+    marker would be parsed as a Lark char-class, and an inner ``>``/whitespace
+    would break the reference (codex #558-PR4 nit). We therefore require the
+    ``<...>`` special-token-ref shape: a leading ``<``, a trailing ``>``, a
+    non-empty body, and no interior ``<``/``>`` or whitespace that would
+    desync the reference. Reasoning markers that fail this are DROPPED (the free
+    prefix silently loses that marker's tolerance) rather than emitting Lark
+    that fails to compile — a best-effort degrade consistent with the rest of
+    this module. In practice the shipped reasoning parsers only ever produce
+    ``<think>``/``</think>``, which pass.
+    """
+    if len(s) < 3 or s[0] != "<" or s[-1] != ">":
+        return False
+    body = s[1:-1]
+    if not body:
+        return False
+    # Reject anything that would break out of the ``<...>`` reference: interior
+    # angle brackets or any whitespace (Lark token refs are a single lexeme).
+    return not any(c in body for c in "<>") and not any(c.isspace() for c in body)
+
+
 def _lark_escape(s: str) -> str:
     """Render ``s`` as a Lark double-quoted string literal (JSON-escaped)."""
     if not s:
@@ -458,7 +485,17 @@ def build_tool_lark(
     # cannot match a special token, which is exactly why the design-doc claim
     # that ``TAG_TEXT`` alone swallows ``<think>`` is wrong on real reasoning
     # tokenizers (see build_tool_lark docstring GROUND TRUTH).
-    reasoning_refs = tuple(dict.fromkeys(s for s in reasoning_sentinels if s))
+    # Keep only well-formed ``<...>`` special-token refs (dedup, drop empties).
+    # A marker that is a single tokenizer token but NOT a valid bare Lark ref
+    # (e.g. ``[THINK]``) is dropped rather than emitted as syntactically-invalid
+    # Lark that would fail to compile (codex #558-PR4 nit). If every marker is
+    # dropped, the prefix falls back to the bare ``TAG_TEXT`` (no reasoning
+    # tolerance) — safe degrade, never a compile failure.
+    reasoning_refs = tuple(
+        dict.fromkeys(
+            s for s in reasoning_sentinels if s and _is_lark_special_token_ref(s)
+        )
+    )
     prefix_ref = "prefix" if reasoning_refs else "TAG_TEXT"
     lark = (
         "%llguidance {}\n"

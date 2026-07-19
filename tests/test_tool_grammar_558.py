@@ -588,20 +588,47 @@ def test_reasoning_prefix_lark_has_prefix_and_rtok_rules():
     assert "tag_0: prefix <tool_call>" in lark
 
 
+# The exact grammar PR-3 emits for ``TOOLS`` at ``tool_choice="required"``. This
+# is a CHECKED-IN GOLDEN captured from the pre-PR-4 builder — comparing against
+# it (not against another call of the same implementation) proves the
+# non-reasoning path is byte-identical to PR-3 even if the whole builder drifted
+# (codex #558-PR4 blocking: default==explicit_empty only proves the two paths
+# agree, not that either matches PR-3).
+_PR3_GOLDEN_LARK = (
+    "%llguidance {}\n"
+    "start: (tag_0 | tag_1)+ tag_end\n"
+    "tag_end: TAG_TEXT\n"
+    "TAG_TEXT: /(.|\\n)*/\n"
+    "\n"
+    'tag_0: TAG_TEXT <tool_call> "\\n{\\"name\\": \\"get_weather\\", '
+    '\\"arguments\\": " %json {"type": "object", "properties": {"city": '
+    '{"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}, '
+    '"required": ["city"], "additionalProperties": false} "}\\n" </tool_call>\n'
+    "\n"
+    'tag_1: TAG_TEXT <tool_call> "\\n{\\"name\\": \\"get_time\\", '
+    '\\"arguments\\": " %json {"type": "object", "properties": {"tz": '
+    '{"type": "string"}}, "required": ["tz"], "additionalProperties": false} '
+    '"}\\n" </tool_call>\n'
+)
+
+
 def test_non_reasoning_lark_is_unchanged_from_pr3():
-    """Empty reasoning_sentinels reproduces the PR-3 grammar byte-for-byte — the
-    non-reasoning path carries ZERO regression."""
+    """Empty reasoning_sentinels reproduces the PR-3 grammar BYTE-FOR-BYTE — the
+    non-reasoning path carries ZERO regression. Asserts against a checked-in
+    PR-3 golden (not another call of the same code), so a shared regression in
+    both call paths cannot hide behind ``default == explicit_empty``."""
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
     default = build_tool_lark(TOOLS, "required", infos)
     explicit_empty = build_tool_lark(TOOLS, "required", infos, reasoning_sentinels=())
-    assert default == explicit_empty
-    # No reasoning machinery leaks into the non-reasoning grammar.
+    # Both no-reasoning call shapes are byte-identical to the PR-3 golden.
+    assert default == _PR3_GOLDEN_LARK, "non-reasoning grammar drifted from PR-3"
+    assert explicit_empty == _PR3_GOLDEN_LARK
+    # No reasoning machinery leaks into the non-reasoning grammar (redundant with
+    # the golden, kept as a readable intent assertion).
     assert "prefix:" not in default
     assert "rtok:" not in default
-    assert "tag_end: TAG_TEXT" in default
-    assert "tag_0: TAG_TEXT <tool_call>" in default
 
 
 def test_reasoning_sentinels_dedup_and_drop_empty():
@@ -619,6 +646,37 @@ def test_reasoning_sentinels_dedup_and_drop_empty():
     # Deduped to a single ``<think>`` alternative + ``</think>``; no empty ref.
     assert "rtok: <think> | </think>" in lark
     assert "rtok: <think> | <think>" not in lark
+
+
+def test_malformed_reasoning_sentinel_is_dropped_not_emitted():
+    """A marker that is NOT a valid bare ``<...>`` special-token ref (e.g. a
+    ``[THINK]`` char-class shape, or one with interior whitespace/brackets) is
+    DROPPED — it must never be interpolated into Lark as syntactically-invalid
+    source (codex #558-PR4 nit). A well-formed ``<...>`` marker still emits."""
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    # Only ``<think>`` is a valid ref; the others are malformed and dropped.
+    lark = build_tool_lark(
+        TOOLS,
+        "required",
+        infos,
+        reasoning_sentinels=("[THINK]", "<a b>", "<x<y>", "<think>"),
+    )
+    assert "rtok: <think>" in lark
+    # None of the malformed markers leaked into the grammar source.
+    assert "[THINK]" not in lark
+    assert "<a b>" not in lark
+    assert "<x<y>" not in lark
+
+    # If EVERY marker is malformed, the prefix degrades to bare TAG_TEXT (no
+    # reasoning machinery) rather than emitting broken Lark.
+    lark_all_bad = build_tool_lark(
+        TOOLS, "required", infos, reasoning_sentinels=("[THINK]", "<a b>")
+    )
+    assert "prefix:" not in lark_all_bad
+    assert "rtok:" not in lark_all_bad
+    assert "tag_end: TAG_TEXT" in lark_all_bad
 
 
 def test_resolve_reasoning_sentinels_from_parser(tok):
@@ -686,12 +744,19 @@ def test_reasoning_prefix_then_tool_call_is_accepted(tok, lltok):
 
 
 @_requires_llguidance
-def test_bare_tag_text_prefix_rejects_think_token(tok, lltok):
-    """REGRESSION GUARD (the exact bug PR-4 fixes): WITHOUT reasoning sentinels,
-    the bare ``TAG_TEXT`` byte-regex prefix CANNOT match the ``<think>`` special
-    token — the matcher rejects it immediately. This is why path A needs PR-4;
-    if this ever stops rejecting, the reasoning-tolerant prefix is redundant and
-    the fix rationale must be revisited."""
+def test_reasoning_tolerant_prefix_is_what_admits_the_think_token(tok, lltok):
+    """The reasoning-tolerant prefix (PR-4) is what makes path A work: WITH
+    reasoning sentinels the ``<think>`` special token is admitted; the bare
+    PR-3 prefix does not admit it on this tokenizer.
+
+    We assert the LOAD-BEARING direction — the reasoning-tolerant grammar
+    accepts the ``<think>``-prefixed call — unconditionally. For the legacy
+    grammar we only DOCUMENT that the bare byte prefix does not accept the
+    ``<think>`` special token today (the exact bug PR-4 fixes); we do NOT assert
+    the legacy MUST stay broken, so a future llguidance that lets byte terminals
+    match special tokens would not spuriously fail this suite (codex #558-PR4
+    nit) — it would just make the reasoning-tolerant prefix redundant, which the
+    positive assertion still tolerates."""
     from vllm_mlx.api.tool_grammar import (
         are_single_special_tokens,
         build_tool_grammar,
@@ -699,21 +764,37 @@ def test_bare_tag_text_prefix_rejects_think_token(tok, lltok):
 
     if not are_single_special_tokens(tok, _REASONING_SENTINELS):
         pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
-    grammar = build_tool_grammar(TOOLS, "required", _HermesStubParser())  # no sentinels
-    accepted, total, _ = _consume(
-        grammar,
-        lltok,
-        tok,
+    call = (
         "<think>reasoning</think>\n"
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
-        "</tool_call>",
+        "</tool_call>"
     )
-    # The <think> special token is the FIRST token — the bare byte prefix rejects
-    # it, so ~zero tokens are accepted.
-    assert accepted < total, (
-        "bare TAG_TEXT prefix unexpectedly accepted the <think> special token — "
-        "PR-4's reasoning-tolerant prefix would be unnecessary"
+
+    # LOAD-BEARING: the reasoning-tolerant grammar accepts the whole call.
+    tolerant = build_tool_grammar(
+        TOOLS, "required", _HermesStubParser(), reasoning_sentinels=_REASONING_SENTINELS
     )
+    t_accepted, t_total, t_accepting = _consume(tolerant, lltok, tok, call)
+    assert t_accepted == t_total and t_accepting, (
+        "reasoning-tolerant prefix did NOT admit the <think>-prefixed call — "
+        "path A broken"
+    )
+
+    # DOCUMENTED (not asserted as a hard requirement): the bare PR-3 prefix does
+    # not admit the leading <think> special token on this tokenizer. If a future
+    # llguidance changes this, the tolerant path above still passes; we surface
+    # the change via an xfail-style note rather than a hard failure.
+    legacy = build_tool_grammar(TOOLS, "required", _HermesStubParser())
+    l_accepted, l_total, _ = _consume(legacy, lltok, tok, call)
+    if l_accepted >= l_total:
+        pytest.skip(
+            "bare TAG_TEXT prefix now admits the <think> special token — the "
+            "reasoning-tolerant prefix is redundant here (llguidance changed); "
+            "PR-4 remains correct, revisit whether it is still necessary"
+        )
+    # Current behavior: legacy rejects before consuming the whole call because
+    # the leading <think> special token is unmatched by the byte prefix.
+    assert l_accepted < l_total
 
 
 @_requires_llguidance
@@ -764,14 +845,27 @@ def test_off_schema_argument_rejected_after_reasoning(tok, lltok):
         _HermesStubParser(),
         reasoning_sentinels=_REASONING_SENTINELS,
     )
-    accepted, total, _ = _consume(
-        grammar,
-        lltok,
-        tok,
+    # Precise negative control (codex #558-PR4 blocking): ``accepted < total``
+    # alone would also pass if some EARLIER token were rejected, which would not
+    # prove the off-schema integer is what the grammar masked. So we (1) prove
+    # the valid prefix — reasoning + trigger + ``"city": `` — is accepted IN
+    # FULL, then (2) prove the grammar rejects at exactly the token that starts
+    # the integer value. ``4`` violates the ``"city": string`` schema.
+    valid_prefix = (
         "<think>reasoning</think>\n"
-        '<tool_call>\n{"name": "get_weather", "arguments": {"city": 4',
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": '
     )
-    assert accepted < total, (
-        "off-schema integer argument accepted after reasoning — schema "
-        "enforcement leaked through the reasoning-tolerant prefix"
+    pre_accepted, pre_total, _ = _consume(grammar, lltok, tok, valid_prefix)
+    assert pre_accepted == pre_total, (
+        f"valid reasoning+trigger prefix was rejected ({pre_accepted}/{pre_total})"
+        " — the negative control below would be meaningless"
+    )
+    # Now append the schema-violating integer. The grammar must accept exactly
+    # the prefix tokens and reject at the first token of the ``4`` value.
+    accepted, total, _ = _consume(grammar, lltok, tok, valid_prefix + "4")
+    assert total > pre_total, "appending '4' did not add a token to encode"
+    assert accepted == pre_total, (
+        f"grammar rejected at token {accepted}, not at the off-schema integer "
+        f"(prefix has {pre_total} tokens) — schema enforcement leaked or "
+        "mis-fired through the reasoning-tolerant prefix"
     )
