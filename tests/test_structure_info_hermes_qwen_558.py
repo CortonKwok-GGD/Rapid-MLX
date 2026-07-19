@@ -94,38 +94,57 @@ _PARSER_IMPORTS = {
 }
 
 
+class _FakeAddedToken:
+    """Stand-in for transformers' ``AddedToken`` — carries a ``special`` flag.
+
+    GROUND TRUTH: on the real Qwen3.5 tokenizer, ``<tool_call>``/``</tool_call>``
+    are ADDED tokens with ``special=False``. The guard must accept them, so it
+    keys on added-token REGISTRATION (``added_tokens_decoder`` membership), NOT
+    the ``special`` flag — this stub defaults ``special=False`` to hold the guard
+    to that reality.
+    """
+
+    def __init__(self, content, special=False):
+        self.content = content
+        self.special = special
+
+
 class _FakeTokenizer:
     """Minimal tokenizer stub modeling the surfaces the guard probes.
 
     ``structure_info()`` opts into grammar constraint only when the model's
     tokenizer proves ``<tool_call>``/``</tool_call>`` are DISTINCT single
-    REGISTERED special tokens (the hermes parser is also routed to Llama
-    tokenizers where they are NOT). The guard checks: ``len(encode(s)) == 1``,
-    ``decode([id]) == s`` (round-trip), the id is in ``added_tokens_decoder``
-    (registered special), and distinct ids across sentinels. This stub lets the
-    pure-Python tests exercise every opt-in/opt-out branch WITHOUT a network
-    fetch, so they stay hermetic and never skip.
+    REGISTERED added tokens that round-trip (the hermes parser is also routed to
+    Llama tokenizers where they are NOT). The guard checks: ``len(encode(s)) ==
+    1``, ``decode([id]) == s`` (round-trip), the id is in
+    ``added_tokens_decoder`` (explicitly-added atomic token), and distinct ids
+    across sentinels. This stub lets the pure-Python tests exercise every
+    opt-in/opt-out branch WITHOUT a network fetch, so they stay hermetic.
 
-    ``specials`` maps each special string to its single id (registered special,
-    round-trips). Any other string encodes as multi-token (opt-out path).
-    ``ordinary`` maps a string to a single id that round-trips but is NOT a
-    registered special (ordinary-vocab opt-out case). ``collapse`` maps strings
+    ``added`` maps each ADDED-token string to its single id (round-trips, in
+    ``added_tokens_decoder`` — modeled with ``special=False`` to match the real
+    Qwen tokenizer). Any other string encodes as multi-token (opt-out path).
+    ``ordinary`` maps a string to a single id that round-trips but is NOT in the
+    added-token registry (ordinary-BPE opt-out case). ``collapse`` maps strings
     to a shared single id that does NOT round-trip (``[UNK]`` collapse case).
     """
 
-    def __init__(self, specials=None, ordinary=None, collapse=None):
-        self._specials = dict(specials or {})
+    def __init__(self, added=None, ordinary=None, collapse=None):
+        self._added = dict(added or {})
         self._ordinary = dict(ordinary or {})
         self._collapse = dict(collapse or {})
-        # id -> source string, for round-trip decode of specials + ordinary.
-        self._id_to_str = {i: s for s, i in self._specials.items()}
+        # id -> source string, for round-trip decode of added + ordinary.
+        self._id_to_str = {i: s for s, i in self._added.items()}
         self._id_to_str.update({i: s for s, i in self._ordinary.items()})
-        # added_tokens_decoder: only the registered specials.
-        self.added_tokens_decoder = {i: object() for i in self._specials.values()}
+        # added_tokens_decoder: {id: AddedToken(special=False)} — matches the
+        # real Qwen layout where <tool_call> is an added but non-special token.
+        self.added_tokens_decoder = {
+            i: _FakeAddedToken(s, special=False) for s, i in self._added.items()
+        }
 
     def encode(self, text, add_special_tokens=False):
-        if text in self._specials:
-            return [self._specials[text]]
+        if text in self._added:
+            return [self._added[text]]
         if text in self._ordinary:
             return [self._ordinary[text]]
         if text in self._collapse:
@@ -137,18 +156,19 @@ class _FakeTokenizer:
 
 
 def _single_token_tokenizer():
-    """Qwen3-like: both sentinels are distinct single registered specials."""
-    return _FakeTokenizer(specials={"<tool_call>": 100, "</tool_call>": 101})
+    """Qwen3-like: both sentinels are distinct single ADDED (special=False)
+    tokens that round-trip -> opt in (the real Qwen layout)."""
+    return _FakeTokenizer(added={"<tool_call>": 100, "</tool_call>": 101})
 
 
 def _multitoken_tokenizer():
     """Llama-Hermes-like: neither sentinel is a single token -> opt out."""
-    return _FakeTokenizer(specials={})
+    return _FakeTokenizer(added={})
 
 
 def _ordinary_vocab_tokenizer():
-    """Both sentinels are single tokens that round-trip but are NOT registered
-    special tokens -> opt out (special-ref semantics would not match)."""
+    """Both sentinels are single tokens that round-trip but are NOT in the
+    added-token registry (ordinary BPE tokens) -> opt out."""
     return _FakeTokenizer(ordinary={"<tool_call>": 100, "</tool_call>": 101})
 
 
@@ -218,9 +238,29 @@ def test_structure_info_opts_out_on_unk_collapse(family):
 
 @pytest.mark.parametrize("family", ["hermes", "qwen"])
 def test_structure_info_opts_in_on_single_token_tokenizer(family):
-    # A tokenizer where both sentinels ARE distinct single registered specials
-    # (Qwen3-like) -> opt in.
+    # A tokenizer where both sentinels ARE distinct single added tokens that
+    # round-trip (Qwen3-like) -> opt in.
     parser = _make_parser(family, tokenizer=_single_token_tokenizer())
+    assert parser.structure_info() is not None
+
+
+@pytest.mark.parametrize("family", ["hermes", "qwen"])
+def test_structure_info_opts_in_on_non_special_added_token(family):
+    # GROUND-TRUTH regression (codex r3): on the REAL Qwen3.5 tokenizer,
+    # <tool_call>/</tool_call> are ADDED tokens with AddedToken.special == False
+    # (and NOT in all_special_ids). They are still distinct atomic tokens a
+    # grammar special-token ref resolves against (the enforcement tests below
+    # pass on exactly this tokenizer). The guard MUST key on added-token
+    # REGISTRATION, not the `special` flag — gating on special==True would break
+    # the feature for its own target tokenizer. `_single_token_tokenizer` models
+    # special=False added tokens, so this asserting opt-in is the regression.
+    from vllm_mlx.api.tool_grammar import are_single_special_tokens
+
+    tokenizer = _single_token_tokenizer()
+    # Every modeled added token carries special=False (matches real Qwen).
+    assert all(at.special is False for at in tokenizer.added_tokens_decoder.values())
+    assert are_single_special_tokens(tokenizer, ("<tool_call>", "</tool_call>"))
+    parser = _make_parser(family, tokenizer=tokenizer)
     assert parser.structure_info() is not None
 
 
@@ -322,13 +362,7 @@ def test_real_parser_lark_has_trigger_and_schema_region(family):
 # tokenizer exception) propagates and FAILS the test.
 # --------------------------------------------------------------------------
 def _offline_skip_exc_types():
-    """Only genuine network/cache-miss errors are a sanctioned skip.
-
-    A corrupt tokenizer artifact, an invalid revision, or a tokenizer/config
-    incompatibility must FAIL the enforcement test, not silently skip it. So we
-    skip ONLY on the specific huggingface_hub offline/cache-miss signals (and a
-    raw connection error), letting every other exception propagate.
-    """
+    """huggingface_hub / requests offline signals that are ALWAYS a skip."""
     types: list[type[BaseException]] = []
     try:
         from huggingface_hub.errors import (
@@ -345,7 +379,67 @@ def _offline_skip_exc_types():
         types.append(_ReqConnErr)
     except Exception:  # pragma: no cover - requests not present
         pass
-    return tuple(types) or (OSError,)
+    return tuple(types)
+
+
+# Substrings transformers/hub embed in an OSError message when a model is not
+# cached AND the network is unavailable (offline / connection failure). These
+# indicate genuine UNAVAILABILITY -> a sanctioned skip. A corrupt-artifact
+# OSError (bad JSON, truncated file, checksum) carries none of these and must
+# still FAIL the test.
+_OFFLINE_OSERROR_MARKERS = (
+    "offline",
+    "couldn't connect",
+    "can't load",
+    "cannot find the requested files",
+    "look for the file",
+    "connection error",
+    "not a local folder and is not a valid model identifier",
+    "we couldn't connect",
+    "max retries exceeded",
+    "failed to connect",
+)
+
+
+def _is_offline_oserror(exc: BaseException) -> bool:
+    """True iff ``exc`` (a bare ``OSError`` from transformers) is an offline /
+    cache-miss wrap rather than a corrupt-artifact error — by inspecting the
+    message and the exception chain (transformers wraps the hub error as
+    ``__cause__``)."""
+    seen = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur).lower()
+        if any(marker in msg for marker in _OFFLINE_OSERROR_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def test_offline_oserror_classification():
+    # codex r3: transformers wraps an offline cache-miss as a bare OSError. The
+    # `tok` fixture must SKIP on that (offline) but FAIL on a corrupt-artifact
+    # OSError. Directly exercise the classifier both ways, incl. the chained
+    # `__cause__` transformers actually sets.
+    offline_direct = OSError(
+        "We couldn't connect to 'https://huggingface.co' to load this file"
+    )
+    assert _is_offline_oserror(offline_direct)
+
+    # Offline signal buried in the chained cause (how transformers wraps it).
+    chained = OSError("Can't load tokenizer for 'x'")
+    try:
+        try:
+            raise ConnectionError("Max retries exceeded with url: ...")
+        except ConnectionError as cause:
+            raise chained from cause
+    except OSError as raised:
+        assert _is_offline_oserror(raised)
+
+    # A corrupt-artifact OSError carries NO offline marker -> must NOT skip.
+    corrupt = OSError("Unable to load weights: file is not a valid JSON document")
+    assert not _is_offline_oserror(corrupt)
 
 
 @pytest.fixture(scope="module")
@@ -360,6 +454,17 @@ def tok():
             f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not "
             "cached and no network — enforcement tests require it"
         )
+    except OSError as exc:  # pragma: no cover - transformers-wrapped offline
+        # transformers commonly wraps an offline cache-miss as a bare OSError.
+        # Skip ONLY when the message/chain proves offline/cache-miss; a
+        # corrupt-artifact OSError has no offline marker and re-raises (fails).
+        if _is_offline_oserror(exc):
+            pytest.skip(
+                f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not "
+                "cached and no network (transformers OSError) — enforcement "
+                "tests require it"
+            )
+        raise
 
 
 @pytest.fixture(scope="module")
