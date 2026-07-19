@@ -129,15 +129,36 @@ def build_tool_lark(
     docstring). ``tool_choice`` selects the repetition quantifier:
 
       * ``auto``     -> ``(...)*``  (may emit zero calls; at_least_one=false)
-      * ``required`` -> ``(...)+``  (design R1: at least one call forced)
-      * ``named``    -> ``(...)+``  (single tag; forced)
+      * anything else (``required`` / a specific function name) -> ``(...)+``
+        (design R1: at least one call forced)
+
+    The grammar is built over exactly the ``tools`` passed in — one ``tag_i``
+    alternative per tool. For a NAMED ``tool_choice`` the caller narrows
+    ``tools`` to the single requested function BEFORE calling the builder
+    (design §4 / chat.py named routing), so the alternation naturally
+    collapses to a single forced tag. The builder does not itself resolve a
+    function name out of a multi-tool list — that routing lands in PR-3.
 
     Every tag is: ``TAG_TEXT <trigger-and-begin> %json <schema> <end>``.
     ``TAG_TEXT`` is the lazy free prefix that swallows reasoning/prose until
     the trigger — this is also the reasoning-aware delay (design §5 path A).
     """
-    assert tools, "tools must not be empty"
-    assert len(tools) == len(structure_infos)
+    if not tools:
+        raise ValueError("build_tool_lark: tools must not be empty")
+    if len(tools) != len(structure_infos):
+        raise ValueError(
+            "build_tool_lark: tools and structure_infos length mismatch "
+            f"({len(tools)} != {len(structure_infos)})"
+        )
+    for si in structure_infos:
+        # StructTag invariant: begin must start with trigger. Enforce it so a
+        # malformed per-family structure_info() is caught at build time rather
+        # than silently producing a grammar whose trigger prefix is unused.
+        if si.trigger and not si.begin.startswith(si.trigger):
+            raise ValueError(
+                "build_tool_lark: StructureInfo.begin must start with its "
+                f"trigger (trigger={si.trigger!r}, begin={si.begin!r})"
+            )
 
     quant = "*" if tool_choice == "auto" else "+"
     tag_names = " | ".join(f"tag_{i}" for i in range(len(tools)))

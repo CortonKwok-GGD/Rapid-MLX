@@ -20,14 +20,27 @@ still proving the builder against a realistic hermes wire format.
 
 The negative-control tests need a fast (Rust) tokenizer whose
 ``<tool_call>``/``</tool_call>`` are single special tokens — the pilot
-verified this on ``mlx-community/Qwen3.5-4B-MLX-4bit``. If that tokenizer or
-llguidance is unavailable the enforcement tests skip; the pure-Python ABC and
-Lark-structure tests always run.
+verified this on ``mlx-community/Qwen3.5-4B-MLX-4bit``. Those tests skip ONLY
+on genuine unavailability (llguidance extra absent, or the tokenizer neither
+cached nor reachable); any other failure is surfaced, not swallowed. The
+pure-Python ABC and Lark-structure tests never skip — they carry no optional
+dependency and always run.
 """
+
+import importlib.util
 
 import pytest
 
-pytest.importorskip("llguidance")
+# NOTE: llguidance is only needed by the grammar-BUILD and enforcement tests
+# below (they compile a Lark grammar / build an LLTokenizer). The ABC-contract
+# and pure-Lark-string tests need NOTHING optional, so we do NOT skip at module
+# level — a repo without the [guided] extra still exercises the ABC change and
+# the builder's string output. Tests that need llguidance guard themselves via
+# ``_requires_llguidance``.
+_HAS_LLGUIDANCE = importlib.util.find_spec("llguidance") is not None
+_requires_llguidance = pytest.mark.skipif(
+    not _HAS_LLGUIDANCE, reason="llguidance ([guided] extra) not installed"
+)
 
 _TOKENIZER_MODEL = "mlx-community/Qwen3.5-4B-MLX-4bit"
 
@@ -143,22 +156,63 @@ def test_lark_quantifier_tracks_tool_choice():
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
     # auto -> may emit zero calls -> (...)*
     assert "start: (tag_0 | tag_1)* tag_end" in build_tool_lark(TOOLS, "auto", infos)
-    # required/named -> at least one call -> (...)+
+    # required (and any non-auto choice) -> at least one call -> (...)+
     assert "start: (tag_0 | tag_1)+ tag_end" in build_tool_lark(
         TOOLS, "required", infos
     )
 
 
+def test_named_choice_narrows_to_single_forced_tag():
+    # A NAMED tool_choice is expressed by the caller narrowing ``tools`` to the
+    # single requested function before calling the builder (design §4). The
+    # builder then emits exactly one forced tag — it never leaks the other
+    # tools' alternatives into a named request.
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    only = [TOOLS[0]]  # caller pre-filtered to the requested function
+    info = [_hermes_structure_info()(only[0]["name"])]
+    lark = build_tool_lark(only, "get_weather", info)
+    assert "start: (tag_0)+ tag_end" in lark
+    assert "tag_1" not in lark  # no other tool's alternative present
+    assert "get_time" not in lark
+
+
+def test_build_tool_lark_rejects_bad_inputs():
+    # Public-ish input validation raises ValueError (survives ``python -O``),
+    # rather than asserting.
+    from vllm_mlx.api.tool_grammar import StructureInfo, build_tool_lark
+
+    with pytest.raises(ValueError):
+        build_tool_lark([], "required", [])
+    with pytest.raises(ValueError):
+        # length mismatch
+        build_tool_lark(TOOLS, "required", [_hermes_structure_info()("get_weather")])
+    with pytest.raises(ValueError):
+        # begin does not start with trigger -> invariant violation
+        bad = StructureInfo(begin="oops", end="", trigger="<tool_call>")
+        build_tool_lark([TOOLS[0]], "required", [bad])
+
+
 # --------------------------------------------------------------------------
 # Grammar ENFORCEMENT via offline validate_tokens (the #558 proof).
+#
+# These need a fast (Rust) tokenizer whose <tool_call>/</tool_call> are single
+# special tokens. The ONLY sanctioned skip is genuine tokenizer/llguidance
+# UNAVAILABILITY (no network + not cached, or the optional extra absent) — any
+# OTHER failure (a real grammar regression, a matcher error, an unexpected
+# tokenizer exception) propagates and FAILS the test, so a green run of these
+# tests always means enforcement was actually exercised.
 # --------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def tok():
     transformers = pytest.importorskip("transformers")
     try:
         return transformers.AutoTokenizer.from_pretrained(_TOKENIZER_MODEL)
-    except Exception:  # pragma: no cover - network / cache miss
-        pytest.skip("hermes-wire tokenizer not available")
+    except OSError:  # pragma: no cover - offline & uncached
+        pytest.skip(
+            f"tokenizer {_TOKENIZER_MODEL} not cached and no network — "
+            "enforcement tests require it"
+        )
 
 
 @pytest.fixture(scope="module")
@@ -167,7 +221,9 @@ def lltok(tok):
 
     Mirrors ``guided.py``'s tokenizer resolution: try the wrapper's inner
     fast tokenizer, then the object itself (transformers 5.x exposes a
-    ``TokenizersBackend`` that IS the fast tokenizer llguidance wants).
+    ``TokenizersBackend`` that IS the fast tokenizer llguidance wants). A
+    slow tokenizer is the one sanctioned skip; a genuine ``from_tokenizer``
+    regression is NOT swallowed — it fails the test.
     """
     import llguidance.hf as llg_hf
 
@@ -176,14 +232,23 @@ def lltok(tok):
     if inner is not None:
         candidates.append(inner)
     candidates.append(tok)
-    for cand in candidates:
-        if getattr(cand, "is_fast", True) is False:
-            continue
+    fast_candidates = [
+        c for c in candidates if getattr(c, "is_fast", True) is not False
+    ]
+    if not fast_candidates:
+        pytest.skip("tokenizer is not a fast tokenizer — llguidance needs one")
+    last_exc = None
+    for cand in fast_candidates:
         try:
             return llg_hf.from_tokenizer(cand)
-        except Exception:
-            continue
-    pytest.skip("could not build an LLTokenizer for this tokenizer")
+        except Exception as exc:  # noqa: BLE001 - re-raised below if all fail
+            last_exc = exc
+    # Every fast candidate raised — that is a real regression, not an
+    # environment gap. Surface it rather than skipping.
+    raise AssertionError(
+        f"llguidance could not build an LLTokenizer from any fast candidate: "
+        f"{last_exc!r}"
+    )
 
 
 def _accepts_full(grammar, lltok, tok, text):
@@ -202,6 +267,7 @@ def _accepts_full(grammar, lltok, tok, text):
     return accepted == len(ids), accepted, len(ids)
 
 
+@_requires_llguidance
 def test_valid_hermes_call_is_accepted(tok, lltok):
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
@@ -216,6 +282,7 @@ def test_valid_hermes_call_is_accepted(tok, lltok):
     assert full, f"valid hermes call unexpectedly rejected ({accepted}/{total})"
 
 
+@_requires_llguidance
 def test_hallucinated_tool_name_is_rejected(tok, lltok):
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
@@ -226,6 +293,7 @@ def test_hallucinated_tool_name_is_rejected(tok, lltok):
     assert not full, "hallucinated tool name was NOT rejected by the grammar"
 
 
+@_requires_llguidance
 def test_off_schema_argument_is_rejected(tok, lltok):
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
@@ -240,6 +308,7 @@ def test_off_schema_argument_is_rejected(tok, lltok):
     assert not full, "off-schema integer argument was NOT rejected by the grammar"
 
 
+@_requires_llguidance
 def test_bad_enum_value_is_rejected(tok, lltok):
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
