@@ -43,6 +43,12 @@ _requires_llguidance = pytest.mark.skipif(
 )
 
 _TOKENIZER_MODEL = "mlx-community/Qwen3.5-4B-MLX-4bit"
+# Pin the revision so the enforcement proof runs against an IMMUTABLE artifact
+# (codex: an unpinned Hub revision is a mutable third-party dependency). The
+# tokenizer's <tool_call>/</tool_call> single-special-token layout is fixed at
+# this commit; a different upstream revision must not silently change what the
+# enforcement tests exercise.
+_TOKENIZER_REVISION = "32f3e8ecf65426fc3306969496342d504bfa13f3"
 
 TOOLS = [
     {
@@ -146,6 +152,31 @@ def test_build_tool_grammar_none_for_tool_choice_none():
 
 
 @_requires_llguidance
+def test_build_tool_grammar_named_choice_narrows_to_requested_tool():
+    # A NAMED tool_choice (a concrete function name) must constrain to ONLY
+    # that tool even when the full multi-tool list is passed — the builder
+    # narrows internally, so a named call can never emit a different tool.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "get_weather", _HermesStubParser())
+    assert grammar is not None
+    # Only the requested tool's tag survives — get_time is not reachable.
+    assert "get_weather" in grammar
+    assert "get_time" not in grammar
+    # Single forced alternative (named => exactly one tag, forced).
+    assert "start: (tag_0)+ tag_end" in grammar
+
+
+def test_build_tool_grammar_named_choice_unknown_name_degrades():
+    # An unknown named function degrades to free-form (None), not a crash.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    # This path is reached before the llguidance short-circuit only when the
+    # extra is present; when absent it also returns None. Either way: None.
+    assert build_tool_grammar(TOOLS, "does_not_exist", _HermesStubParser()) is None
+
+
+@_requires_llguidance
 def test_build_tool_grammar_degrades_when_factory_raises():
     # A per-family structure_info() factory that raises on a tool name must
     # degrade to free-form (None), not crash the request.
@@ -231,6 +262,10 @@ def test_build_tool_lark_rejects_bad_inputs():
         # trigger not declared as a special-token sentinel -> rejected
         bad = StructureInfo(begin="<x>go", end="", trigger="<x>", sentinels=())
         build_tool_lark([TOOLS[0]], "required", [bad])
+    with pytest.raises(ValueError):
+        # empty trigger -> rejected (StructureInfo contract requires one)
+        bad = StructureInfo(begin="anything", end="", trigger="", sentinels=())
+        build_tool_lark([TOOLS[0]], "required", [bad])
 
 
 def test_build_tool_lark_preserves_falsy_schemas():
@@ -272,11 +307,13 @@ def test_build_tool_lark_defaults_only_when_parameters_absent():
 def tok():
     transformers = pytest.importorskip("transformers")
     try:
-        return transformers.AutoTokenizer.from_pretrained(_TOKENIZER_MODEL)
+        return transformers.AutoTokenizer.from_pretrained(
+            _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
+        )
     except OSError:  # pragma: no cover - offline & uncached
         pytest.skip(
-            f"tokenizer {_TOKENIZER_MODEL} not cached and no network — "
-            "enforcement tests require it"
+            f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not "
+            "cached and no network — enforcement tests require it"
         )
 
 
@@ -316,35 +353,63 @@ def lltok(tok):
     )
 
 
-def _accepts_full(grammar, lltok, tok, text):
-    """Offline check: does the grammar accept EVERY token of ``text``?
+def _consume(grammar, lltok, tok, text):
+    """Offline enforcement probe. Returns ``(accepted, total, is_accepting)``.
 
-    Uses ``LLMatcher.validate_tokens`` — the count of the longest accepted
-    token prefix. ``== len(ids)`` means fully accepted; anything less means
-    the grammar mask forbids some token (enforcement).
+    Advances real grammar state one token at a time via
+    ``LLMatcher.consume_tokens`` (which returns a bool per batch), counting how
+    many tokens the grammar actually accepts before it rejects one. Unlike
+    ``validate_tokens`` this ADVANCES matcher state, so afterwards
+    ``is_accepting()`` reports whether the grammar can TERMINATE there — a
+    "fully accepted" positive test therefore proves the string is a COMPLETE
+    valid derivation, not merely an accepted prefix of one.
     """
     from llguidance.mlx import LLMatcher
 
     ids = tok.encode(text, add_special_tokens=False)
     matcher = LLMatcher(lltok, grammar)
     assert not matcher.get_error(), matcher.get_error()
-    accepted = matcher.validate_tokens(ids)
-    return accepted == len(ids), accepted, len(ids)
+    accepted = 0
+    for tid in ids:
+        if not matcher.consume_tokens([tid]):
+            break
+        accepted += 1
+    return accepted, len(ids), matcher.is_accepting()
 
 
 @_requires_llguidance
-def test_valid_hermes_call_is_accepted(tok, lltok):
+def test_valid_hermes_call_is_accepted_and_terminates(tok, lltok):
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
     grammar = build_tool_grammar(TOOLS, "required", _HermesStubParser())
     assert grammar is not None
-    full, accepted, total = _accepts_full(
+    accepted, total, accepting = _consume(
         grammar,
         lltok,
         tok,
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>',
     )
-    assert full, f"valid hermes call unexpectedly rejected ({accepted}/{total})"
+    assert accepted == total, f"valid hermes call rejected ({accepted}/{total})"
+    # Stronger than accepted-prefix: the complete call is a terminal state.
+    assert accepting, "valid complete hermes call is not an accepting (terminal) state"
+
+
+@_requires_llguidance
+def test_valid_enum_value_is_accepted(tok, lltok):
+    # Positive enum control (paired with the rejection test below): a VALID
+    # enum value is accepted and terminates — so the rejection test cannot pass
+    # merely because the grammar forbids the optional `unit` property entirely.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "required", _HermesStubParser())
+    accepted, total, accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "P", "unit": "c"}}\n</tool_call>',
+    )
+    assert accepted == total, f"valid enum value rejected ({accepted}/{total})"
+    assert accepting, "valid enum call is not an accepting (terminal) state"
 
 
 @_requires_llguidance
@@ -352,10 +417,10 @@ def test_hallucinated_tool_name_is_rejected(tok, lltok):
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
     grammar = build_tool_grammar(TOOLS, "required", _HermesStubParser())
-    full, accepted, total = _accepts_full(
+    accepted, total, _ = _consume(
         grammar, lltok, tok, '<tool_call>\n{"name": "get_stockquote'
     )
-    assert not full, "hallucinated tool name was NOT rejected by the grammar"
+    assert accepted < total, "hallucinated tool name was NOT rejected by the grammar"
 
 
 @_requires_llguidance
@@ -364,13 +429,13 @@ def test_off_schema_argument_is_rejected(tok, lltok):
 
     grammar = build_tool_grammar(TOOLS, "required", _HermesStubParser())
     # `city` must be a string; an integer must be forbidden.
-    full, accepted, total = _accepts_full(
+    accepted, total, _ = _consume(
         grammar,
         lltok,
         tok,
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": 4',
     )
-    assert not full, "off-schema integer argument was NOT rejected by the grammar"
+    assert accepted < total, "off-schema integer argument was NOT rejected"
 
 
 @_requires_llguidance
@@ -379,10 +444,10 @@ def test_bad_enum_value_is_rejected(tok, lltok):
 
     grammar = build_tool_grammar(TOOLS, "required", _HermesStubParser())
     # `unit` enum is {c, f}; "kelvin" must be forbidden.
-    full, accepted, total = _accepts_full(
+    accepted, total, _ = _consume(
         grammar,
         lltok,
         tok,
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": "P", "unit": "kelvin',
     )
-    assert not full, "invalid enum value was NOT rejected by the grammar"
+    assert accepted < total, "invalid enum value was NOT rejected by the grammar"

@@ -164,17 +164,22 @@ def build_tool_lark(
             "(none produces no constraint at all — caller bug)"
         )
     for si in structure_infos:
+        # A trigger is mandatory (StructureInfo contract) — an empty trigger
+        # would produce a triggerless grammar the lazy TAG_TEXT prefix could
+        # never gate.
+        if not si.trigger:
+            raise ValueError("build_tool_lark: StructureInfo.trigger must be non-empty")
         # StructTag invariant: begin must start with trigger. Enforce it so a
         # malformed per-family structure_info() is caught at build time rather
         # than silently producing a grammar whose trigger prefix is unused.
-        if si.trigger and not si.begin.startswith(si.trigger):
+        if not si.begin.startswith(si.trigger):
             raise ValueError(
                 "build_tool_lark: StructureInfo.begin must start with its "
                 f"trigger (trigger={si.trigger!r}, begin={si.begin!r})"
             )
         # The trigger must be a special-token sentinel (see LIMITATION above),
         # otherwise the lazy TAG_TEXT prefix could swallow it in the auto path.
-        if si.trigger and si.trigger not in si.sentinels:
+        if si.trigger not in si.sentinels:
             raise ValueError(
                 "build_tool_lark: trigger must be declared as a special-token "
                 f"sentinel (trigger={si.trigger!r}, sentinels={si.sentinels!r})"
@@ -256,6 +261,22 @@ def build_tool_grammar(
         return None
     if get_info is None:
         return None  # family opted out (default ABC behavior)
+
+    # NAMED tool_choice: any value other than the reserved ``auto``/``required``
+    # (``none`` already returned above) names a specific function. Narrow
+    # ``tools`` to just that function INSIDE the builder so a named choice can
+    # only ever emit the requested tool — never one of the other supplied
+    # tools — regardless of how the caller passed ``tools`` (design §4). An
+    # unknown name degrades to free-form rather than silently constraining.
+    if tool_choice not in ("auto", "required"):
+        named = [t for t in tools if t.get("name") == tool_choice]
+        if not named:
+            logger.warning(
+                "tool-grammar: named tool_choice %r not in tools; free-form",
+                tool_choice,
+            )
+            return None
+        tools = named
 
     structure_infos: list[StructureInfo] = []
     for tool in tools:
