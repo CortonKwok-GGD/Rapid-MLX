@@ -2601,34 +2601,43 @@ class TestCheckpointMetadataFallback:
         )
         assert auto_config_mod._template_uses_parameterized_xml_tools(nested) is True
 
-    def test_deep_set_capture_chain_beyond_cap_is_not_detected(self):
-        # Set-capture fast-follow (c, beyond cap): a capture chain deeper than
-        # ``_MAX_MACRO_RESOLUTION_DEPTH`` stops resolving at the cap (contributes
-        # an empty path), so the XML at the chain's root is NOT reached and the
-        # template fails SAFE to text routing rather than looping / crashing.
+    def test_deep_set_capture_chain_resolves_and_terminates(self):
+        # A long chain of in-order captures each referencing the previous bounded
+        # binding (``{% set c_n %}{{ c_{n-1} }}{% endset %}``) resolves LINEARLY
+        # (each link is bounded and its referent is already in scope), so the root
+        # XML propagates to the emitted tail — and the walk terminates in one pass
+        # (no per-emission re-expansion, no recursion / hang).  The cumulative
+        # byte budget still bounds pathological width.
         depth = auto_config_mod._MAX_MACRO_RESOLUTION_DEPTH
         links = [("{% set c0 %}" + self._RAW_XML + "{% endset %}")]
-        for i in range(1, depth + 4):
+        for i in range(1, depth + 6):
             links.append(
                 "{% set c" + str(i) + " %}{{ c" + str(i - 1) + " }}{% endset %}"
             )
         chain = (
-            "".join(links) + "{% if tools %}{{ c" + str(depth + 3) + " }}{% endif %}"
+            "".join(links) + "{% if tools %}{{ c" + str(depth + 5) + " }}{% endif %}"
         )
-        # Beyond the cap → not detected, but MUST terminate (no hang / recursion).
-        assert auto_config_mod._template_uses_parameterized_xml_tools(chain) is False
+        import time
 
-    def test_recursive_set_capture_does_not_hang(self):
-        # A (self-)referential capture must terminate via the shared cycle guard,
-        # not loop.  ``{% set c %}...{{ c }}{% endset %}`` references itself; the
-        # first expansion still carries the root XML so it is detected AND
-        # terminates.
+        start = time.time()
+        result = auto_config_mod._template_uses_parameterized_xml_tools(chain)
+        assert time.time() - start < 5.0  # terminates fast, no runaway expansion
+        assert result is True
+
+    def test_self_referential_set_capture_is_not_resolved(self):
+        # A capture whose body references ITSELF (``{% set c %}...{{ c }}
+        # {% endset %}``) — ``c`` is not yet bound while it is being defined, so the
+        # inner ``{{ c }}`` is an UNBOUND name → the body is not bounded-literal →
+        # the capture is not recorded, and a later ``{{ c }}`` routes to text
+        # (fail-safe).  Must terminate (no self-recursion) regardless.
         recursive = (
             "{% set c %}"
             + self._RAW_XML
             + "{{ c }}{% endset %}{% if tools %}{{ c }}{% endif %}"
         )
-        assert auto_config_mod._template_uses_parameterized_xml_tools(recursive) is True
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(recursive) is False
+        )
 
     def test_filtered_set_capture_is_not_resolved(self):
         # ``{% set x | upper %}...{% endset %}`` applies a runtime filter to the
@@ -2702,12 +2711,11 @@ class TestCheckpointMetadataFallback:
             is False
         )
 
-    def test_shadowed_set_capture_is_dropped(self):
-        # codex round-1 BLOCKING #1: a name captured MORE THAN ONCE at module
-        # scope has an ambiguous binding (statement-order dependent), so it is
-        # dropped entirely rather than resolved via "last-definition-wins" — a
-        # later benign redefinition must not let the earlier tool XML leak, and
-        # vice versa.
+    def test_shadowed_set_capture_uses_last_binding_in_order(self):
+        # codex round-1 #1 / round-2 #4: a name captured twice resolves to the
+        # binding LATEST in statement order at the emit site.  Here the XML
+        # capture is overwritten by a benign ``safe`` capture BEFORE ``{{ wire }}``,
+        # so the emit resolves to ``safe`` (not the stale XML) → text routing.
         shadowed = (
             "{% set wire %}"
             + self._RAW_XML
@@ -2715,6 +2723,86 @@ class TestCheckpointMetadataFallback:
             "{% if tools %}{{ wire }}{% endif %}"
         )
         assert auto_config_mod._template_uses_parameterized_xml_tools(shadowed) is False
+
+    def test_reshadowed_set_capture_detects_last_xml_binding(self):
+        # Order-sensitivity, opposite direction: a benign capture overwritten by an
+        # XML capture BEFORE the emit resolves to the XML → detected.  Proves the
+        # in-order resolution honors statement order, not a global map.
+        reshadowed = (
+            "{% set wire %}safe{% endset %}{% set wire %}"
+            + self._RAW_XML
+            + "{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(reshadowed) is True
+        )
+
+    def test_set_capture_used_before_definition_is_not_resolved(self):
+        # codex round-2 #3: a ``{{ wire }}`` emitted BEFORE its ``{% set wire %}``
+        # must not substitute a value Jinja has not assigned yet → text routing.
+        use_before_def = (
+            "{% if tools %}{{ wire }}{% endif %}{% set wire %}"
+            + self._RAW_XML
+            + "{% endset %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(use_before_def)
+            is False
+        )
+
+    def test_scalar_reassignment_invalidates_prior_set_capture(self):
+        # codex round-2 #4: a scalar ``{% set wire = "safe" %}`` (jinja2 ``Assign``)
+        # after a block capture re-binds the name; a following ``{{ wire }}`` must
+        # NOT substitute the obsolete XML capture → text routing.
+        scalar_rebind = (
+            "{% set wire %}"
+            + self._RAW_XML
+            + '{% endset %}{% set wire = "safe" %}{% if tools %}{{ wire }}{% endif %}'
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(scalar_rebind)
+            is False
+        )
+
+    def test_unbound_name_in_capture_body_is_not_resolved(self):
+        # codex round-2 #5: a capture body containing an UNBOUND printed name
+        # (``<tool_{{ suffix }}call>``) is runtime data — accepting the name as an
+        # empty path would fabricate ``<tool_call>`` by joining literals.  The
+        # capture is therefore not bounded-literal → text routing.
+        fabricate = (
+            "{% set wire %}<tool_{{ suffix }}call>"
+            "{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(fabricate) is False
+        )
+
+    def test_set_capture_inside_with_scope_does_not_leak_out(self):
+        # codex round-2 #2: a capture defined inside a ``{% with %}`` scope must not
+        # leak to statements FOLLOWING the ``{% endwith %}``; the outer
+        # ``{{ wire }}`` sees no binding → text routing.
+        with_scope = (
+            "{% with y=1 %}{% set wire %}"
+            + self._RAW_XML
+            + "{% endset %}{% endwith %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(with_scope) is False
+        )
+
+    def test_call_block_capture_body_is_not_resolved(self):
+        # codex round-2 #1: a generic ``{% call helper() %}`` (``CallBlock``) may
+        # transform / discard its caller body, so it is NOT an output-preserving
+        # wrapper; a capture wrapping tool XML in one stays unbounded → text.
+        call_block = (
+            "{% macro helper() %}{{ caller() }}{% endmacro %}"
+            "{% set wire %}{% call helper() %}"
+            + self._RAW_XML
+            + "{% endcall %}{% endset %}{% if tools %}{{ wire }}{% endif %}"
+        )
+        assert (
+            auto_config_mod._template_uses_parameterized_xml_tools(call_block) is False
+        )
 
     def test_path_enumeration_bounded_by_cumulative_byte_budget(self):
         # FIX #5: a template whose path COUNT stays under the cap but whose
