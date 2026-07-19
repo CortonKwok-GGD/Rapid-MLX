@@ -567,8 +567,8 @@ _REASONING_SENTINELS = ("<think>", "</think>")
 
 def test_reasoning_prefix_lark_has_balanced_block_rules():
     """With a reasoning (open, close) pair the free prefix becomes ``prefix:
-    TAG_TEXT (reasoning_block TAG_TEXT)*`` and ``reasoning_block: <open> TAG_TEXT
-    <close>`` — a BALANCED rule-level block, not an unordered alternation."""
+    opened? TAG_TEXT (reasoning_block TAG_TEXT)*`` — a BALANCED, PREFILL-tolerant
+    rule-level block, not an unordered alternation."""
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
@@ -576,9 +576,11 @@ def test_reasoning_prefix_lark_has_balanced_block_rules():
         TOOLS, "required", infos, reasoning_sentinels=_REASONING_SENTINELS
     )
     # The free prefix is the reasoning-tolerant ``prefix`` nonterminal with a
-    # BALANCED block (open must be closed) — NOT the unordered ``<think> |
+    # BALANCED block (open must be closed) plus an OPTIONAL leading close
+    # (``opened?``) for prefilled-<think> models — NOT the unordered ``<think> |
     # </think>`` alternation (which accepted an unclosed opener).
-    assert "prefix: TAG_TEXT (reasoning_block TAG_TEXT)*" in lark
+    assert "prefix: opened? TAG_TEXT (reasoning_block TAG_TEXT)*" in lark
+    assert "opened: TAG_TEXT </think>" in lark
     assert "reasoning_block: <think> TAG_TEXT </think>" in lark
     assert "rtok:" not in lark  # the old unordered alternation is gone
     # Reasoning refs are bare token references, NOT quoted byte literals.
@@ -935,10 +937,13 @@ def test_unbalanced_think_opener_is_rejected(tok, lltok):
 
 
 @_requires_llguidance
-def test_stray_think_close_without_opener_is_rejected(tok, lltok):
-    """A stray ``</think>`` with no matching ``<think>`` opener before the
-    trigger is rejected — the balanced block admits a close ONLY after an
-    open (codex #558-PR4 blocking)."""
+def test_prefilled_think_leading_close_is_accepted(tok, lltok):
+    """PREFILL-TOLERANCE PROOF (codex #558-PR4 round-4 blocking): reasoning chat
+    templates prefill ``<think>`` at the END of the prompt (Qwen3.6, DeepSeek-R1),
+    so the GENERATED stream begins already inside reasoning — reasoning text,
+    then a ``</think>`` whose opener lives in the unseen prompt, then the call.
+    The grammar admits ONE such leading close (``opened?``) so the required tool
+    call is NOT blocked on prefilled-think models."""
     from vllm_mlx.api.tool_grammar import (
         are_single_special_tokens,
         build_tool_grammar,
@@ -952,15 +957,125 @@ def test_stray_think_close_without_opener_is_rejected(tok, lltok):
         _HermesStubParser(),
         reasoning_sentinels=_REASONING_SENTINELS,
     )
+    # Generated stream when <think> is prompt-prefilled: reasoning text, leading
+    # </think> (no generated opener), then the call. Must be accepted IN FULL.
+    accepted, total, accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        "The user wants the weather.</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted == total and accepting, (
+        "prefilled-<think> generated stream (leading </think>) was rejected — "
+        "the required tool call would be blocked on every prefilled-think model"
+    )
+
+
+@_requires_llguidance
+def test_two_leading_closes_are_rejected(tok, lltok):
+    """``opened?`` admits AT MOST ONE leading close (the single prefilled-think
+    opener). A SECOND unmatched ``</think>`` is rejected — the prefill tolerance
+    does not degrade into accepting arbitrary stray closes."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # Two leading closes with no matching opens -> the second is unmatched.
     accepted, total, _ = _consume(
         grammar,
         lltok,
         tok,
-        "leading text</think>\n"
+        "a</think>b</think>\n"
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
         "</tool_call>",
     )
     assert accepted < total, (
-        "a stray </think> with no opener was accepted — the reasoning block is "
-        "not balanced"
+        "two leading </think> closes were accepted — opened? must permit only "
+        "one (the single prompt-prefilled opener)"
+    )
+
+
+# DeepSeek-R1 uses the ``deepseek_r1`` reasoning parser and, like Qwen3, prefills
+# ``<think>`` in its chat template. Test against the ACTUAL formatted DeepSeek
+# prompt (codex #558-PR4 round-4) to prove the prefill tolerance is not
+# Qwen-specific. Cached locally as ``DeepSeek-R1-Distill-Qwen-32B-4bit``; skips
+# only on genuine unavailability.
+_DEEPSEEK_MODEL = "mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit"
+
+
+@_requires_llguidance
+def test_deepseek_r1_prefilled_think_template_is_tolerated(lltok):
+    """Using the REAL DeepSeek-R1 chat template (which prefills ``<think>``) and
+    the ``deepseek_r1`` reasoning parser, the generated stream — reasoning text +
+    a leading ``</think>`` + the tool call — is accepted in full. Proves the
+    prefill tolerance holds for DeepSeek-R1's actual formatted prompt, not just
+    a hand-written string (codex #558-PR4 round-4)."""
+    transformers = pytest.importorskip("transformers")
+    try:
+        ds_tok = transformers.AutoTokenizer.from_pretrained(_DEEPSEEK_MODEL)
+    except _offline_skip_exc_types():  # pragma: no cover - offline & uncached
+        pytest.skip(f"{_DEEPSEEK_MODEL} not cached and no network")
+
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_lltokenizer,
+        build_tool_grammar,
+        resolve_reasoning_sentinels,
+    )
+
+    if not are_single_special_tokens(ds_tok, ("<tool_call>", "</tool_call>")):
+        pytest.skip("DeepSeek tokenizer lacks single-token <tool_call> sentinels")
+
+    # The REAL template must prefill <think> at the end of the assistant turn —
+    # otherwise this test would not exercise the prefill path.
+    rendered = ds_tok.apply_chat_template(
+        [{"role": "user", "content": "Weather in Paris? Use the tool."}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    if not rendered.rstrip().endswith("<think>"):
+        pytest.skip("DeepSeek-R1 template revision no longer prefills <think>")
+
+    # deepseek_r1 reasoning parser -> <think>/</think>, kept iff single tokens.
+    sentinels = resolve_reasoning_sentinels("deepseek_r1", ds_tok)
+    if sentinels != ("<think>", "</think>"):
+        pytest.skip("DeepSeek tokenizer lacks single-token <think>/</think>")
+
+    # Build the DeepSeek LLTokenizer via the PRODUCTION path (build_lltokenizer):
+    # DeepSeek-R1's tokenizer is a ``Qwen2Tokenizer`` that raw
+    # ``llguidance.hf.from_tokenizer`` rejects on some transformers revisions —
+    # the candidate-3 serialized fallback in build_lltokenizer closes exactly
+    # that gap, which is why the route uses it. A None here is a genuine env gap.
+    ds_lltok = build_lltokenizer(ds_tok)
+    if ds_lltok is None:  # pragma: no cover - conversion gap is an env issue
+        pytest.skip("could not build an LLTokenizer for the DeepSeek tokenizer")
+
+    grammar = build_tool_grammar(
+        TOOLS, "required", _HermesStubParser(), reasoning_sentinels=sentinels
+    )
+    assert grammar is not None
+    # Generated stream after the prompt-prefilled <think>: reasoning, leading
+    # </think>, then the tool call.
+    accepted, total, accepting = _consume(
+        grammar,
+        ds_lltok,
+        ds_tok,
+        "The user wants Paris weather.</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted == total and accepting, (
+        "DeepSeek-R1 prefilled-<think> generated stream was rejected — the "
+        "required tool call would be blocked on DeepSeek-R1"
     )

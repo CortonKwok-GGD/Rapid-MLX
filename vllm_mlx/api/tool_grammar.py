@@ -255,11 +255,32 @@ def resolve_reasoning_sentinels(
         return ()
     try:
         from ..reasoning import get_parser
-
-        parser_cls = get_parser(reasoning_parser_name)
     except Exception:
-        # Unknown/unregistered reasoning parser -> no reasoning tolerance
-        # (free prefix stays bare TAG_TEXT). Never disables tool enforcement.
+        # The reasoning package failed to import — an unexpected defect, not an
+        # unconfigured parser. Log it (with the parser name) so it is not
+        # silently indistinguishable from the benign case (codex #558-PR4 nit).
+        logger.exception(
+            "tool-grammar: reasoning package import failed for parser %r; "
+            "no reasoning tolerance",
+            reasoning_parser_name,
+        )
+        return ()
+    try:
+        parser_cls = get_parser(reasoning_parser_name)
+    except KeyError:
+        # EXPECTED: an unknown/unregistered reasoning parser name. No reasoning
+        # tolerance (free prefix stays bare TAG_TEXT); never disables tool
+        # enforcement. This is a benign config case, not logged as an error.
+        return ()
+    except Exception:
+        # UNEXPECTED lookup failure (registry defect) — surface it with the
+        # parser name rather than silently degrading, so a real bug is not
+        # masked as "parser not configured" (codex #558-PR4 nit).
+        logger.exception(
+            "tool-grammar: unexpected error resolving reasoning parser %r; "
+            "no reasoning tolerance",
+            reasoning_parser_name,
+        )
         return ()
     markers: list[str] = []
     for attr in ("start_token", "end_token"):
@@ -413,20 +434,31 @@ def build_tool_lark(
     FALSE whenever those markers are special tokens (exactly the reasoning case
     this PR targets). The matcher rejects the very first ``<think>`` token and
     path A collapses. To make path A actually correct we build the free prefix as
-    ``prefix: TAG_TEXT (reasoning_block TAG_TEXT)*`` with
-    ``reasoning_block: <open> TAG_TEXT <close>`` — zero or more BALANCED
-    ``<think>...</think>`` blocks interleaved with free text. The refs MUST be
-    rule-level, not lexer terminals, because llguidance rejects special tokens
-    inside a terminal (``special tokens ... cannot be used in terminals``).
+    ``prefix: opened? TAG_TEXT (reasoning_block TAG_TEXT)*`` with
+    ``opened: TAG_TEXT <close>`` and ``reasoning_block: <open> TAG_TEXT
+    <close>``. The refs MUST be rule-level, not lexer terminals, because
+    llguidance rejects special tokens inside a terminal (``special tokens ...
+    cannot be used in terminals``).
 
-    The block is BALANCED (codex #558-PR4 blocking): every emitted ``<think>``
-    opener MUST be closed by ``</think>`` before the trigger, and a stray
-    ``</think>`` with no opener is rejected. An unbalanced-tolerant
-    ``rtok: <think> | </think>`` would accept an UNCLOSED
+    The block is BALANCED (codex #558-PR4 blocking): a mid-stream ``<think>``
+    opener MUST be closed by ``</think>`` before the trigger. An
+    unbalanced-tolerant ``rtok: <think> | </think>`` would accept an UNCLOSED
     ``<think>...<tool_call>...</tool_call>`` that a lenient reasoning parser
     could classify entirely as reasoning, letting the tool call be swallowed and
-    ``tool_choice="required"`` slip. The no-reasoning path stays direct (the tag
-    can begin immediately, no ``<think>`` required).
+    ``tool_choice="required"`` slip.
+
+    ``opened?`` handles the PREFILLED-``<think>`` case (codex #558-PR4 round-4
+    blocking): many reasoning chat templates prefill ``<think>`` at the END of
+    the prompt (verified on Qwen3.6 and DeepSeek-R1 — the assistant turn ends
+    ``...<think>``), so GENERATION begins already inside the reasoning block. The
+    grammar processor baselines past the prompt and only ever sees the GENERATED
+    tokens, which then begin with reasoning text and a ``</think>`` whose opener
+    lives in the (unseen) prompt. ``opened`` permits AT MOST ONE such leading
+    close, modelling the prompt's already-open reasoning state (vLLM seeds the
+    same opener state). Without it the balanced block would reject that leading
+    ``</think>`` and BLOCK the required call on every prefilled-think model. The
+    no-reasoning path stays direct (the tag can begin immediately, no ``<think>``
+    required).
 
     When ``reasoning_sentinels`` is empty / has fewer than two distinct
     well-formed ``<...>`` refs (no reasoning parser, or its markers are NOT
@@ -488,21 +520,23 @@ def build_tool_lark(
     # emitted grammar is byte-identical to PR-3 (no reasoning regression).
     #
     # With a reasoning (open, close) pair (each PROVEN a single special token by
-    # the caller) ``prefix`` admits ZERO OR MORE BALANCED
-    # ``<think> ... </think>`` blocks interleaved with free text, then the tag
-    # enforces the tool-call structure. The refs MUST be rule-level, never lexer
-    # terminals: llguidance rejects a special token inside a terminal. A bare
-    # ``TAG_TEXT`` (a byte regex) cannot match a special token, which is exactly
-    # why the design-doc claim that ``TAG_TEXT`` alone swallows ``<think>`` is
-    # wrong on real reasoning tokenizers (see docstring GROUND TRUTH).
+    # the caller) ``prefix`` admits an optional PREFILLED-reasoning leading close
+    # plus zero or more BALANCED ``<think> ... </think>`` blocks interleaved with
+    # free text, then the tag enforces the tool-call structure. The refs MUST be
+    # rule-level, never lexer terminals: llguidance rejects a special token
+    # inside a terminal. A bare ``TAG_TEXT`` (a byte regex) cannot match a
+    # special token, which is exactly why the design-doc claim that ``TAG_TEXT``
+    # alone swallows ``<think>`` is wrong on real reasoning tokenizers (see
+    # docstring GROUND TRUTH).
     #
-    # BALANCED (codex #558-PR4 blocking): the reasoning block is
-    # ``reasoning_block: <open> TAG_TEXT <close>``, so an emitted ``<think>``
-    # opener MUST be closed by ``</think>`` before the trigger, and a stray
-    # ``</think>`` with no opener is rejected. An earlier unordered
-    # ``rtok: <think> | </think>`` accepted an UNCLOSED ``<think>...<tool_call>``
-    # that a lenient reasoning parser could classify entirely as reasoning,
-    # letting the tool call be swallowed and ``tool_choice="required"`` slip.
+    # BALANCED + PREFILL-TOLERANT (codex #558-PR4 rounds 3-4): a mid-stream
+    # ``<open>`` MUST be closed by ``<close>`` before the trigger (an unclosed
+    # opener a lenient parser could swallow the call into is rejected), BUT an
+    # OPTIONAL leading ``<close>`` (``opened?``) is allowed because reasoning
+    # chat templates prefill ``<think>`` in the PROMPT — generation begins inside
+    # reasoning and the processor only sees the generated tokens (leading
+    # ``</think>``, opener in the unseen prompt). See docstring for the full
+    # rationale.
     #
     # ``reasoning_sentinels`` is an ORDERED ``(open, close)`` pair. We take the
     # first two DISTINCT, well-formed ``<...>`` special-token refs as
@@ -525,14 +559,28 @@ def build_tool_lark(
         "\n"
     )
     if reasoning_pair:
-        # ``prefix: TAG_TEXT (reasoning_block TAG_TEXT)*`` — free text with zero
-        # or more BALANCED reasoning blocks. ``reasoning_block: <open> TAG_TEXT
-        # <close>`` forces every opener to be closed before the trigger. Refs are
-        # already in ``<...>`` special-token-ref form; llguidance Lark treats a
-        # bare ``<name>`` as a special-token reference.
+        # ``prefix: opened? TAG_TEXT (reasoning_block TAG_TEXT)*``:
+        #   * ``opened: TAG_TEXT <close>`` — an OPTIONAL leading close. Many
+        #     reasoning chat templates PREFILL ``<think>`` at the end of the
+        #     prompt (verified on Qwen3.6 and DeepSeek-R1: the assistant turn
+        #     ends ``...<think>\n``), so GENERATION starts already INSIDE the
+        #     reasoning block. The grammar processor baselines PAST the prompt
+        #     and only ever sees the GENERATED tokens, which then begin with
+        #     reasoning text and a ``</think>`` whose ``<think>`` opener lives in
+        #     the (unseen) prompt. Without ``opened?`` the balanced block would
+        #     reject that leading ``</think>`` and BLOCK the required tool call
+        #     on every prefilled-think model (codex #558-PR4 blocking). ``opened``
+        #     permits AT MOST ONE such leading close, modelling the prompt's
+        #     already-open reasoning state (vLLM seeds the same opener state).
+        #   * ``(reasoning_block TAG_TEXT)*`` — any number of further EXPLICIT
+        #     balanced ``<open> ... <close>`` blocks emitted in-stream.
+        # A mid-stream ``<open>`` that never closes is still rejected (it is not
+        # a leading close and has no matching ``<close>``), preserving the
+        # round-3 balance guarantee.
         open_ref, close_ref = reasoning_pair
         lark += (
-            "prefix: TAG_TEXT (reasoning_block TAG_TEXT)*\n"
+            "prefix: opened? TAG_TEXT (reasoning_block TAG_TEXT)*\n"
+            f"opened: TAG_TEXT {close_ref}\n"
             f"reasoning_block: {open_ref} TAG_TEXT {close_ref}\n"
         )
 
