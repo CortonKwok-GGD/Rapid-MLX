@@ -330,7 +330,12 @@ def test_build_tool_lark_defaults_only_when_parameters_absent():
     info = _hermes_structure_info()("get_weather")
     tool_missing = {"name": "get_weather"}  # no "parameters" key
     lark = build_tool_lark([tool_missing], "required", [info])
-    assert '%json {"type": "object", "properties": {}}' in lark
+    # The default for an omitted schema is CLOSED — a no-parameter tool must
+    # accept NO arguments (additionalProperties: false), not arbitrary keys.
+    assert (
+        '%json {"type": "object", "properties": {}, "additionalProperties": false}'
+        in lark
+    )
 
 
 # --------------------------------------------------------------------------

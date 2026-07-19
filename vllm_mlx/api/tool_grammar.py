@@ -145,11 +145,15 @@ def build_tool_lark(
     Every tag is: ``TAG_TEXT <trigger-and-begin> %json <schema> <end>``.
     ``TAG_TEXT`` is the lazy free prefix that swallows reasoning/prose until
     the trigger — this is also the reasoning-aware delay (design §5 path A).
-    LIMITATION (design §7 open-Q1, deferred to the PR-5 auto path): for the
-    ``auto`` (``*``) branch the trigger MUST be a single special token so the
-    lazy ``TAG_TEXT`` prefix cannot swallow it. We therefore require every
-    trigger to be declared as a ``sentinel`` — a text (multi-token) trigger
-    is rejected here rather than silently producing an unenforceable grammar.
+    REQUIREMENT (applies to ALL modes, not just ``auto``): the trigger MUST be
+    a single special token, declared in ``sentinels``. This is enforced
+    UNCONDITIONALLY because the lazy ``TAG_TEXT`` prefix can reassemble a
+    multi-byte *text* trigger from ordinary token pieces in any mode — a
+    text trigger is unenforceable regardless of the ``*``/``+`` quantifier, so
+    the builder rejects it (raises ``ValueError``) rather than silently
+    producing an unenforceable grammar. Full text-trigger support (excluding
+    the trigger byte sequence from ``TAG_TEXT`` across token boundaries) is
+    design §7 open-Q1, deferred to the PR-5 auto path.
     """
     if not tools:
         raise ValueError("build_tool_lark: tools must not be empty")
@@ -177,8 +181,9 @@ def build_tool_lark(
                 "build_tool_lark: StructureInfo.begin must start with its "
                 f"trigger (trigger={si.trigger!r}, begin={si.begin!r})"
             )
-        # The trigger must be a special-token sentinel (see LIMITATION above),
-        # otherwise the lazy TAG_TEXT prefix could swallow it in the auto path.
+        # The trigger must be a special-token sentinel (see REQUIREMENT above)
+        # in EVERY mode — the lazy TAG_TEXT prefix could otherwise reassemble a
+        # text trigger from ordinary token pieces and bypass enforcement.
         if si.trigger not in si.sentinels:
             raise ValueError(
                 "build_tool_lark: trigger must be declared as a special-token "
@@ -196,14 +201,22 @@ def build_tool_lark(
         "\n"
     )
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
-        # Only substitute the permissive default when ``parameters`` is ABSENT.
-        # A falsy-but-present schema ({} = allow-any, false = allow-none) is a
+        # Only substitute the default when ``parameters`` is ABSENT. A
+        # falsy-but-present schema ({} = allow-any, false = allow-none) is a
         # deliberate, meaningful JSON Schema and must be preserved verbatim —
-        # ``tool.get("parameters") or default`` would silently clobber it.
+        # ``tool.get("parameters") or default`` would silently clobber it. The
+        # default itself is CLOSED (``additionalProperties: false``): a tool
+        # that documents no parameters must accept NO arguments, otherwise the
+        # grammar would let the model hallucinate arbitrary keys into a
+        # no-arg call.
         if "parameters" in tool and tool["parameters"] is not None:
             params = tool["parameters"]
         else:
-            params = {"type": "object", "properties": {}}
+            params = {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            }
         schema = json.dumps(params)
         begin_body = _emit_literal_with_sentinels(si.begin, si.sentinels)
         end_body = _emit_literal_with_sentinels(si.end, si.sentinels)
