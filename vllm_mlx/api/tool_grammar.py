@@ -402,24 +402,34 @@ def build_tool_lark(
     the trigger byte sequence from the free prefix across token boundaries) is
     design §7 open-Q1, deferred to the PR-5 auto path.
 
-    REASONING-TOLERANT PREFIX (#558 PR-4, path A). ``reasoning_sentinels`` is a
-    tuple of the model family's reasoning-boundary strings (``<think>`` /
-    ``</think>``) that the caller has PROVEN are single special tokens on this
-    tokenizer (via ``are_single_special_tokens``). GROUND TRUTH (verified on the
-    real Qwen3.6 tokenizer, 2026-07): a bare ``TAG_TEXT: /(.|\\n)*/`` free prefix
-    is a BYTE regex and therefore CANNOT match a ``<think>`` *special token* (id
-    248068) — the design-doc §5.3 claim that a bare ``TAG_TEXT`` "swallows the
-    whole ``<think>...</think>`` block" is FALSE whenever those markers are
-    special tokens (exactly the reasoning case this PR targets). The matcher
-    rejects the very first ``<think>`` token and path A collapses. To make path A
-    actually correct we build the free prefix as
-    ``prefix: TAG_TEXT (rtok TAG_TEXT)*`` where ``rtok`` is a RULE-level
-    alternation of the reasoning special-token refs — they MUST be rule-level,
-    not lexer terminals, because llguidance rejects special tokens inside a
-    terminal (``special tokens ... cannot be used in terminals``). This admits an
-    interleaving of free text and reasoning special tokens BEFORE the trigger,
-    then the tag enforces the tool-call structure exactly as before. When
-    ``reasoning_sentinels`` is empty (no reasoning parser, or its markers are NOT
+    REASONING-TOLERANT PREFIX (#558 PR-4, path A). ``reasoning_sentinels`` is an
+    ORDERED ``(open, close)`` pair of the model family's reasoning-boundary
+    strings (``<think>`` / ``</think>``) that the caller has PROVEN are single
+    special tokens on this tokenizer (via ``are_single_special_tokens``). GROUND
+    TRUTH (verified on the real Qwen3.6 tokenizer, 2026-07): a bare
+    ``TAG_TEXT: /(.|\\n)*/`` free prefix is a BYTE regex and therefore CANNOT
+    match a ``<think>`` *special token* (id 248068) — the design-doc §5.3 claim
+    that a bare ``TAG_TEXT`` "swallows the whole ``<think>...</think>`` block" is
+    FALSE whenever those markers are special tokens (exactly the reasoning case
+    this PR targets). The matcher rejects the very first ``<think>`` token and
+    path A collapses. To make path A actually correct we build the free prefix as
+    ``prefix: TAG_TEXT (reasoning_block TAG_TEXT)*`` with
+    ``reasoning_block: <open> TAG_TEXT <close>`` — zero or more BALANCED
+    ``<think>...</think>`` blocks interleaved with free text. The refs MUST be
+    rule-level, not lexer terminals, because llguidance rejects special tokens
+    inside a terminal (``special tokens ... cannot be used in terminals``).
+
+    The block is BALANCED (codex #558-PR4 blocking): every emitted ``<think>``
+    opener MUST be closed by ``</think>`` before the trigger, and a stray
+    ``</think>`` with no opener is rejected. An unbalanced-tolerant
+    ``rtok: <think> | </think>`` would accept an UNCLOSED
+    ``<think>...<tool_call>...</tool_call>`` that a lenient reasoning parser
+    could classify entirely as reasoning, letting the tool call be swallowed and
+    ``tool_choice="required"`` slip. The no-reasoning path stays direct (the tag
+    can begin immediately, no ``<think>`` required).
+
+    When ``reasoning_sentinels`` is empty / has fewer than two distinct
+    well-formed ``<...>`` refs (no reasoning parser, or its markers are NOT
     single special tokens on this tokenizer) the prefix is the bare ``TAG_TEXT``
     — the non-reasoning grammar is byte-identical to PR-3, so this change is a
     strict superset with ZERO regression for non-reasoning constrained calls. The
@@ -474,29 +484,39 @@ def build_tool_lark(
 
     # Free-prefix nonterminal (design §5 path A). ``prefix`` is what every tag —
     # and the trailing ``tag_end`` — consumes before/after the tool call. With
-    # NO reasoning sentinels it is the bare lazy ``TAG_TEXT`` byte regex, so the
+    # NO reasoning pair it is the bare lazy ``TAG_TEXT`` byte regex, so the
     # emitted grammar is byte-identical to PR-3 (no reasoning regression).
     #
-    # With reasoning sentinels (each PROVEN a single special token by the caller)
-    # ``prefix`` interleaves free text with the reasoning special-token refs so
-    # a ``<think>...</think>`` block is admitted before the trigger. The refs
-    # MUST be rule-level (``rtok:``), never lexer terminals: llguidance rejects
-    # a special token inside a terminal. A bare ``TAG_TEXT`` (a byte regex)
-    # cannot match a special token, which is exactly why the design-doc claim
-    # that ``TAG_TEXT`` alone swallows ``<think>`` is wrong on real reasoning
-    # tokenizers (see build_tool_lark docstring GROUND TRUTH).
-    # Keep only well-formed ``<...>`` special-token refs (dedup, drop empties).
-    # A marker that is a single tokenizer token but NOT a valid bare Lark ref
-    # (e.g. ``[THINK]``) is dropped rather than emitted as syntactically-invalid
-    # Lark that would fail to compile (codex #558-PR4 nit). If every marker is
-    # dropped, the prefix falls back to the bare ``TAG_TEXT`` (no reasoning
-    # tolerance) — safe degrade, never a compile failure.
+    # With a reasoning (open, close) pair (each PROVEN a single special token by
+    # the caller) ``prefix`` admits ZERO OR MORE BALANCED
+    # ``<think> ... </think>`` blocks interleaved with free text, then the tag
+    # enforces the tool-call structure. The refs MUST be rule-level, never lexer
+    # terminals: llguidance rejects a special token inside a terminal. A bare
+    # ``TAG_TEXT`` (a byte regex) cannot match a special token, which is exactly
+    # why the design-doc claim that ``TAG_TEXT`` alone swallows ``<think>`` is
+    # wrong on real reasoning tokenizers (see docstring GROUND TRUTH).
+    #
+    # BALANCED (codex #558-PR4 blocking): the reasoning block is
+    # ``reasoning_block: <open> TAG_TEXT <close>``, so an emitted ``<think>``
+    # opener MUST be closed by ``</think>`` before the trigger, and a stray
+    # ``</think>`` with no opener is rejected. An earlier unordered
+    # ``rtok: <think> | </think>`` accepted an UNCLOSED ``<think>...<tool_call>``
+    # that a lenient reasoning parser could classify entirely as reasoning,
+    # letting the tool call be swallowed and ``tool_choice="required"`` slip.
+    #
+    # ``reasoning_sentinels`` is an ORDERED ``(open, close)`` pair. We take the
+    # first two DISTINCT, well-formed ``<...>`` special-token refs as
+    # ``(open, close)``; anything else (fewer than two, a marker that is a single
+    # tokenizer token but not a valid bare Lark ref like ``[THINK]``, or open ==
+    # close) drops reasoning tolerance and falls back to the bare ``TAG_TEXT``
+    # prefix — a safe degrade, never a compile failure.
     reasoning_refs = tuple(
         dict.fromkeys(
             s for s in reasoning_sentinels if s and _is_lark_special_token_ref(s)
         )
     )
-    prefix_ref = "prefix" if reasoning_refs else "TAG_TEXT"
+    reasoning_pair = reasoning_refs[:2] if len(reasoning_refs) >= 2 else ()
+    prefix_ref = "prefix" if reasoning_pair else "TAG_TEXT"
     lark = (
         "%llguidance {}\n"
         f"start: ({tag_names}){quant} tag_end\n"
@@ -504,13 +524,17 @@ def build_tool_lark(
         r"TAG_TEXT: /(.|\n)*/"
         "\n"
     )
-    if reasoning_refs:
-        # ``prefix: TAG_TEXT (rtok TAG_TEXT)*`` — free text with interleaved
-        # reasoning special tokens. Sentinels are already in ``<...>`` special-
-        # token-ref form (e.g. ``<think>``); llguidance Lark treats a bare
-        # ``<name>`` as a special-token reference.
-        rtok_alts = " | ".join(reasoning_refs)
-        lark += f"prefix: TAG_TEXT (rtok TAG_TEXT)*\nrtok: {rtok_alts}\n"
+    if reasoning_pair:
+        # ``prefix: TAG_TEXT (reasoning_block TAG_TEXT)*`` — free text with zero
+        # or more BALANCED reasoning blocks. ``reasoning_block: <open> TAG_TEXT
+        # <close>`` forces every opener to be closed before the trigger. Refs are
+        # already in ``<...>`` special-token-ref form; llguidance Lark treats a
+        # bare ``<name>`` as a special-token reference.
+        open_ref, close_ref = reasoning_pair
+        lark += (
+            "prefix: TAG_TEXT (reasoning_block TAG_TEXT)*\n"
+            f"reasoning_block: {open_ref} TAG_TEXT {close_ref}\n"
+        )
 
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
         # Only substitute the default when ``parameters`` is ABSENT. A
@@ -575,11 +599,12 @@ def build_tool_grammar(
     builder stays a small, pure, request-shape-agnostic unit. An unexpected
     shape degrades safely to ``None`` (free-form) rather than crashing.
 
-    ``reasoning_sentinels`` (#558 PR-4, path A): reasoning-boundary special
-    tokens (``<think>`` / ``</think>``) the CALLER has proven single special
-    tokens on this tokenizer. Passed through to ``build_tool_lark`` so the free
-    prefix admits a ``<think>...</think>`` block before the trigger. Empty (the
-    default) reproduces the PR-3 non-reasoning grammar exactly.
+    ``reasoning_sentinels`` (#558 PR-4, path A): an ORDERED ``(open, close)``
+    pair of reasoning-boundary special tokens (``<think>`` / ``</think>``) the
+    CALLER has proven single special tokens on this tokenizer. Passed through to
+    ``build_tool_lark`` so the free prefix admits a BALANCED ``<think>...
+    </think>`` block before the trigger. Empty (the default) reproduces the PR-3
+    non-reasoning grammar exactly.
 
     Returns ``None`` when ``tool_choice`` is ``"none"`` (no constraint at
     all), when the parser declares no ``structure_info`` (family not yet

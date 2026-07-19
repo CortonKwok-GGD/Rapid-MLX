@@ -565,20 +565,22 @@ def test_bad_enum_value_is_rejected(tok, lltok):
 _REASONING_SENTINELS = ("<think>", "</think>")
 
 
-def test_reasoning_prefix_lark_has_prefix_and_rtok_rules():
-    """With reasoning_sentinels the free prefix becomes ``prefix: TAG_TEXT
-    (rtok TAG_TEXT)*`` and ``rtok`` is a rule-level special-token alternation."""
+def test_reasoning_prefix_lark_has_balanced_block_rules():
+    """With a reasoning (open, close) pair the free prefix becomes ``prefix:
+    TAG_TEXT (reasoning_block TAG_TEXT)*`` and ``reasoning_block: <open> TAG_TEXT
+    <close>`` — a BALANCED rule-level block, not an unordered alternation."""
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
     lark = build_tool_lark(
         TOOLS, "required", infos, reasoning_sentinels=_REASONING_SENTINELS
     )
-    # The free prefix is now the reasoning-tolerant ``prefix`` nonterminal.
-    assert "prefix: TAG_TEXT (rtok TAG_TEXT)*" in lark
-    # rtok is a RULE-level alternation of BARE special-token refs (llguidance
-    # rejects special tokens inside a terminal, so this MUST be a rule).
-    assert "rtok: <think> | </think>" in lark
+    # The free prefix is the reasoning-tolerant ``prefix`` nonterminal with a
+    # BALANCED block (open must be closed) — NOT the unordered ``<think> |
+    # </think>`` alternation (which accepted an unclosed opener).
+    assert "prefix: TAG_TEXT (reasoning_block TAG_TEXT)*" in lark
+    assert "reasoning_block: <think> TAG_TEXT </think>" in lark
+    assert "rtok:" not in lark  # the old unordered alternation is gone
     # Reasoning refs are bare token references, NOT quoted byte literals.
     assert '"<think>"' not in lark
     assert '"</think>"' not in lark
@@ -632,8 +634,8 @@ def test_non_reasoning_lark_is_unchanged_from_pr3():
 
 
 def test_reasoning_sentinels_dedup_and_drop_empty():
-    """Duplicate / empty reasoning markers are de-duped and dropped so the
-    ``rtok`` alternation is well-formed."""
+    """Duplicate / empty reasoning markers are de-duped and dropped; the first
+    two DISTINCT refs become the balanced ``(open, close)`` block."""
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
@@ -643,39 +645,53 @@ def test_reasoning_sentinels_dedup_and_drop_empty():
         infos,
         reasoning_sentinels=("<think>", "", "<think>", "</think>"),
     )
-    # Deduped to a single ``<think>`` alternative + ``</think>``; no empty ref.
-    assert "rtok: <think> | </think>" in lark
-    assert "rtok: <think> | <think>" not in lark
+    # Deduped to (open=<think>, close=</think>); no empty ref, no self-pair.
+    assert "reasoning_block: <think> TAG_TEXT </think>" in lark
+    assert "reasoning_block: <think> TAG_TEXT <think>" not in lark
+
+
+def test_single_reasoning_marker_degrades_to_bare_prefix():
+    """A single reasoning marker (no distinct close) cannot form a balanced
+    block, so the prefix degrades to the bare ``TAG_TEXT`` (no reasoning
+    tolerance) rather than emitting a half-open block."""
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
+    lark = build_tool_lark(TOOLS, "required", infos, reasoning_sentinels=("<think>",))
+    assert "reasoning_block:" not in lark
+    assert "prefix:" not in lark
+    assert "tag_end: TAG_TEXT" in lark
 
 
 def test_malformed_reasoning_sentinel_is_dropped_not_emitted():
     """A marker that is NOT a valid bare ``<...>`` special-token ref (e.g. a
     ``[THINK]`` char-class shape, or one with interior whitespace/brackets) is
     DROPPED — it must never be interpolated into Lark as syntactically-invalid
-    source (codex #558-PR4 nit). A well-formed ``<...>`` marker still emits."""
+    source (codex #558-PR4 nit). The remaining well-formed pair still emits."""
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
-    # Only ``<think>`` is a valid ref; the others are malformed and dropped.
+    # Only ``<think>``/``</think>`` are valid refs; the others are dropped, so
+    # the balanced (open, close) pair is recovered from the survivors.
     lark = build_tool_lark(
         TOOLS,
         "required",
         infos,
-        reasoning_sentinels=("[THINK]", "<a b>", "<x<y>", "<think>"),
+        reasoning_sentinels=("[THINK]", "<think>", "<a b>", "<x<y>", "</think>"),
     )
-    assert "rtok: <think>" in lark
+    assert "reasoning_block: <think> TAG_TEXT </think>" in lark
     # None of the malformed markers leaked into the grammar source.
     assert "[THINK]" not in lark
     assert "<a b>" not in lark
     assert "<x<y>" not in lark
 
-    # If EVERY marker is malformed, the prefix degrades to bare TAG_TEXT (no
-    # reasoning machinery) rather than emitting broken Lark.
+    # If FEWER than two valid refs survive, the prefix degrades to bare TAG_TEXT
+    # (no reasoning machinery) rather than emitting broken Lark.
     lark_all_bad = build_tool_lark(
         TOOLS, "required", infos, reasoning_sentinels=("[THINK]", "<a b>")
     )
     assert "prefix:" not in lark_all_bad
-    assert "rtok:" not in lark_all_bad
+    assert "reasoning_block:" not in lark_all_bad
     assert "tag_end: TAG_TEXT" in lark_all_bad
 
 
@@ -868,4 +884,83 @@ def test_off_schema_argument_rejected_after_reasoning(tok, lltok):
         f"grammar rejected at token {accepted}, not at the off-schema integer "
         f"(prefix has {pre_total} tokens) — schema enforcement leaked or "
         "mis-fired through the reasoning-tolerant prefix"
+    )
+
+
+@_requires_llguidance
+def test_unbalanced_think_opener_is_rejected(tok, lltok):
+    """BALANCED-BLOCK PROOF (codex #558-PR4 blocking): an UNCLOSED ``<think>``
+    (opener with no ``</think>``) before the trigger is rejected — the grammar
+    forces the opener to be closed before the tool call, so a lenient reasoning
+    parser can never swallow the whole ``<think>...<tool_call>...`` region as
+    reasoning and drop the required call."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    # <think> opens but NEVER closes before the tool call -> must be rejected.
+    accepted, total, _ = _consume(
+        grammar,
+        lltok,
+        tok,
+        "<think>reasoning that never closes\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted < total, (
+        "unclosed <think> opener was accepted — the reasoning block is not "
+        "balanced, so tool_choice=required could be swallowed into reasoning"
+    )
+    # Control: the SAME sequence with a </think> close IS accepted in full.
+    b_accepted, b_total, b_accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        "<think>reasoning that closes</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert b_accepted == b_total and b_accepting, (
+        "the balanced <think>...</think> variant should be accepted in full"
+    )
+
+
+@_requires_llguidance
+def test_stray_think_close_without_opener_is_rejected(tok, lltok):
+    """A stray ``</think>`` with no matching ``<think>`` opener before the
+    trigger is rejected — the balanced block admits a close ONLY after an
+    open (codex #558-PR4 blocking)."""
+    from vllm_mlx.api.tool_grammar import (
+        are_single_special_tokens,
+        build_tool_grammar,
+    )
+
+    if not are_single_special_tokens(tok, _REASONING_SENTINELS):
+        pytest.skip("fixture tokenizer lacks single-token <think>/</think>")
+    grammar = build_tool_grammar(
+        TOOLS,
+        "required",
+        _HermesStubParser(),
+        reasoning_sentinels=_REASONING_SENTINELS,
+    )
+    accepted, total, _ = _consume(
+        grammar,
+        lltok,
+        tok,
+        "leading text</think>\n"
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "</tool_call>",
+    )
+    assert accepted < total, (
+        "a stray </think> with no opener was accepted — the reasoning block is "
+        "not balanced"
     )
