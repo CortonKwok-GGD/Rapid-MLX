@@ -1126,7 +1126,7 @@ def validate_output_against_schema(
 ) -> tuple[bool, str | None]:
     """Post-decode belt-and-braces validation for strict json_schema (H-06).
 
-    Outlines-backed constrained decoding should make the output validate
+    llguidance-backed constrained decoding should make the output validate
     against the schema by construction. This helper is the smoke alarm
     that flags any case where guided decoding silently degraded
     (e.g. an llguidance version bump renames the constraint API and the

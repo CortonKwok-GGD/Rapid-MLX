@@ -40,7 +40,38 @@ requires_guided = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_model(lltok, plan):
+def _build_byte_level_fast_tokenizer():
+    """Build a hermetic byte-level BPE ``PreTrainedTokenizerFast`` in memory.
+
+    No network, no ``from_pretrained``, no model weights. The vocab covers
+    the full 256-symbol ByteLevel alphabet plus a few specials, so every
+    UTF-8 byte is representable and encode/decode round-trips exactly. This
+    is the exact tokenizer shape llguidance's ``hf.from_tokenizer`` expects
+    (a Rust-backed fast tokenizer with ``is_fast == True``) and mirrors the
+    in-repo offline-tokenizer pattern in ``test_streaming_detokenizer_bpe``.
+    """
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    alphabet = pre_tokenizers.ByteLevel.alphabet()  # 256 printable byte proxies
+    vocab: dict[str, int] = {}
+    for special in ("<pad>", "<s>", "</s>"):
+        vocab[special] = len(vocab)
+    for symbol in sorted(alphabet):
+        vocab[symbol] = len(vocab)
+
+    rust = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    rust.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    rust.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=rust,
+        eos_token="</s>",
+        bos_token="<s>",
+        pad_token="<pad>",
+    )
+
+
+def _make_fake_model(lltok, plan, prompt_len):
     """Build a stub model whose logits deterministically pick ``plan`` tokens.
 
     ``plan`` is a list of token ids the model "wants" to emit in order. On
@@ -50,36 +81,82 @@ def _make_fake_model(lltok, plan):
     permits it. This lets a test drive a fully real llguidance mask over a
     predictable model without any weights.
 
-    The model is a plain callable returning an ``(1, seq, vocab)`` mx array
-    matching the ``model(ids[None])[:, -1, :]`` access pattern in
-    ``_decode_constrained``.
+    CONTEXT DEPENDENCE (guards the missing-KV-cache regression). The plan
+    position is derived SOLELY from the per-request KV cache's ``offset``
+    — i.e. how many tokens have actually flowed through the cache — NOT an
+    internal step counter. A correct decode loop (mirroring
+    ``mlx_lm.generate.generate_step``) prefills the whole prompt through
+    the cache (offset -> ``prompt_len``) and then feeds one token per step
+    (offset -> ``prompt_len + 1``, ``+ 2`` …), so ``offset - prompt_len``
+    walks the plan 0, 1, 2, …. A BUGGY loop that drops the cache (passes no
+    cache, or a fresh cache each step) leaves ``offset`` stuck at the
+    single-token width it just saw, so ``offset - prompt_len`` goes
+    negative/constant and the model emits the WRONG planned token —
+    producing garbage that fails the caller's exact-value assertion. This
+    makes the fake model a genuine trap for a #1-class regression instead
+    of a step-counter that ignores its inputs.
+
+    The model mimics ``mlx-lm``'s cache contract: it exposes ``make_cache``
+    (so ``make_prompt_cache(model)`` defers to it) and updates the KV cache
+    on every ``model(ids, cache=cache)`` call, exactly like a real model.
     """
     import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
 
     vocab = lltok.vocab_size
-    state = {"step": 0}
 
     class _FakeModel:
         class args:  # noqa: N801 - mimic mlx-lm model.args.vocab_size
             vocab_size = vocab
 
-        def __call__(self, ids):
+        def make_cache(self):
+            # A single real KVCache — its ``offset`` is our position source
+            # of truth, and it enforces that callers actually thread it.
+            return [KVCache()]
+
+        def __call__(self, ids, cache=None):
             # ids has shape (1, seq_len). We only inspect the last position.
             seq_len = ids.shape[1]
+
+            # A call's last-position logits predict the NEXT token. The plan
+            # index is derived from the cache offset AFTER this call appends
+            # its tokens, relative to the prompt length: the prefill call
+            # (offset 0 -> prompt_len) predicts ``plan[0]``, the step that
+            # emits the k-th generated token (offset prompt_len+k-1 ->
+            # prompt_len+k) predicts ``plan[k]``. This is read SOLELY from
+            # the KV cache — a decode loop that drops the cache leaves
+            # ``offset`` stuck at the single-token width it just saw, so the
+            # plan index collapses and the model emits the WRONG token,
+            # producing garbage that fails the caller's exact-value
+            # assertion. That makes this a real trap for a #1-class
+            # regression rather than a step counter that ignores its inputs.
+            if cache is None:
+                raise AssertionError(
+                    "fake model called without a KV cache — the constrained "
+                    "decode loop must thread make_prompt_cache(model) through "
+                    "every model(...) call (mirrors mlx_lm.generate_step)"
+                )
+            offset_after = cache[0].offset + seq_len
+            pos = offset_after - prompt_len
+
             logits = mx.zeros((1, seq_len, vocab))
-            # The prefill call carries the whole prompt; subsequent calls
-            # carry a single generated token. Advance the plan pointer on
-            # single-token (decode) calls only.
             want = None
-            idx = min(state["step"], len(plan) - 1) if plan else 0
             if plan:
-                want = plan[idx]
+                if 0 <= pos < len(plan):
+                    want = plan[pos]
+                elif pos >= len(plan):
+                    want = plan[-1]
             if want is not None and want < vocab:
                 # Bias the last-position logits toward the planned token.
                 row = [0.0] * vocab
                 row[want] = 100.0
                 logits[0, -1] = mx.array(row)
-            state["step"] += 1
+
+            # Append this call's tokens into the cache so ``offset`` advances
+            # exactly like a real forward pass (prefill: +seq_len; step: +1).
+            keys = mx.zeros((1, 1, seq_len, 1))
+            cache[0].update_and_fetch(keys, keys)
+
             return logits
 
     return _FakeModel()
@@ -371,10 +448,19 @@ class TestConstrainedDecodeWithRealLLGuidance:
 
     @pytest.fixture(scope="class")
     def hf_fast_tokenizer(self):
-        """A real fast tokenizer (GPT-2's) — small, no torch, no model
-        weights. llguidance only needs the tokenizer, not the model."""
-        transformers = pytest.importorskip("transformers")
-        return transformers.AutoTokenizer.from_pretrained("gpt2")
+        """A real *fast* (Rust-backed) tokenizer built entirely in memory —
+        no network, no cache lookup, no model download. This keeps the
+        constrained-decode tests hermetic in a clean/offline CI (the prior
+        ``AutoTokenizer.from_pretrained("gpt2")`` did an uncaught
+        network/cache fetch and failed offline).
+
+        It is a complete byte-level BPE tokenizer: the vocab spans the full
+        256-symbol ByteLevel alphabet, so it can encode ANY UTF-8 string
+        (every JSON structural char, ``Sure``, ``[``, arbitrary content)
+        and round-trips exactly — which is all llguidance needs to build an
+        ``LLTokenizer`` and drive the grammar mask.
+        """
+        return _build_byte_level_fast_tokenizer()
 
     @pytest.fixture(scope="class")
     def wrapped_tokenizer(self, hf_fast_tokenizer):
@@ -394,7 +480,7 @@ class TestConstrainedDecodeWithRealLLGuidance:
 
         return _Wrapper(hf_fast_tokenizer)
 
-    def _make_generator(self, wrapped, plan):
+    def _make_generator(self, wrapped, plan, prompt="prompt"):
         import vllm_mlx.api.guided as guided
 
         gen = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
@@ -402,23 +488,43 @@ class TestConstrainedDecodeWithRealLLGuidance:
         gen._lltokenizer = False
         lltok = gen._get_lltokenizer()
         assert lltok is not None
-        gen._model = _make_fake_model(lltok, plan)
+        # The fake model reads its plan position from the KV cache offset,
+        # so it needs to know how many prompt tokens the prefill consumes.
+        prompt_len = len(wrapped.encode(prompt))
+        gen._model = _make_fake_model(lltok, plan, prompt_len)
         return gen, lltok
 
     def test_json_object_grammar_produces_valid_object(self, wrapped_tokenizer):
         """A model that wants to emit ``{"a":1}`` under the json_object
-        grammar produces exactly that (all planned tokens are grammar-
-        legal, so the mask never blocks them)."""
+        grammar produces EXACTLY that (all planned tokens are grammar-legal,
+        so the mask never blocks them).
+
+        This is also the primary guard against the missing-KV-cache
+        regression (#1): the fake model reads its plan position from the KV
+        cache offset, so the ``{"a":1}`` sequence only lands if the decode
+        loop threads ``make_prompt_cache(model)`` through the prefill and
+        every step. A loop that drops the cache de-syncs the plan and the
+        exact-value assertion below fails. Asserting only ``isinstance(...,
+        dict)`` (the old check) could not catch that — a garbled ``{}`` is
+        still a dict."""
         # Plan out the tokens for {"a":1}. Encode piecewise so we know the
-        # ids; the fake model then "wants" each in turn.
+        # ids; the fake model then "wants" each in turn — driven by the KV
+        # cache offset, not a blind step counter.
         inner = wrapped_tokenizer._tokenizer
         target = '{"a":1}'
         plan = inner.encode(target)
         gen, _ = self._make_generator(wrapped_tokenizer, plan)
         out = gen.generate_json_object("prompt", max_tokens=32, temperature=0.0)
-        assert out is not None
+        assert out is not None, (
+            "constrained decode returned None — either the grammar never "
+            "reached an accepting state or the KV cache was not threaded"
+        )
         parsed = json.loads(out)
-        assert isinstance(parsed, dict)
+        assert parsed == {"a": 1}, (
+            f"expected exactly {{'a': 1}} but got {parsed!r}; a mismatch here "
+            "means the decode loop lost context (missing KV cache) so the "
+            "context-dependent fake model emitted the wrong planned tokens"
+        )
 
     def test_negative_control_first_token_mask(self, wrapped_tokenizer):
         """NEGATIVE CONTROL: under a JSON-object grammar the first-step
@@ -440,7 +546,7 @@ class TestConstrainedDecodeWithRealLLGuidance:
 
         grammar = LLMatcher.grammar_from_json_schema(
             json.dumps({"type": "object"}),
-            overrides={"whitespace_flexible": False},
+            overrides={"whitespace_flexible": True},
         )
         matcher = LLMatcher(lltok, grammar)
         assert not matcher.get_error()
@@ -486,7 +592,7 @@ class TestConstrainedDecodeWithRealLLGuidance:
 
         grammar = LLMatcher.grammar_from_json_schema(
             json.dumps({"type": "object"}),
-            overrides={"whitespace_flexible": False},
+            overrides={"whitespace_flexible": True},
         )
         matcher = LLMatcher(lltok, grammar)
         bitmask = allocate_token_bitmask(1, lltok.vocab_size)
@@ -509,17 +615,31 @@ class TestConstrainedDecodeWithRealLLGuidance:
 
     def test_defs_ref_schema_constrains_to_object(self, wrapped_tokenizer):
         """waybarrios#546 regression: a schema using ``$defs`` + ``$ref`` +
-        ``enum`` + ``additionalProperties:false`` must compile and the
-        first-step mask must require an object opener (``{``), NOT a JSON
-        array opener (``[``). Pre-migration, routing such a schema through
-        the shallow pydantic converter dropped the ``$ref`` and the model
-        could emit a JSON array; here we prove llguidance keeps it an
-        object.
+        ``enum`` + ``additionalProperties:false`` must compile, and the
+        constraint must hold not only at the top-level opener but INSIDE the
+        referenced nested object.
+
+        Pre-migration, routing such a schema through the shallow pydantic
+        converter dropped the ``$ref`` and the model could emit a JSON
+        array; a step-0-only test would miss a converter that drops the
+        NESTED constraints while keeping the object opener. This test
+        therefore drives the matcher token-by-token through a complete,
+        schema-valid document (into the ``$ref`` Inner object, the enum, and
+        the anyOf field), validates the finished document against the FULL
+        schema, and — at two nested positions — asserts an invalid token is
+        driven to ``-inf`` while the valid one stays finite:
+
+          * inside ``$defs.Inner`` (``additionalProperties:false``): the
+            only legal key is ``x`` — a ``y`` key char is masked.
+          * at the ``kind`` enum value: only ``a``/``b`` are legal — a ``c``
+            is masked.
         """
+        import mlx.core as mx
         import numpy as np
         from llguidance.mlx import (
             LLMatcher,
             allocate_token_bitmask,
+            apply_token_bitmask,
             fill_next_token_bitmask,
         )
 
@@ -549,34 +669,37 @@ class TestConstrainedDecodeWithRealLLGuidance:
             "additionalProperties": False,
         }
         grammar = LLMatcher.grammar_from_json_schema(
-            json.dumps(schema), overrides={"whitespace_flexible": False}
+            json.dumps(schema), overrides={"whitespace_flexible": True}
         )
         matcher = LLMatcher(lltok, grammar)
         assert not matcher.get_error(), (
             f"$defs/$ref schema failed to compile: {matcher.get_error()}"
         )
 
-        bitmask = allocate_token_bitmask(1, lltok.vocab_size)
-        fill_next_token_bitmask(matcher, bitmask, 0)
-        arr = np.asarray(bitmask).reshape(-1)
+        vocab = lltok.vocab_size
+        bitmask = allocate_token_bitmask(1, vocab)
+        inner = wrapped_tokenizer._tokenizer
 
-        def _allowed(tok_id: int) -> bool:
+        def _refresh_mask() -> np.ndarray:
+            fill_next_token_bitmask(matcher, bitmask, 0)
+            return np.asarray(bitmask).reshape(-1)
+
+        def _allowed(arr: np.ndarray, tok_id: int) -> bool:
             return bool((int(arr[tok_id // 32]) >> (tok_id % 32)) & 1)
 
-        inner = wrapped_tokenizer._tokenizer
-        # Enumerate every allowed step-0 token and prove:
-        #   * at least one exists (grammar is non-empty), and
-        #   * EVERY one of them decodes to a string that starts the object
-        #     ('{' or the merged '{"' BPE token) — never a JSON array
-        #     opener ('['). llguidance's masking is tokenizer-aware, so
-        #     with additionalProperties:false + fixed required keys the
-        #     only legal continuation may collapse to the single merged
-        #     '{"' token; asserting on a hard-coded '{' id would be
-        #     tokenizer-specific, so we assert on the DECODED prefix.
-        allowed_ids = [t for t in range(lltok.vocab_size) if _allowed(t)]
+        def _mask_is_neg_inf(tok_id: int) -> bool:
+            # Apply the CURRENT mask to an all-ones row via the native
+            # kernel and read back whether this slot is -inf.
+            fill_next_token_bitmask(matcher, bitmask, 0)
+            row = apply_token_bitmask(mx.ones((1, vocab)), bitmask)
+            return float(row[0, tok_id].item()) == float("-inf")
+
+        # ---- Step 0: object opener required, array opener forbidden. ----
+        arr0 = _refresh_mask()
+        allowed_ids = [t for t in range(vocab) if _allowed(arr0, t)]
         assert allowed_ids, "grammar admitted no tokens at object start"
         bracket = inner.encode("[")[0]
-        assert not _allowed(bracket), (
+        assert not _allowed(arr0, bracket), (
             "array opener '[' must be forbidden — the schema requires an "
             "object; allowing '[' is the waybarrios#546 regression"
         )
@@ -588,25 +711,132 @@ class TestConstrainedDecodeWithRealLLGuidance:
                 f"constrain to an object opener"
             )
 
+        # ---- Drive INTO the nested $ref Inner object. ----
+        # Consume the prefix up to (but not into) the inner key name, so the
+        # matcher is positioned at the key-open of Inner where
+        # additionalProperties:false is in force.
+        for t in inner.encode('{"inner":{"'):
+            assert _allowed(_refresh_mask(), t), (
+                f"prefix token {t} ({inner.decode([t])!r}) unexpectedly masked "
+                "while descending into the $ref Inner object"
+            )
+            assert matcher.consume_token(t)
+
+        # NESTED CONSTRAINT #1 — Inner has additionalProperties:false with
+        # the single property 'x'. The key char 'x' must be allowed; 'y'
+        # must be masked to -inf.
+        x_key = inner.encode("x")[0]
+        y_key = inner.encode("y")[0]
+        assert _allowed(_refresh_mask(), x_key), (
+            "the only legal Inner key char 'x' must be allowed — the nested "
+            "$ref object's properties were dropped"
+        )
+        assert _mask_is_neg_inf(y_key), (
+            "an out-of-schema key char 'y' must be driven to -inf inside the "
+            "$ref Inner object (additionalProperties:false); it was allowed, "
+            "so the nested constraint was not enforced"
+        )
+
+        # Finish the Inner object and advance to the 'kind' enum value.
+        for t in inner.encode('x":1},"kind":"'):
+            assert matcher.consume_token(t)
+
+        # NESTED CONSTRAINT #2 — 'kind' is an enum of {'a','b'}. 'a' must be
+        # allowed; 'c' must be masked to -inf.
+        a_val = inner.encode("a")[0]
+        c_val = inner.encode("c")[0]
+        assert _allowed(_refresh_mask(), a_val), (
+            "enum value 'a' must be allowed at the 'kind' position"
+        )
+        assert _mask_is_neg_inf(c_val), (
+            "out-of-enum value 'c' must be driven to -inf at the 'kind' enum "
+            "position; it was allowed, so the enum constraint was not enforced"
+        )
+
+        # ---- Finish a full valid document and prove it reaches accepting
+        #      and validates against the COMPLETE schema. ----
+        for t in inner.encode('a","tag":null}'):
+            assert matcher.consume_token(t), (
+                f"token {t} ({inner.decode([t])!r}) rejected while completing "
+                "the valid document"
+            )
+        assert matcher.is_accepting(), (
+            "the completed document did not drive the matcher to an accepting "
+            "state — the nested grammar is over- or under-constrained"
+        )
+        import jsonschema
+
+        produced = json.loads('{"inner":{"x":1},"kind":"a","tag":null}')
+        assert produced == {"inner": {"x": 1}, "kind": "a", "tag": None}
+        jsonschema.validate(produced, schema)  # raises if the doc is invalid
+
     def test_json_object_mode_actually_constrains_bug1(self, wrapped_tokenizer):
-        """BUG-1 regression: ``generate_json_object`` must produce a real
-        constraint (not silently unconstrained). We plan a model that
-        *wants* to emit plain prose ('Sure') first; under the json_object
-        grammar that token is masked, so the output must still be a valid
-        JSON object opener rather than the prose.
+        """BUG-1 regression: ``generate_json_object`` must produce a REAL
+        constraint (not silently unconstrained).
+
+        Two independent proofs:
+
+        1. Step-0 mask: under the json_object grammar a plain-prose token
+           (``Sure``) is masked to ``-inf`` at the opener while ``{`` stays
+           finite — the model literally *cannot* emit prose there.
+        2. Full decode: a model whose plan is a valid object ``{"ok":1}``
+           decodes to exactly that and reaches the grammar's accepting
+           state — with the KV cache threaded, the context-dependent fake
+           model can only reproduce the object if it kept full context.
         """
+        import math
+
+        import mlx.core as mx
+        from llguidance.mlx import (
+            LLMatcher,
+            allocate_token_bitmask,
+            apply_token_bitmask,
+            fill_next_token_bitmask,
+        )
+
         inner = wrapped_tokenizer._tokenizer
-        # The model "wants" prose then a valid object; the grammar must
-        # force it to the object from token 0.
-        prose_plan = inner.encode("Sure, here: ") + inner.encode('{"ok":1}')
-        gen = self._make_generator(wrapped_tokenizer, prose_plan)[0]
+
+        # ---- Proof 1: prose is masked at the opener. ----
+        import vllm_mlx.api.guided as guided
+
+        gen0 = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
+        gen0._tokenizer = wrapped_tokenizer
+        gen0._lltokenizer = False
+        lltok = gen0._get_lltokenizer()
+        grammar = LLMatcher.grammar_from_json_schema(
+            json.dumps({"type": "object"}),
+            overrides={"whitespace_flexible": True},
+        )
+        matcher = LLMatcher(lltok, grammar)
+        bitmask = allocate_token_bitmask(1, lltok.vocab_size)
+        fill_next_token_bitmask(matcher, bitmask, 0)
+        masked = apply_token_bitmask(mx.ones((1, lltok.vocab_size)), bitmask)
+        brace = inner.encode("{")[0]
+        prose = inner.encode("Sure")[0]
+        assert math.isfinite(float(masked[0, brace].item())), (
+            "'{' must stay finite at a json_object opener"
+        )
+        assert float(masked[0, prose].item()) == float("-inf"), (
+            "json_object mode did not mask a prose token at the opener — "
+            "BUG-1 (silently unconstrained) is back"
+        )
+
+        # ---- Proof 2: a valid-object plan decodes to exactly that object
+        #      and completes the grammar. ----
+        plan = inner.encode('{"ok":1}')
+        gen = self._make_generator(wrapped_tokenizer, plan)[0]
         out = gen.generate_json_object("prompt", max_tokens=16, temperature=0.0)
-        assert out is not None
-        # The first non-whitespace character must be '{' — the prose the
-        # model wanted was masked away.
+        assert out is not None, (
+            "constrained decode returned None — grammar never completed or "
+            "the KV cache was not threaded"
+        )
         assert out.lstrip().startswith("{"), (
             f"json_object mode did not constrain to an object opener; "
             f"got {out!r} — BUG-1 (silently unconstrained) is back"
+        )
+        assert json.loads(out) == {"ok": 1}, (
+            f"expected exactly {{'ok': 1}} but got {out!r}; a mismatch means "
+            "the decode loop lost context (missing KV cache)"
         )
 
 
@@ -799,8 +1029,13 @@ class TestGuidedJsonSchemaPassthrough:
         # The captured schema string must round-trip to the EXACT raw
         # schema — no pydantic reduction, all $defs/$ref/enum preserved.
         assert json.loads(captured["schema_str"]) == schema
-        # And the whitespace override must be present (compact JSON).
-        assert captured["overrides"] == {"whitespace_flexible": False}
+        # And the whitespace override must be present. It is
+        # ``whitespace_flexible: True`` (the default): forbidding structural
+        # whitespace masks a chat model's natural space-prefixed string
+        # opener and derails greedy decoding on unbounded string fields into
+        # fluent-but-wrong content (proved on a real model), so the grammar
+        # must permit optional whitespace.
+        assert captured["overrides"] == {"whitespace_flexible": True}
 
     def test_converter_not_called_from_generate_json(self, monkeypatch):
         """Negative control: ``json_schema_to_pydantic`` must NOT be invoked

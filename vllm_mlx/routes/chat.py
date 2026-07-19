@@ -2964,7 +2964,7 @@ async def _create_chat_completion_impl(
 
     # H-06: when the client asked for strict json_schema mode and we
     # routed through guided decoding, validate the buffered text
-    # against the schema. Outlines should make this unreachable; a
+    # against the schema. llguidance should make this unreachable; a
     # non-zero ``rapid_mlx_response_format_strict_violations_total``
     # rate signals that the constrained-decoding path silently
     # degraded (e.g. ``generate_with_schema`` swallowed an llguidance
@@ -4751,7 +4751,7 @@ async def stream_chat_completion_guided(
         # SSE envelope instead of letting the schema-invalid bytes
         # reach the client.
         #
-        # Outlines should make this unreachable; the violations
+        # llguidance should make this unreachable; the violations
         # counter ticks regardless so operators see both the rate
         # AND the error response. We emit a single SSE error chunk
         # carrying the canonical OpenAI envelope, then DONE — clients

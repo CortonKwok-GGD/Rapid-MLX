@@ -267,6 +267,23 @@ class GuidedGenerator:
     ) -> str | None:
         """Run an ``mlx_lm`` decode loop constrained by an llguidance grammar.
 
+        Incremental generation MIRRORS ``mlx_lm``'s supported decode path
+        (``mlx_lm.generate.generate_step``): a per-request KV cache built
+        with ``mlx_lm.models.cache.make_prompt_cache(model)`` is threaded
+        through *every* model call via the ``cache=`` kwarg. The prompt is
+        prefilled once WITH the cache, and each subsequent step feeds only
+        the single new token — the cache carries the prompt + all prior
+        tokens forward, so the model keeps full context instead of seeing
+        one bare token in isolation. This matches how rapid-mlx's own
+        engine threads the cache (e.g. ``mllm_batch_generator`` /
+        ``engine/batched``): ``make_prompt_cache(model)`` then
+        ``model(ids, cache=cache)``.
+
+        Threading note: guided generation runs on the model-owning executor
+        thread and the mask kernel shares that thread's default stream, so
+        we do NOT introduce ``mx.new_stream``. The cache is per-call local
+        state — no cross-thread sharing.
+
         On every step:
           1. ``fill_next_token_bitmask`` computes the allow-mask for the
              matcher's current state.
@@ -276,11 +293,18 @@ class GuidedGenerator:
              Metal kernel writes ``-inf`` into disallowed positions.
           3. The next token is chosen (greedy at ``temperature<=0``, else
              temperature sampling) and fed back into the matcher.
-          4. The model is advanced by that one token.
+          4. The model is advanced by that one token, appending its KV into
+             the same cache.
 
-        Returns the decoded text, or ``None`` if the grammar failed to
-        compile or the tokenizer was unavailable.
+        Returns the decoded text ONLY when the grammar reached an accepting
+        (fully-satisfied) state; ``None`` otherwise — i.e. if the grammar
+        failed to compile, the tokenizer was unavailable, generation was
+        truncated by ``max_tokens`` mid-object, or a token was rejected
+        mid-parse. An incomplete result is never returned to the caller,
+        which treats ``None`` as guided-unavailable (strict-mode 422).
         """
+        from mlx_lm.models.cache import make_prompt_cache
+
         lltok = self._get_lltokenizer()
         if lltok is None:
             return None
@@ -302,8 +326,15 @@ class GuidedGenerator:
         prompt_ids = tokenizer.encode(prompt)
         prompt_arr = mx.array(prompt_ids)
 
-        # Prefill.
-        logits = model(prompt_arr[None])[:, -1, :]
+        # Per-request KV cache (mirrors mlx_lm.generate.generate_step).
+        cache = make_prompt_cache(model)
+
+        # Prefill the FULL prompt through the cache so every generated token
+        # sees the whole prompt context. Passing only the latest token with
+        # no cache (the prior bug) discarded all prompt + prior-token state
+        # after step 1, yielding grammar-valid but semantically-garbage
+        # output.
+        logits = model(prompt_arr[None], cache=cache)[:, -1, :]
 
         generated: list[int] = []
         for _ in range(max_tokens):
@@ -326,21 +357,28 @@ class GuidedGenerator:
                 tok = int(mx.argmax(masked, axis=1).item())
 
             # 4. feed back into the matcher. Because we masked, this should
-            #    always be accepted; if not, stop cleanly rather than emit
-            #    an out-of-grammar token.
+            #    always be accepted; if not, abort — the result is now an
+            #    incomplete parse and MUST NOT be returned as if valid.
             ok = matcher.consume_token(tok)
             if not ok or matcher.is_error():
                 e = matcher.get_error()
                 if e:
                     logger.error("llguidance rejected token %d: %s", tok, e)
-                break
+                return None
 
             generated.append(tok)
 
-            # 5. advance the model by one token.
-            logits = model(mx.array([tok])[None])[:, -1, :]
+            # 5. advance the model by one token — its KV appends into the
+            #    same cache, carrying full context to the next step.
+            logits = model(mx.array([tok])[None], cache=cache)[:, -1, :]
 
-        if not generated:
+        # Only return output the grammar actually completed. ``is_accepting``
+        # is True iff the matcher is in a state where the grammar is fully
+        # satisfied and could terminate here. If we fell out of the loop on
+        # ``max_tokens`` with an unclosed object, the parse is incomplete —
+        # return None so the caller degrades to guided-unavailable / 422
+        # rather than leaking a truncated JSON fragment.
+        if not generated or not matcher.is_accepting():
             return None
         return tokenizer.decode(generated)
 
@@ -357,9 +395,22 @@ class GuidedGenerator:
         ``LLMatcher.grammar_from_json_schema``, which natively understands
         ``$defs``, ``$ref``, ``anyOf``, ``enum``, numeric bounds,
         ``additionalProperties: false``, and nested objects. We compile
-        with ``overrides={"whitespace_flexible": False}`` so the grammar
-        emits compact JSON (no free structural whitespace), matching the
-        server's canonical JSON shape.
+        with ``overrides={"whitespace_flexible": True}`` (llguidance's
+        default) so structural whitespace is OPTIONAL, not forbidden.
+
+        Whitespace flexibility is a correctness requirement, not cosmetic.
+        With ``whitespace_flexible: False`` the grammar forbids the space
+        after ``:`` / ``,`` — but a chat-tuned model's natural top token
+        after ``"answer":`` is the SPACE-prefixed string opener (`` "``).
+        Masking that token forces greedy decoding onto the next-best
+        allowed token, which on real models derails an UNBOUNDED string
+        field into fluent-but-wrong content (observed: ``"answer"`` became a
+        fabricated URL instead of ``"Paris"``). Permitting the space keeps
+        the model on its true distribution, so the answer stays coherent.
+        Downstream validation is whitespace-agnostic (it ``json.loads`` then
+        ``jsonschema.validate``), and the route re-serialises via
+        ``json.dumps``, so the extra structural whitespace never reaches the
+        client — the parsed object is identical.
 
         We deliberately do NOT route the schema through
         ``json_schema_to_pydantic`` first — that shallow converter silently
@@ -374,7 +425,7 @@ class GuidedGenerator:
             schema_str = _json.dumps(json_schema)
             grammar = LLMatcher.grammar_from_json_schema(
                 schema_str,
-                overrides={"whitespace_flexible": False},
+                overrides={"whitespace_flexible": True},
             )
             return self._decode_constrained(
                 grammar=grammar,
@@ -412,9 +463,12 @@ class GuidedGenerator:
             JSON string, or None on failure
         """
         try:
+            # ``whitespace_flexible: True`` (default) — see ``generate_json``
+            # for why forbidding structural whitespace derails greedy
+            # decoding on real models into fluent-but-wrong content.
             grammar = LLMatcher.grammar_from_json_schema(
                 _JSON_OBJECT_SCHEMA,
-                overrides={"whitespace_flexible": False},
+                overrides={"whitespace_flexible": True},
             )
             return self._decode_constrained(
                 grammar=grammar,
