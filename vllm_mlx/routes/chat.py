@@ -770,6 +770,10 @@ async def _offload_tool_grammar_build(engine, cfg, request):
         # A build error leaves the slot to the done-callback above; fall back to
         # free-form for this request. (``CancelledError`` is a ``BaseException``,
         # so it is NOT swallowed here — it propagates to unwind the request.)
+        # Log it (codex #558-PR3 nit): the inner builder already swallows its own
+        # exceptions, so anything surfacing HERE is unexpected and must not be
+        # silently indistinguishable from an intentional free-form fallback.
+        logger.exception("tool-grammar: off-loop build failed; free-form fallback")
         return None
 
 

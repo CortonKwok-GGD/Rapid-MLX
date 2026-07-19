@@ -439,14 +439,15 @@ def test_eligible_false_for_unicode_escaped_oversized_schema():
     assert _tool_grammar_eligible(cfg, req) is False
 
 
-def test_charge_scalar_rejects_giant_int_without_rendering():
+def test_charge_scalar_rejects_giant_int_without_rendering(monkeypatch):
     # codex #558-PR3 blocking (round-3): Python ints are ARBITRARY precision, so
     # ``json.dumps(huge_int)`` renders an attacker-sized decimal string BEFORE
     # the budget check — an event-loop-blocking allocation. The O(1)
-    # ``bit_length`` preflight must reject a giant int WITHOUT rendering it, and
-    # fast.
-    import time
-
+    # ``bit_length`` preflight must reject an over-budget int WITHOUT ever
+    # rendering it. Prove that DETERMINISTICALLY (no wall-clock): monkeypatch the
+    # module's ``json.dumps`` to explode if it is ever handed a large int, and
+    # use an int just past the byte cutoff (not a multi-megabyte monster).
+    from vllm_mlx.routes import chat as chat_mod
     from vllm_mlx.routes.chat import (
         _TOOL_GRAMMAR_MAX_SCHEMA_BYTES,
         _BoundsExceededError,
@@ -454,36 +455,41 @@ def test_charge_scalar_rejects_giant_int_without_rendering():
         _tools_within_grammar_bounds,
     )
 
-    # An int with ~10M decimal digits: rendering it would be very slow / large.
-    giant = 10**10_000_000
-    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
-    t = time.time()
-    raised = False
-    try:
-        _charge_json_scalar_bytes(giant, budget)
-    except _BoundsExceededError:
-        raised = True
-    dt = time.time() - t
-    assert raised, "a giant int must be rejected by the bounds check"
-    assert dt < 0.5, (
-        f"giant-int reject took {dt:.3f}s — the bit_length preflight must reject "
-        "WITHOUT rendering the decimal string (codex #558-PR3)"
-    )
+    _real_dumps = chat_mod.json.dumps
 
-    # And end-to-end through the tools walker: a schema carrying a giant int
-    # default is rejected (free-form fallback), also fast.
+    def _guard_dumps(obj, *a, **k):
+        # The preflight must reject an over-budget int BEFORE dumps is called.
+        if isinstance(obj, int) and not isinstance(obj, bool):
+            if obj.bit_length() // 4 + 1 > _TOOL_GRAMMAR_MAX_SCHEMA_BYTES:
+                raise AssertionError(
+                    "json.dumps was called on an over-budget int — the "
+                    "bit_length preflight failed to reject it first (codex "
+                    "#558-PR3)"
+                )
+        return _real_dumps(obj, *a, **k)
+
+    monkeypatch.setattr(chat_mod.json, "dumps", _guard_dumps)
+
+    # An int whose minimum decimal-digit count (bit_length/4 + 1) exceeds the
+    # byte cap: rejected by the O(1) preflight, dumps never called. Chosen just
+    # past the cutoff — no multi-megabyte big-int construction.
+    over = 1 << (_TOOL_GRAMMAR_MAX_SCHEMA_BYTES * 4 + 8)  # bit_length//4 > cap
+    budget = [_TOOL_GRAMMAR_MAX_SCHEMA_BYTES]
+    with pytest.raises(_BoundsExceededError):
+        _charge_json_scalar_bytes(over, budget)  # must reject, dumps not called
+
+    # End-to-end through the tools walker: a schema carrying the over-budget int
+    # default is rejected (free-form fallback) and dumps is still never rendered.
     tool = _FunctionTool(
         "n",
         parameters={
             "type": "object",
-            "properties": {"x": {"type": "integer", "default": giant}},
+            "properties": {"x": {"type": "integer", "default": over}},
         },
     )
-    t = time.time()
     assert _tools_within_grammar_bounds([tool]) is False
-    assert time.time() - t < 0.5, "walker must reject the giant int fast"
 
-    # A small int is charged normally and stays within bounds.
+    # A small int is charged normally (dumps IS called, harmlessly) and fits.
     ok = _FunctionTool(
         "n",
         parameters={
@@ -1532,13 +1538,17 @@ def test_broken_processor_reports_is_broken_and_masks_nothing():
         tg.allocate_token_bitmask = orig_alloc
 
 
-def test_rejected_committed_token_fails_closed_and_stops_masking():
-    # codex #558-PR3 nit (restored in PR-3b): a matcher that REJECTS an
-    # already-sampled+committed token is desynced from the real output stream.
-    # The processor must FAIL-CLOSED — latch ``_aborted``, stop consuming into
-    # the invalid matcher, and stop imposing a (garbage) mask — rather than the
-    # old fail-OPEN behavior that only logged and kept masking from the desynced
-    # state. Uses a fake matcher so no real llguidance internals are needed.
+def test_rejected_committed_token_drops_constraint_and_stops_masking():
+    # codex #558-PR3 nit: a matcher that REJECTS an already-sampled+committed
+    # token is desynced from the real output stream. The processor DROPS the
+    # constraint (a controlled FAIL-OPEN fallback) — latch ``_aborted``, stop
+    # consuming into the invalid matcher, and stop imposing a (garbage) mask,
+    # returning logits UNCHANGED so downstream free-form parsing owns the
+    # request. This is deliberately fail-open, NOT fail-closed: masking from a
+    # desynced matcher would be strictly worse, and this whole module is
+    # best-effort (missing extra / bad grammar / unsupported tokenizer all
+    # degrade to free-form, never an error). Uses a fake matcher so no real
+    # llguidance internals are needed.
     import importlib.util
 
     if importlib.util.find_spec("llguidance") is None:
@@ -1623,7 +1633,7 @@ def test_rejected_committed_token_fails_closed_and_stops_masking():
             "the mask branch must be skipped once aborted"
         )
 
-        # Step 3: any subsequent call also stays fail-closed (logits unchanged).
+        # Step 3: any subsequent call also stays dropped (logits unchanged).
         logits3 = mx.zeros((1, 8))
         out3 = proc(mx.array([1, 2, 3, 4]), logits3)
         assert np.array_equal(np.array(out3), np.array(logits3))
