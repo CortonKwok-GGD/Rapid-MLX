@@ -480,9 +480,15 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
     length precheck. The walk never materializes the WHOLE serialized tree, so
     the early-abort bounded-prefix guarantee holds.
     """
-    if depth > _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH:
-        raise _BoundsExceededError
+    # The depth cap counts CONTAINER nesting (objects/arrays) only — a scalar leaf
+    # is not a nesting level, so it is charged for size but never trips the depth
+    # cap (codex #558-PR3 round-7 nit — checking depth on scalars made the
+    # documented container-depth cap content-dependent: a scalar inside a
+    # depth-``MAX`` container would be rejected at depth ``MAX+1`` even though no
+    # further object/array exists). Each container checks the cap on ENTRY.
     if isinstance(obj, dict):
+        if depth > _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH:
+            raise _BoundsExceededError
         budget[0] -= 2  # {}
         if budget[0] < 0:
             raise _BoundsExceededError
@@ -498,6 +504,8 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
             _charge_json_scalar_bytes(k if isinstance(k, str) else str(k), budget)
             _walk_size_and_depth(v, budget, depth + 1)
     elif isinstance(obj, (list, tuple)):
+        if depth > _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH:
+            raise _BoundsExceededError
         budget[0] -= 2  # []
         if budget[0] < 0:
             raise _BoundsExceededError
@@ -508,7 +516,8 @@ def _walk_size_and_depth(obj, budget: list[int], depth: int) -> None:
                     raise _BoundsExceededError
             _walk_size_and_depth(v, budget, depth + 1)
     else:
-        # Scalar: string / number / bool / None. O(1)-safe true-byte charge.
+        # Scalar leaf: string / number / bool / None. O(1)-safe true-byte charge;
+        # NOT a nesting level, so it is exempt from the container-depth cap.
         _charge_json_scalar_bytes(obj, budget)
 
 
@@ -745,8 +754,14 @@ async def _offload_tool_grammar_build(engine, cfg, request):
     (codex #558-PR3 blocking): the eligibility gate + ``_try_admit`` MUST run
     before any ``submit`` so a compile flood past the cap never queues unbounded
     work. Returns ``None`` (free-form fallback) when the request is ineligible,
-    admission is refused (at capacity), submission fails, or the build errors /
-    is cancelled.
+    admission is refused (at capacity), submission fails, or the build errors.
+
+    A CANCELLED caller (client disconnect) does NOT return ``None``: the
+    ``asyncio.CancelledError`` is deliberately NOT caught here — it propagates to
+    unwind the request (codex #558-PR3 round-7 nit). The underlying compile is
+    ``asyncio.shield``-ed, so it keeps running to genuine completion and releases
+    its admission slot via the done-callback; only the caller's await is
+    abandoned.
 
     The cheap eligibility gate runs SYNCHRONOUSLY so the vast majority of traffic
     (no tools, ``"auto"``/``"none"``) never enters the thread pool. Only an

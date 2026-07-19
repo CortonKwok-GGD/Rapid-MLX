@@ -570,17 +570,17 @@ def test_walker_charges_commas_between_not_before_first_member():
     _walk_size_and_depth(obj, budget, 0)
     charged = _TOOL_GRAMMAR_MAX_SCHEMA_BYTES - budget[0]
 
-    # The estimate must be a safe UPPER bound (>= real compact bytes) — never
-    # under-count, or an oversized schema could slip the cap.
-    assert charged >= compact_bytes, (
-        f"walker under-counted: charged {charged} < compact {compact_bytes}"
-    )
-    # ...but must be TIGHT: the only slack is the per-key ``"`` quotes the
-    # compact form also has, so the overshoot is small and bounded, NOT the
-    # old per-member phantom comma (which grew with member count).
-    assert charged - compact_bytes <= 8, (
-        f"walker over-counts by {charged - compact_bytes} — a phantom "
-        "first-member comma inflates the estimate (codex #558-PR3)"
+    # The walker charges keys with the same ``"..."`` quotes ``json.dumps`` emits
+    # and exactly N-1 commas per container, so its estimate must EQUAL the compact
+    # byte count — no under-count (an oversized schema could slip the cap) and no
+    # over-count. Assert EXACT equality, not a slack bound (codex #558-PR3
+    # round-7 blocking): this fixture has 5 nonempty dicts, so the old phantom-
+    # first-member-comma bug over-charged by exactly 5 — a ``<= 8`` slack would
+    # NOT have caught it. Exact equality does: any phantom comma breaks it.
+    assert charged == compact_bytes, (
+        f"walker charged {charged} != compact {compact_bytes} — a phantom comma "
+        "or miscounted quote inflates/deflates the estimate (codex #558-PR3). "
+        "The estimate must byte-match compact json.dumps exactly."
     )
 
     # Exact-boundary: a single scalar just at the cap is accepted; one byte over
@@ -614,6 +614,42 @@ def test_eligible_false_for_overdeep_schema():
     cfg = _CfgStub("hermes")
     req = _RequestStub(tools=[deep], tool_choice="required")
     assert _tool_grammar_eligible(cfg, req) is False
+
+
+def test_depth_cap_counts_containers_only_not_scalar_leaves():
+    # codex #558-PR3 round-7 nit: the depth cap counts CONTAINER (object/array)
+    # nesting only. A scalar leaf is not a nesting level, so it must never trip
+    # the cap by being one level below the deepest container — otherwise the
+    # documented container-depth cap is content-dependent (a schema whose deepest
+    # container holds a scalar would reject one level shallower than one that
+    # doesn't). Build a chain of EXACTLY ``MAX`` nested objects with a scalar leaf
+    # at the bottom: the scalar sits at container-depth ``MAX`` and must be
+    # accepted; adding ONE more container tips it over and must reject.
+    from vllm_mlx.routes.chat import (
+        _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH,
+        _BoundsExceededError,
+        _walk_size_and_depth,
+    )
+
+    # The cap admits container nesting for depths ``0 .. MAX`` inclusive, i.e.
+    # ``MAX + 1`` nested containers (the innermost is entered at depth ``MAX``,
+    # and ``MAX > MAX`` is false). Build exactly that many nested objects with a
+    # scalar leaf at the bottom. Under the FIXED walker the scalar leaf (visited
+    # at depth ``MAX + 1``) is exempt, so the whole chain is accepted. Under the
+    # OLD walker the scalar's depth-``MAX + 1`` check would REJECT this exact
+    # chain — the content-dependent bug this test guards.
+    n_at_cap = _TOOL_GRAMMAR_MAX_SCHEMA_DEPTH + 1
+    at_cap: dict = {"leaf": "x"}
+    for _ in range(n_at_cap - 1):
+        at_cap = {"inner": at_cap}
+    budget = [1 << 20]  # generous size budget; we test depth, not size
+    _walk_size_and_depth(at_cap, budget, 0)  # scalar leaf at max depth: NO raise
+
+    # One additional CONTAINER pushes the innermost object past the cap: it is
+    # entered at depth ``MAX + 1`` (``> MAX``) and must reject.
+    over = {"inner": at_cap}
+    with pytest.raises(_BoundsExceededError):
+        _walk_size_and_depth(over, [1 << 20], 0)
 
 
 def test_eligible_false_for_oversized_tool_name():
