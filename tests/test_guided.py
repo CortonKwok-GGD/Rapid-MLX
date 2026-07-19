@@ -841,6 +841,423 @@ class TestConstrainedDecodeWithRealLLGuidance:
 
 
 # ---------------------------------------------------------------------------
+# Chunked-prefill + empty-prompt regressions (codex findings #1 and #2)
+# ---------------------------------------------------------------------------
+
+
+@requires_guided
+class TestChunkedPrefillAndEmptyPrompt:
+    """Regressions for the two BLOCKING codex findings on the constrained
+    decode path:
+
+      #1 The prefill fed the ENTIRE prompt in one ``model(prompt[None],
+         cache)`` forward pass, materializing sequence-wide activations and
+         OOM-ing on long contexts. It now chunks the prompt in
+         ``_PREFILL_STEP_SIZE`` steps (ported from
+         ``mlx_lm.generate.generate_step``).
+      #2 An empty ``tokenizer.encode(prompt)`` made ``[:, -1, :]`` index an
+         empty sequence axis → guided generation silently returned None.
+         The path now seeds a BOS token when the tokenizer defines one.
+    """
+
+    @pytest.fixture(scope="class")
+    def hf_fast_tokenizer(self):
+        return _build_byte_level_fast_tokenizer()
+
+    def _wrap(self, hf_fast_tokenizer, bos_token_id=None):
+        class _Wrapper:
+            def __init__(self, inner, bos):
+                self._tokenizer = inner
+                if bos is not None:
+                    self.bos_token_id = bos
+
+            def encode(self, s):
+                return self._tokenizer.encode(s)
+
+            def decode(self, ids):
+                return self._tokenizer.decode(ids)
+
+        return _Wrapper(hf_fast_tokenizer, bos_token_id)
+
+    def _build_lltok(self, wrapped):
+        import vllm_mlx.api.guided as guided
+
+        gen = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
+        gen._tokenizer = wrapped
+        gen._lltokenizer = False
+        lltok = gen._get_lltokenizer()
+        assert lltok is not None
+        return gen, lltok
+
+    def test_chunked_prefill_matches_single_call_and_actually_chunks(
+        self, hf_fast_tokenizer, monkeypatch
+    ):
+        """A prompt LONGER than ``_PREFILL_STEP_SIZE`` must decode to the
+        SAME constrained output as the single-call path, AND the model must
+        have been called in multiple prefill chunks (the chunk loop actually
+        ran).
+
+        The fake model derives its plan position from ``cache[0].offset`` —
+        so if the chunked prefill advanced the cache offset incorrectly, the
+        context-dependent model would emit the wrong planned token and the
+        exact-JSON assertion below would FAIL. This makes the test a genuine
+        trap for a chunking bug that corrupts KV positions, not just a
+        "did it run" smoke check.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        import vllm_mlx.api.guided as guided
+
+        wrapped = self._wrap(hf_fast_tokenizer)
+        _, lltok = self._build_lltok(wrapped)
+        vocab = lltok.vocab_size
+
+        # Shrink the prefill chunk so a modest prompt spans several chunks
+        # (keeps the test fast) — we assert on the number of prefill chunks,
+        # which is a function of prompt_len / step, so the small value is
+        # only a test-speed knob, not a change in behavior under test.
+        step = 8
+        monkeypatch.setattr(guided, "_PREFILL_STEP_SIZE", step)
+
+        target = '{"a":1}'
+        plan = list(hf_fast_tokenizer.encode(target))
+
+        # A prompt whose token length is a comfortable multiple of ``step``
+        # so the prefill loop runs several full chunks plus a trailing
+        # remainder — exercising the exact ``while y.size > step`` path.
+        prompt = "x" * 40
+        prompt_len = len(wrapped.encode(prompt))
+        assert prompt_len > step, "test prompt must exceed the prefill step"
+
+        # A recording fake model: same context-dependent plan logic as the
+        # shared ``_make_fake_model`` (position read SOLELY from the cache
+        # offset), but it also records the ``seq_len`` of every forward call
+        # so we can prove the prefill was chunked.
+        prefill_seq_lens: list[int] = []
+
+        class _RecordingModel:
+            class args:  # noqa: N801
+                vocab_size = vocab
+
+            def __init__(self):
+                self._prompt_done = False
+
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, ids, cache=None):
+                seq_len = ids.shape[1]
+                if cache is None:
+                    raise AssertionError("fake model called without a KV cache")
+                # Record only the prefill-phase call widths (multi-token
+                # chunks). Single-token decode steps (seq_len == 1) are the
+                # generation phase and are not what we assert chunking on.
+                if not self._prompt_done:
+                    prefill_seq_lens.append(seq_len)
+
+                offset_after = cache[0].offset + seq_len
+                pos = offset_after - prompt_len
+
+                logits = mx.zeros((1, seq_len, vocab))
+                want = None
+                if plan:
+                    if 0 <= pos < len(plan):
+                        want = plan[pos]
+                    elif pos >= len(plan):
+                        want = plan[-1]
+                if want is not None and want < vocab:
+                    row = [0.0] * vocab
+                    row[want] = 100.0
+                    logits[0, -1] = mx.array(row)
+
+                keys = mx.zeros((1, 1, seq_len, 1))
+                cache[0].update_and_fetch(keys, keys)
+
+                # Once the cache has consumed the whole prompt, the prefill
+                # phase is over — subsequent calls are the decode loop.
+                if cache[0].offset >= prompt_len:
+                    self._prompt_done = True
+                return logits
+
+        gen = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
+        gen._tokenizer = wrapped
+        gen._lltokenizer = False
+        gen._model = _RecordingModel()
+
+        out = gen.generate_json_object(prompt, max_tokens=32, temperature=0.0)
+
+        # 1) The chunk loop actually ran: prefill spanned MORE THAN ONE
+        #    forward call, each capped at the step size.
+        assert len(prefill_seq_lens) > 1, (
+            f"prefill was not chunked — recorded {prefill_seq_lens!r}; a "
+            "single-call prefill (the OOM regression) records exactly one "
+            "multi-token forward pass"
+        )
+        assert all(n <= step for n in prefill_seq_lens), (
+            f"a prefill chunk exceeded _PREFILL_STEP_SIZE={step}: {prefill_seq_lens!r}"
+        )
+        assert sum(prefill_seq_lens) == prompt_len, (
+            f"chunked prefill did not cover the whole prompt: processed "
+            f"{sum(prefill_seq_lens)} of {prompt_len} tokens ({prefill_seq_lens!r})"
+        )
+
+        # 2) The constrained output is IDENTICAL to the single-call path.
+        #    Because the fake model's plan position is read from the cache
+        #    offset, this only holds if the chunked prefill advanced the
+        #    offset to exactly ``prompt_len`` (correct KV positions).
+        assert out is not None, (
+            "chunked-prefill constrained decode returned None — the chunk "
+            "loop corrupted the cache offset or never reached accepting"
+        )
+        assert json.loads(out) == {"a": 1}, (
+            f"chunked prefill produced {out!r}, not the expected {{'a': 1}} — "
+            "the chunk loop advanced the KV cache offset incorrectly, so the "
+            "context-dependent model emitted the wrong planned tokens"
+        )
+
+    def test_chunked_prefill_equivalent_to_single_call_output(self, hf_fast_tokenizer):
+        """Direct equivalence: the SAME prompt decoded with the default
+        (large) ``_PREFILL_STEP_SIZE`` (single-call, prompt < step) and with
+        a tiny step (multi-chunk) yields byte-identical constrained output.
+        """
+        import mlx.core as mx
+
+        import vllm_mlx.api.guided as guided
+
+        wrapped = self._wrap(hf_fast_tokenizer)
+        _, lltok = self._build_lltok(wrapped)
+
+        prompt = "hello world " * 4  # short enough to be single-call by default
+        plan = list(hf_fast_tokenizer.encode('{"ok":1}'))
+        prompt_len = len(wrapped.encode(prompt))
+
+        def _run(step_size):
+            model = _make_fake_model(lltok, plan, prompt_len)
+            gen = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
+            gen._tokenizer = wrapped
+            gen._lltokenizer = False
+            gen._model = model
+            orig = guided._PREFILL_STEP_SIZE
+            guided._PREFILL_STEP_SIZE = step_size
+            try:
+                return gen.generate_json_object(prompt, max_tokens=16, temperature=0.0)
+            finally:
+                guided._PREFILL_STEP_SIZE = orig
+
+        single_call = _run(2048)  # prompt << step -> exactly one prefill call
+        chunked = _run(3)  # prompt >> step -> many chunks
+        assert single_call is not None and chunked is not None
+        assert single_call == chunked, (
+            f"chunked prefill ({chunked!r}) diverged from single-call "
+            f"({single_call!r}) — the ported chunk loop is not equivalent"
+        )
+        assert json.loads(chunked) == {"ok": 1}
+        # Silence unused-import lint if mx ends up unreferenced across edits.
+        _ = mx
+
+    def test_empty_prompt_with_bos_produces_valid_json(self, hf_fast_tokenizer):
+        """An EMPTY prompt with a BOS-defining tokenizer must still produce
+        valid constrained JSON (not None). Pre-fix, ``encode("")`` -> ``[]``
+        made ``[:, -1, :]`` index an empty axis and guided generation
+        silently returned None.
+        """
+        # BOS id present on the wrapper (matches mlx-lm TokenizerWrapper's
+        # attribute proxying). The fake model's plan starts at cache offset
+        # == prompt_len; with a 1-token BOS prefill, prompt_len == 1.
+        bos_id = hf_fast_tokenizer.bos_token_id
+        assert bos_id is not None
+        wrapped = self._wrap(hf_fast_tokenizer, bos_token_id=bos_id)
+        _, lltok = self._build_lltok(wrapped)
+
+        import vllm_mlx.api.guided as guided
+
+        plan = list(hf_fast_tokenizer.encode('{"a":1}'))
+        # prompt_len is the length of the seeded prompt (the single BOS token).
+        prompt_len = 1
+        gen = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
+        gen._tokenizer = wrapped
+        gen._lltokenizer = False
+        gen._model = _make_fake_model(lltok, plan, prompt_len)
+
+        out = gen.generate_json_object("", max_tokens=32, temperature=0.0)
+        assert out is not None, (
+            "empty prompt with a valid BOS token produced None — the "
+            "empty-prompt guard did not seed BOS before prefill"
+        )
+        assert json.loads(out) == {"a": 1}, (
+            f"empty-prompt constrained decode produced {out!r}, not {{'a': 1}}"
+        )
+
+    def test_empty_prompt_without_bos_returns_none(self, hf_fast_tokenizer):
+        """An empty prompt on a tokenizer with NO BOS token must degrade to
+        None (guided-unavailable), never index into an empty sequence axis
+        or raise."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        import vllm_mlx.api.guided as guided
+
+        # Wrapper WITHOUT a bos_token_id attribute.
+        wrapped = self._wrap(hf_fast_tokenizer, bos_token_id=None)
+        assert not hasattr(wrapped, "bos_token_id")
+        _, lltok = self._build_lltok(wrapped)
+        vocab = lltok.vocab_size
+
+        called = {"n": 0}
+
+        class _Model:
+            class args:  # noqa: N801
+                vocab_size = vocab
+
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, ids, cache=None):
+                called["n"] += 1
+                return mx.zeros((1, ids.shape[1], vocab))
+
+        gen = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
+        gen._tokenizer = wrapped
+        gen._lltokenizer = False
+        gen._model = _Model()
+
+        out = gen.generate_json_object("", max_tokens=8, temperature=0.0)
+        assert out is None, (
+            "empty prompt with no BOS must degrade to None, not fabricate "
+            "output or raise"
+        )
+        assert called["n"] == 0, (
+            "with an empty prompt and no BOS the model must not be called at "
+            "all — there is nothing to prefill"
+        )
+
+    def test_no_trailing_forward_step_after_stop(self, hf_fast_tokenizer):
+        """Finding #3: the decode loop must NOT advance the model with a
+        forward pass AFTER the token that stopped the matcher.
+
+        We count forward calls. For a plan that exactly completes ``{"ok":1}``
+        (8 tokens) and drives the grammar to a stopped state on the last
+        token, the correct call count is:
+
+            1 prefill  +  (8 - 1) advancing steps  =  8
+
+        i.e. the token that stops the matcher is sampled but is NOT followed
+        by another ``model(...)`` call. The prior code always advanced after
+        every sampled token, so it recorded ONE extra (wasted) forward pass
+        — a call count of 9 here.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        import vllm_mlx.api.guided as guided
+
+        wrapped = self._wrap(hf_fast_tokenizer)
+        _, lltok = self._build_lltok(wrapped)
+        vocab = lltok.vocab_size
+
+        prompt = "prompt"
+        prompt_len = len(wrapped.encode(prompt))
+        plan = list(hf_fast_tokenizer.encode('{"ok":1}'))
+
+        calls = {"total": 0}
+
+        class _CountingModel:
+            class args:  # noqa: N801
+                vocab_size = vocab
+
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, ids, cache=None):
+                calls["total"] += 1
+                seq_len = ids.shape[1]
+                if cache is None:
+                    raise AssertionError("fake model called without a KV cache")
+                offset_after = cache[0].offset + seq_len
+                pos = offset_after - prompt_len
+                logits = mx.zeros((1, seq_len, vocab))
+                want = None
+                if plan:
+                    if 0 <= pos < len(plan):
+                        want = plan[pos]
+                    elif pos >= len(plan):
+                        want = plan[-1]
+                if want is not None and want < vocab:
+                    row = [0.0] * vocab
+                    row[want] = 100.0
+                    logits[0, -1] = mx.array(row)
+                keys = mx.zeros((1, 1, seq_len, 1))
+                cache[0].update_and_fetch(keys, keys)
+                return logits
+
+        gen = guided.GuidedGenerator.__new__(guided.GuidedGenerator)
+        gen._tokenizer = wrapped
+        gen._lltokenizer = False
+        gen._model = _CountingModel()
+
+        out = gen.generate_json_object(prompt, max_tokens=32, temperature=0.0)
+        assert out is not None and json.loads(out) == {"ok": 1}
+
+        n_generated = len(plan)  # 8 tokens produced
+        expected_calls = 1 + (n_generated - 1)  # 1 prefill + advancing steps
+        assert calls["total"] == expected_calls, (
+            f"expected {expected_calls} forward passes (1 prefill + "
+            f"{n_generated - 1} advancing steps) but got {calls['total']}; a "
+            "higher count means the loop advanced the model with a wasted "
+            "forward pass AFTER the token that stopped the matcher (finding #3)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Import diagnostics on missing/broken llguidance (codex finding #4)
+# ---------------------------------------------------------------------------
+
+
+class TestImportDiagnostics:
+    """Finding #4: a failed llguidance import must be LOGGED (which component
+    failed), not silently swallowed, while still degrading to
+    ``HAS_LLGUIDANCE = False``. We reload the module with the llguidance
+    stack forced unimportable and assert a warning is emitted."""
+
+    def test_broken_import_logs_warning_and_degrades(self, caplog):
+        import builtins
+        import importlib
+        import logging
+
+        real_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name == "llguidance" or name.startswith("llguidance."):
+                raise ImportError("simulated broken llguidance install")
+            return real_import(name, *args, **kwargs)
+
+        import vllm_mlx.api.guided as guided
+
+        try:
+            with caplog.at_level(logging.WARNING, logger=guided.__name__):
+                builtins.__import__ = _fake_import
+                reloaded = importlib.reload(guided)
+            # Degrade behavior preserved.
+            assert reloaded.HAS_LLGUIDANCE is False
+            # And the failure was surfaced, not swallowed.
+            warnings = [
+                r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+            ]
+            assert any("Guided generation disabled" in m for m in warnings), (
+                f"expected an import-diagnostic warning; got {warnings!r}"
+            )
+            assert any("simulated broken llguidance install" in m for m in warnings), (
+                "the warning must include the underlying exception detail so a "
+                "broken install is distinguishable from an absent extra"
+            )
+        finally:
+            builtins.__import__ = real_import
+            # Restore the module to its real (working) state for later tests.
+            importlib.reload(guided)
+
+
+# ---------------------------------------------------------------------------
 # generate_with_schema convenience wrapper
 # ---------------------------------------------------------------------------
 

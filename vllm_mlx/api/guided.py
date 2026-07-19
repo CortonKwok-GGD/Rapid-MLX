@@ -59,7 +59,23 @@ try:
     )
 
     HAS_LLGUIDANCE = True
-except ImportError:
+except ImportError as _guided_import_error:
+    # Log WHICH component failed before degrading. A bare, silent
+    # ``HAS_LLGUIDANCE = False`` makes a broken / version-incompatible
+    # llguidance install indistinguishable from an intentionally-absent
+    # ``[guided]`` extra — the operator sees "guided unavailable" either
+    # way. Surfacing the exception detail (e.g. a moved symbol in
+    # ``llguidance.mlx`` after a minor bump) turns an opaque no-op into a
+    # diagnosable one. Degrade behavior is unchanged: guided generation is
+    # still disabled.
+    logger.warning(
+        "Guided generation disabled: could not import the llguidance "
+        "stack (%s: %s). Install the extra with `pip install "
+        "'rapid-mlx[guided]'`; if it is installed, this indicates a "
+        "broken or version-incompatible llguidance/mlx install.",
+        type(_guided_import_error).__name__,
+        _guided_import_error,
+    )
     HAS_LLGUIDANCE = False
     mx = None
     mlx_lm = None
@@ -69,6 +85,15 @@ except ImportError:
     allocate_token_bitmask = None
     apply_token_bitmask = None
     fill_next_token_bitmask = None
+
+
+# Prompt chunk size for the constrained-decode prefill. Matches
+# ``mlx_lm.generate.generate_step``'s ``prefill_step_size`` default (2048)
+# so guided decode shares the same peak-memory behavior as the standard
+# mlx-lm decode path: the prompt is fed to the model in ≤ this-many-token
+# chunks (with the KV cache eval'd + ``mx.clear_cache()`` between chunks)
+# instead of one sequence-wide forward pass that OOMs on long contexts.
+_PREFILL_STEP_SIZE = 2048
 
 
 def is_guided_available() -> bool:
@@ -271,13 +296,23 @@ class GuidedGenerator:
         (``mlx_lm.generate.generate_step``): a per-request KV cache built
         with ``mlx_lm.models.cache.make_prompt_cache(model)`` is threaded
         through *every* model call via the ``cache=`` kwarg. The prompt is
-        prefilled once WITH the cache, and each subsequent step feeds only
-        the single new token — the cache carries the prompt + all prior
-        tokens forward, so the model keeps full context instead of seeing
-        one bare token in isolation. This matches how rapid-mlx's own
-        engine threads the cache (e.g. ``mllm_batch_generator`` /
-        ``engine/batched``): ``make_prompt_cache(model)`` then
-        ``model(ids, cache=cache)``.
+        prefilled WITH the cache, and each subsequent step feeds only the
+        single new token — the cache carries the prompt + all prior tokens
+        forward, so the model keeps full context instead of seeing one bare
+        token in isolation. This matches how rapid-mlx's own engine threads
+        the cache (e.g. ``mllm_batch_generator`` / ``engine/batched``):
+        ``make_prompt_cache(model)`` then ``model(ids, cache=cache)``.
+
+        Prefill is CHUNKED, not single-call. Feeding the whole prompt in one
+        ``model(prompt[None], cache=cache)`` forward pass materializes
+        sequence-wide activations and OOMs on long production prompts (e.g.
+        structured extraction over a long document). We therefore port the
+        exact chunking loop from ``mlx_lm.generate.generate_step`` (mlx-lm
+        0.31.3, ``generate.py`` lines 424-453): process the prompt in
+        ``_PREFILL_STEP_SIZE`` (2048, mlx-lm's default) token chunks,
+        ``mx.eval`` the cache state and ``mx.clear_cache()`` between chunks
+        to bound peak memory, and leave the trailing (< step size) remainder
+        to produce the first constrained sample's last-token logits.
 
         Threading note: guided generation runs on the model-owning executor
         thread and the mask kernel shares that thread's default stream, so
@@ -324,17 +359,50 @@ class GuidedGenerator:
         bitmask = allocate_token_bitmask(1, vocab)
 
         prompt_ids = tokenizer.encode(prompt)
-        prompt_arr = mx.array(prompt_ids)
+
+        # Empty-prompt guard. When ``encode`` yields ``[]`` (e.g. an empty
+        # prompt string), indexing the last-token logits ``[:, -1, :]`` off a
+        # zero-length sequence axis raises, and guided generation silently
+        # returned None. Seed with the tokenizer's BOS id if it defines one
+        # (matches how a real prompt would begin) so a legitimately-empty
+        # prompt still produces valid constrained output. If there is no BOS,
+        # there is nothing to prefill and no last-token logits to sample from,
+        # so degrade to guided-unavailable (None) rather than indexing an
+        # empty axis.
+        if not prompt_ids:
+            bos_id = getattr(tokenizer, "bos_token_id", None)
+            if bos_id is None:
+                logger.warning(
+                    "Guided generation: empty prompt with no tokenizer BOS "
+                    "token id — nothing to prefill. Returning None."
+                )
+                return None
+            prompt_ids = [int(bos_id)]
 
         # Per-request KV cache (mirrors mlx_lm.generate.generate_step).
         cache = make_prompt_cache(model)
 
-        # Prefill the FULL prompt through the cache so every generated token
-        # sees the whole prompt context. Passing only the latest token with
-        # no cache (the prior bug) discarded all prompt + prior-token state
-        # after step 1, yielding grammar-valid but semantically-garbage
-        # output.
-        logits = model(prompt_arr[None], cache=cache)[:, -1, :]
+        # ---- Chunked prefill (ported from mlx_lm.generate.generate_step,
+        #      mlx-lm 0.31.3 generate.py:424-453). Feeding the whole prompt in
+        #      one forward pass materializes sequence-wide activations and OOMs
+        #      on long contexts. Instead process the prompt in
+        #      ``_PREFILL_STEP_SIZE`` chunks, eval'ing the cache state and
+        #      clearing the MLX buffer cache between chunks to bound peak
+        #      memory. mlx-lm's loop condition ``while remaining > 1`` always
+        #      leaves ≥ 1 trailing token; that trailing (< step size) remainder
+        #      is fed last and its last-token logits seed the first constrained
+        #      sample. The KV cache carries the whole prompt forward, so every
+        #      generated token still sees full context.
+        y = mx.array(prompt_ids)
+        while y.size > _PREFILL_STEP_SIZE:
+            model(y[:_PREFILL_STEP_SIZE][None], cache=cache)
+            mx.eval([c.state for c in cache])
+            y = y[_PREFILL_STEP_SIZE:]
+            mx.clear_cache()
+
+        # Trailing remainder (1 .. _PREFILL_STEP_SIZE tokens): this final
+        # forward pass yields the last-token logits for the first sample.
+        logits = model(y[None], cache=cache)[:, -1, :]
 
         generated: list[int] = []
         for _ in range(max_tokens):
@@ -368,8 +436,14 @@ class GuidedGenerator:
 
             generated.append(tok)
 
-            # 5. advance the model by one token — its KV appends into the
-            #    same cache, carrying full context to the next step.
+            # 5. Only advance the model if another constrained step will
+            #    actually run. Checking termination BEFORE the next forward
+            #    pass avoids a wasted model call (and needless cache mutation)
+            #    when this token already stopped the matcher or we have hit
+            #    ``max_tokens`` — the prior code always advanced, one step
+            #    past the last token it could ever use.
+            if matcher.is_stopped() or len(generated) >= max_tokens:
+                break
             logits = model(mx.array([tok])[None], cache=cache)[:, -1, :]
 
         # Only return output the grammar actually completed. ``is_accepting``
