@@ -167,12 +167,14 @@ def test_build_tool_grammar_named_choice_narrows_to_requested_tool():
     assert "start: (tag_0)+ tag_end" in grammar
 
 
+@_requires_llguidance
 def test_build_tool_grammar_named_choice_unknown_name_degrades():
     # An unknown named function degrades to free-form (None), not a crash.
+    # Requires llguidance so execution reaches the named-choice narrowing
+    # branch rather than returning None via the HAS_LLGUIDANCE short-circuit
+    # (which would keep this green even if the named validation were deleted).
     from vllm_mlx.api.tool_grammar import build_tool_grammar
 
-    # This path is reached before the llguidance short-circuit only when the
-    # extra is present; when absent it also returns None. Either way: None.
     assert build_tool_grammar(TOOLS, "does_not_exist", _HermesStubParser()) is None
 
 
@@ -201,9 +203,15 @@ def test_lark_contains_trigger_and_schema_region():
     infos = [_hermes_structure_info()(t["name"]) for t in TOOLS]
     lark = build_tool_lark(TOOLS, "required", infos)
 
-    # trigger sentinel is emitted as a Lark special-token ref (bare <tool_call>)
-    assert "<tool_call>" in lark
-    assert "</tool_call>" in lark
+    # The sentinels MUST be emitted as BARE special-token references (llguidance
+    # renders a bare ``<name>`` as a special token), NOT as quoted byte-string
+    # literals — a quoted ``"<tool_call>"`` would be a multi-byte string the
+    # model's single ``<tool_call>`` token could never satisfy (the ground-truth
+    # correction this PR ports). Assert the exact production shape.
+    assert " <tool_call> " in lark  # space-delimited bare token ref
+    assert lark.rstrip().endswith("</tool_call>")  # bare closing token ref
+    assert '"<tool_call>"' not in lark  # NOT a quoted literal
+    assert '"</tool_call>"' not in lark  # NOT a quoted literal
     # a %json schema-constraint region is present for the arguments object
     assert "%json" in lark
     # the concrete tool names are substituted into the begin bodies
@@ -236,6 +244,23 @@ def test_named_choice_narrows_to_single_forced_tag():
     assert "start: (tag_0)+ tag_end" in lark
     assert "tag_1" not in lark  # no other tool's alternative present
     assert "get_time" not in lark
+
+
+def test_text_trigger_is_rejected_at_build_time():
+    # PR-1's guard against the auto-path fake-trigger risk (design §7 open-Q1;
+    # full auto text-trigger handling is PR-5): the builder REFUSES to emit a
+    # grammar whose trigger is a plain text (multi-token) string not declared
+    # as a special-token sentinel — because the lazy ``TAG_TEXT`` prefix could
+    # then swallow bytes that reassemble the trigger, producing an
+    # unenforceable ``auto`` grammar. A special-token trigger cannot be
+    # reassembled from ordinary token pieces, so we require one here.
+    from vllm_mlx.api.tool_grammar import StructureInfo, build_tool_lark
+
+    text_trigger = StructureInfo(
+        begin="TOOL_CALL args:", end="", trigger="TOOL_CALL", sentinels=()
+    )
+    with pytest.raises(ValueError, match="sentinel"):
+        build_tool_lark([TOOLS[0]], "auto", [text_trigger])
 
 
 def test_build_tool_lark_rejects_bad_inputs():
