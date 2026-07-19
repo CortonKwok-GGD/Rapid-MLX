@@ -225,6 +225,64 @@ def are_single_special_tokens(tokenizer: Any, candidates: tuple[str, ...]) -> bo
     return True
 
 
+def resolve_reasoning_sentinels(
+    reasoning_parser_name: str | None, tokenizer: Any
+) -> tuple[str, ...]:
+    """Reasoning-boundary special tokens (``<think>``/``</think>``) for path A.
+
+    Looks up the configured reasoning parser (by the server config's
+    ``reasoning_parser_name``) and reads its ``start_token`` / ``end_token``
+    markers (e.g. ``<think>`` / ``</think>``). Returns ONLY the markers that are
+    PROVEN single special tokens on ``tokenizer`` (via
+    ``are_single_special_tokens``), so the grammar's reasoning-tolerant prefix
+    references real atomic tokens the model can emit — never a byte string the
+    lazy prefix cannot match (#558 PR-4 GROUND TRUTH; see ``build_tool_lark``).
+
+    Returns ``()`` (the non-reasoning path — grammar byte-identical to PR-3)
+    when: no reasoning parser is configured, the parser class exposes no
+    ``start_token``/``end_token``, the markers are not single special tokens on
+    this tokenizer, or anything raises. A missing/degenerate reasoning parser
+    must NOT disable tool-call enforcement — it only means the free prefix is
+    the bare ``TAG_TEXT`` (no reasoning tolerance), which is correct for a
+    non-reasoning model.
+
+    We reuse ``are_single_special_tokens`` — the exact gate the tool sentinels
+    use — so ``<think>`` on a tokenizer that splits it into ordinary text is
+    correctly excluded (declaring it a special-token ref there would build an
+    unenforceable prefix, the same failure mode the sentinel gate guards).
+    """
+    if not reasoning_parser_name or tokenizer is None:
+        return ()
+    try:
+        from ..reasoning import get_parser
+
+        parser_cls = get_parser(reasoning_parser_name)
+    except Exception:
+        # Unknown/unregistered reasoning parser -> no reasoning tolerance
+        # (free prefix stays bare TAG_TEXT). Never disables tool enforcement.
+        return ()
+    markers: list[str] = []
+    for attr in ("start_token", "end_token"):
+        try:
+            # ``start_token``/``end_token`` are read-only properties on the
+            # concrete parsers (deepseek_r1/qwen3/glm4); reading them off the
+            # CLASS returns the property object, so instantiate to get the str.
+            # The reasoning parsers take no required ctor args.
+            value = getattr(parser_cls(), attr, None)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value:
+            markers.append(value)
+    if not markers:
+        return ()
+    # Dedup preserving order (start_token/end_token are distinct, but a parser
+    # could in principle repeat one).
+    ordered = tuple(dict.fromkeys(markers))
+    # Only keep markers that are single special tokens on THIS tokenizer.
+    kept = tuple(m for m in ordered if are_single_special_tokens(tokenizer, (m,)))
+    return kept
+
+
 def _lark_escape(s: str) -> str:
     """Render ``s`` as a Lark double-quoted string literal (JSON-escaped)."""
     if not s:
@@ -274,6 +332,7 @@ def build_tool_lark(
     structure_infos: list["StructureInfo"],
     *,
     single_call: bool = False,
+    reasoning_sentinels: tuple[str, ...] = (),
 ) -> str:
     """Assemble the Lark grammar for a set of per-tool structure triples.
 
@@ -303,18 +362,43 @@ def build_tool_lark(
     collapses to a single forced tag. The builder does not itself resolve a
     function name out of a multi-tool list — that routing lands in PR-3.
 
-    Every tag is: ``TAG_TEXT <trigger-and-begin> %json <schema> <end>``.
-    ``TAG_TEXT`` is the lazy free prefix that swallows reasoning/prose until
-    the trigger — this is also the reasoning-aware delay (design §5 path A).
+    Every tag is: ``<free-prefix> <trigger-and-begin> %json <schema> <end>``.
+    The free prefix is the lazy region that swallows reasoning/prose until the
+    trigger — this is the reasoning-aware delay (design §5 path A).
     REQUIREMENT (applies to ALL modes, not just ``auto``): the trigger MUST be
     a single special token, declared in ``sentinels``. This is enforced
-    UNCONDITIONALLY because the lazy ``TAG_TEXT`` prefix can reassemble a
+    UNCONDITIONALLY because the lazy free prefix can reassemble a
     multi-byte *text* trigger from ordinary token pieces in any mode — a
     text trigger is unenforceable regardless of the ``*``/``+`` quantifier, so
     the builder rejects it (raises ``ValueError``) rather than silently
     producing an unenforceable grammar. Full text-trigger support (excluding
-    the trigger byte sequence from ``TAG_TEXT`` across token boundaries) is
+    the trigger byte sequence from the free prefix across token boundaries) is
     design §7 open-Q1, deferred to the PR-5 auto path.
+
+    REASONING-TOLERANT PREFIX (#558 PR-4, path A). ``reasoning_sentinels`` is a
+    tuple of the model family's reasoning-boundary strings (``<think>`` /
+    ``</think>``) that the caller has PROVEN are single special tokens on this
+    tokenizer (via ``are_single_special_tokens``). GROUND TRUTH (verified on the
+    real Qwen3.6 tokenizer, 2026-07): a bare ``TAG_TEXT: /(.|\\n)*/`` free prefix
+    is a BYTE regex and therefore CANNOT match a ``<think>`` *special token* (id
+    248068) — the design-doc §5.3 claim that a bare ``TAG_TEXT`` "swallows the
+    whole ``<think>...</think>`` block" is FALSE whenever those markers are
+    special tokens (exactly the reasoning case this PR targets). The matcher
+    rejects the very first ``<think>`` token and path A collapses. To make path A
+    actually correct we build the free prefix as
+    ``prefix: TAG_TEXT (rtok TAG_TEXT)*`` where ``rtok`` is a RULE-level
+    alternation of the reasoning special-token refs — they MUST be rule-level,
+    not lexer terminals, because llguidance rejects special tokens inside a
+    terminal (``special tokens ... cannot be used in terminals``). This admits an
+    interleaving of free text and reasoning special tokens BEFORE the trigger,
+    then the tag enforces the tool-call structure exactly as before. When
+    ``reasoning_sentinels`` is empty (no reasoning parser, or its markers are NOT
+    single special tokens on this tokenizer) the prefix is the bare ``TAG_TEXT``
+    — the non-reasoning grammar is byte-identical to PR-3, so this change is a
+    strict superset with ZERO regression for non-reasoning constrained calls. The
+    reasoning tolerance lives in the compiled grammar, never in a runtime on/off
+    gate (path B, a footgun that desyncs the matcher on multi-token boundaries —
+    see ``GrammarLogitsProcessor``).
     """
     if not tools:
         raise ValueError("build_tool_lark: tools must not be empty")
@@ -360,13 +444,37 @@ def build_tool_lark(
     else:
         quant = "+"
     tag_names = " | ".join(f"tag_{i}" for i in range(len(tools)))
+
+    # Free-prefix nonterminal (design §5 path A). ``prefix`` is what every tag —
+    # and the trailing ``tag_end`` — consumes before/after the tool call. With
+    # NO reasoning sentinels it is the bare lazy ``TAG_TEXT`` byte regex, so the
+    # emitted grammar is byte-identical to PR-3 (no reasoning regression).
+    #
+    # With reasoning sentinels (each PROVEN a single special token by the caller)
+    # ``prefix`` interleaves free text with the reasoning special-token refs so
+    # a ``<think>...</think>`` block is admitted before the trigger. The refs
+    # MUST be rule-level (``rtok:``), never lexer terminals: llguidance rejects
+    # a special token inside a terminal. A bare ``TAG_TEXT`` (a byte regex)
+    # cannot match a special token, which is exactly why the design-doc claim
+    # that ``TAG_TEXT`` alone swallows ``<think>`` is wrong on real reasoning
+    # tokenizers (see build_tool_lark docstring GROUND TRUTH).
+    reasoning_refs = tuple(dict.fromkeys(s for s in reasoning_sentinels if s))
+    prefix_ref = "prefix" if reasoning_refs else "TAG_TEXT"
     lark = (
         "%llguidance {}\n"
         f"start: ({tag_names}){quant} tag_end\n"
-        "tag_end: TAG_TEXT\n"
+        f"tag_end: {prefix_ref}\n"
         r"TAG_TEXT: /(.|\n)*/"
         "\n"
     )
+    if reasoning_refs:
+        # ``prefix: TAG_TEXT (rtok TAG_TEXT)*`` — free text with interleaved
+        # reasoning special tokens. Sentinels are already in ``<...>`` special-
+        # token-ref form (e.g. ``<think>``); llguidance Lark treats a bare
+        # ``<name>`` as a special-token reference.
+        rtok_alts = " | ".join(reasoning_refs)
+        lark += f"prefix: TAG_TEXT (rtok TAG_TEXT)*\nrtok: {rtok_alts}\n"
+
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
         # Only substitute the default when ``parameters`` is ABSENT. A
         # falsy-but-present schema ({} = allow-any, false = allow-none) is a
@@ -387,7 +495,7 @@ def build_tool_lark(
         schema = json.dumps(params)
         begin_body = _emit_literal_with_sentinels(si.begin, si.sentinels)
         end_body = _emit_literal_with_sentinels(si.end, si.sentinels)
-        lark += f"\ntag_{i}: TAG_TEXT {begin_body} %json {schema}"
+        lark += f"\ntag_{i}: {prefix_ref} {begin_body} %json {schema}"
         if end_body:
             lark += f" {end_body}"
         lark += "\n"
@@ -414,6 +522,7 @@ def build_tool_grammar(
     parser: Any,
     *,
     single_call: bool = False,
+    reasoning_sentinels: tuple[str, ...] = (),
 ) -> str | None:
     """Public entry: (tools, tool_choice, parser) -> compiled llguidance grammar.
 
@@ -428,6 +537,12 @@ def build_tool_grammar(
     request objects; that responsibility lives with the routing PR so the
     builder stays a small, pure, request-shape-agnostic unit. An unexpected
     shape degrades safely to ``None`` (free-form) rather than crashing.
+
+    ``reasoning_sentinels`` (#558 PR-4, path A): reasoning-boundary special
+    tokens (``<think>`` / ``</think>``) the CALLER has proven single special
+    tokens on this tokenizer. Passed through to ``build_tool_lark`` so the free
+    prefix admits a ``<think>...</think>`` block before the trigger. Empty (the
+    default) reproduces the PR-3 non-reasoning grammar exactly.
 
     Returns ``None`` when ``tool_choice`` is ``"none"`` (no constraint at
     all), when the parser declares no ``structure_info`` (family not yet
@@ -496,7 +611,11 @@ def build_tool_grammar(
 
     try:
         lark = build_tool_lark(
-            tools, tool_choice, structure_infos, single_call=single_call
+            tools,
+            tool_choice,
+            structure_infos,
+            single_call=single_call,
+            reasoning_sentinels=reasoning_sentinels,
         )
     except ValueError:
         # Malformed structure_info / unsupported tool_choice -> free-form.
