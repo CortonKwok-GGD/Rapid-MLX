@@ -30,14 +30,14 @@ Design notes
   the strict-xfail collection hook). They are ``family_alias``-parametrized,
   so a single-family server boot runs only that family's deep cells and the
   family-guard skips the rest — identical semantics to the smoke matrix.
-* Constraint MODE is now a SERVER-env toggle the gate driver applies when it
-  boots the per-arm server (``scripts/default_on_gate.py``): the off arm boots
-  with ``RAPID_MLX_CONSTRAIN_TOOLS=0`` (free-form base) and the on arm boots
-  default-on (env unset — #558 PR-5 flipped the default to ON). Both arms keep
-  ``tool_choice="auto"`` so the REAL PR-5 auto-path is exercised; the only
-  independent variable is the server-side constraint. ``RAPID_MLX_TOOL_CONSTRAINT``
-  (still set on the pytest process) now only labels the per-cell latency
-  breadcrumb with its mode. Before PR-5 landed, ``on`` was a per-request
+* Constraint MODE is a SERVER-env toggle applied when the per-arm server is
+  booted: the off arm boots with ``RAPID_MLX_CONSTRAIN_TOOLS=0`` (free-form
+  base) and the on arm boots default-on (env unset — #558 PR-5 flipped the
+  default to ON). Both arms keep ``tool_choice="auto"`` so the REAL PR-5
+  auto-path is exercised; the only independent variable is the server-side
+  constraint. ``RAPID_MLX_TOOL_CONSTRAINT`` (optionally set on the pytest
+  process) now only labels the per-cell latency breadcrumb with its mode.
+  Before PR-5 landed, ``on`` was a per-request
   ``tool_choice="auto"->"required"`` proxy in ``_apply_constraint_mode``; that
   seam is now a no-op that pins ``tool_choice="auto"`` in both arms. The
   negative-control cell does NOT depend on the toggle: it drives the
@@ -79,9 +79,10 @@ from tests.integrations.conftest import (
 def constraint_mode() -> str:
     """Return the requested constraint mode: ``"off"`` (default) or ``"on"``.
 
-    Set by the gate driver (``scripts/default_on_gate.py``) via
-    ``RAPID_MLX_TOOL_CONSTRAINT`` so the SAME cells run once per mode and the
-    driver can diff the two per-cell result sets (baseline-vs-constrained).
+    Read from ``RAPID_MLX_TOOL_CONSTRAINT`` (optionally set on the pytest
+    process) so the SAME cells can be run once per mode and a caller can diff
+    the two per-cell result sets (baseline-vs-constrained). Defaults to ``off``
+    when unset, so an ordinary ``pytest`` run needs no external orchestration.
     """
     val = os.environ.get("RAPID_MLX_TOOL_CONSTRAINT", "off").strip().lower()
     return "on" if val in ("1", "on", "true", "yes") else "off"
@@ -305,12 +306,18 @@ class TestMultiTurnToolLoop:
         assert_content_nonempty(final, ctx=ctx)
         assert_no_think_tag_leak(final)
         assert_no_analysis_channel_leak(final)
-        # The final answer must consume the tool output — grounded on the
-        # 21°C / sunny result we fed back, not a hallucinated re-answer.
+        # The final answer must consume the tool RESULT — grounded on the
+        # values only the tool returned (21°C / sunny), NOT the echoed city.
+        # ``Tokyo`` is already in the user prompt, so accepting it would let an
+        # answer that ignored the tool output pass (codex #558-PR5 finding 4).
+        # We require result-only evidence: the temperature or the sky the tool
+        # reported, which the model could only have obtained from the fed-back
+        # ``role="tool"`` turn.
         low = final.lower()
-        assert ("21" in final) or ("sunny" in low) or ("tokyo" in low), (
+        assert ("21" in final) or ("sunny" in low), (
             f"{ctx}: final answer {final[:200]!r} did not consume the tool "
-            "result (expected mention of 21 / sunny / tokyo)"
+            "result — expected the tool-returned 21°C / sunny, not the echoed "
+            "city (which the user prompt already contained)"
         )
         # Perf breadcrumb for the gate's per-cell latency record.
         print(f"[deep-latency] {ctx} mode={constraint_mode()} {latency_s:.2f}s")
@@ -384,31 +391,33 @@ class TestVariedSchemas:
             strict_skip_or_fail(f"{ctx}: no tool_calls (content={content[:120]!r})")
             return
 
-        # The call must name the tool we offered — a constraint that emitted a
-        # different function name (or the model hallucinated one) is a failure
-        # regardless of the argument shape (codex #558-PR5).
-        called = tool_calls[0].function.name
-        assert called == "record_query", (
-            f"{ctx}: wrong function called: {called!r} (expected record_query)"
-        )
-
-        args = json.loads(tool_calls[0].function.arguments)
-        assert isinstance(args, dict), f"{ctx}: args not an object: {args!r}"
-        # FULL-SCHEMA validation (codex #558-PR5): validate the emitted argument
-        # object against the COMPLETE parameter schema — for EVERY variant,
-        # including ``no_additional_props`` (which the old hand-rolled checks did
-        # not cover at all). ``jsonschema.validate`` enforces the whole contract:
+        # Validate EVERY emitted tool_call, not just the first (codex #558-PR5
+        # finding 5): a model that emits a correct first call plus a malformed
+        # additional call must fail. For each call we assert it names the tool we
+        # offered and that its ``arguments`` JSON-parse and satisfy the COMPLETE
+        # parameter schema. ``jsonschema.validate`` enforces the whole contract:
         # ``additionalProperties: false`` rejects any forbidden extra key, and a
-        # missing ``required`` field fails. This is the real proof the constrained
-        # arm honours the schema — the earlier per-key spot checks could pass a
-        # call that snuck in an extra key or dropped a required one.
-        try:
-            jsonschema.validate(instance=args, schema=schema)
-        except jsonschema.ValidationError as exc:
-            pytest.fail(
-                f"{ctx}: emitted args violate the parameter schema: {args!r} "
-                f"— {exc.message}"
+        # missing ``required`` field fails — real proof the constrained arm
+        # honours the schema, where the earlier per-key spot checks (only on
+        # ``tool_calls[0]``) could pass a call that snuck in an extra key, dropped
+        # a required one, or a bad sibling call entirely.
+        for idx, call in enumerate(tool_calls):
+            called = call.function.name
+            assert called == "record_query", (
+                f"{ctx}: tool_calls[{idx}] wrong function called: {called!r} "
+                "(expected record_query)"
             )
+            args = json.loads(call.function.arguments)
+            assert isinstance(args, dict), (
+                f"{ctx}: tool_calls[{idx}] args not an object: {args!r}"
+            )
+            try:
+                jsonschema.validate(instance=args, schema=schema)
+            except jsonschema.ValidationError as exc:
+                pytest.fail(
+                    f"{ctx}: tool_calls[{idx}] args violate the parameter "
+                    f"schema: {args!r} — {exc.message}"
+                )
         print(f"[deep-latency] {ctx} mode={constraint_mode()} {latency_s:.2f}s")
 
 
