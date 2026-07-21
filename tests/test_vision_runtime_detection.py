@@ -66,7 +66,9 @@ def _simulate_mlx_vlm_present_but_pil_missing(monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    sys.modules.pop("mlx_vlm", None)
+    # ``delitem`` (not ``sys.modules.pop``) so monkeypatch restores any
+    # pre-existing cached ``mlx_vlm`` on teardown → order-independent tests.
+    monkeypatch.delitem(sys.modules, "mlx_vlm", raising=False)
 
 
 def _simulate_mlx_vlm_absent(monkeypatch):
@@ -89,7 +91,45 @@ def _simulate_mlx_vlm_absent(monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    sys.modules.pop("mlx_vlm", None)
+    monkeypatch.delitem(sys.modules, "mlx_vlm", raising=False)
+
+
+def _spec_present_for_mlx_vlm(monkeypatch):
+    """Make ``find_spec('mlx_vlm')`` report the top-level package present
+    (installed) without importing it — shared setup for the "installed but
+    the import chain is broken" simulators below."""
+    real_find_spec = _ilu.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "mlx_vlm":
+            spec = real_find_spec(name, *args, **kwargs)
+            return spec if spec is not None else object()
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(_ilu, "find_spec", fake_find_spec)
+
+
+def _simulate_mlx_vlm_installed_but_import_raises(monkeypatch, exc):
+    """mlx-vlm's top-level package IS installed (``find_spec`` present) but
+    ``import mlx_vlm`` raises ``exc``.
+
+    Covers the states the pre-fix name-heuristic mishandled:
+    * a damaged/incomplete install whose OWN submodule is missing
+      (``ModuleNotFoundError(name='mlx_vlm.<sub>')`` → was wrongly ABSENT),
+    * a missing shared lib / broken native ext
+      (``OSError``/``RuntimeError`` → previously ESCAPED and crashed the guard).
+    """
+    _spec_present_for_mlx_vlm(monkeypatch)
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "mlx_vlm" or name.startswith("mlx_vlm."):
+            raise exc
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.delitem(sys.modules, "mlx_vlm", raising=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -134,6 +174,85 @@ def test_mlx_vlm_available_false_when_pil_missing(monkeypatch):
     _simulate_mlx_vlm_present_but_pil_missing(monkeypatch)
 
     assert mlx_vlm_available() is False
+
+
+def test_status_broken_when_internal_submodule_missing(monkeypatch):
+    """A damaged/incomplete mlx-vlm whose OWN internal submodule is missing
+    (``ModuleNotFoundError(name='mlx_vlm.<sub>')``) is installed-but-broken,
+    NOT absent. Pre-fix the ``name.startswith('mlx_vlm')`` heuristic
+    mislabelled it ABSENT → misleading "install mlx-vlm" for an install that
+    is already present."""
+    from vllm_mlx.models.mllm import VisionRuntimeStatus, vision_runtime_status
+
+    _simulate_mlx_vlm_installed_but_import_raises(
+        monkeypatch,
+        ModuleNotFoundError(
+            "No module named 'mlx_vlm.trainer'", name="mlx_vlm.trainer"
+        ),
+    )
+
+    status, detail = vision_runtime_status()
+    assert status is VisionRuntimeStatus.BROKEN, (
+        f"present-but-damaged mlx-vlm must be BROKEN, not ABSENT; got {status}"
+    )
+    assert detail, "BROKEN must carry an actionable diagnostic, not None/empty"
+
+
+def test_status_broken_when_import_raises_oserror(monkeypatch):
+    """A missing shared library surfaces as ``OSError`` from ``import
+    mlx_vlm``. Pre-fix this ESCAPED ``vision_runtime_status`` (only
+    ModuleNotFoundError/ImportError were caught) and crashed the boot guard;
+    it must now be classified BROKEN without raising."""
+    from vllm_mlx.models.mllm import VisionRuntimeStatus, vision_runtime_status
+
+    _simulate_mlx_vlm_installed_but_import_raises(
+        monkeypatch, OSError("dlopen(libmlx.dylib): image not found")
+    )
+
+    status, detail = vision_runtime_status()  # must NOT raise
+    assert status is VisionRuntimeStatus.BROKEN, (
+        f"OSError on import ⇒ installed-but-broken, got {status}"
+    )
+    assert detail, "BROKEN must retain a diagnostic for the OSError failure"
+
+
+def test_status_broken_when_import_raises_runtimeerror(monkeypatch):
+    """A broken native extension / ABI mismatch can raise ``RuntimeError``
+    on import — also non-control-flow, also previously escaping. Must be
+    BROKEN, not a crash."""
+    from vllm_mlx.models.mllm import VisionRuntimeStatus, vision_runtime_status
+
+    _simulate_mlx_vlm_installed_but_import_raises(
+        monkeypatch, RuntimeError("incompatible mlx ABI")
+    )
+
+    status, detail = vision_runtime_status()  # must NOT raise
+    assert status is VisionRuntimeStatus.BROKEN
+    assert detail
+
+
+def test_boot_guard_exit_2_when_import_raises_oserror(monkeypatch, capsys):
+    """The tri-state contract's whole point: a missing-shared-lib ``OSError``
+    must be caught and turned into a clean exit-code-2 boot guard with an
+    honest diagnostic — NOT propagate as an uncaught crash, and NOT misdirect
+    the user to "install mlx-vlm" (which IS installed)."""
+    from vllm_mlx.models.mllm import require_mlx_vlm_or_exit
+
+    _simulate_mlx_vlm_installed_but_import_raises(
+        monkeypatch, OSError("dlopen(libmlx.dylib): image not found")
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        require_mlx_vlm_or_exit("gemma-4-26b-a4b-it-4bit")
+    assert exc_info.value.code == 2
+
+    err = capsys.readouterr().err
+    assert "vision runtime cannot load" in err, (
+        f"broken-runtime boot hint must say the runtime can't load, got: {err!r}"
+    )
+    # Honest: the primary directive must NOT be the misleading bare
+    # "install mlx-vlm" absent message — it IS installed.
+    assert "requires the optional `mlx-vlm` dependency" not in err
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -306,3 +425,68 @@ def test_doctor_vision_row_warns_when_mlx_vlm_truly_absent(monkeypatch):
         f"truly-absent mlx-vlm must WARN, got {vision_row.status}"
     )
     assert "not installed" in vision_row.label.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Doctor's PIL probe must reflect the REAL import, not just find_spec.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _simulate_pillow_damaged(monkeypatch):
+    """Shadowed/damaged Pillow: ``find_spec('PIL')`` still succeeds (a dir /
+    stale metadata named PIL is discoverable) but the real ``from PIL import
+    Image`` raises — the exact false-green ``find_spec``-only probing would
+    miss. Leaves ``importlib.util.find_spec`` untouched precisely so a
+    find_spec-based probe would WRONGLY pass."""
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "PIL" or name.startswith("PIL."):
+            raise ImportError("cannot import name 'Image' from 'PIL' (shadowed)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.delitem(sys.modules, "PIL", raising=False)
+    monkeypatch.delitem(sys.modules, "PIL.Image", raising=False)
+
+
+def test_pil_importable_false_when_pillow_damaged(monkeypatch):
+    """``_pil_importable`` must return False when the real ``from PIL import
+    Image`` raises even though something named PIL is discoverable. Pre-fix it
+    used ``find_spec('PIL')`` only and returned True (false green)."""
+    from vllm_mlx.doctor import env_health
+
+    # find_spec('PIL') still resolves on this dev box (Pillow installed) —
+    # a find_spec-only probe would (wrongly) pass here.
+    assert _ilu.find_spec("PIL") is not None
+    _simulate_pillow_damaged(monkeypatch)
+
+    assert env_health._pil_importable() is False
+
+
+def test_doctor_vision_row_red_when_pillow_damaged(monkeypatch):
+    """End-to-end: a damaged/shadowed Pillow must turn the doctor vision +
+    dflash rows red, exercising the REAL ``_pil_importable`` (not a stub) so
+    the find_spec-only false-green regression stays pinned."""
+    from vllm_mlx.doctor import env_health
+    from vllm_mlx.doctor.env_health import CheckStatus
+
+    def fake_safe_version(dist):
+        return "0.6.5" if dist == "mlx-vlm" else None
+
+    monkeypatch.setattr(env_health, "_safe_version", fake_safe_version)
+    _simulate_pillow_damaged(monkeypatch)
+
+    section = env_health.section_optional_packages()
+
+    vision_row = _find_row(section, "mlx-vlm", "vision")
+    assert vision_row is not None, "vision (mlx-vlm) row missing from doctor"
+    assert vision_row.status is not CheckStatus.OK, (
+        f"vision row must NOT be green when Pillow is damaged, got "
+        f"{vision_row.status}: {vision_row.label!r}"
+    )
+    assert "pil" in vision_row.label.lower() or "pillow" in vision_row.label.lower()
+
+    dflash_row = _find_row(section, "dflash")
+    assert dflash_row is not None
+    assert dflash_row.status is not CheckStatus.OK

@@ -426,20 +426,29 @@ def _safe_version(dist: str) -> str | None:
 
 
 def _pil_importable() -> bool:
-    """Lightweight probe: is Pillow (import name ``PIL``) importable?
+    """Lightweight probe: does mlx-vlm's ``from PIL import Image`` actually
+    work?
 
     mlx-vlm does ``from PIL import Image`` at module load, so a present
     mlx-vlm with an absent PIL — the Homebrew ``pip install --no-deps
-    mlx-vlm`` state (#1126) — is a FALSE positive: metadata says
-    installed, but every vision path crashes on import. We probe via
-    ``find_spec`` (NOT a real ``import mlx_vlm``) to keep ``doctor`` fast
-    (≤5 s contract; a real vision import would pull torch)."""
-    import importlib.util
+    mlx-vlm`` state (#1126) — is a FALSE positive: metadata says installed,
+    but every vision path crashes on import.
 
+    We perform the EXACT lightweight import mlx-vlm uses rather than a
+    ``find_spec('PIL')`` probe: ``find_spec`` only proves *something named
+    PIL is discoverable*, so a shadowed namespace dir or a damaged Pillow
+    (broken ``_imaging`` C extension) whose real ``from PIL import Image``
+    raises would still get a green row. ``PIL.Image`` is a small pure-Python
+    module over a C extension — well within doctor's ≤5 s budget and it does
+    NOT pull torch the way a real ``import mlx_vlm`` would. ANY failure
+    (missing, shadowed, broken native ext) ⇒ not importable."""
     try:
-        return importlib.util.find_spec("PIL") is not None
-    except (ImportError, ValueError):
+        from PIL import Image  # noqa: F401
+    except Exception:
+        # ImportError (absent/shadowed), OSError (broken native ext), or any
+        # other load-time failure — all mean the real vision import can't run.
         return False
+    return True
 
 
 def _version_at_least(ver: str, minimum: tuple[int, ...]) -> bool:
