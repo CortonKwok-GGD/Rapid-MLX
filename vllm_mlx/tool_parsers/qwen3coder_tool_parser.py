@@ -134,6 +134,77 @@ class Qwen3CoderToolParser(ToolParser):
     SUPPORTS_NATIVE_TOOL_FORMAT = True
     EXPECTED_WIRE_FORMATS = ("qwen3_coder_xml_named", "tool_call_xml_body")
 
+    # Grammar-CAPABLE (#558 E3): overrides ``structure_info`` below to emit the
+    # Qwen3-Coder XML-args wire triple. The class-level marker lets the route
+    # gate decide the constrained path is reachable without instantiating the
+    # parser (an oversized schema still 400s here, per #561), mirroring
+    # hermes/qwen/harmony.
+    SUPPORTS_GRAMMAR: bool = True
+
+    # ``<tool_call>`` precedes ONLY tool calls (never plain-text responses), so
+    # auto's zero-call invariant holds — unlike harmony's shared ``<|channel|>``.
+    # Defaults ``True`` (see ``ToolParser.TOOL_GRAMMAR_AUTO_SAFE``); stated
+    # explicitly for discoverability alongside the other grammar flags.
+    TOOL_GRAMMAR_AUTO_SAFE: bool = True
+
+    _GRAMMAR_SENTINELS = ("<tool_call>", "</tool_call>")
+
+    def structure_info(self):
+        """Grammar-constraint wire triple for the Qwen3-Coder XML args (#558 E3).
+
+        Extends #558 constraint coverage from the JSON-body families
+        (hermes/qwen/harmony) to the XML-body Qwen3-Coder wire. The wire the
+        model emits (verified byte-for-byte against the Qwen3-Coder chat
+        template's ``message.tool_calls`` rendering and this parser's regexes)::
+
+            <tool_call>
+            <function=NAME>
+            <parameter=KEY>
+            VALUE
+            </parameter>
+            </function>
+            </tool_call>
+
+        ``begin`` = ``<tool_call>\\n<function=NAME>\\n``, ``end`` =
+        ``</function>\\n</tool_call>``. ``<tool_call>``/``</tool_call>`` are
+        single special tokens on Qwen tokenizers, so they are declared as
+        ``sentinels`` (rendered as Lark special-token refs); ``<function=`` /
+        ``</function>`` / ``<parameter=`` are ordinary multi-token text emitted
+        as byte literals. The per-property XML value bodies are grammar-typed by
+        ``build_tool_lark`` via ``arg_format="qwen_xml"`` (this is the XGrammar
+        ``qwen_3_coder`` built-in's ``style="qwen_xml"`` ported to llguidance).
+
+        As on hermes/qwen, OPT OUT (return ``None`` -> free-form-then-parse
+        fallback) unless the tokenizer proves both sentinels are single special
+        tokens — a special-token sentinel on a tokenizer that encodes
+        ``<tool_call>`` as multi-token text would build an unenforceable grammar.
+        Grammar constraint is a best-effort opt-in, never a hard requirement.
+        """
+        from vllm_mlx.api.tool_grammar import (
+            StructureInfo,
+            are_single_special_tokens,
+        )
+
+        if not are_single_special_tokens(self.model_tokenizer, self._GRAMMAR_SENTINELS):
+            return None
+
+        def _info(name: str):
+            # The tool name is a bare identifier inside the ``<function=NAME>``
+            # tag (NOT JSON-quoted). OpenAI-spec tool names are ``[\w-]+``, so
+            # the raw name is safe as a byte literal. ``begin`` starts with the
+            # ``<tool_call>`` trigger (builder invariant).
+            begin = f"<tool_call>\n<function={name}>\n"
+            end = "</function>\n</tool_call>"
+            return StructureInfo(
+                begin=begin,
+                end=end,
+                trigger="<tool_call>",
+                sentinels=self._GRAMMAR_SENTINELS,
+                arg_format="qwen_xml",
+            )
+
+        return _info
+
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
 

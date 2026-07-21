@@ -99,12 +99,25 @@ class StructureInfo:
     ``ToolParser.structure_info()``. ``sentinels`` lists literal substrings
     inside ``begin``/``end`` that are single special tokens for this family
     and must be emitted as Lark special-token refs, not byte strings.
+
+    ``arg_format`` selects how the tool's JSON Schema is rendered as the
+    grammar BODY between ``begin`` and ``end`` (#558 E3):
+
+      * ``"json"`` (default) — the arguments are a single JSON object,
+        constrained by ``%json <schema>`` (hermes/qwen/harmony/deepseek-JSON).
+      * ``"qwen_xml"`` — the arguments are serialized as Qwen3-Coder XML
+        parameter blocks (``<parameter=key>\\nvalue\\n</parameter>\\n``), one
+        per schema property, with the value grammar-typed per the property's
+        JSON Schema type. This is the XGrammar ``qwen_3_coder`` built-in's
+        ``style="qwen_xml"``; the exact wire is verified byte-for-byte against
+        the Qwen3-Coder chat template and our ``qwen3coder_tool_parser``.
     """
 
     begin: str
     end: str
     trigger: str
     sentinels: tuple[str, ...] = field(default=())
+    arg_format: str = "json"
 
 
 def _is_registered_added_token(tokenizer: Any, tok_id: int) -> bool:
@@ -375,6 +388,99 @@ def _emit_literal_with_sentinels(text: str, sentinels: tuple[str, ...]) -> str:
     return " ".join(p for p in parts if p)
 
 
+# --------------------------------------------------------------------------
+# XML-args body (#558 E3). Shared, once-per-grammar named terminals that the
+# qwen_xml value rules reference. Kept maximal-munch so llguidance's contextual
+# lexer selects the right one per property position:
+#   * ``STRVAL`` — any run of non-``<`` bytes (incl. newlines). It ABSORBS the
+#     value's trailing ``\n`` (the qwen wire is ``<parameter=k>\nVALUE\n</...``),
+#     so a string param's close literal is ``</parameter>\n`` (NO leading ``\n``)
+#     while a typed param's is ``\n</parameter>\n`` — see ``_qwen_xml_param``.
+#     The ``[^<]*`` bound cannot represent a string value containing a literal
+#     ``<`` (a documented, conservative limitation; tool string args rarely do).
+#   * ``INTVAL`` / ``NUMVAL`` — JSON int / number, matching the chat template's
+#     ``args_value | tojson`` rendering of non-string scalars.
+_XML_ARG_TERMINALS = (
+    "STRVAL: /[^<]*/\n"
+    "INTVAL: /-?(0|[1-9][0-9]*)/\n"
+    r"NUMVAL: /-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?/"
+    "\n"
+)
+
+
+def _qwen_xml_param(key: str, subschema: dict[str, Any]) -> str:
+    """Render ONE Qwen3-Coder XML parameter block as a Lark fragment.
+
+    Wire (verified against the Qwen3-Coder chat template's ``message.tool_calls``
+    rendering and ``qwen3coder_tool_parser``):
+    ``<parameter=KEY>\\n`` + VALUE + ``\\n</parameter>\\n`` — where VALUE is the
+    raw string for a string-typed property, else the property's ``tojson``
+    (int/number/bool/array/object). We grammar-type VALUE per the JSON Schema:
+
+      * enum          -> alternation of the exact enum literals (raw if string,
+                         else its JSON form, matching the template's tojson rule)
+      * integer       -> ``INTVAL``
+      * number        -> ``NUMVAL``
+      * boolean       -> ``"true" | "false"``
+      * object/array  -> ``%json <subschema>`` (the template tojson's these; the
+                         parser ``json.loads`` them back)
+      * string / else -> ``STRVAL`` (permissive fallback for string, missing
+                         type, union types, ``null``, ``anyOf``, …)
+
+    The string path uses a close of ``</parameter>\\n`` because ``STRVAL``
+    (``[^<]*``) is maximal-munch and swallows the value's trailing ``\\n``;
+    every other path keeps the explicit ``\\n</parameter>\\n`` separator.
+    """
+    open_lit = _lark_escape(f"<parameter={key}>\n")
+    close_typed = _lark_escape("\n</parameter>\n")
+    close_str = _lark_escape("</parameter>\n")
+
+    enum_vals = subschema.get("enum") if isinstance(subschema, dict) else None
+    typ = subschema.get("type") if isinstance(subschema, dict) else None
+
+    if enum_vals:
+        # Each enum literal is emitted exactly as the model renders it: raw text
+        # for a string value, its JSON form otherwise (template ``tojson`` rule).
+        alts = " | ".join(
+            _lark_escape(v if isinstance(v, str) else json.dumps(v)) for v in enum_vals
+        )
+        return f"{open_lit} ({alts}) {close_typed}"
+    if typ == "integer":
+        return f"{open_lit} INTVAL {close_typed}"
+    if typ == "number":
+        return f"{open_lit} NUMVAL {close_typed}"
+    if typ == "boolean":
+        return f'{open_lit} ("true" | "false") {close_typed}'
+    if typ in ("object", "array"):
+        return f"{open_lit} %json {json.dumps(subschema)} {close_typed}"
+    # string, missing/union/null type, or anything unrecognized -> permissive.
+    return f"{open_lit} STRVAL {close_str}"
+
+
+def _emit_qwen_xml_args(params: dict[str, Any]) -> str:
+    """Assemble the qwen_xml args BODY (the sequence of ``<parameter=...>``
+    blocks) for one tool's JSON Schema, as a Lark fragment.
+
+    Required properties are mandatory (in schema-declared order); optional ones
+    are each wrapped ``( ... )?``. Emitting in declared order (rather than
+    XGrammar's ``any_order``) is a deliberate first-cut simplification: the
+    constraint GUIDES the model to declared order, which still yields a
+    schema-valid call. A no-property schema returns ``""`` (a bare
+    ``<function=NAME>\\n</function>`` no-arg call).
+    """
+    props = params.get("properties") if isinstance(params, dict) else None
+    if not props:
+        return ""
+    required = set(params.get("required") or [])
+    parts: list[str] = []
+    for key, subschema in props.items():
+        if not isinstance(subschema, dict):
+            subschema = {}
+        block = _qwen_xml_param(key, subschema)
+        parts.append(block if key in required else f"({block})?")
+    return " ".join(parts)
+
+
 def build_tool_lark(
     tools: list[dict[str, Any]],
     tool_choice: str,
@@ -602,6 +708,13 @@ def build_tool_lark(
         )
     prefix_ref = "bal_prefix" if reasoning_pair else "TAG_TEXT"
 
+    # #558 E3: emit the shared XML-args value terminals ONCE if any tag renders
+    # its body as XML (``arg_format != "json"``). Unused terminals compile fine,
+    # so all three are emitted whenever XML is needed; a pure-JSON grammar is
+    # byte-identical to before (no regression).
+    if any(getattr(si, "arg_format", "json") != "json" for si in structure_infos):
+        lark += _XML_ARG_TERMINALS
+
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
         # Only substitute the default when ``parameters`` is ABSENT. A
         # falsy-but-present schema ({} = allow-any, false = allow-none) is a
@@ -619,10 +732,20 @@ def build_tool_lark(
                 "properties": {},
                 "additionalProperties": False,
             }
-        schema = json.dumps(params)
         begin_body = _emit_literal_with_sentinels(si.begin, si.sentinels)
         end_body = _emit_literal_with_sentinels(si.end, si.sentinels)
-        lark += f"\ntag_{i}: {prefix_ref} {begin_body} %json {schema}"
+        # Body dispatch (#558 E3): JSON-object args -> ``%json <schema>``
+        # (unchanged); XML args -> the family's per-property XML parameter
+        # blocks. An unknown ``arg_format`` degrades to ``%json`` rather than
+        # emitting a broken grammar.
+        arg_format = getattr(si, "arg_format", "json")
+        if arg_format == "qwen_xml":
+            body = _emit_qwen_xml_args(params)
+        else:
+            body = f"%json {json.dumps(params)}"
+        lark += f"\ntag_{i}: {prefix_ref} {begin_body}"
+        if body:
+            lark += f" {body}"
         if end_body:
             lark += f" {end_body}"
         lark += "\n"
