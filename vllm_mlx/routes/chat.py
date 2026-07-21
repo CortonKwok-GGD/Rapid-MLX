@@ -784,20 +784,22 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
                 return None
             flat_tools = narrowed
 
-        # OpenAI ``parallel_tool_calls=False`` -> force EXACTLY ONE call so the
-        # grammar matches the downstream single-call cap (codex #558-PR3). A
-        # NAMED choice is already single-tool but could still emit ≥2 calls to
-        # the same tool without this; ``required`` could emit calls to several
-        # tools. Only an explicit ``False`` narrows to exactly-one (``True`` /
-        # unset keep the one-or-more ``required`` grammar, per OpenAI semantics).
-        # AUTO never sets ``single_call`` — its ``*`` quantifier already permits
-        # zero-or-more, and a zero-or-one grammar would still let auto emit no
-        # call, so ``single_call`` is meaningless for auto (the builder ignores
-        # it for ``tool_choice="auto"``).
-        single_call = (
-            getattr(request, "parallel_tool_calls", None) is False
-            and choice["mode"] != "auto"
-        )
+        # OpenAI ``parallel_tool_calls=False`` -> the model may call AT MOST ONE
+        # tool. We honour it in EVERY mode, including ``auto`` (codex #558-PR5):
+        #   * required/named + False -> EXACTLY ONE call (the builder drops the
+        #     ``+`` quantifier); a NAMED choice is already single-tool but could
+        #     still emit ≥2 calls to the same tool without this, and ``required``
+        #     could emit calls to several tools.
+        #   * auto + False -> ZERO-OR-ONE call (the builder uses ``?`` instead of
+        #     ``*``). Auto's own semantics are "may call zero"; ``parallel_tool_
+        #     calls=False`` adds "if calling, at most one" — the combination is
+        #     zero-or-one, NOT the zero-or-more ``*`` auto would otherwise use.
+        #     Ignoring ``False`` for auto (the old ``and choice["mode"] != "auto"``
+        #     guard) let a no-parallel auto request still emit multiple calls,
+        #     contradicting the client's explicit cap.
+        # ``True`` / unset keep the mode's default quantifier (auto ``*`` /
+        # required ``+``), per OpenAI semantics.
+        single_call = getattr(request, "parallel_tool_calls", None) is False
 
         # Reasoning-tolerant grammar (design §5 path A, #558 PR-4). Bake the
         # model's reasoning-boundary special tokens (``<think>``/``</think>``)
@@ -888,6 +890,22 @@ async def _offload_tool_grammar_build(engine, cfg, request):
     if not _tool_grammar_eligible(cfg, request):
         return None
     if not _try_admit_tool_grammar_build():
+        # DELIBERATE AVAILABILITY DEGRADE (NOT fail-closed) — codex #558-PR5.
+        # The bounded compile-admission pool is saturated, so this request falls
+        # back to the pre-#558 free-form tool-parsing path instead of being
+        # rejected. Free-form here is the SAME behavior as the operator opt-out /
+        # base engine (no NEW failure mode under load), which we prefer over
+        # fail-closed's hurt to availability. We LOG it (WARNING, not silent) so
+        # the degrade is observable — an operator seeing this frequently should
+        # raise ``_TOOL_GRAMMAR_MAX_INFLIGHT``. The structural guarantee is
+        # therefore best-effort under saturation, not an unconditional promise
+        # (see the policy comment at the chat-route call site).
+        logger.warning(
+            "tool-grammar: compile-admission pool full (>= %d in-flight); "
+            "request degrades to free-form tool parsing (availability policy — "
+            "raise the compile-pool cap if this is frequent)",
+            _TOOL_GRAMMAR_MAX_INFLIGHT,
+        )
         return None
     try:
         fut = _get_tool_grammar_build_executor().submit(
@@ -2723,6 +2741,22 @@ async def _create_chat_completion_impl(
     # default-on would drop the structural guarantee the operator asked for.
     _enforce_tool_grammar_bounds_or_400(cfg, request)
     _glp = await _offload_tool_grammar_build(engine, cfg, request)
+    # DELIBERATE AVAILABILITY POLICY (codex #558-PR5 override, NOT fail-closed):
+    # a ``None`` here degrades this request to the pre-#558 free-form
+    # tool-parsing path. That degrade is reserved for exactly two families of
+    # cause — (1) the operator/family OPTED OUT or the request is ineligible
+    # (``RAPID_MLX_CONSTRAIN_TOOLS=0`` / no tools / unsupported family / bounds
+    # already 400'd above), and (2) an INTERNAL transient — the bounded
+    # compile-admission pool is saturated, or the grammar/tokenizer build failed.
+    # We do NOT fail closed on (2): free-form is the same behavior as the base
+    # engine (no NEW under-load failure mode, users keep a smooth experience),
+    # whereas rejecting the request would introduce one. The trade-off: on the
+    # NORMAL path the guarantee is 100% constrained, but under compile-pool
+    # saturation or an internal build failure it is BEST-EFFORT — it degrades to
+    # free-form (identical to opt-out), and every such degrade is LOGGED
+    # (WARNING for admission-full in ``_offload_tool_grammar_build``; ERROR for a
+    # grammar/matcher compile failure in ``_maybe_build_tool_grammar_processor``)
+    # so the degrade is observable, not a silent guarantee hole.
     if _glp is not None:
         chat_kwargs["grammar_logits_processor"] = _glp
 

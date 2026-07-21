@@ -258,11 +258,14 @@ def test_lark_single_call_forces_exactly_one_tag():
     assert "start: (tag_0 | tag_1) tag_end" in lark
     assert "start: (tag_0 | tag_1)+ tag_end" not in lark
     assert "start: (tag_0 | tag_1)* tag_end" not in lark
-    # single_call does not override auto's zero-or-more (auto never sets it, but
-    # be explicit that auto stays ``*`` even if single_call were passed).
-    assert "start: (tag_0 | tag_1)* tag_end" in build_tool_lark(
-        TOOLS, "auto", infos, single_call=True
-    )
+    # auto + single_call (parallel_tool_calls=False) -> ZERO-OR-ONE (codex
+    # #558-PR5): auto may still emit NO call, but AT MOST one. Not ``*`` (would
+    # allow ≥2 calls despite the client's parallel cap) and not ``+`` (auto is
+    # never forced to call).
+    auto_single = build_tool_lark(TOOLS, "auto", infos, single_call=True)
+    assert "start: (tag_0 | tag_1)? tag_end" in auto_single
+    assert "start: (tag_0 | tag_1)* tag_end" not in auto_single
+    assert "start: (tag_0 | tag_1)+ tag_end" not in auto_single
 
 
 def test_named_choice_narrows_to_single_forced_tag():
@@ -577,7 +580,9 @@ def test_auto_mode_accepts_a_structured_tool_call(tok, lltok):
         tok,
         '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>',
     )
-    assert accepted == total, f"auto-mode rejected a valid tool call ({accepted}/{total})"
+    assert accepted == total, (
+        f"auto-mode rejected a valid tool call ({accepted}/{total})"
+    )
     assert accepting, "a complete tool call is not terminal under the auto grammar"
 
 
@@ -628,6 +633,57 @@ def test_auto_mode_rejects_a_malformed_tool_call(tok, lltok):
     assert accepted < total, (
         "auto-mode did not enforce the schema on an opened tool call "
         "(hallucinated tool name was accepted)"
+    )
+
+
+@_requires_llguidance
+def test_auto_mode_single_call_is_zero_or_one(tok, lltok):
+    # AUTO + parallel_tool_calls=False (single_call=True) -> ZERO-OR-ONE grammar
+    # (``(...)?``): the model may emit NO call, or AT MOST one — never two (codex
+    # #558-PR5). This is the enforcement proof behind the string-level quantifier
+    # test: the ``?`` quantifier must (a) accept zero calls, (b) accept one call,
+    # and (c) REJECT a second call the client's parallel cap forbade.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "auto", _HermesStubParser(), single_call=True)
+    assert grammar is not None
+
+    one_call = (
+        '<tool_call>\n{"name": "get_weather", "arguments": '
+        '{"city": "Paris"}}\n</tool_call>'
+    )
+
+    # (a) ZERO calls — plain text with no call — is accepted AND terminal (auto
+    # never forces a call, single_call or not).
+    z_accepted, z_total, z_accepting = _consume(
+        grammar, lltok, tok, "The sky is a quiet grey this morning."
+    )
+    assert z_accepted == z_total, (
+        f"auto+single_call rejected a no-call plain-text response "
+        f"({z_accepted}/{z_total})"
+    )
+    assert z_accepting, (
+        "auto+single_call treated plain text as non-terminal — it must permit "
+        "ZERO calls"
+    )
+
+    # (b) EXACTLY one call is accepted AND terminal.
+    o_accepted, o_total, o_accepting = _consume(grammar, lltok, tok, one_call)
+    assert o_accepted == o_total, (
+        f"auto+single_call rejected a single valid call ({o_accepted}/{o_total})"
+    )
+    assert o_accepting, "auto+single_call: one complete call is not terminal"
+
+    # (c) A SECOND call is REJECTED — the ``?`` quantifier caps at one, and the
+    # trailing ``tag_end`` (a byte-regex ``TAG_TEXT``) cannot match the second
+    # call's ``<tool_call>`` SPECIAL token, so the grammar masks it (this is the
+    # parallel_tool_calls=False cap the old ``*`` auto grammar violated).
+    two_calls = one_call + "\n" + one_call
+    t_accepted, t_total, _ = _consume(grammar, lltok, tok, two_calls)
+    assert t_accepted < t_total, (
+        "auto+single_call accepted a SECOND tool call — parallel_tool_calls="
+        "False cap not enforced on the auto path (zero-or-more instead of "
+        "zero-or-one)"
     )
 
 
