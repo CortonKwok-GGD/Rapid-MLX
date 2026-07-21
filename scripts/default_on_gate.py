@@ -189,7 +189,11 @@ def parse_junit(xml_path: Path, family: str, mode: str) -> list[CellResult]:
             (p for p in parts if p.startswith("test_")), parts[-1] if parts else ""
         )
         cls_part = parts[-1] if parts and parts[-1].startswith("Test") else ""
-        nodeid = f"{file_part}.py::{cls_part}::{name}" if cls_part else f"{file_part}.py::{name}"
+        nodeid = (
+            f"{file_part}.py::{cls_part}::{name}"
+            if cls_part
+            else f"{file_part}.py::{name}"
+        )
         status, message, leak = _classify(tc)
         cells.append(
             CellResult(
@@ -316,7 +320,13 @@ def _materialise_ref(ref: str, workdir: Path) -> tuple[Path, Path]:
     if not venv_py.exists():
         subprocess.run(["python3.12", "-m", "venv", str(venv_dir)], check=True)
         subprocess.run(
-            [str(venv_dir / "bin" / "pip"), "install", "-e", ".[guided,dev]", "--quiet"],
+            [
+                str(venv_dir / "bin" / "pip"),
+                "install",
+                "-e",
+                ".[guided,dev]",
+                "--quiet",
+            ],
             cwd=str(wt_dir),
             check=True,
         )
@@ -429,7 +439,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
             model_id = _wait_for_server(base_url, timeout_s=20)
             if model_id is None:
-                print(f"[gate] {family}: WARN no server at {base_url} — cells will skip/fail")
+                print(
+                    f"[gate] {family}: WARN no server at {base_url} — cells will skip/fail"
+                )
             for mode in _MODES:
                 print(f"[gate] {family}/{mode}: running stages (reused server)...")
                 xml_path = _run_stage(
@@ -511,6 +523,39 @@ def _print_run_summary(report: RunReport) -> None:
 
 _OK_STATUSES = {"pass", "xfail"}  # xfail is an APPROVED non-red outcome
 
+# A cell/arm whose status is one of these can NEVER be "parity or better" — it
+# is a hard failure that must FAIL the gate regardless of the perf/leak verdict
+# (codex #558-PR5). Everything NOT here (pass/skip/xfail) is a non-red outcome;
+# ``xpass`` is a strict-xfail that unexpectedly PASSED — a tripwire the gate must
+# surface, not swallow. ``skip`` is benign (family-guard / optional-dep), so it
+# is NOT fatal (kept out of this set on purpose).
+_HARD_FAIL_STATUSES = {"fail", "error", "xpass"}
+
+
+def _fatal_reason(base: CellResult | None, head: CellResult | None) -> str | None:
+    """Return a non-None reason iff this (cell) pair must FAIL the gate outright.
+
+    A crashed/absent ARM (either side missing), or ANY hard-fail status
+    (``fail``/``error``/``xpass`` — i.e. not pass/skip/xfail) in EITHER arm, is
+    FATAL: it can never be "parity or better". Without this a two-arm-IDENTICAL
+    failure would be classified ``PARITY`` and a missing arm ``GONE``/``NEW``,
+    both of which slip past a CLI that only blocks on ``REGRESSED*`` — so a
+    crashed or absent run could show GREEN having validated nothing (codex
+    #558-PR5). This check is orthogonal to ``_verdict`` (which judges relative
+    regression); the gate blocks on EITHER a fatal cell OR a ``REGRESSED*``
+    verdict.
+    """
+    if base is None or head is None:
+        return "missing arm (crashed/absent run)"
+    bad = []
+    if base.status in _HARD_FAIL_STATUSES:
+        bad.append(f"base={base.status}")
+    if head.status in _HARD_FAIL_STATUSES:
+        bad.append(f"head={head.status}")
+    if bad:
+        return "hard-fail status (" + ", ".join(bad) + ")"
+    return None
+
 
 def _verdict(base: CellResult | None, head: CellResult | None) -> str:
     """Classify a per-(cell,mode) pair as PARITY / BETTER / REGRESSED / NEW / GONE."""
@@ -558,17 +603,25 @@ def cmd_compare(args: argparse.Namespace) -> int:
     keys = sorted(set(base) | set(head))
 
     print(f"\n=== COMPARISON  baseline={args.baseline}  head={args.head} ===")
-    print(f"{'nodeid':<58} {'mode':<4} {'base':<6} {'head':<6} {'blat':>6} {'hlat':>6} verdict")
+    print(
+        f"{'nodeid':<58} {'mode':<4} {'base':<6} {'head':<6} {'blat':>6} {'hlat':>6} verdict"
+    )
     print("-" * 108)
     counts: dict[str, int] = {}
-    regressions: list[str] = []
+    blockers: list[str] = []
     for nodeid, mode in keys:
         b = base.get((nodeid, mode))
         h = head.get((nodeid, mode))
         v = _verdict(b, h)
         counts[v] = counts.get(v, 0) + 1
-        if v.startswith("REGRESSED"):
-            regressions.append(f"{nodeid} [{mode}]: {v}")
+        # A fatal cell (missing arm / hard-fail status) blocks the gate even when
+        # ``_verdict`` calls it PARITY (two-arm-identical fail) or GONE/NEW
+        # (missing arm) — codex #558-PR5. A REGRESSED* verdict also blocks.
+        fatal = _fatal_reason(b, h)
+        if fatal is not None:
+            blockers.append(f"{nodeid} [{mode}]: FATAL — {fatal}")
+        elif v.startswith("REGRESSED"):
+            blockers.append(f"{nodeid} [{mode}]: {v}")
         node = nodeid if len(nodeid) <= 58 else "…" + nodeid[-57:]
         print(
             f"{node:<58} {mode:<4} "
@@ -580,11 +633,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
     for v in sorted(counts):
         print(f"  {v:<20} {counts[v]}")
 
-    if regressions:
-        print("\n*** REGRESSIONS (block default-on) ***")
-        for r in regressions:
+    if blockers:
+        print("\n*** BLOCKERS (block default-on) ***")
+        for r in blockers:
             print(f"  - {r}")
-        print(f"\nGATE: RED — {len(regressions)} regressed cell(s)")
+        print(f"\nGATE: RED — {len(blockers)} blocking cell(s)")
         return 1
     print("\nGATE: GREEN — every cell at parity or better")
     return 0
@@ -611,14 +664,20 @@ def cmd_compare_modes(args: argparse.Namespace) -> int:
     print(f"{'nodeid':<58} {'off':<6} {'on':<6} {'olat':>6} {'nlat':>6} verdict")
     print("-" * 106)
     counts: dict[str, int] = {}
-    regressions: list[str] = []
+    blockers: list[str] = []
     for nodeid in sorted(by_node):
         off = by_node[nodeid].get("off")
         on = by_node[nodeid].get("on")
         v = _verdict(off, on)
         counts[v] = counts.get(v, 0) + 1
-        if v.startswith("REGRESSED"):
-            regressions.append(f"{nodeid}: {v}")
+        # A missing off/on arm, or a hard-fail (fail/error/xpass) in either arm,
+        # is FATAL even if ``_verdict`` reads PARITY/GONE — a crashed arm must
+        # never show GREEN (codex #558-PR5). REGRESSED* also blocks.
+        fatal = _fatal_reason(off, on)
+        if fatal is not None:
+            blockers.append(f"{nodeid}: FATAL — {fatal}")
+        elif v.startswith("REGRESSED"):
+            blockers.append(f"{nodeid}: {v}")
         node = nodeid if len(nodeid) <= 58 else "…" + nodeid[-57:]
         print(
             f"{node:<58} "
@@ -631,11 +690,11 @@ def cmd_compare_modes(args: argparse.Namespace) -> int:
     for v in sorted(counts):
         print(f"  {v:<20} {counts[v]}")
 
-    if regressions:
-        print("\n*** REGRESSIONS (block default-on) ***")
-        for r in regressions:
+    if blockers:
+        print("\n*** BLOCKERS (block default-on) ***")
+        for r in blockers:
             print(f"  - {r}")
-        print(f"\nGATE: RED — {len(regressions)} regressed cell(s)")
+        print(f"\nGATE: RED — {len(blockers)} blocking cell(s)")
         return 1
     print("\nGATE: GREEN — every on-arm cell at parity or better vs off-arm base")
     return 0
@@ -647,7 +706,9 @@ def cmd_compare_modes(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="run the two-stage gate for a git ref")
@@ -661,9 +722,13 @@ def main(argv: list[str] | None = None) -> int:
         default="qwen36",
         help="comma-separated families (qwen36,gemma4,deepseek,gptoss,hy3)",
     )
-    r.add_argument("--port", type=int, default=8123, help="serve port (never operator ports)")
+    r.add_argument(
+        "--port", type=int, default=8123, help="serve port (never operator ports)"
+    )
     r.add_argument("--out", default="/tmp/gate-out", help="output root dir")
-    r.add_argument("--boot-timeout", type=float, default=300.0, help="server boot wait (s)")
+    r.add_argument(
+        "--boot-timeout", type=float, default=300.0, help="server boot wait (s)"
+    )
     r.add_argument(
         "--reuse-server-url",
         default=None,
@@ -673,7 +738,9 @@ def main(argv: list[str] | None = None) -> int:
     r.set_defaults(func=cmd_run)
 
     c = sub.add_parser("compare", help="diff two run outputs into a parity table")
-    c.add_argument("--baseline", required=True, help="baseline ref out dir (…/<ref-label>)")
+    c.add_argument(
+        "--baseline", required=True, help="baseline ref out dir (…/<ref-label>)"
+    )
     c.add_argument("--head", required=True, help="head ref out dir (…/<ref-label>)")
     c.set_defaults(func=cmd_compare)
 
