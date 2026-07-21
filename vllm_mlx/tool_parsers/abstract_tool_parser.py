@@ -176,6 +176,19 @@ class ToolParser(ABC):
         tokenizer (class-attribute + class-level function-identity comparison),
         so the synchronous route gate stays cheap.
 
+        DELIBERATELY class-level (#1144 mandates a cheap probe, "DO NOT invent a
+        heavy probe"): capability is a family/class property, NOT the per-request
+        result of ``structure_info()``. A grammar-capable family whose
+        ``structure_info()`` is tokenizer-GATED to ``None`` at runtime (e.g.
+        hermes on a non-Qwen tokenizer where ``<tool_call>`` is multi-token) is
+        still reported capable here, so an oversized schema for it keeps the #561
+        HTTP 400 — the SAME behavior as before this change and exactly what #1144
+        says to preserve for grammar-capable parsers (remedy:
+        ``RAPID_MLX_CONSTRAIN_TOOLS=0``). Resolving the true runtime result would
+        require instantiating the parser with the tokenizer on the event loop —
+        the heavy probe #1144 forbids. Only NON-capable families change (#1144:
+        oversized -> free-form instead of 400).
+
         Returns:
             True if this parser class supports grammar constraint.
         """
