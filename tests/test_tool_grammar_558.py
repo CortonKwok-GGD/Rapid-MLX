@@ -1367,6 +1367,16 @@ def test_llguidance_is_core_dependency():
         "silently degrades default-on to free-form (the 0.10.14 regression). "
         f"Got core deps: {core_deps!r}"
     )
+    # The core pin must be UNCONDITIONAL (no environment marker). A marker like
+    # ``; python_version < "3"`` or ``; platform_system == "Linux"`` would
+    # exclude some supported Python/platform, so a bare ``pip install rapid-mlx``
+    # there would NOT receive llguidance and default-on would silently regress
+    # to free-form on that environment (codex #1146 round-3).
+    assert req.marker is None, (
+        "llguidance core dep must be UNCONDITIONAL (no environment marker); got "
+        f"marker {str(req.marker)!r} — that would exclude some supported "
+        "Python/platform and silently re-break default-on there."
+    )
     # The floor must be at least 1.7.6 — the minimum that ships the native
     # llguidance.mlx Metal mask kernel the runtime relies on. Assert an explicit
     # >=1.7.6 lower-bound clause so no version below it can ever resolve.
@@ -1392,6 +1402,12 @@ def test_guided_extra_still_resolves():
     req = _find_llguidance_requirement(extras["guided"])
     assert req is not None, (
         f"[guided] extra must still pin llguidance; got {extras['guided']!r}"
+    )
+    assert req.marker is None, (
+        "[guided] llguidance pin must be UNCONDITIONAL (no environment marker); "
+        f"got marker {str(req.marker)!r} — a marked pin would leave "
+        "`pip install 'rapid-mlx[guided]'` without llguidance on some supported "
+        "environment."
     )
     assert _has_lower_bound_at_least(req.specifier), (
         f"[guided] llguidance pin {str(req.specifier)!r} must floor at >=1.7.6 "
