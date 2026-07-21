@@ -150,6 +150,36 @@ class ToolParser(ABC):
     # reading-the-source archeology.
     EXPECTED_WIRE_FORMATS: tuple[str, ...] = ()
 
+    # Class-level marker for decoder-level grammar-constraint capability
+    # (#558 / #1144). A parser is grammar-CAPABLE when it overrides
+    # ``structure_info`` to return a ``name -> StructureInfo`` wire triple; set
+    # this to ``True`` in those subclasses (currently hermes + qwen). Default
+    # ``False`` on the ABC — the family is parsed free-form-then-parse and is
+    # NEVER decoder-constrained. This is a CHEAP class-level probe (no
+    # instantiation, no tokenizer) so the synchronous route gate can decide
+    # whether the constrained-tool path is even reachable before doing any
+    # heavy work; keep it in sync with ``structure_info``
+    # (``test_supports_grammar_marker_matches_structure_info_override`` enforces
+    # the invariant).
+    SUPPORTS_GRAMMAR: bool = False
+
+    @classmethod
+    def supports_grammar(cls) -> bool:
+        """Cheap class-level probe: is this parser grammar-CAPABLE (#558/#1144)?
+
+        Returns ``True`` iff the parser overrides ``structure_info`` to emit a
+        wire triple and is therefore eligible for decoder-level grammar
+        constraint. A non-capable parser (the ABC default) always falls back to
+        free-form-then-parse regardless of schema size, so an oversized schema
+        for such a parser must NOT be rejected with HTTP 400 (#1144) — it was
+        never going to be constrained. Backed by the ``SUPPORTS_GRAMMAR`` class
+        attribute so the check needs neither instantiation nor a tokenizer.
+
+        Returns:
+            True if this parser class supports grammar constraint.
+        """
+        return cls.SUPPORTS_GRAMMAR
+
     @classmethod
     def supports_native_format(cls) -> bool:
         """
