@@ -7900,6 +7900,59 @@ Examples:
     )
     subparsers.add_parser("ps", help="List running rapid-mlx servers")
 
+    # Convert — GGUF → MLX pipeline. The heavy lifting lives in
+    # ``vllm_mlx.gguf_convert`` and is imported lazily at dispatch time so
+    # CLI startup stays flat (same pattern as jlens/doctor/share/launch).
+    convert_parser = subparsers.add_parser(
+        "convert",
+        help="Convert a GGUF model to an MLX-servable directory",
+        description=(
+            "Convert a GGUF checkpoint (local file or HuggingFace repo) into "
+            "a directory `rapid-mlx serve` can load. Weights are dequantized "
+            "and re-sharded as safetensors; --bits additionally re-quantizes "
+            "to MLX N-bit via mlx-lm."
+        ),
+    )
+    convert_parser.add_argument(
+        "source",
+        help="Local .gguf path, HF repo (org/repo — must contain exactly one "
+        ".gguf), or org/repo:filename.gguf",
+    )
+    convert_parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output directory (default: ./<model-stem>-mlx, with a -Nbit "
+        "suffix when --bits is given)",
+    )
+    convert_parser.add_argument(
+        "--bits",
+        type=int,
+        choices=[2, 3, 4, 6, 8],
+        default=None,
+        help="Re-quantize the output to MLX N-bit (default: keep --dtype "
+        "full precision)",
+    )
+    convert_parser.add_argument(
+        "--group-size",
+        type=int,
+        default=64,
+        help="Group size for --bits re-quantization (default: 64)",
+    )
+    convert_parser.add_argument(
+        "--dtype",
+        choices=["bfloat16", "float16", "float32"],
+        default="bfloat16",
+        help="Intermediate/output dtype for dequantized weights (default: bfloat16)",
+    )
+    convert_parser.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Print a perplexity comparison (full-precision vs quantized) "
+        "after conversion. Default: on when --bits is given, off otherwise.",
+    )
+
     # Upgrade — detect install method and run the right upgrade command
     upgrade_parser = subparsers.add_parser(
         "upgrade",
@@ -8558,6 +8611,10 @@ Examples:
         pull_command(args)
     elif args.command == "rm":
         rm_command(args)
+    elif args.command == "convert":
+        from vllm_mlx.gguf_convert import convert_command
+
+        convert_command(args)
     elif args.command == "ps":
         ps_command(args)
     elif args.command == "upgrade":
