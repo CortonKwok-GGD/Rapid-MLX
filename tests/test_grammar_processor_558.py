@@ -876,11 +876,15 @@ def test_normal_schema_free_form_for_non_grammar_parser(monkeypatch, choice):
     assert _enforce_tool_grammar_bounds_or_400(cfg, req) is None
 
 
-def test_supports_grammar_marker_matches_structure_info_override():
-    # Invariant guard: keep the cheap class-level ``SUPPORTS_GRAMMAR`` marker in
-    # sync with the actual ``structure_info`` override across ALL registered
-    # parsers, so a new grammar-capable parser can't ship a stale marker (which
-    # would silently drop the #561 400) or a stale True (spurious 400s).
+def test_supports_grammar_marker_declared_for_in_tree_parsers():
+    # In-tree DISCOVERABILITY guard (#1149 codex): the explicit
+    # ``SUPPORTS_GRAMMAR`` marker itself must match the ``structure_info``
+    # override across ALL registered parsers, so the grep-able capability list
+    # stays honest — a new grammar-capable in-tree parser can't ship WITHOUT the
+    # marker (which would rot the list), and a non-capable parser can't ship a
+    # stale ``True`` (spurious 400s). NB: this asserts the marker DIRECTLY, not
+    # the derived ``supports_grammar()`` — the runtime inference net (next test)
+    # would otherwise mask a missing marker and make this a tautology.
     from vllm_mlx.tool_parsers import ToolParserManager
     from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
 
@@ -889,11 +893,43 @@ def test_supports_grammar_marker_matches_structure_info_override():
     for name in names:
         cls = ToolParserManager.get_tool_parser(name)
         overrides_structure_info = cls.structure_info is not ToolParser.structure_info
-        assert cls.supports_grammar() == overrides_structure_info, (
-            f"{cls.__name__} (parser '{name}'): SUPPORTS_GRAMMAR="
-            f"{cls.supports_grammar()} but structure_info overridden="
-            f"{overrides_structure_info}; keep the marker in sync (#1144)"
+        assert bool(cls.SUPPORTS_GRAMMAR) == overrides_structure_info, (
+            f"{cls.__name__} (parser '{name}'): SUPPORTS_GRAMMAR marker="
+            f"{cls.SUPPORTS_GRAMMAR} but structure_info overridden="
+            f"{overrides_structure_info}; declare the marker to match (#1144)"
         )
+
+
+def test_supports_grammar_infers_capability_without_marker():
+    # Runtime ROBUSTNESS net (#1149 codex): an out-of-tree parser that overrides
+    # ``structure_info`` but OMITS the marker is STILL grammar-capable via
+    # structural inference — no silent regression of grammar / #561 enforcement.
+    # A plain parser (no override, no marker) is NOT capable. This exercises the
+    # inference branch independently of the in-tree marker guard above.
+    from vllm_mlx.tool_parsers import ToolParserManager
+    from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+    class _OverrideNoMarker(ToolParser):
+        EXPECTED_WIRE_FORMATS = ("tool_call_json",)
+
+        def extract_tool_calls(self, model_output, request=None):
+            return None
+
+        def structure_info(self):
+            return lambda name: None
+
+    class _PlainNoOverride(ToolParser):
+        EXPECTED_WIRE_FORMATS = ("tool_call_json",)
+
+        def extract_tool_calls(self, model_output, request=None):
+            return None
+
+    assert _OverrideNoMarker.SUPPORTS_GRAMMAR is False  # marker deliberately unset
+    assert _OverrideNoMarker.supports_grammar() is True  # inferred from override
+    assert _PlainNoOverride.supports_grammar() is False
+    # And the concrete in-tree capable parsers report capable.
+    assert ToolParserManager.get_tool_parser("hermes").supports_grammar() is True
+    assert ToolParserManager.get_tool_parser("qwen").supports_grammar() is True
 
 
 def test_offline_skip_classifies_http_status():
