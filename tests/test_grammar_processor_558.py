@@ -885,19 +885,30 @@ def test_supports_grammar_marker_declared_for_in_tree_parsers():
     # stale ``True`` (spurious 400s). NB: this asserts the marker DIRECTLY, not
     # the derived ``supports_grammar()`` — the runtime inference net (next test)
     # would otherwise mask a missing marker and make this a tautology.
+    #
+    # SCOPE (#1149 codex): restrict to IN-TREE parser classes (module under
+    # ``vllm_mlx.tool_parsers``). An out-of-tree parser MAY legitimately override
+    # ``structure_info`` WITHOUT the marker and still work via the inference net
+    # (proven in ``test_supports_grammar_infers_capability_without_marker``), so
+    # asserting the marker on it would contradict that compatibility contract.
     from vllm_mlx.tool_parsers import ToolParserManager
     from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
 
     names = ToolParserManager.list_registered()
     assert names, "no tool parsers registered"
+    checked = 0
     for name in names:
         cls = ToolParserManager.get_tool_parser(name)
+        if not cls.__module__.startswith("vllm_mlx.tool_parsers"):
+            continue  # out-of-tree parser: covered by the inference net, not the marker
+        checked += 1
         overrides_structure_info = cls.structure_info is not ToolParser.structure_info
         assert bool(cls.SUPPORTS_GRAMMAR) == overrides_structure_info, (
             f"{cls.__name__} (parser '{name}'): SUPPORTS_GRAMMAR marker="
             f"{cls.SUPPORTS_GRAMMAR} but structure_info overridden="
             f"{overrides_structure_info}; declare the marker to match (#1144)"
         )
+    assert checked, "no in-tree tool parsers checked"
 
 
 def test_supports_grammar_infers_capability_without_marker():
