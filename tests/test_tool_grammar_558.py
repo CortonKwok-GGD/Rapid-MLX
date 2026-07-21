@@ -1299,15 +1299,11 @@ def test_deepseek_r1_prefilled_think_template_is_tolerated(lltok):
 # it lived only in the ``[guided]`` extra — so the default-on path silently
 # degraded to free-form for naive users (``_maybe_build_tool_grammar_processor``
 # returns None when ``get_lltokenizer`` finds no llguidance). The 0.10.15 fix
-# promotes llguidance to core ``[project].dependencies``. This structural test
-# locks that in so a future refactor cannot demote it back to extra-only and
-# silently re-break default-on out-of-the-box. It carries NO optional dependency
-# (parses pyproject.toml only), so it ALWAYS runs — never skipped.
-def test_llguidance_is_core_dependency():
-    """llguidance MUST be in core ``[project].dependencies`` (not only the
-    ``[guided]`` extra) so default-on constrained tool-calling (#558 PR-5)
-    works out-of-the-box on a bare ``pip install rapid-mlx``.
-    """
+# promotes llguidance to core ``[project].dependencies``. These structural tests
+# lock that in so a future refactor cannot demote it back to extra-only and
+# silently re-break default-on out-of-the-box. They carry NO optional dependency
+# (parse pyproject.toml only), so they ALWAYS run — never skipped.
+def _load_pyproject():
     import sys
     from pathlib import Path
 
@@ -1318,15 +1314,50 @@ def test_llguidance_is_core_dependency():
 
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
-        data = tomllib.load(fh)
+        return tomllib.load(fh)
 
-    core_deps = data["project"]["dependencies"]
-    assert any(d.startswith("llguidance") for d in core_deps), (
+
+def _find_llguidance_requirement(dep_strings):
+    """Return the parsed ``Requirement`` whose CANONICAL name is exactly
+    ``llguidance`` (or ``None``). Uses ``packaging.requirements.Requirement``
+    so a look-alike like ``llguidance-fake`` cannot satisfy the check
+    (codex #558 fix-slot: a bare ``startswith('llguidance')`` matched
+    ``llguidance-fake`` and never verified the version floor).
+    """
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    for dep in dep_strings:
+        req = Requirement(dep)
+        if canonicalize_name(req.name) == "llguidance":
+            return req
+    return None
+
+
+def test_llguidance_is_core_dependency():
+    """llguidance MUST be in core ``[project].dependencies`` (not only the
+    ``[guided]`` extra), pinned to a ``>=1.7.6`` floor, so default-on
+    constrained tool-calling (#558 PR-5) works out-of-the-box on a bare
+    ``pip install rapid-mlx``.
+    """
+    core_deps = _load_pyproject()["project"]["dependencies"]
+    req = _find_llguidance_requirement(core_deps)
+    assert req is not None, (
         "llguidance is missing from core [project].dependencies. Default-on "
         "grammar-constrained tool-calling (#558 PR-5) needs it out-of-the-box; "
         "with it only in the [guided] extra, a bare `pip install rapid-mlx` "
         "silently degrades default-on to free-form (the 0.10.14 regression). "
         f"Got core deps: {core_deps!r}"
+    )
+    # Verify the version FLOOR is at least 1.7.6 — the minimum that ships the
+    # native llguidance.mlx Metal mask kernel the runtime relies on. A specifier
+    # that admitted 1.7.5 would silently allow an incompatible install.
+    assert not req.specifier.contains("1.7.5", prereleases=True), (
+        f"llguidance core pin must floor at >=1.7.6, but {str(req.specifier)!r} "
+        "still admits 1.7.5"
+    )
+    assert req.specifier.contains("1.7.6", prereleases=True), (
+        f"llguidance core pin {str(req.specifier)!r} must admit the 1.7.6 floor"
     )
 
 
@@ -1334,26 +1365,20 @@ def test_guided_extra_still_resolves():
     """The ``[guided]`` extra is retained for backward compat (historical
     install path ``pip install 'rapid-mlx[guided]'`` printed in guided.py's
     degrade warning + docs). Assert it still exists and still pins llguidance
-    so that install path keeps working even though llguidance is now core.
+    (>=1.7.6) so that install path keeps working even though llguidance is now
+    core.
     """
-    import sys
-    from pathlib import Path
-
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:  # pragma: no cover — 3.10 floor
-        import tomli as tomllib
-
-    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    with pyproject.open("rb") as fh:
-        data = tomllib.load(fh)
-
-    extras = data["project"]["optional-dependencies"]
+    extras = _load_pyproject()["project"]["optional-dependencies"]
     assert "guided" in extras, (
         "pyproject.toml dropped the [guided] extra. Keep it as a "
         "backward-compat alias so `pip install 'rapid-mlx[guided]'` still "
         "resolves — that command is printed in guided.py's degrade warning."
     )
-    assert any(d.startswith("llguidance") for d in extras["guided"]), (
+    req = _find_llguidance_requirement(extras["guided"])
+    assert req is not None, (
         f"[guided] extra must still pin llguidance; got {extras['guided']!r}"
+    )
+    assert req.specifier.contains("1.7.6", prereleases=True), (
+        f"[guided] llguidance pin {str(req.specifier)!r} must admit the "
+        "1.7.6 floor"
     )
