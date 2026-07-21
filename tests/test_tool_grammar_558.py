@@ -547,6 +547,91 @@ def test_bad_enum_value_is_rejected(tok, lltok):
 
 
 # --------------------------------------------------------------------------
+# PR-5: AUTO-MODE PARITY (the #1 regression guard). ``tool_choice="auto"`` (and
+# unset/None, which defaults to auto) is now CONSTRAINED by the optional-call
+# ``(...)* tag_end`` grammar: the model MAY emit a structurally-correct tool
+# call, OR it MAY emit plain text and call NO tool. Auto must NEVER force a call
+# — forcing one turns auto into required, the exact regression that breaks
+# parity with the base (unconstrained) model. These two enforcement probes pin
+# BOTH directions offline (no VLM):
+#   (a) a tool-needed derivation — a well-formed call — is accepted + terminal
+#       under the auto grammar (same structural enforcement as required-mode);
+#   (b) a no-tool-needed derivation — plain text with no call — is accepted +
+#       terminal under the auto grammar, and (contrast) NON-terminal under the
+#       required grammar (which forces a call). (b) is the auto-vs-required
+#       discriminator: if auto ever forced a call, plain text would not reach an
+#       accepting state and this test would fail.
+# --------------------------------------------------------------------------
+@_requires_llguidance
+def test_auto_mode_accepts_a_structured_tool_call(tok, lltok):
+    # (a) When the model DOES decide to call under auto, a well-formed tool call
+    # is accepted in full and terminates — auto still structurally enforces the
+    # call it chose to make.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "auto", _HermesStubParser())
+    assert grammar is not None
+    accepted, total, accepting = _consume(
+        grammar,
+        lltok,
+        tok,
+        '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>',
+    )
+    assert accepted == total, f"auto-mode rejected a valid tool call ({accepted}/{total})"
+    assert accepting, "a complete tool call is not terminal under the auto grammar"
+
+
+@_requires_llguidance
+def test_auto_mode_permits_plain_text_without_forcing_a_call(tok, lltok):
+    # (b) THE regression guard: with tools available and tool_choice=auto, plain
+    # text that calls NO tool must be accepted AND terminal — auto lets the model
+    # decline the tool. The SAME plain text must be NON-terminal under required
+    # (required forces a call), proving auto != required.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    plain = "The sea is calm and wide, a mirror to the evening sky."
+
+    auto = build_tool_grammar(TOOLS, "auto", _HermesStubParser())
+    assert auto is not None
+    a_accepted, a_total, a_accepting = _consume(auto, lltok, tok, plain)
+    assert a_accepted == a_total, (
+        f"auto-mode rejected plain text ({a_accepted}/{a_total}) — auto must not "
+        "reject a no-tool-call response"
+    )
+    assert a_accepting, (
+        "plain text is not an accepting (terminal) state under auto — auto "
+        "FORCED a call (the #1 regression: auto degenerated into required)"
+    )
+
+    # Contrast: required-mode must NOT accept the same plain text as terminal.
+    required = build_tool_grammar(TOOLS, "required", _HermesStubParser())
+    assert required is not None
+    _, _, r_accepting = _consume(required, lltok, tok, plain)
+    assert not r_accepting, (
+        "required-mode wrongly treated plain text as terminal — required must "
+        "force at least one tool call"
+    )
+
+
+@_requires_llguidance
+def test_auto_mode_rejects_a_malformed_tool_call(tok, lltok):
+    # Auto is not "anything goes": once the model COMMITS to a call (emits the
+    # ``<tool_call>`` trigger) the schema is still enforced. A hallucinated tool
+    # name inside an opened call is rejected — the structural guarantee holds for
+    # the call the model chose to start.
+    from vllm_mlx.api.tool_grammar import build_tool_grammar
+
+    grammar = build_tool_grammar(TOOLS, "auto", _HermesStubParser())
+    accepted, total, _ = _consume(
+        grammar, lltok, tok, '<tool_call>\n{"name": "get_stockquote'
+    )
+    assert accepted < total, (
+        "auto-mode did not enforce the schema on an opened tool call "
+        "(hallucinated tool name was accepted)"
+    )
+
+
+# --------------------------------------------------------------------------
 # PR-4: reasoning-tolerant grammar (path A). A REASONING model emits a
 # ``<think>...</think>`` block BEFORE the tool call. The bare ``TAG_TEXT``
 # byte-regex free prefix from PR-3 CANNOT match a ``<think>`` special token, so
