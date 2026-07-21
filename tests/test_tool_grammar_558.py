@@ -1289,3 +1289,71 @@ def test_deepseek_r1_prefilled_think_template_is_tolerated(lltok):
         "DeepSeek-R1 prefilled-<think> generated stream was rejected — the "
         "required tool call would be blocked on DeepSeek-R1"
     )
+
+
+# ---------------------------------------------------------------------------
+# 0.10.15 fix-slot regression lock-in (#558): llguidance is a CORE dependency.
+# ---------------------------------------------------------------------------
+# #558 PR-5 shipped grammar-constrained tool-calling DEFAULT-ON (0.10.14), but a
+# fresh-venv dogfood proved ``pip install rapid-mlx`` did NOT pull llguidance —
+# it lived only in the ``[guided]`` extra — so the default-on path silently
+# degraded to free-form for naive users (``_maybe_build_tool_grammar_processor``
+# returns None when ``get_lltokenizer`` finds no llguidance). The 0.10.15 fix
+# promotes llguidance to core ``[project].dependencies``. This structural test
+# locks that in so a future refactor cannot demote it back to extra-only and
+# silently re-break default-on out-of-the-box. It carries NO optional dependency
+# (parses pyproject.toml only), so it ALWAYS runs — never skipped.
+def test_llguidance_is_core_dependency():
+    """llguidance MUST be in core ``[project].dependencies`` (not only the
+    ``[guided]`` extra) so default-on constrained tool-calling (#558 PR-5)
+    works out-of-the-box on a bare ``pip install rapid-mlx``.
+    """
+    import sys
+    from pathlib import Path
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:  # pragma: no cover — 3.10 floor
+        import tomli as tomllib
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        data = tomllib.load(fh)
+
+    core_deps = data["project"]["dependencies"]
+    assert any(d.startswith("llguidance") for d in core_deps), (
+        "llguidance is missing from core [project].dependencies. Default-on "
+        "grammar-constrained tool-calling (#558 PR-5) needs it out-of-the-box; "
+        "with it only in the [guided] extra, a bare `pip install rapid-mlx` "
+        "silently degrades default-on to free-form (the 0.10.14 regression). "
+        f"Got core deps: {core_deps!r}"
+    )
+
+
+def test_guided_extra_still_resolves():
+    """The ``[guided]`` extra is retained for backward compat (historical
+    install path ``pip install 'rapid-mlx[guided]'`` printed in guided.py's
+    degrade warning + docs). Assert it still exists and still pins llguidance
+    so that install path keeps working even though llguidance is now core.
+    """
+    import sys
+    from pathlib import Path
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:  # pragma: no cover — 3.10 floor
+        import tomli as tomllib
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        data = tomllib.load(fh)
+
+    extras = data["project"]["optional-dependencies"]
+    assert "guided" in extras, (
+        "pyproject.toml dropped the [guided] extra. Keep it as a "
+        "backward-compat alias so `pip install 'rapid-mlx[guided]'` still "
+        "resolves — that command is printed in guided.py's degrade warning."
+    )
+    assert any(d.startswith("llguidance") for d in extras["guided"]), (
+        f"[guided] extra must still pin llguidance; got {extras['guided']!r}"
+    )
