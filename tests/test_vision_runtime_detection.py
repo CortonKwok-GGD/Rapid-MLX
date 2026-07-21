@@ -478,6 +478,45 @@ def test_pil_importable_false_when_pillow_damaged(monkeypatch):
     assert env_health._pil_importable() is False
 
 
+def _simulate_pillow_native_backend_broken(monkeypatch):
+    """Pillow's Python layer imports fine but its native ``_imaging`` backend
+    is broken/ABI-mismatched, so a real image op raises. ``find_spec('PIL')``
+    passes and ``from PIL import Image`` succeeds — only touching the native
+    core reveals the breakage.
+
+    Hermetic: inject a stand-in ``PIL`` / ``PIL.Image`` whose ``new`` raises,
+    so no host Pillow (or a real broken build) is required."""
+    import types
+
+    fake_pil = types.ModuleType("PIL")
+    fake_image = types.ModuleType("PIL.Image")
+
+    def _broken_new(*_a, **_k):
+        raise ImportError("The _imaging C module is not installed or ABI-mismatched")
+
+    fake_image.new = _broken_new
+    fake_pil.Image = fake_image
+
+    monkeypatch.setitem(sys.modules, "PIL", fake_pil)
+    monkeypatch.setitem(sys.modules, "PIL.Image", fake_image)
+
+
+def test_pil_importable_false_when_native_backend_broken(monkeypatch):
+    """``_pil_importable`` must return False when Pillow's Python layer imports
+    but its native ``_imaging`` backend is broken — i.e. ``from PIL import
+    Image`` succeeds yet a real op (``Image.new``) raises. A probe that only
+    did the import (no native-backed op) could false-green this."""
+    from vllm_mlx.doctor import env_health
+
+    _simulate_pillow_native_backend_broken(monkeypatch)
+
+    # The import itself succeeds against the stand-in …
+    from PIL import Image  # noqa: F401
+
+    # … but the native-backed probe must still report broken.
+    assert env_health._pil_importable() is False
+
+
 def test_doctor_vision_row_red_when_pillow_damaged(monkeypatch):
     """End-to-end: a damaged/shadowed Pillow must turn the doctor vision +
     dflash rows red, exercising the REAL ``_pil_importable`` (not a stub) so

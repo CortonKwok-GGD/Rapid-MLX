@@ -437,13 +437,21 @@ def _pil_importable() -> bool:
     We perform the EXACT lightweight import mlx-vlm uses rather than a
     ``find_spec('PIL')`` probe: ``find_spec`` only proves *something named
     PIL is discoverable*, so a shadowed namespace dir or a damaged Pillow
-    (broken ``_imaging`` C extension) whose real ``from PIL import Image``
-    raises would still get a green row. ``PIL.Image`` is a small pure-Python
-    module over a C extension — well within doctor's ≤5 s budget and it does
-    NOT pull torch the way a real ``import mlx_vlm`` would. ANY failure
-    (missing, shadowed, broken native ext) ⇒ not importable."""
+    whose real ``from PIL import Image`` raises would still get a green row.
+    We then run a minimal native-backed op (``Image.new``) so a Pillow whose
+    Python layer imports but whose ``_imaging`` C extension is missing or
+    ABI-mismatched — present-but-broken, not merely absent — is caught too,
+    without relying on the version-specific moment Pillow first touches
+    ``_imaging``. ``PIL.Image`` + a 1×1 allocation is microsecond-cheap and
+    does NOT pull torch the way a real ``import mlx_vlm`` would, so it stays
+    well within doctor's ≤5 s budget. ANY failure (missing, shadowed, broken
+    native ext) ⇒ not importable."""
     try:
-        from PIL import Image  # noqa: F401
+        from PIL import Image
+
+        # Force the native ``_imaging`` backend to actually initialise — a
+        # broken/ABI-mismatched C ext otherwise slips through as healthy.
+        Image.new("RGB", (1, 1))
     except Exception:
         # ImportError (absent/shadowed), OSError (broken native ext), or any
         # other load-time failure — all mean the real vision import can't run.
