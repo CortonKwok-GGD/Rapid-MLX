@@ -1334,6 +1334,24 @@ def _find_llguidance_requirement(dep_strings):
     return None
 
 
+def _has_lower_bound_at_least(specifier_set, floor="1.7.6"):
+    """True iff ``specifier_set`` GUARANTEES every allowed version is >= floor.
+
+    Codex #1146 round-2: a ``.contains("1.7.5") is False`` style check is not a
+    real floor — ``>=1.0,!=1.7.5`` excludes exactly 1.7.5 yet still admits 1.7.4,
+    and an EMPTY specifier admits everything. We instead require an explicit
+    lower-bound clause (``>=`` / ``==`` / ``~=``) whose own floor is >= the
+    target, which rigorously proves no version below ``floor`` can resolve.
+    """
+    from packaging.version import Version
+
+    floor_v = Version(floor)
+    for spec in specifier_set:
+        if spec.operator in (">=", "==", "~=") and Version(spec.version) >= floor_v:
+            return True
+    return False
+
+
 def test_llguidance_is_core_dependency():
     """llguidance MUST be in core ``[project].dependencies`` (not only the
     ``[guided]`` extra), pinned to a ``>=1.7.6`` floor, so default-on
@@ -1349,15 +1367,12 @@ def test_llguidance_is_core_dependency():
         "silently degrades default-on to free-form (the 0.10.14 regression). "
         f"Got core deps: {core_deps!r}"
     )
-    # Verify the version FLOOR is at least 1.7.6 — the minimum that ships the
-    # native llguidance.mlx Metal mask kernel the runtime relies on. A specifier
-    # that admitted 1.7.5 would silently allow an incompatible install.
-    assert not req.specifier.contains("1.7.5", prereleases=True), (
-        f"llguidance core pin must floor at >=1.7.6, but {str(req.specifier)!r} "
-        "still admits 1.7.5"
-    )
-    assert req.specifier.contains("1.7.6", prereleases=True), (
-        f"llguidance core pin {str(req.specifier)!r} must admit the 1.7.6 floor"
+    # The floor must be at least 1.7.6 — the minimum that ships the native
+    # llguidance.mlx Metal mask kernel the runtime relies on. Assert an explicit
+    # >=1.7.6 lower-bound clause so no version below it can ever resolve.
+    assert _has_lower_bound_at_least(req.specifier), (
+        f"llguidance core pin {str(req.specifier)!r} must floor at >=1.7.6 "
+        "(an explicit >=/==/~= lower bound of at least 1.7.6)"
     )
 
 
@@ -1378,7 +1393,7 @@ def test_guided_extra_still_resolves():
     assert req is not None, (
         f"[guided] extra must still pin llguidance; got {extras['guided']!r}"
     )
-    assert req.specifier.contains("1.7.6", prereleases=True), (
-        f"[guided] llguidance pin {str(req.specifier)!r} must admit the "
-        "1.7.6 floor"
+    assert _has_lower_bound_at_least(req.specifier), (
+        f"[guided] llguidance pin {str(req.specifier)!r} must floor at >=1.7.6 "
+        "(an explicit >=/==/~= lower bound of at least 1.7.6)"
     )
