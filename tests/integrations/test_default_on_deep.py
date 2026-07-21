@@ -30,17 +30,19 @@ Design notes
   the strict-xfail collection hook). They are ``family_alias``-parametrized,
   so a single-family server boot runs only that family's deep cells and the
   family-guard skips the rest — identical semantics to the smoke matrix.
-* Constraint MODE is read from the env the gate driver sets:
-  ``RAPID_MLX_TOOL_CONSTRAINT`` (``off`` default / ``on``). This is a
-  FORWARD-COMPATIBLE knob: as of this file's landing the #558 runtime
-  wiring (PR-3) has no per-request/server flip yet, so ``on`` currently only
-  changes the *tool_choice* the tool cells send (``auto`` → ``required``,
-  which is the closest live proxy for "constrain the model to emit a call").
-  When the tool-calling PRs expose the real default-on knob (server flag /
-  request field / env), point ``_apply_constraint_mode`` at it — no gate or
-  matrix rewiring needed. The negative-control cell does NOT depend on that
-  knob: it drives the ALREADY-LIVE ``response_format`` guided path, so it
-  proves the underlying llguidance masking works on any ref, today.
+* Constraint MODE is now a SERVER-env toggle the gate driver applies when it
+  boots the per-arm server (``scripts/default_on_gate.py``): the off arm boots
+  with ``RAPID_MLX_CONSTRAIN_TOOLS=0`` (free-form base) and the on arm boots
+  default-on (env unset — #558 PR-5 flipped the default to ON). Both arms keep
+  ``tool_choice="auto"`` so the REAL PR-5 auto-path is exercised; the only
+  independent variable is the server-side constraint. ``RAPID_MLX_TOOL_CONSTRAINT``
+  (still set on the pytest process) now only labels the per-cell latency
+  breadcrumb with its mode. Before PR-5 landed, ``on`` was a per-request
+  ``tool_choice="auto"->"required"`` proxy in ``_apply_constraint_mode``; that
+  seam is now a no-op that pins ``tool_choice="auto"`` in both arms. The
+  negative-control cell does NOT depend on the toggle: it drives the
+  ALREADY-LIVE ``response_format`` guided path, so it proves the underlying
+  llguidance masking works on any ref, today.
 * Every cell degrades to skip on a missing server / SDK unless
   ``RAPID_MLX_MATRIX_STRICT=1`` (shared ``strict_skip_or_fail`` semantics),
   so a naive ``pytest tests/integrations`` on a clean box stays green.
@@ -80,20 +82,28 @@ def constraint_mode() -> str:
 
 
 def _apply_constraint_mode(payload: dict[str, Any]) -> dict[str, Any]:
-    """Mutate a chat.completions kwargs dict for the active constraint mode.
+    """Pin ``tool_choice="auto"`` in BOTH arms — the seam PR-5 turned into a no-op.
 
-    ``off`` — leave the request as the current default (``tool_choice="auto"``).
-    ``on``  — the default-on proxy. Until the #558 runtime knob lands, the
-              closest LIVE lever that asks the server to actually constrain
-              the model toward a well-formed call is ``tool_choice="required"``
-              (chat.py already honours it, see the forced-function block).
-              When the real default-on flip lands, swap the body here for the
-              server flag / request field / env the tool-calling PRs expose —
-              this is the ONE seam the whole gate routes constraint through.
+    #558 PR-5 landed the real default-on knob, so the off/on distinction is now
+    driven by the SERVER the gate driver boots, NOT by a per-request
+    ``tool_choice`` swap:
+
+    * **off** — driver boots the server with ``RAPID_MLX_CONSTRAIN_TOOLS=0``
+      (constrained tool-calling opted OUT -> legacy free-form base).
+    * **on**  — driver boots the server default-on (env unset/ON), so
+      ``tool_choice="auto"`` exercises the REAL PR-5 auto-path optional-call
+      grammar (the model MAY emit a structurally-correct call or plain text and
+      is never forced).
+
+    Both arms therefore issue the identical ``tool_choice="auto"`` request and
+    the server-side constraint is the only independent variable — that is what
+    makes the off-vs-on comparison a true free-form-vs-constrained parity test.
+    Before PR-5 this seam forced ``tool_choice="required"`` on the on arm as a
+    pre-landing proxy, which would have tested forced-emission, not the auto
+    path. ``constraint_mode()`` is still read to label the latency breadcrumb.
     """
-    if constraint_mode() == "on":
-        payload = dict(payload)
-        payload["tool_choice"] = "required"
+    payload = dict(payload)
+    payload["tool_choice"] = "auto"
     return payload
 
 

@@ -14,9 +14,11 @@ What it runs (per git ref, per family)
 --------------------------------------
 * **Stage 1 — smoke sweep**: the existing per-cell agent×family + framework
   wire smokes (``tests/integrations/test_agents_matrix.py`` +
-  ``test_frameworks_matrix.py``), run once with the tool-calling constraint
-  OFF (baseline default) and once ON (``RAPID_MLX_TOOL_CONSTRAINT=on`` — the
-  forward-compatible knob, see ``test_default_on_deep._apply_constraint_mode``).
+  ``test_frameworks_matrix.py``), run once against a server booted with the
+  tool-calling constraint OFF (``RAPID_MLX_CONSTRAIN_TOOLS=0`` — free-form
+  base) and once against a server booted default-ON (env unset — #558 PR-5).
+  Requests keep ``tool_choice="auto"`` in both arms so the on arm exercises the
+  real PR-5 auto-path (see ``test_default_on_deep._apply_constraint_mode``).
   Per cell we record pass/fail/skip/xfail + latency + any channel-marker leak
   (the matrix's ``assert_no_*_leak`` helpers fail the cell on a leak).
 * **Stage 2 — deep cells**: ``tests/integrations/test_default_on_deep.py`` —
@@ -26,17 +28,21 @@ What it runs (per git ref, per family)
 
 How to run it
 -------------
-The gate is a SINGLE server-per-(ref,family) driver. It:
+The gate boots a FRESH server per ``(ref, family, mode)`` so the off/on arms
+are a real SERVER-env toggle. It:
   1. materialises the given git ref in a sibling worktree (unless the ref is
      ``WORKTREE`` = "use the current worktree as-is"),
   2. builds an isolated venv there and installs ``.[guided,dev]``,
-  3. boots ``rapid-mlx serve <family-alias>`` on ``--port`` (non-operator),
-  4. runs Stage-1 + Stage-2 in mode=off then mode=on via pytest ``--junit-xml``,
+  3. for each mode boots ``rapid-mlx serve <family-alias>`` on ``--port``
+     (non-operator) with the mode's ``RAPID_MLX_CONSTRAIN_TOOLS`` — off=``0``
+     (free-form), on=unset (default-ON),
+  4. runs Stage-1 + Stage-2 against that server via pytest ``--junit-xml``,
   5. emits ``<out>/<ref-label>/<family>/{off,on}.xml`` + a parsed
      ``results.json`` (per-cell status + latency + mode).
 
-The comparator then diffs two refs' ``results.json`` into a per-cell
-PARITY / BETTER / REGRESSED table.
+``compare`` diffs two refs' ``results.json`` (same mode) into a per-cell
+PARITY / BETTER / REGRESSED table; ``compare-modes`` diffs off-vs-on WITHIN a
+single ref's ``results.json`` (the free-form-vs-constrained parity table).
 
 Typical invocations
 -------------------
@@ -227,8 +233,18 @@ def _boot_server(
     alias: str,
     port: int,
     log_path: Path,
+    env_overrides: dict[str, str | None] | None = None,
 ) -> subprocess.Popen:
-    """Launch ``rapid-mlx serve <alias>`` on the given port; return the Popen."""
+    """Launch ``rapid-mlx serve <alias>`` on the given port; return the Popen.
+
+    ``env_overrides`` sets (or, when a value is ``None``, UNSETS) environment
+    variables in the server child process. The gate uses this to make the
+    off/on arms a real SERVER-env toggle of ``RAPID_MLX_CONSTRAIN_TOOLS``
+    (#558 PR-5 default-on) rather than a per-request ``tool_choice`` swap:
+    off boots with ``RAPID_MLX_CONSTRAIN_TOOLS=0`` (free-form), on unsets it so
+    the server default (ON) applies. Unsetting is explicit so an opt-out value
+    inherited from the gate's own environment can never leak into the on arm.
+    """
     log_fh = open(log_path, "w")  # noqa: SIM115 — handed to Popen, closed on stop
     cmd = [
         str(python_bin),
@@ -243,8 +259,14 @@ def _boot_server(
         "--log-level",
         "INFO",
     ]
+    env = os.environ.copy()
+    for key, val in (env_overrides or {}).items():
+        if val is None:
+            env.pop(key, None)
+        else:
+            env[key] = val
     return subprocess.Popen(
-        cmd, cwd=str(repo_dir), stdout=log_fh, stderr=subprocess.STDOUT
+        cmd, cwd=str(repo_dir), stdout=log_fh, stderr=subprocess.STDOUT, env=env
     )
 
 
@@ -343,6 +365,26 @@ def _run_stage(
     return xml_path
 
 
+def _server_env_for_mode(mode: str) -> dict[str, str | None]:
+    """Return the server-process env override implementing the off/on arm.
+
+    #558 PR-5 default-on: constrained tool-calling is ON unless
+    ``RAPID_MLX_CONSTRAIN_TOOLS`` is ``0``/``off``/``false``.
+
+    * **off** — free-form base: set ``RAPID_MLX_CONSTRAIN_TOOLS=0`` (opt OUT).
+    * **on**  — default-on auto-path: UNSET the var (``None``) so the server's
+      own default (ON) applies, even if the gate's own environment happens to
+      carry an opt-out value.
+
+    Requests keep ``tool_choice="auto"`` in both arms (see
+    ``test_default_on_deep._apply_constraint_mode``), so the server env is the
+    only independent variable in the off-vs-on parity comparison.
+    """
+    if mode == "off":
+        return {"RAPID_MLX_CONSTRAIN_TOOLS": "0"}
+    return {"RAPID_MLX_CONSTRAIN_TOOLS": None}  # unset => server default (ON)
+
+
 # --------------------------------------------------------------------------- #
 # run subcommand
 # --------------------------------------------------------------------------- #
@@ -375,36 +417,58 @@ def cmd_run(args: argparse.Namespace) -> int:
         fam_out.mkdir(parents=True, exist_ok=True)
         base_url = args.reuse_server_url or f"http://127.0.0.1:{args.port}/v1"
 
-        proc = None
         if args.reuse_server_url:
-            print(f"[gate] {family}: reusing server at {base_url}")
+            # A reused server has ONE fixed RAPID_MLX_CONSTRAIN_TOOLS config, so
+            # the off/on arms cannot be a real server-env toggle here — both
+            # arms hit the same server. Kept only for quick single-arm smokes;
+            # the parity matrix uses the boot-per-(family,mode) path below.
+            print(
+                f"[gate] {family}: reusing server at {base_url} — WARNING: "
+                "off/on SERVER-env toggle inactive under --reuse-server-url; "
+                "both arms exercise the reused server's own constraint config"
+            )
             model_id = _wait_for_server(base_url, timeout_s=20)
             if model_id is None:
                 print(f"[gate] {family}: WARN no server at {base_url} — cells will skip/fail")
-        else:
-            log_path = fam_out / "serve.log"
-            print(f"[gate] {family}: booting rapid-mlx serve {alias} on :{args.port}")
-            proc = _boot_server(repo_dir, python_bin, alias, args.port, log_path)
-            model_id = _wait_for_server(base_url, timeout_s=args.boot_timeout)
-            if model_id is None:
-                print(
-                    f"[gate] {family}: server did not come up within "
-                    f"{args.boot_timeout}s — see {log_path}; skipping family"
-                )
-                if proc:
-                    proc.terminate()
-                continue
-            print(f"[gate] {family}: server up, model_id={model_id}")
-
-        try:
             for mode in _MODES:
+                print(f"[gate] {family}/{mode}: running stages (reused server)...")
+                xml_path = _run_stage(
+                    repo_dir, python_bin, family, mode, base_url, fam_out
+                )
+                report.cells.extend(parse_junit(xml_path, family, mode))
+            continue
+
+        # Boot a FRESH server per (family, mode) so the off/on arm is a real
+        # SERVER-env toggle of RAPID_MLX_CONSTRAIN_TOOLS (#558 PR-5 default-on),
+        # NOT a per-request tool_choice swap. Requests keep tool_choice="auto"
+        # in both arms.
+        for mode in _MODES:
+            env_overrides = _server_env_for_mode(mode)
+            constrain = env_overrides["RAPID_MLX_CONSTRAIN_TOOLS"]
+            log_path = fam_out / f"serve-{mode}.log"
+            print(
+                f"[gate] {family}/{mode}: booting rapid-mlx serve {alias} on "
+                f":{args.port} (RAPID_MLX_CONSTRAIN_TOOLS="
+                f"{constrain if constrain is not None else '<unset:default-ON>'})"
+            )
+            proc = _boot_server(
+                repo_dir, python_bin, alias, args.port, log_path, env_overrides
+            )
+            try:
+                model_id = _wait_for_server(base_url, timeout_s=args.boot_timeout)
+                if model_id is None:
+                    print(
+                        f"[gate] {family}/{mode}: server did not come up within "
+                        f"{args.boot_timeout}s — see {log_path}; skipping this arm"
+                    )
+                    continue
+                print(f"[gate] {family}/{mode}: server up, model_id={model_id}")
                 print(f"[gate] {family}/{mode}: running stages...")
                 xml_path = _run_stage(
                     repo_dir, python_bin, family, mode, base_url, fam_out
                 )
                 report.cells.extend(parse_junit(xml_path, family, mode))
-        finally:
-            if proc is not None:
+            finally:
                 proc.terminate()
                 try:
                     proc.wait(timeout=30)
@@ -526,6 +590,57 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compare_modes(args: argparse.Namespace) -> int:
+    """Diff the off-arm vs on-arm cells WITHIN a single run's results.json.
+
+    This is the Stage-1b parity comparison the #558 PR-5 gate exists to emit:
+    free-form base (server ``RAPID_MLX_CONSTRAIN_TOOLS=0`` -> mode=off cells)
+    vs default-on auto-path (server default ON -> mode=on cells), on the SAME
+    worktree ref. It reuses ``_verdict`` (base=off, head=on) so PARITY /
+    BETTER / REGRESSED semantics match the cross-ref ``compare``: an on-arm
+    cell that newly fails vs its off-arm base, or is materially slower, is a
+    REGRESSED that blocks default-on.
+    """
+    cells = _load(Path(args.run))
+    by_node: dict[str, dict[str, CellResult]] = {}
+    for (nodeid, mode), cr in cells.items():
+        by_node.setdefault(nodeid, {})[mode] = cr
+
+    print(f"\n=== OFF-vs-ON PARITY  run={args.run} ===")
+    print("(base=off free-form  head=on default-on auto-path; same worktree ref)")
+    print(f"{'nodeid':<58} {'off':<6} {'on':<6} {'olat':>6} {'nlat':>6} verdict")
+    print("-" * 106)
+    counts: dict[str, int] = {}
+    regressions: list[str] = []
+    for nodeid in sorted(by_node):
+        off = by_node[nodeid].get("off")
+        on = by_node[nodeid].get("on")
+        v = _verdict(off, on)
+        counts[v] = counts.get(v, 0) + 1
+        if v.startswith("REGRESSED"):
+            regressions.append(f"{nodeid}: {v}")
+        node = nodeid if len(nodeid) <= 58 else "…" + nodeid[-57:]
+        print(
+            f"{node:<58} "
+            f"{(off.status if off else '-'):<6} {(on.status if on else '-'):<6} "
+            f"{(off.duration_s if off else 0):>6.2f} "
+            f"{(on.duration_s if on else 0):>6.2f} {v}"
+        )
+
+    print("\n=== VERDICT TALLY ===")
+    for v in sorted(counts):
+        print(f"  {v:<20} {counts[v]}")
+
+    if regressions:
+        print("\n*** REGRESSIONS (block default-on) ***")
+        for r in regressions:
+            print(f"  - {r}")
+        print(f"\nGATE: RED — {len(regressions)} regressed cell(s)")
+        return 1
+    print("\nGATE: GREEN — every on-arm cell at parity or better vs off-arm base")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -561,6 +676,18 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--baseline", required=True, help="baseline ref out dir (…/<ref-label>)")
     c.add_argument("--head", required=True, help="head ref out dir (…/<ref-label>)")
     c.set_defaults(func=cmd_compare)
+
+    cm = sub.add_parser(
+        "compare-modes",
+        help="diff off-arm vs on-arm cells within one run's results.json "
+        "(the #558 PR-5 free-form-vs-constrained parity table)",
+    )
+    cm.add_argument(
+        "--run",
+        required=True,
+        help="a run output dir containing results.json (…/<ref-label>)",
+    )
+    cm.set_defaults(func=cmd_compare_modes)
 
     args = p.parse_args(argv)
     return args.func(args)
