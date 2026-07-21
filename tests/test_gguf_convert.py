@@ -182,6 +182,41 @@ def converted_4bit(tmp_path_factory, tiny_gguf) -> tuple[Path, object]:
     return out, result
 
 
+@pytest.fixture(autouse=True)
+def _generation_stream_on_current_thread(monkeypatch):
+    """Pin ``mlx_lm.generate.generation_stream`` to this thread's default stream.
+
+    mlx-lm 0.31.3 captures ``generation_stream = mx.new_thread_local_stream(...)``
+    at *module-import* time (``mlx_lm/generate.py:226``). In the full suite,
+    earlier engine-booting tests (e.g. ``test_cli_bench.py``'s
+    ``bench_command``) import ``mlx_lm.generate`` on a *worker* thread; via
+    ``vllm_mlx._mlx_compat``'s patched factory the captured handle is the
+    worker's plain default stream (``Stream(gpu, 1)`` — see the
+    ``engine_core`` "worker default = generation_stream" boot log). Once the
+    worker exits, the main thread cannot eval that handle: any later
+    main-thread ``mlx_lm.generate()`` dies at prefill with
+    ``RuntimeError: There is no Stream(gpu, N) in current thread.``
+    (#720 family; empirical contract in
+    ``tests/test_mllm_cross_thread_stream_contract.py``).
+
+    The repo's sanctioned remedy is ``engine_core._init_mlx_step_thread``'s
+    shim: reassign the module attribute to the *current* thread's
+    process-wide default stream (``mx.default_stream(mx.default_device())``)
+    — "the only path that round-trips cleanly across threads". Applying it
+    before every test here makes ``generate()`` immune to whatever stream
+    state earlier suite members leave behind; standalone runs are unaffected
+    and ``monkeypatch`` restores the captured value at teardown.
+    """
+    import importlib
+
+    import mlx.core as mx
+
+    gen_mod = importlib.import_module("mlx_lm.generate")
+    monkeypatch.setattr(
+        gen_mod, "generation_stream", mx.default_stream(mx.default_device())
+    )
+
+
 # ----- config.json ----------------------------------------------------------
 
 
@@ -537,6 +572,38 @@ def test_report_without_bits_is_skipped(tmp_path, tiny_gguf, capsys):
     result = convert_gguf(str(tiny_gguf), out_dir=out, bits=None, report=True)
     assert result.report is None
     assert "report skipped" in capsys.readouterr().out
+
+
+# ----- 1-bit source re-quantization warning ---------------------------------
+
+
+def test_one_bit_source_quant_detection(monkeypatch):
+    """The predicate reads ``general.file_type`` first (IQ1_M → named)."""
+    from vllm_mlx import gguf_convert as gc
+
+    monkeypatch.setattr(gc, "_field", lambda _r, _name: int(GGMLQuantizationType.IQ1_M))
+    assert gc._one_bit_source_quant(SimpleNamespace()) == "IQ1_M"
+
+    # Non-1-bit file_type falls through to the tensor-type majority vote
+    # (empty tensor list → no majority → clean).
+    monkeypatch.setattr(gc, "_field", lambda _r, _name: int(GGMLQuantizationType.Q4_0))
+    assert gc._one_bit_source_quant(SimpleNamespace(tensors=[])) is None
+
+
+def test_one_bit_requant_warns_on_stderr(tiny_gguf, tmp_path, capsys, monkeypatch):
+    """1-bit source + --bits → loud stderr warning naming the source quant."""
+    from vllm_mlx import gguf_convert as gc
+
+    monkeypatch.setattr(gc, "_one_bit_source_quant", lambda _reader: "IQ1_M")
+    convert_gguf(str(tiny_gguf), out_dir=tmp_path / "q", bits=4, report=False)
+    err = capsys.readouterr().err
+    assert "1-bit" in err and "IQ1_M" in err
+
+
+def test_dense_source_requant_stays_quiet(tiny_gguf, tmp_path, capsys):
+    """Ordinary sources (the Q4_0/f16 fixture) re-quantize with no warning."""
+    convert_gguf(str(tiny_gguf), out_dir=tmp_path / "q", bits=4, report=False)
+    assert "1-bit" not in capsys.readouterr().err
 
 
 # ----- source resolution (mocked hub) ----------------------------------------

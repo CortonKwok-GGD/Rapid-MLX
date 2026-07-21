@@ -273,6 +273,39 @@ def _kv_prefix_and_model_type(reader: Any) -> tuple[str, str]:
     return arch, model_type
 
 
+# GGML quantization types in the 1-bit family. Dequantizing these to bf16 is
+# already a big information loss, so *re*-quantizing the result with --bits
+# stacks quantization error on quantization error — see the warning in
+# ``convert_gguf`` for the measured impact.
+_ONE_BIT_QTYPE_NAMES = frozenset({"IQ1_S", "IQ1_M", "TQ1_0", "TQ2_0"})
+
+
+def _one_bit_source_quant(reader: Any) -> str | None:
+    """Return the 1-bit family quant name if the source is one, else ``None``.
+
+    Primary signal is ``general.file_type`` (the file-wide quant stamp);
+    mixed-quant files without a matching file_type fall back to a tensor-type
+    majority vote.
+    """
+    from gguf import GGMLQuantizationType
+
+    ft = _field(reader, "general.file_type")
+    if ft is not None:
+        try:
+            qname = GGMLQuantizationType(int(ft)).name
+        except ValueError:
+            qname = None
+        if qname in _ONE_BIT_QTYPE_NAMES:
+            return qname
+    counts: dict[str, int] = {}
+    for t in reader.tensors:
+        counts[t.tensor_type.name] = counts.get(t.tensor_type.name, 0) + 1
+    for name in _ONE_BIT_QTYPE_NAMES:
+        if counts.get(name, 0) > len(reader.tensors) / 2:
+            return name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Source resolution: local path / org/repo / org/repo:file.gguf
 # ---------------------------------------------------------------------------
@@ -1103,6 +1136,24 @@ def convert_gguf(
         # ---- optional re-quantization ------------------------------------
         if bits is not None:
             import mlx_lm
+
+            # 1-bit sources (IQ1_*/TQ*_0): dequantization to bf16 already
+            # cost most of the signal; squeezing the remainder through a
+            # second quantizer compounds the error. Measured on
+            # Qwen3-0.6B IQ1_M: bf16 ppl 747 → 3-bit ppl 19927 (26× worse).
+            # Warn loudly but don't block — the user may have a reason.
+            one_bit = _one_bit_source_quant(reader)
+            if one_bit is not None:
+                print(
+                    f"  WARNING: source is {one_bit} (1-bit quantization). "
+                    f"Re-quantizing to {bits}-bit stacks quantization error "
+                    "on quantization error\n"
+                    "  (measured: Qwen3-0.6B IQ1_M bf16 ppl 747 vs 3-bit "
+                    "ppl 19927).\n"
+                    "  Recommendation: rerun without --bits for a plain "
+                    f"--dtype {dtype} artifact instead.",
+                    file=sys.stderr,
+                )
 
             print(f"  Re-quantizing to {bits}-bit (group_size={group_size}) …")
             mlx_lm.convert(
