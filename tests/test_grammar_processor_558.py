@@ -888,9 +888,7 @@ def test_supports_grammar_marker_matches_structure_info_override():
     assert names, "no tool parsers registered"
     for name in names:
         cls = ToolParserManager.get_tool_parser(name)
-        overrides_structure_info = (
-            cls.structure_info is not ToolParser.structure_info
-        )
+        overrides_structure_info = cls.structure_info is not ToolParser.structure_info
         assert cls.supports_grammar() == overrides_structure_info, (
             f"{cls.__name__} (parser '{name}'): SUPPORTS_GRAMMAR="
             f"{cls.supports_grammar()} but structure_info overridden="

@@ -616,20 +616,24 @@ def _tool_parser_supports_grammar(cfg) -> bool:
     not treat it as active.
 
     Resolving the class is a cached dict lookup (the parser module is imported
-    once at model load), and the marker is a class attribute, so this stays a
-    light synchronous check with no instantiation and no tokenizer. An unknown /
-    unresolvable parser name is treated as NOT grammar-capable (free-form) — the
-    same non-breaking fallback the heavy build path already takes.
+    once at model load), and ``supports_grammar`` is a class-level check, so this
+    stays a light synchronous probe with no instantiation and no tokenizer. An
+    UNKNOWN parser name (``KeyError`` from the manager) is treated as NOT
+    grammar-capable (free-form) — the same non-breaking fallback the heavy build
+    path already takes. Any OTHER failure (a broken import/registry for a known
+    parser) is NOT swallowed here (codex #1149): failing open would silently drop
+    both the grammar constraint and the #561 oversized-schema enforcement for a
+    genuinely-configured parser, so it propagates to surface the real bug.
     """
     name = getattr(cfg, "tool_call_parser", None)
     if not name:
         return False
-    try:
-        from ..tool_parsers import ToolParserManager
+    from ..tool_parsers import ToolParserManager
 
+    try:
         parser_cls = ToolParserManager.get_tool_parser(name)
-    except Exception:
-        return False
+    except KeyError:
+        return False  # unknown / unregistered parser name -> free-form.
     return bool(parser_cls.supports_grammar())
 
 
