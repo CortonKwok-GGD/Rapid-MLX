@@ -18,7 +18,6 @@ import base64
 import logging
 import math
 import os
-import re
 import sys
 import tempfile
 import threading
@@ -77,17 +76,6 @@ class VisionRuntimeStatus(str, Enum):
     OK = "ok"
     ABSENT = "absent"
     BROKEN = "broken"
-
-
-# A bare or dotted Python module name (``PIL``, ``mlx_vlm.trainer``) — used
-# to tell a "missing importable module" diagnostic apart from an opaque
-# failure summary (``OSError: dlopen(...): image not found``).
-_MODULE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-
-
-def _looks_like_module_name(detail: str | None) -> bool:
-    """True iff ``detail`` is a plain import-module name (no spaces/punct)."""
-    return bool(detail) and _MODULE_NAME_RE.match(detail) is not None
 
 
 def _mlx_vlm_installed() -> bool:
@@ -170,15 +158,19 @@ def _vlm_broken_install_hint(detail: str | None) -> str:
     """Install hint for the "mlx-vlm present but its import chain is broken"
     case (#1126).
 
-    ``detail`` is either the missing external module name (e.g. ``PIL``) or,
+    ``detail`` is either a missing external module name (e.g. ``PIL``) or,
     when the failure names no external dependency (a damaged internal
     ``mlx_vlm`` submodule, a missing shared lib, an incompatible symbol), the
-    raw exception summary. A recognisable EXTERNAL module gets a precise
-    ``pip install`` target; everything else surfaces the diagnostic verbatim
-    and points at a clean reinstall — never a misleading "install mlx-vlm"
+    raw exception summary. Only a module we EXPLICITLY map to a PyPI
+    distribution (:data:`_MISSING_MODULE_PIP_NAME`) earns a precise
+    ``pip install <dist>`` line — guessing ``pip install <import-name>`` for
+    an unmapped module produces invalid commands (``cv2`` is really
+    ``opencv-python``; a dotted submodule isn't a distribution at all).
+    Everything else surfaces the diagnostic verbatim and points at a clean
+    reinstall of the vision extra — never a misleading "install mlx-vlm"
     (which IS installed).
     """
-    if _looks_like_module_name(detail) and not detail.startswith("mlx_vlm"):
+    if detail in _MISSING_MODULE_PIP_NAME:
         pip_name = _pip_name_for_module(detail)
         return (
             f"`mlx-vlm` is installed but its dependency {detail!r} is not, so "

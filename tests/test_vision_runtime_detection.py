@@ -433,11 +433,25 @@ def test_doctor_vision_row_warns_when_mlx_vlm_truly_absent(monkeypatch):
 
 
 def _simulate_pillow_damaged(monkeypatch):
-    """Shadowed/damaged Pillow: ``find_spec('PIL')`` still succeeds (a dir /
-    stale metadata named PIL is discoverable) but the real ``from PIL import
-    Image`` raises — the exact false-green ``find_spec``-only probing would
-    miss. Leaves ``importlib.util.find_spec`` untouched precisely so a
-    find_spec-based probe would WRONGLY pass."""
+    """Shadowed/damaged Pillow: a ``PIL`` spec is discoverable but the real
+    ``from PIL import Image`` raises — the exact false-green a
+    ``find_spec('PIL')``-only probe would miss.
+
+    BOTH the spec presence AND the failing import are simulated so the test is
+    hermetic on the supported base install that intentionally omits the
+    ``[vision]`` extra (no host Pillow required)."""
+    real_find_spec = _ilu.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "PIL":
+            # Discoverable even where Pillow isn't installed — a find_spec-only
+            # probe would WRONGLY pass here.
+            spec = real_find_spec(name, *args, **kwargs)
+            return spec if spec is not None else object()
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(_ilu, "find_spec", fake_find_spec)
+
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
@@ -456,11 +470,11 @@ def test_pil_importable_false_when_pillow_damaged(monkeypatch):
     used ``find_spec('PIL')`` only and returned True (false green)."""
     from vllm_mlx.doctor import env_health
 
-    # find_spec('PIL') still resolves on this dev box (Pillow installed) —
-    # a find_spec-only probe would (wrongly) pass here.
-    assert _ilu.find_spec("PIL") is not None
     _simulate_pillow_damaged(monkeypatch)
 
+    # A find_spec-only probe (the pre-fix behaviour) would pass here — the
+    # simulated spec is discoverable — yet the real import is broken.
+    assert _ilu.find_spec("PIL") is not None
     assert env_health._pil_importable() is False
 
 

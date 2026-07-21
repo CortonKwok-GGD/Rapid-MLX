@@ -513,11 +513,12 @@ def section_optional_packages() -> Section:
             # gap so the user fixes the right thing.
             if dist == "mlx-vlm" and not _pil_importable():
                 s.add(
-                    f"{label} {ver} present but Pillow (PIL) missing — "
-                    f"vision paths will fail (`{hint}`)",
+                    f"{label} {ver} present but Pillow (PIL) missing or "
+                    f"broken — vision paths will fail (`{hint}`)",
                     CheckStatus.WARN,
                     detail=(
-                        f"distribution={dist} version={ver} pil=missing hint={hint}"
+                        f"distribution={dist} version={ver} "
+                        f"pil=missing-or-broken hint={hint}"
                     ),
                 )
                 continue
@@ -547,11 +548,11 @@ def section_optional_packages() -> Section:
         if not _pil_importable():
             s.add(
                 "mlx-vlm 0.5.0+ (dflash extras) present but Pillow (PIL) "
-                "missing — dflash/vision paths will fail",
+                "missing or broken — dflash/vision paths will fail",
                 CheckStatus.WARN,
                 detail=(
-                    f"distribution=mlx-vlm version={vlm_ver} pil=missing "
-                    "hint=pip install 'rapid-mlx[vision]'"
+                    f"distribution=mlx-vlm version={vlm_ver} "
+                    "pil=missing-or-broken hint=pip install 'rapid-mlx[vision]'"
                 ),
             )
         else:
