@@ -55,6 +55,12 @@ import os
 import time
 from typing import Any
 
+# ``jsonschema`` is a hard dep of the [dev] extra (used across the suite), so we
+# import it at module scope: the varied-schema cell validates EVERY emitted
+# argument object against the COMPLETE tool parameter schema (codex #558-PR5),
+# which requires it. If it were somehow absent the deep cells cannot prove the
+# constraint, so failing to import here is correct (not a silent skip).
+import jsonschema
 import pytest
 
 from tests.integrations.conftest import (
@@ -202,9 +208,7 @@ class TestMultiTurnToolLoop:
         rapid_mlx_server: dict[str, Any],
         family_alias: FamilyAlias,
     ) -> None:
-        client, wire_errors = _openai_client_and_errors(
-            rapid_mlx_server["base_url"]
-        )
+        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
         model_id = rapid_mlx_server["model_id"]
         ctx = f"multiturn/{family_alias.family}"
 
@@ -237,8 +241,7 @@ class TestMultiTurnToolLoop:
             assert_no_think_tag_leak(content)
             assert_no_analysis_channel_leak(content)
             strict_skip_or_fail(
-                f"{ctx}: turn-1 produced no tool_calls "
-                f"(content={content[:120]!r})"
+                f"{ctx}: turn-1 produced no tool_calls (content={content[:120]!r})"
             )
             return
 
@@ -333,9 +336,7 @@ class TestVariedSchemas:
         family_alias: FamilyAlias,
         schema_key: str,
     ) -> None:
-        client, wire_errors = _openai_client_and_errors(
-            rapid_mlx_server["base_url"]
-        )
+        client, wire_errors = _openai_client_and_errors(rapid_mlx_server["base_url"])
         model_id = rapid_mlx_server["model_id"]
         ctx = f"schema-{schema_key}/{family_alias.family}"
         schema = _VARIED_TOOL_SCHEMAS[schema_key]
@@ -383,143 +384,230 @@ class TestVariedSchemas:
             strict_skip_or_fail(f"{ctx}: no tool_calls (content={content[:120]!r})")
             return
 
+        # The call must name the tool we offered — a constraint that emitted a
+        # different function name (or the model hallucinated one) is a failure
+        # regardless of the argument shape (codex #558-PR5).
+        called = tool_calls[0].function.name
+        assert called == "record_query", (
+            f"{ctx}: wrong function called: {called!r} (expected record_query)"
+        )
+
         args = json.loads(tool_calls[0].function.arguments)
         assert isinstance(args, dict), f"{ctx}: args not an object: {args!r}"
-        # Shape-specific structural assertions.
-        if schema_key == "enum":
-            assert args.get("unit") in ("celsius", "fahrenheit"), (
-                f"{ctx}: enum arg out of range: {args!r}"
-            )
-        elif schema_key == "nested_object":
-            loc = args.get("location")
-            assert isinstance(loc, dict) and "city" in loc, (
-                f"{ctx}: nested object missing location.city: {args!r}"
-            )
-        elif schema_key == "required_fields":
-            assert "city" in args and "day" in args, (
-                f"{ctx}: required fields missing: {args!r}"
+        # FULL-SCHEMA validation (codex #558-PR5): validate the emitted argument
+        # object against the COMPLETE parameter schema — for EVERY variant,
+        # including ``no_additional_props`` (which the old hand-rolled checks did
+        # not cover at all). ``jsonschema.validate`` enforces the whole contract:
+        # ``additionalProperties: false`` rejects any forbidden extra key, and a
+        # missing ``required`` field fails. This is the real proof the constrained
+        # arm honours the schema — the earlier per-key spot checks could pass a
+        # call that snuck in an extra key or dropped a required one.
+        try:
+            jsonschema.validate(instance=args, schema=schema)
+        except jsonschema.ValidationError as exc:
+            pytest.fail(
+                f"{ctx}: emitted args violate the parameter schema: {args!r} "
+                f"— {exc.message}"
             )
         print(f"[deep-latency] {ctx} mode={constraint_mode()} {latency_s:.2f}s")
 
 
 # --------------------------------------------------------------------------- #
 # Stage-2 deep cell: NEGATIVE CONTROL — the constraint actually fires
+#
+# DETERMINISTIC offline token-mask probe (codex #558-PR5). The prior version
+# drove a LIVE model through ``response_format=json_schema`` and only asserted
+# the CONSTRAINED output was on-schema — so it passed TRIVIALLY whenever the
+# model happened to emit an in-schema value on its own, proving nothing about
+# masking. A real negative control must show the constraint CHANGES the outcome:
+# the SAME off-schema token that is ACCEPTED without guidance is REJECTED with
+# guidance. We do that offline (no model, no sampling → zero flake) with the
+# llguidance ``LLMatcher.consume_tokens`` idiom from
+# ``tests/test_tool_grammar_558.py``: feed a fixed off-schema JSON token stream
+# to (a) a PERMISSIVE grammar (no guidance) and (b) the strict-schema grammar.
 # --------------------------------------------------------------------------- #
+
+# The pinned single-special-token tokenizer the #558 enforcement proofs use
+# (mirrors ``tests/test_tool_grammar_558.py``); an IMMUTABLE revision so the
+# probe exercises a fixed artifact.
+_NEGCTRL_TOKENIZER = "mlx-community/Qwen3.5-4B-MLX-4bit"
+_NEGCTRL_REVISION = "32f3e8ecf65426fc3306969496342d504bfa13f3"
+
+# Strict schema: ``answer`` is pinned to the enum ["yes","no"]. "maybe" is
+# trivially off-schema and cannot be reassembled — a clean masking target.
+_NEGCTRL_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+_NEGCTRL_OFFSCHEMA = '{"answer": "maybe"}'  # "maybe" ∉ {"yes","no"}
+_NEGCTRL_ONSCHEMA = '{"answer": "yes"}'  # positive control
+
+
+def _negctrl_offline_skip_types() -> tuple[type[BaseException], ...]:
+    """Only genuine offline/cache-miss errors are a sanctioned skip.
+
+    Mirrors ``test_tool_grammar_558._offline_skip_exc_types``: a corrupt/absent
+    tokenizer artifact must FAIL the probe, not silently skip. We skip ONLY on
+    the specific huggingface_hub offline / cache-miss signals (or a raw
+    connection error); every other exception propagates.
+    """
+    types: list[type[BaseException]] = []
+    try:
+        from huggingface_hub.errors import (
+            LocalEntryNotFoundError,
+            OfflineModeIsEnabled,
+        )
+
+        types += [LocalEntryNotFoundError, OfflineModeIsEnabled]
+    except Exception:  # pragma: no cover - old hub without these names
+        pass
+    try:
+        from requests.exceptions import ConnectionError as _ReqConnErr
+
+        types.append(_ReqConnErr)
+    except Exception:  # pragma: no cover - requests not present
+        pass
+    return tuple(types) or (OSError,)
+
+
+def _load_negctrl_tokenizers():
+    """Return ``(tok, lltok)`` for the offline probe, or ``pytest.skip``.
+
+    Skips ONLY on genuine unavailability (llguidance extra absent, tokenizer
+    neither cached nor reachable, or a slow-only tokenizer). A real
+    ``from_tokenizer`` regression is surfaced, not swallowed.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("llguidance") is None:
+        pytest.skip("llguidance ([guided] extra) not installed — negctrl needs it")
+    transformers = pytest.importorskip("transformers")
+    try:
+        tok = transformers.AutoTokenizer.from_pretrained(
+            _NEGCTRL_TOKENIZER, revision=_NEGCTRL_REVISION
+        )
+    except _negctrl_offline_skip_types():  # pragma: no cover - offline & uncached
+        pytest.skip(
+            f"tokenizer {_NEGCTRL_TOKENIZER}@{_NEGCTRL_REVISION[:8]} not cached "
+            "and no network — negative control requires it"
+        )
+    import llguidance.hf as llg_hf
+
+    candidates = []
+    inner = getattr(tok, "_tokenizer", None)
+    if inner is not None:
+        candidates.append(inner)
+    candidates.append(tok)
+    fast = [c for c in candidates if getattr(c, "is_fast", True) is not False]
+    if not fast:
+        pytest.skip("tokenizer is not a fast tokenizer — llguidance needs one")
+    last_exc = None
+    for cand in fast:
+        try:
+            return tok, llg_hf.from_tokenizer(cand)
+        except Exception as exc:  # noqa: BLE001 - re-raised below if all fail
+            last_exc = exc
+    raise AssertionError(
+        f"llguidance could not build an LLTokenizer from any fast candidate: "
+        f"{last_exc!r}"
+    )
+
+
+def _negctrl_consume(tok, lltok, grammar, text: str) -> tuple[int, int, bool]:
+    """Advance ``grammar`` over ``text``'s tokens; return (accepted, total, terminal).
+
+    Uses ``LLMatcher.consume_tokens`` (advances real matcher state) so a full
+    accept also proves the string is a COMPLETE derivation, not merely a
+    prefix — identical to the ``_consume`` idiom in test_tool_grammar_558.
+    """
+    from llguidance.mlx import LLMatcher
+
+    ids = tok.encode(text, add_special_tokens=False)
+    matcher = LLMatcher(lltok, grammar)
+    assert not matcher.get_error(), matcher.get_error()
+    accepted = 0
+    for tid in ids:
+        if not matcher.consume_tokens([tid]):
+            break
+        accepted += 1
+    return accepted, len(ids), matcher.is_accepting()
 
 
 class TestConstraintNegativeControl:
     """Prove llguidance masking actually fires — not a no-op passthrough.
 
-    Drives the ALREADY-LIVE guided-decode path via
-    ``response_format={"type":"json_schema","strict":true,...}`` (→ llguidance,
-    ``engine/batched.py``). We ask for a value that is trivially off-schema
-    under the strict schema (an integer for a field the schema pins to a
-    ``["yes","no"]`` enum) and craft the prompt to TEMPT the model off-schema.
+    DETERMINISTIC, OFFLINE, model-free. Builds the strict-``["yes","no"]`` JSON
+    schema grammar and a PERMISSIVE (accept-any-bytes) grammar, then feeds the
+    SAME off-schema token stream (``{"answer": "maybe"}``) to both:
 
-    * UN-constrained run (``response_format`` absent / ``json_object``): the
-      model is FREE to emit the off-schema value — recorded, not asserted.
-    * CONSTRAINED run (strict schema): the emitted JSON MUST validate against
-      the schema. If a "constrained" run still emits the off-schema value,
-      the constraint is a no-op and the cell FAILS.
+    * WITHOUT guidance (permissive grammar): the off-schema value is ACCEPTED in
+      full — establishing that the token stream is otherwise unobjectionable, so
+      any later rejection is attributable to the constraint alone.
+    * WITH guidance (strict schema grammar): the off-schema ``"maybe"`` token is
+      REJECTED mid-stream — the constraint demonstrably masks it.
 
-    This is the load-bearing proof for raullen's acceptance bar: default-on
-    only means anything if the constraint demonstrably masks off-schema tokens.
-    It is independent of the tool-calling PRs' not-yet-landed default-on knob,
-    so it produces a real signal on ANY git ref today.
+    If the guided run ALSO accepted the off-schema value the constraint would be
+    a no-op and the cell FAILS. A positive control (on-schema ``"yes"`` accepted
+    + terminal under the same strict grammar) rules out a grammar that rejects
+    everything. This is the load-bearing proof for raullen's acceptance bar and,
+    being offline, produces a real signal on ANY git ref with zero flake.
     """
 
-    _STRICT_SCHEMA = {
-        "type": "object",
-        "properties": {
-            "answer": {"type": "string", "enum": ["yes", "no"]},
-        },
-        "required": ["answer"],
-        "additionalProperties": False,
-    }
+    def test_offschema_token_accepted_without_guidance_rejected_with(self) -> None:
+        from llguidance.mlx import LLMatcher
 
-    def test_constraint_fires(
-        self,
-        rapid_mlx_server: dict[str, Any],
-        family_alias: FamilyAlias,
-    ) -> None:
-        client, wire_errors = _openai_client_and_errors(
-            rapid_mlx_server["base_url"]
+        tok, lltok = _load_negctrl_tokenizers()
+
+        constrained = LLMatcher.grammar_from_lark(
+            "%llguidance {}\nstart: %json " + json.dumps(_NEGCTRL_SCHEMA) + "\n"
         )
-        model_id = rapid_mlx_server["model_id"]
-        ctx = f"negctrl/{family_alias.family}"
-
-        # A prompt engineered to tempt the model OFF the ["yes","no"] enum —
-        # it wants to answer with a number / prose, which the strict schema
-        # forbids.
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    "On a scale of 1 to 10, how confident are you that the "
-                    "sky is blue? Reply as JSON with a single key 'answer'. "
-                    "Prefer a numeric confidence."
-                ),
-            }
-        ]
-
-        # (a) UN-constrained — record whether the model goes off the enum.
-        try:
-            unc = client.chat.completions.create(
-                model=model_id,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.0,
-                max_tokens=64,
-            )
-        except wire_errors as exc:
-            strict_skip_or_fail(f"{ctx}: server rejected json_object request: {exc}")
-        unc_text = (unc.choices[0].message.content or "").strip()
-
-        # (b) CONSTRAINED — strict enum schema; llguidance must mask off-enum.
-        t0 = time.perf_counter()
-        try:
-            con = client.chat.completions.create(
-                model=model_id,
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "confidence",
-                        "schema": self._STRICT_SCHEMA,
-                        "strict": True,
-                    },
-                },
-                temperature=0.0,
-                max_tokens=64,
-            )
-        except wire_errors as exc:
-            # If the server does not support json_schema strict guided decode
-            # on this ref, the negative control can't run — degrade cleanly.
-            strict_skip_or_fail(
-                f"{ctx}: server rejected json_schema strict request "
-                f"(guided path unavailable on this ref?): {exc}"
-            )
-        latency_s = time.perf_counter() - t0
-        con_text = (con.choices[0].message.content or "").strip()
-
-        # The constrained output MUST parse AND satisfy the enum. A no-op
-        # constraint (off-schema value survives) fails here.
-        try:
-            con_obj = json.loads(con_text)
-        except json.JSONDecodeError as exc:
-            pytest.fail(
-                f"{ctx}: CONSTRAINED output not JSON — constraint did not "
-                f"fire: {con_text!r} ({exc})"
-            )
-        assert isinstance(con_obj, dict) and "answer" in con_obj, (
-            f"{ctx}: constrained output missing required 'answer': {con_obj!r}"
+        permissive = LLMatcher.grammar_from_lark(
+            "%llguidance {}\nstart: TAG_TEXT\nTAG_TEXT: /(.|\\n)*/\n"
         )
-        assert con_obj["answer"] in ("yes", "no"), (
-            f"{ctx}: CONSTRAINT NO-OP — off-enum value survived strict "
-            f"schema: answer={con_obj['answer']!r} (unconstrained was "
-            f"{unc_text[:120]!r}). llguidance masking is not firing."
+
+        # (a) WITHOUT guidance: the off-schema stream is fully accepted + terminal
+        # — a truly unconstrained baseline (else the negative control is vacuous).
+        u_acc, u_total, u_term = _negctrl_consume(
+            tok, lltok, permissive, _NEGCTRL_OFFSCHEMA
+        )
+        assert u_acc == u_total and u_term, (
+            f"WITHOUT guidance the off-schema stream {_NEGCTRL_OFFSCHEMA!r} was "
+            f"not fully accepted ({u_acc}/{u_total}, terminal={u_term}) — the "
+            "unconstrained baseline is not truly permissive, so the probe would "
+            "be vacuous"
+        )
+
+        # (b) WITH guidance: the SAME off-schema stream is REJECTED mid-stream —
+        # the constraint masks the off-enum token. A no-op constraint would
+        # accept it (u_acc == c_acc), which fails here.
+        c_acc, c_total, c_term = _negctrl_consume(
+            tok, lltok, constrained, _NEGCTRL_OFFSCHEMA
+        )
+        assert c_acc < c_total, (
+            f"CONSTRAINT NO-OP — off-schema stream {_NEGCTRL_OFFSCHEMA!r} was "
+            f"ACCEPTED in full under the strict schema ({c_acc}/{c_total}). "
+            "llguidance masking is not firing."
+        )
+        assert not c_term, (
+            f"off-schema stream reached a terminal state under the strict schema "
+            f"({c_acc}/{c_total}) — the constraint did not actually forbid it"
+        )
+
+        # Positive control: an ON-schema value IS accepted + terminal under the
+        # SAME strict grammar — proving (b)'s rejection is the enum constraint,
+        # not a grammar that rejects everything.
+        p_acc, p_total, p_term = _negctrl_consume(
+            tok, lltok, constrained, _NEGCTRL_ONSCHEMA
+        )
+        assert p_acc == p_total and p_term, (
+            f"strict schema rejected the ON-schema value {_NEGCTRL_ONSCHEMA!r} "
+            f"({p_acc}/{p_total}, terminal={p_term}) — the grammar is over-"
+            "constraining, so (b)'s rejection is not a clean enum-mask signal"
         )
         print(
-            f"[negctrl] {ctx} unconstrained={unc_text[:80]!r} "
-            f"constrained={con_text!r} latency={latency_s:.2f}s"
+            f"[negctrl] offline mask proof: off-schema accepted-without-guidance="
+            f"{u_acc}/{u_total} rejected-with-guidance={c_acc}/{c_total} "
+            f"on-schema={p_acc}/{p_total}"
         )
