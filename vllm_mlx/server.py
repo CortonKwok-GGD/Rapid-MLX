@@ -1300,19 +1300,40 @@ def load_embedding_model(
 
 def _ensure_routing_config(model_name: str) -> None:
     """Materialize the checkpoint config on disk before the offline routing
-    probes run.
+    probes run, and FAIL FAST if it cannot be materialized.
 
     ``resolve_serving_lane`` reads the checkpoint config from the local cache
     to decide the MLLM-vs-text lane. On a first-time uncached remote startup
     that config does not exist yet, so a hybrid VLM would probe "not hybrid"
     and get routed into the MLLM engine that cannot serve it (#352 dogfood
-    P1-②). Pre-fetch the model here (the same canonical mirror/HF fetch the CLI
-    uses) so the probes have real evidence. No-op on local paths and on
-    fully-cached repos; best-effort — a prefetch hiccup must never block load
-    (the engine's own loader still downloads and reports errors). Module-level
-    so tests can substitute it to simulate "config appears only after
-    download".
+    P1-②).
+
+    Contract: on a normal return the routing probes have real config evidence.
+    - Already materialized (cached repo, a prior prefetch, or a local dir that
+      ships a config) -> nothing to do; the probe is reliable. Fully offline
+      and cheap, so warm starts and the unit suite never trigger a download.
+    - Otherwise prefetch via the same canonical mirror/HF fetch the CLI uses,
+      then VERIFY the config actually landed. If it did not, raise an
+      actionable error instead of letting the caller route on a guess — a
+      silent miss here misroutes a hybrid VLM into the crashing MLLM lane.
+
+    A hard disk-space gate (``SystemExit``) from the prefetch is an intentional
+    fail-fast and propagates unchanged. Module-level so tests can substitute
+    the prefetch to simulate "config appears only after download".
     """
+    from .model_metadata import read_model_metadata
+
+    # Config already readable (warm cache / local checkpoint dir) -> the routing
+    # probe has real evidence; skip the prefetch so warm starts and the unit
+    # suite never download.
+    if read_model_metadata(model_name) is not None:
+        return
+    # A local path the user pointed us at: trust their files. If a config is
+    # genuinely absent the engine's own loader surfaces it with its own
+    # message; we must not try to "download" a filesystem path.
+    if os.path.exists(model_name):
+        return
+
     try:
         from .cli import _ensure_model_downloaded
 
@@ -1321,8 +1342,23 @@ def _ensure_routing_config(model_name: str) -> None:
         # ``_ensure_model_downloaded`` may exit(1) on a hard disk-space gate —
         # that is an intentional fail-fast; let it propagate.
         raise
-    except Exception as _e:  # noqa: BLE001 — never block load on a prefetch hiccup
-        logger.debug("routing-config prefetch failed (non-fatal): %r", _e)
+    except Exception as _e:  # noqa: BLE001 — re-verified below, not swallowed
+        logger.debug("routing-config prefetch raised (will re-verify): %r", _e)
+
+    # VERIFY the prefetch actually put the config on disk. If it did not, the
+    # routing probes would fall back to a guess and could misroute a hybrid VLM
+    # into the MLLM engine that cannot serve it (#352). Fail fast with an
+    # actionable message instead of silently guess-routing.
+    if read_model_metadata(model_name) is None:
+        raise RuntimeError(
+            f"Could not materialize the checkpoint config for {model_name!r} "
+            "before selecting the serving lane. The MLLM-vs-text routing "
+            "decision needs the model's config.json on disk; without it a "
+            "hybrid VLM can be misrouted into the multimodal engine that "
+            "cannot serve it (GH #352). Check network / HuggingFace access / "
+            "disk space and retry, or pass --no-mllm to force the text-only "
+            "lane (or --mllm to force the multimodal lane)."
+        )
 
 
 def load_model(

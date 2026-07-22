@@ -2272,11 +2272,17 @@ def test_param_is_bool_handles_pep604_unions():
     assert not _param_is_bool(_param_with(inspect.Parameter.empty, default=None))
 
 
-def test_hybrid_overrides_mutually_exclusive_in_load_model():
+def test_hybrid_overrides_mutually_exclusive_in_load_model(monkeypatch):
     """server.load_model raises ValueError if both --force-hybrid and
     --no-hybrid are passed. Second line of defense — CLI also rejects
     via sys.exit(2), but load_model is a public entry point too."""
+    import vllm_mlx.server as srv
     from vllm_mlx.server import load_model
+
+    # This test drives the routing block with a placeholder repo id — stub the
+    # config-materialization seam so it doesn't fail-fast on the (uncached)
+    # "fake/model" before reaching the flag-conflict guard under test (#1178).
+    monkeypatch.setattr(srv, "_ensure_routing_config", lambda name: None)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_model(
@@ -2286,10 +2292,15 @@ def test_hybrid_overrides_mutually_exclusive_in_load_model():
         )
 
 
-def test_spec_decode_overrides_mutually_exclusive_in_load_model():
+def test_spec_decode_overrides_mutually_exclusive_in_load_model(monkeypatch):
     """server.load_model raises ValueError if both --force-spec-decode
     and --no-spec-decode are passed."""
+    import vllm_mlx.server as srv
     from vllm_mlx.server import load_model
+
+    # Placeholder repo id — stub the config-materialization seam (see the
+    # sibling hybrid test) so the fail-fast doesn't preempt the guard (#1178).
+    monkeypatch.setattr(srv, "_ensure_routing_config", lambda name: None)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_model(

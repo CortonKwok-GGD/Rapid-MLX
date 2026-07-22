@@ -173,6 +173,54 @@ def test_bench_command_proceeds_when_mirror_prefetch_is_silent_noop(
     assert load_called == ["mlx-community/Qwen3-1.7B-4bit"]
 
 
+def test_bench_command_hybrid_vlm_benches_on_text_lane(monkeypatch, capsys) -> None:
+    """BLOCKING (#1178 codex r4): a hybrid VLM alias must bench on the TEXT
+    lane. ``bench`` has no MLLM/continuous-batching engine — it always loads
+    the text model via ``mlx_lm.load`` — so the effective serving lane it feeds
+    to PFlash defaulting/validation must be the RESOLVED lane (text for a hybrid
+    VLM that auto-downgrades, #352), never the raw multimodal classification.
+    Assert PFlash sees ``is_multimodal=False`` and the auto-downgrade is
+    surfaced to the user.
+    """
+    cli = importlib.import_module("vllm_mlx.cli")
+    from vllm_mlx.api import utils as api_utils
+
+    # Hybrid VLM: resolver returns (is_mllm_lane=False, auto_text_fallback=True).
+    monkeypatch.setattr(
+        api_utils, "resolve_serving_lane", lambda name, **kw: (False, True)
+    )
+
+    seen: dict[str, object] = {}
+
+    def _capture_pflash(args, *, model_name, is_multimodal=False):
+        seen["is_multimodal"] = is_multimodal
+        return "off"
+
+    monkeypatch.setattr("vllm_mlx.pflash.resolve_pflash_mode_default", _capture_pflash)
+    monkeypatch.setattr(cli, "_check_disk_space", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda name: None)
+
+    def _fake_load(name: str):
+        # Stop before the (heavy) real engine boot; bench's own except
+        # branch turns this into sys.exit(1).
+        raise ValueError("test-abort after lane resolution")
+
+    _patch_mlx_lm_load(monkeypatch, _fake_load)
+
+    args = _make_freeform_bench_args("some/hybrid-vlm-4bit")
+
+    with pytest.raises(SystemExit):
+        cli.bench_command(args)
+
+    # PFlash defaulting saw the EFFECTIVE (text) lane, not the raw multimodal
+    # classification — a hybrid VLM is PFlash-capable on the text lane.
+    assert seen.get("is_multimodal") is False
+    # And the auto-downgrade is attributed to the right lane for the user.
+    out = capsys.readouterr().out
+    assert "hybrid VLM" in out and "text-only" in out
+
+
 # ---------- --submit community-bench path (_run_submit_flow) ----------------
 def _install_submit_flow_stubs(monkeypatch, cli, *, alias: str, hf_path: str):
     """Common patches for the ``--submit`` path: bypass the Apple-Silicon

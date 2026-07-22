@@ -171,6 +171,99 @@ def test_load_model_genuine_vlm_stays_on_mllm_lane(monkeypatch):
     assert server._engine.kwargs.get("force_text") is False
 
 
+def test_ensure_routing_config_raises_when_prefetch_does_not_materialize(monkeypatch):
+    """BLOCKING (#1178 codex r4): ``_ensure_routing_config`` must NOT swallow a
+    prefetch failure and let the caller route on a guess. If, after the
+    prefetch attempt, the checkpoint config is still absent, the MLLM-vs-text
+    probe would fall back to "not hybrid" and misroute a hybrid VLM into the
+    crashing MLLM engine (#352). Assert it fails fast with an actionable error
+    instead.
+    """
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    # Uncached remote repo id (not a local path → os.path.exists False).
+    model = "some/uncached-and-unmaterializable-4bit"
+    # Config NEVER becomes readable, even after the prefetch runs.
+    monkeypatch.setattr(mm, "read_model_metadata", lambda name: None)
+    called = {"prefetch": False}
+
+    def _noop_prefetch(name):
+        called["prefetch"] = True  # ran, but didn't put a config on disk
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _noop_prefetch)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        server._ensure_routing_config(model)
+
+    assert called["prefetch"] is True, "prefetch must be attempted before failing"
+    msg = str(excinfo.value)
+    assert model in msg
+    # Actionable: names the routing consequence and the escape hatches.
+    assert "--no-mllm" in msg
+    assert "#352" in msg
+
+
+def test_ensure_routing_config_succeeds_when_prefetch_materializes(monkeypatch):
+    """Happy path for the first-time uncached startup: config is absent, the
+    prefetch materializes it, and ``_ensure_routing_config`` returns cleanly."""
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    state = {"materialized": False}
+    monkeypatch.setattr(
+        mm,
+        "read_model_metadata",
+        lambda name: object() if state["materialized"] else None,
+    )
+
+    def _fake_prefetch(name):
+        state["materialized"] = True
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _fake_prefetch)
+
+    # Must not raise.
+    server._ensure_routing_config("some/uncached-but-fetchable-4bit")
+    assert state["materialized"] is True
+
+
+def test_ensure_routing_config_skips_prefetch_when_config_already_readable(monkeypatch):
+    """Warm cache / local checkpoint: config already readable → no download is
+    attempted (keeps warm starts and the unit suite fully offline)."""
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    monkeypatch.setattr(mm, "read_model_metadata", lambda name: object())
+
+    def _must_not_run(name):  # pragma: no cover - asserted never called
+        raise AssertionError("prefetch must be skipped when config is readable")
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _must_not_run)
+
+    server._ensure_routing_config("mlx-community/Qwen3.5-9B-4bit")
+
+
+def test_ensure_routing_config_propagates_disk_gate_systemexit(monkeypatch):
+    """The intentional hard disk-space gate (``SystemExit``) from the prefetch
+    must propagate unchanged — it is a fail-fast, not a swallowable hiccup."""
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    monkeypatch.setattr(mm, "read_model_metadata", lambda name: None)
+
+    def _disk_gate(name):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _disk_gate)
+
+    with pytest.raises(SystemExit):
+        server._ensure_routing_config("some/uncached-4bit")
+
+
 def test_load_model_infers_programmatic_max_tokens_explicit(monkeypatch):
     from vllm_mlx import server
     from vllm_mlx.config import get_config, reset_config

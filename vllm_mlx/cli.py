@@ -4122,11 +4122,27 @@ def bench_command(args):
     # multimodal classification (#352 dogfood P1-②).
     from .api.utils import resolve_serving_lane as _bench_resolve_serving_lane
 
-    _bench_is_mllm, _ = _bench_resolve_serving_lane(
+    _bench_is_mllm, _bench_auto_text_fallback = _bench_resolve_serving_lane(
         args.model,
         force_mllm=getattr(args, "mllm", False),
         force_text=getattr(args, "no_mllm", False),
     )
+    # ``bench`` has no MLLM/continuous-batching lane: it always loads the text
+    # model via ``mlx_lm.load`` and drives ``AsyncEngineCore`` with it (see
+    # ``run_benchmark`` below — there is no ``force_text``/``force_mllm`` engine
+    # surface here the way ``serve``'s ``BatchedEngine`` has). So a bench always
+    # runs on the text lane by construction, and ``_bench_is_mllm`` (the
+    # RESOLVED effective lane — already ``False`` for a hybrid VLM that
+    # auto-downgrades, #352) is exactly the right signal for PFlash defaulting
+    # and the MLLM-rejection gate below. We surface the auto-downgrade the same
+    # way ``serve`` does so the bench numbers are attributed to the correct lane
+    # and a future reader does not "fix" this by wiring an MLLM lane that would
+    # crash on the hybrid backbone (GatedDeltaNet vs BatchKVCache, GH #352).
+    if _bench_auto_text_fallback:
+        print(
+            f"Note: {args.model!r} is a hybrid VLM — benching on the text-only "
+            "mlx-lm lane, matching 'serve' auto-downgrade (#352)."
+        )
     args.pflash = _pflash_resolve_default(
         args, model_name=args.model, is_multimodal=_bench_is_mllm
     )
