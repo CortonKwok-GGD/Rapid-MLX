@@ -2317,7 +2317,12 @@ def serve_command(args):
 
         _stub_notice = weightless_stub_notice(args.model)
         if _stub_notice:
-            print(_stub_notice)
+            # stderr + flush: in the exact non-TTY / RAPID_MLX_AUTO_PULL=1
+            # case this notice targets, block-buffered stdout may never
+            # flush before the multi-GB download + server lifetime, leaving
+            # the warning invisible. stderr is line-buffered/unbuffered and
+            # is the correct stream for an operational warning anyway.
+            print(_stub_notice, file=sys.stderr, flush=True)
     except Exception:
         pass
 
