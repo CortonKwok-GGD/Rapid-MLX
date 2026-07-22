@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
-from ..api.guided import GuidedSchemaCompileError
+from ..api.guided import GuidedSchemaCompileError, guided_schema_compile_error_detail
 from ..api.models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -3693,20 +3693,13 @@ async def _create_chat_completion_impl(
                 # NOT a strict-mode 502 (the schema itself is the fault, not a
                 # server-side soundness breach) and NEVER a silent fallback.
                 # Applies in both strict and non-strict mode: an invalid schema
-                # is malformed input regardless of the strictness flag.
+                # is malformed input regardless of the strictness flag. Shared
+                # envelope (guided_schema_compile_error_detail) keeps the 400
+                # body identical to the streaming, responses, and centralized
+                # handler surfaces.
                 raise HTTPException(
                     status_code=400,
-                    detail={
-                        "error": {
-                            "message": (
-                                "response_format.json_schema.schema failed to "
-                                f"compile: {compile_err}"
-                            ),
-                            "type": "invalid_request_error",
-                            "code": "invalid_response_format_schema",
-                            "param": "response_format.json_schema.schema",
-                        }
-                    },
+                    detail=guided_schema_compile_error_detail(compile_err),
                 ) from compile_err
             except Exception as guided_err:
                 # Codex r6 BLOCKING parity (non-streaming chat path):
@@ -5541,17 +5534,7 @@ async def stream_chat_completion_guided(
                 "unconstrained streaming: %s",
                 compile_err,
             )
-            _compile_err_envelope = {
-                "error": {
-                    "message": (
-                        "response_format.json_schema.schema failed to "
-                        f"compile: {compile_err}"
-                    ),
-                    "type": "invalid_request_error",
-                    "code": "invalid_response_format_schema",
-                    "param": "response_format.json_schema.schema",
-                }
-            }
+            _compile_err_envelope = guided_schema_compile_error_detail(compile_err)
             yield f"data: {json.dumps(_compile_err_envelope)}\n\n"
             yield "data: [DONE]\n\n"
             return

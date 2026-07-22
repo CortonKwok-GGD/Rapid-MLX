@@ -53,6 +53,33 @@ class GuidedSchemaCompileError(Exception):
     """
 
 
+def guided_schema_compile_error_detail(
+    exc: BaseException,
+    param: str = "response_format.json_schema.schema",
+) -> dict[str, Any]:
+    """Build the canonical OpenAI-shaped 400 envelope for a compile error.
+
+    Shared by EVERY endpoint that constrains output to a caller schema (and
+    the centralized exception handler) so the 400 body is byte-identical
+    across ``/v1/chat/completions`` and ``/v1/responses``. ``param`` locates
+    the offending field per surface: ``response_format.json_schema.schema``
+    on the chat/completions API, ``text.format.schema`` on the responses API.
+
+    The message embeds only the schema-level diagnostic carried by
+    ``GuidedSchemaCompileError`` (which describes the CALLER's own malformed
+    schema) — never a server-internal exception, because the raise sites
+    narrow to genuine schema-invalid signals before constructing it.
+    """
+    return {
+        "error": {
+            "message": f"{param} failed to compile: {exc}",
+            "type": "invalid_request_error",
+            "code": "invalid_response_format_schema",
+            "param": param,
+        }
+    }
+
+
 # MUST install the MLX hardware-compat shim BEFORE the `mlx_lm` import below.
 # Even though the import is inside a `try`, the body still runs at module
 # load time; on success it triggers `mlx_lm/__init__.py` → `mlx_lm.generate`
@@ -544,9 +571,23 @@ class GuidedGenerator:
                 schema_str,
                 overrides={"whitespace_flexible": True},
             )
-        except GuidedSchemaCompileError:
-            raise
-        except Exception as e:
+        except ValueError as e:
+            # llguidance raises ``ValueError`` for a schema it cannot parse
+            # into a grammar (malformed JSON / grammar input) — a genuine
+            # invalid-schema fault attributable to the caller. Narrow the
+            # catch to ``ValueError`` ONLY (NOT a broad ``except Exception``):
+            # an internal / operational failure (RuntimeError, MemoryError,
+            # …) on a VALID schema must NOT be misclassified as invalid client
+            # input — that would emit a 400 leaking a server-internal
+            # diagnostic. Such failures propagate to the runtime-failure path
+            # (``None`` → best-effort fallback / strict 502) instead.
+            #
+            # NOTE: the common invalid-schema case (e.g. ``{"type":
+            # "notatype"}``) does NOT raise here — llguidance compiles it
+            # lazily and the error surfaces at matcher construction inside
+            # ``_decode_constrained`` (``matcher.get_error()``), which raises
+            # ``GuidedSchemaCompileError`` directly. This ``ValueError`` arm
+            # covers only the eagerly-rejected (unparseable) schemas.
             logger.error("llguidance schema compile error: %s", e)
             raise GuidedSchemaCompileError(str(e)) from e
 

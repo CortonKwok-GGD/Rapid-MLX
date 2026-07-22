@@ -927,6 +927,31 @@ def _generic_error_response() -> JSONResponse:
     )
 
 
+def _guided_compile_error_response(exc: BaseException) -> JSONResponse:
+    """400 for a caller-schema compile failure (``GuidedSchemaCompileError``).
+
+    Centralized shared boundary: EVERY endpoint that constrains output to a
+    caller-supplied schema — chat, responses, and any future surface — that
+    lets the exception propagate here gets the identical 400 envelope instead
+    of an unhandled 500. A caller who explicitly asked for a hard schema
+    guarantee must never silently lose it, and an invalid schema is a
+    deterministic client fault. Routes that need a surface-specific override
+    (the responses API's ``text.format.schema`` param, or the streaming SSE
+    envelope which cannot change an already-committed 200 status) still handle
+    it locally; this is the safety net for everything else.
+
+    The message carries only the schema-level diagnostic on the exception
+    (the caller's own malformed schema) — the raise sites narrow to genuine
+    schema-invalid signals, so no server-internal detail reaches this body.
+    """
+    from ..api.guided import guided_schema_compile_error_detail
+
+    return JSONResponse(
+        status_code=400,
+        content=guided_schema_compile_error_detail(exc),
+    )
+
+
 def _recursion_error_response() -> JSONResponse:
     """The sanitized envelope used when a ``RecursionError`` reaches
     the framework boundary (D-TOOL-RECUR / D-DEEP-JSON defense-in-depth).
@@ -1052,6 +1077,26 @@ def install_exception_handlers(app: FastAPI) -> None:
     """
     _register_canonical_request_models()
 
+    # Imported here (not at module load) so registering the handler does not
+    # force the heavy ``api.guided`` (mlx / llguidance) import at app-setup
+    # time on installs that never reach guided decoding. The class is always
+    # importable — ``api.guided`` degrades gracefully without the extra.
+    from ..api.guided import GuidedSchemaCompileError
+
+    @app.exception_handler(GuidedSchemaCompileError)
+    async def _guided_compile_handler(
+        request: Request,
+        exc: GuidedSchemaCompileError,
+    ):
+        # Centralized 400 for a caller-schema compile failure that escapes a
+        # route (covers all present + future ``generate_with_schema`` callers,
+        # not just chat). Chat/responses catch it locally for surface-specific
+        # shaping; this is the shared safety net.
+        response = _guided_compile_error_response(exc)
+        if _is_anthropic_path(request):
+            response = _wrap_for_anthropic(response)
+        return response
+
     @app.exception_handler(StarletteHTTPException)
     async def _http_handler(
         request: Request,
@@ -1176,6 +1221,12 @@ def install_exception_handlers(app: FastAPI) -> None:
             return _wrap_for_anthropic(response) if anthropic else response
         if isinstance(exc, StarletteHTTPException):
             response = _http_error_response(exc)
+            return _wrap_for_anthropic(response) if anthropic else response
+        if isinstance(exc, GuidedSchemaCompileError):
+            # Same rationale as the dedicated handler above — reroute here in
+            # case a TaskGroup / thread boundary lands the compile error on
+            # the generic handler instead of the dedicated one.
+            response = _guided_compile_error_response(exc)
             return _wrap_for_anthropic(response) if anthropic else response
         if isinstance(exc, RecursionError):
             # ``isinstance(RecursionError) before isinstance(Exception)``:

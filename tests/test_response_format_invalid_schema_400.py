@@ -371,14 +371,15 @@ def test_generate_json_raises_on_schema_compile_failure(monkeypatch):
     (not swallow to ``None``) when the schema fails to compile, so the engine
     can distinguish an invalid schema from a benign guided-unavailable None.
 
-    We monkeypatch ``grammar_from_json_schema`` to raise so the test needs no
+    We monkeypatch ``grammar_from_json_schema`` to raise ``ValueError`` (the
+    type llguidance raises for an unparseable schema) so the test needs no
     real model/tokenizer — it pins the ``generate_json`` compile-guard, the
     contract the whole 400 path depends on.
     """
     from vllm_mlx.api import guided as guided_mod
 
     def _boom(*_a, **_k):
-        raise ValueError("Invalid type: notatype")
+        raise ValueError("expected ident at line 1 column 2")
 
     monkeypatch.setattr(
         guided_mod.LLMatcher, "grammar_from_json_schema", staticmethod(_boom)
@@ -386,6 +387,204 @@ def test_generate_json_raises_on_schema_compile_failure(monkeypatch):
     gen = guided_mod.GuidedGenerator(model=None, tokenizer=None)
     with pytest.raises(GuidedSchemaCompileError):
         gen.generate_json(prompt="hi", json_schema=_INVALID_SCHEMA, max_tokens=8)
+
+
+@pytest.mark.skipif(
+    not is_guided_available(), reason="requires the [guided] (llguidance) extra"
+)
+def test_generate_json_internal_error_not_misreported_as_400(monkeypatch):
+    """Issue-2 narrowing: an INTERNAL / operational failure (e.g. a
+    ``RuntimeError`` resource failure) on the compile call must NOT be
+    misclassified as invalid client input. Only a ``ValueError`` (genuine
+    unparseable schema) becomes ``GuidedSchemaCompileError`` (→ 400); a
+    ``RuntimeError`` propagates as itself to the runtime-failure / 5xx path,
+    so no server-internal diagnostic is ever leaked into a 400 body on a
+    VALID schema.
+    """
+    from vllm_mlx.api import guided as guided_mod
+
+    def _internal_boom(*_a, **_k):
+        raise RuntimeError("internal resource failure / OOM")
+
+    monkeypatch.setattr(
+        guided_mod.LLMatcher,
+        "grammar_from_json_schema",
+        staticmethod(_internal_boom),
+    )
+    gen = guided_mod.GuidedGenerator(model=None, tokenizer=None)
+    with pytest.raises(RuntimeError):
+        gen.generate_json(prompt="hi", json_schema=_SCHEMA, max_tokens=8)
+
+
+# ---------------------------------------------------------------------------
+# Engine path (Issue 3): the REAL BatchedEngine must PROPAGATE a compile error
+# from the guided layer, NOT swallow it into a silent chat() fallback. The
+# mock is injected at the GuidedGenerator layer (not at generate_with_schema),
+# so these tests exercise BatchedEngine._run_guided_generation /
+# generate_with_schema — deleting the engine-layer propagation would turn them
+# red while the route-level mock tests above stayed green.
+# ---------------------------------------------------------------------------
+
+
+def _bare_engine(monkeypatch, gen_exc: Exception):
+    """A minimally-wired REAL ``BatchedEngine`` whose ``GuidedGenerator``
+    raises ``gen_exc`` from ``generate_json``. Constructed via ``__new__`` so
+    no model load happens; only the attributes the guided path reads are set.
+    """
+    from vllm_mlx.engine import batched as batched_mod
+
+    class _FakeGuidedGenerator:
+        def __init__(self, model, tokenizer):
+            pass
+
+        def generate_json(self, **_kw):
+            raise gen_exc
+
+    monkeypatch.setattr(batched_mod, "GuidedGenerator", _FakeGuidedGenerator)
+    eng = batched_mod.BatchedEngine.__new__(batched_mod.BatchedEngine)
+    eng._model = object()
+    eng._tokenizer = object()
+    eng._is_mllm = False
+    return eng, batched_mod
+
+
+def test_run_guided_generation_propagates_compile_error(monkeypatch):
+    """The sync guided worker re-raises ``GuidedSchemaCompileError`` instead
+    of returning ``None`` — the load-bearing line at batched.py that stops the
+    silent fallback."""
+    eng, _ = _bare_engine(
+        monkeypatch, GuidedSchemaCompileError("Invalid type: notatype")
+    )
+    with pytest.raises(GuidedSchemaCompileError):
+        eng._run_guided_generation(
+            prompt="p", json_schema=_INVALID_SCHEMA, max_tokens=8, temperature=0.0
+        )
+
+
+def test_run_guided_generation_generic_failure_returns_none(monkeypatch):
+    """A transient (non-compile) guided failure stays a graceful ``None`` so
+    the best-effort fallback is preserved — only compile errors propagate."""
+    eng, _ = _bare_engine(monkeypatch, RuntimeError("transient blip"))
+    assert (
+        eng._run_guided_generation(
+            prompt="p", json_schema=_SCHEMA, max_tokens=8, temperature=0.0
+        )
+        is None
+    )
+
+
+async def test_generate_with_schema_propagates_compile_error_no_chat_fallback(
+    monkeypatch,
+):
+    """End-to-end through the REAL async ``generate_with_schema`` wrapper: a
+    compile error must propagate to the caller (which the route maps to 400)
+    and MUST NOT silently fall back to unconstrained ``chat()``. Deleting the
+    engine-layer propagation would make this fail — ``chat()`` would run and
+    no exception would surface (the exact production silent-degrade)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    eng, batched_mod = _bare_engine(
+        monkeypatch, GuidedSchemaCompileError("Invalid type: notatype")
+    )
+    monkeypatch.setattr(
+        batched_mod, "shared_apply_chat_template", lambda *a, **k: "PROMPT"
+    )
+    eng._loaded = True
+    eng._model_name = "test-model"
+    chat_calls: list = []
+
+    async def _spy_chat(**kwargs):
+        chat_calls.append(kwargs)
+        return GenerationOutput(
+            text="FALLBACK", new_text="FALLBACK", finish_reason="stop"
+        )
+
+    eng.chat = _spy_chat
+    executor = ThreadPoolExecutor(max_workers=1)
+    eng._model_load_executor = executor
+    try:
+        with pytest.raises(GuidedSchemaCompileError):
+            await eng.generate_with_schema(
+                messages=[{"role": "user", "content": "hi"}],
+                json_schema=_INVALID_SCHEMA,
+                # raise_on_failure=False is the non-streaming default that,
+                # pre-fix, silently fell back to chat() on a None result.
+                raise_on_failure=False,
+            )
+        assert chat_calls == [], "compile error must NOT trigger a chat() fallback"
+    finally:
+        executor.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------------------
+# Non-chat endpoint coverage (Issue 1): /v1/responses must ALSO surface a
+# compile error as HTTP 400 (not the strict 502, not a silent 200 / 500).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _rate_limiter_state():
+    """Save/restore the global rate-limiter so disabling it for the responses
+    route does not leak into other tests."""
+    from vllm_mlx.middleware.auth import rate_limiter
+
+    saved_enabled = rate_limiter.enabled
+    saved_rpm = rate_limiter.requests_per_minute
+    saved_requests = dict(rate_limiter._requests)
+    rate_limiter.enabled = False
+    rate_limiter.requests_per_minute = 60
+    rate_limiter._requests.clear()
+    yield rate_limiter
+    rate_limiter.enabled = saved_enabled
+    rate_limiter.requests_per_minute = saved_rpm
+    rate_limiter._requests.clear()
+    rate_limiter._requests.update(saved_requests)
+
+
+def _make_responses_client(engine: _Engine) -> TestClient:
+    from vllm_mlx.routes.responses import router as responses_router
+
+    cfg = reset_config()
+    cfg.engine = engine
+    cfg.model_name = "test-model"
+    cfg.model_registry = None
+    cfg.no_thinking = True
+    app = FastAPI()
+    install_exception_handlers(app)
+    app.include_router(responses_router)
+    return TestClient(app)
+
+
+def test_responses_invalid_schema_returns_400(_rate_limiter_state):
+    """/v1/responses strict + a schema that fails to compile at guided time →
+    HTTP 400 (param ``text.format.schema``), NOT the strict 502 and NOT a
+    silent 200. Uses a valid-SHAPED schema so it clears the strict
+    ``check_schema_validity`` pre-flight and reaches ``generate_with_schema``,
+    where the (mock) engine reports the compile failure."""
+    engine = _Engine(guided_raises=_COMPILE_ERR)
+    client = _make_responses_client(engine)
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "x",
+                    "schema": _SCHEMA,
+                    "strict": True,
+                }
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_response_format_schema"
+    assert err["param"] == "text.format.schema"
+    assert "failed to compile" in err["message"]
+    assert engine.chat_calls == [], "compile error must NOT fall back to chat()"
 
 
 if __name__ == "__main__":

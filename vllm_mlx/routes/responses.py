@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Mapping
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from ..api.guided import GuidedSchemaCompileError, guided_schema_compile_error_detail
 from ..api.models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -919,6 +920,24 @@ async def _non_stream(
             )
         except HTTPException:
             raise
+        except GuidedSchemaCompileError as compile_err:
+            # Invalid caller schema surfacing at guided-setup time. This is a
+            # deterministic REQUEST error → HTTP 400 (NOT the strict 502
+            # ``strict_schema_violation``, which is for a server-side
+            # soundness breach). ``text.format.schema`` locates the field on
+            # the responses API. Same principle as the chat route: a hard
+            # schema guarantee must never silently collapse.
+            logger.warning(
+                "Guided generation setup on /v1/responses: caller schema "
+                "failed to compile — returning 400: %s",
+                compile_err,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=guided_schema_compile_error_detail(
+                    compile_err, param="text.format.schema"
+                ),
+            ) from compile_err
         except Exception as guided_err:
             logger.warning(
                 "Guided generation setup failed on /v1/responses strict path: %s",
@@ -976,6 +995,21 @@ async def _non_stream(
                 # belongs to the route's standard cancellation
                 # path, not the strict contract.
                 raise
+            except GuidedSchemaCompileError as compile_err:
+                # Invalid caller schema surfacing mid-await (matcher
+                # construction) → HTTP 400, mirroring the setup-time arm
+                # above. Never the strict 502 and never a silent 200.
+                logger.warning(
+                    "Guided generation on /v1/responses: caller schema failed "
+                    "to compile mid-await — returning 400: %s",
+                    compile_err,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=guided_schema_compile_error_detail(
+                        compile_err, param="text.format.schema"
+                    ),
+                ) from compile_err
             except Exception as guided_err:
                 logger.warning(
                     "Guided generation failed mid-await on /v1/responses "
