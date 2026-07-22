@@ -1045,30 +1045,30 @@ def test_is_weightless_stub_real_tree(tmp_path, monkeypatch):
     assert gate.is_weightless_stub("mlx-community/gemma-4-e4b-it-4bit") is False
 
 
-def test_weightless_stub_notice_with_size(monkeypatch):
-    """The one-line notice names the repo, says config is cached / weights
-    missing, and carries the human-readable download size."""
+def test_weightless_stub_notice_is_size_free_and_no_extra_hf_call(monkeypatch):
+    """The notice names the repo and says config cached / weights missing —
+    and is deliberately SIZE-FREE. Computing a byte figure here would fire a
+    second synchronous HF metadata request on the startup path, redundant
+    with the download's own lookup. Pin that ``estimate_repo_size_bytes`` is
+    NOT called (codex #1175 NIT)."""
     monkeypatch.setattr(gate, "is_weightless_stub", lambda _r: True)
-    monkeypatch.setattr(gate, "estimate_repo_size_bytes", lambda *_a, **_k: 3 * 1024**3)
+    monkeypatch.setattr(
+        gate,
+        "estimate_repo_size_bytes",
+        lambda *_a, **_k: pytest.fail(
+            "weightless_stub_notice must not make an HF size request"
+        ),
+    )
 
     notice = gate.weightless_stub_notice("mlx-community/gemma-4-e4b-it-4bit")
     assert notice is not None
     assert "mlx-community/gemma-4-e4b-it-4bit" in notice
     assert "config cached" in notice
     assert "weights are missing" in notice
-    assert "3.0 GiB" in notice
-
-
-def test_weightless_stub_notice_unknown_size(monkeypatch):
-    """When the size lookup fails the notice still fires (download is still
-    about to happen) — just without a byte figure."""
-    monkeypatch.setattr(gate, "is_weightless_stub", lambda _r: True)
-    monkeypatch.setattr(gate, "estimate_repo_size_bytes", lambda *_a, **_k: None)
-
-    notice = gate.weightless_stub_notice("mlx-community/gemma-4-e4b-it-4bit")
-    assert notice is not None
-    assert "config cached" in notice
-    assert "weights" in notice
+    assert "downloading the missing weights first" in notice
+    # No byte figure / size unit leaked into the size-free message.
+    assert "~" not in notice
+    assert "GiB" not in notice and "MiB" not in notice
 
 
 def test_weightless_stub_notice_none_when_not_stub(monkeypatch):
@@ -1082,55 +1082,3 @@ def test_weightless_stub_notice_none_when_not_stub(monkeypatch):
     )
 
     assert gate.weightless_stub_notice("mlx-community/complete-4bit") is None
-
-
-def test_weightless_stub_notice_bounds_size_lookup_timeout(monkeypatch):
-    """NIT (codex #1175): the notice must bound its HF size lookup with a
-    tight deadline so it never materially delays startup — it passes the
-    short stub-notice cap (< the 5s confirmation-gate default) and falls
-    back to the size-free message when the lookup is slow/fails."""
-    monkeypatch.setattr(gate, "is_weightless_stub", lambda _r: True)
-    seen: dict = {}
-
-    def _fake_estimate(repo_id, timeout=gate._HF_API_TIMEOUT_SECONDS):
-        seen["timeout"] = timeout
-        return None  # simulate a slow / failed lookup
-
-    monkeypatch.setattr(gate, "estimate_repo_size_bytes", _fake_estimate)
-
-    notice = gate.weightless_stub_notice("mlx-community/gemma-4-e4b-it-4bit")
-    # Still fires (size-free) rather than blocking on the lookup.
-    assert notice is not None
-    assert "weights" in notice
-    assert seen["timeout"] == gate._STUB_NOTICE_SIZE_TIMEOUT_SECONDS
-    assert seen["timeout"] < gate._HF_API_TIMEOUT_SECONDS
-
-
-def test_estimate_repo_size_forwards_custom_timeout():
-    """``estimate_repo_size_bytes`` forwards a caller-supplied timeout to the
-    bounded HF metadata call so the stub notice's tight cap is honoured."""
-    seen: dict = {}
-
-    def _fake(repo_id, timeout):
-        seen["timeout"] = timeout
-        return SimpleNamespace(siblings=[])
-
-    with patch.object(gate, "_model_info_with_timeout", side_effect=_fake):
-        gate.estimate_repo_size_bytes("foo/bar", timeout=0.25)
-
-    assert seen["timeout"] == 0.25
-
-
-def test_estimate_repo_size_default_timeout_unchanged():
-    """The default timeout stays the 5s confirmation-gate deadline so the
-    existing gate callers are unaffected by the new parameter."""
-    seen: dict = {}
-
-    def _fake(repo_id, timeout):
-        seen["timeout"] = timeout
-        return SimpleNamespace(siblings=[])
-
-    with patch.object(gate, "_model_info_with_timeout", side_effect=_fake):
-        gate.estimate_repo_size_bytes("foo/bar")
-
-    assert seen["timeout"] == gate._HF_API_TIMEOUT_SECONDS

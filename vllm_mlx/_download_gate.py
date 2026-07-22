@@ -76,14 +76,6 @@ _WEIGHT_ONLY_SUFFIXES: tuple[str, ...] = (".safetensors",)
 # signal we should fall through silently rather than block startup.
 _HF_API_TIMEOUT_SECONDS: float = 5.0
 
-# Tighter cap for the purely-informational pre-serve stub notice
-# (:func:`weightless_stub_notice`). The notice must never materially delay
-# startup, so its size lookup gets a short deadline and falls back to a
-# size-free message immediately if the HF API is slow/unreachable — the
-# real download (``_ensure_model_downloaded``) does its own size lookup
-# anyway, so a missing figure here costs nothing.
-_STUB_NOTICE_SIZE_TIMEOUT_SECONDS: float = 1.5
-
 
 def _format_size(num_bytes: int) -> str:
     """Render ``num_bytes`` as a human-friendly string (e.g. ``42.3 GiB``).
@@ -162,22 +154,16 @@ def _model_info_with_timeout(repo_id: str, timeout: float):
     return result.get("info")
 
 
-def estimate_repo_size_bytes(
-    repo_id: str, timeout: float = _HF_API_TIMEOUT_SECONDS
-) -> int | None:
+def estimate_repo_size_bytes(repo_id: str) -> int | None:
     """Best-effort total size of weight + tokenizer files in ``repo_id``.
 
     Returns the sum of ``sibling.size`` (preferring LFS-reported size
     when available) across files whose extension marks them as weight
     or tokenizer payload. ``None`` on any failure (network down, gated
     repo, HF outage, timeout) — callers should fall through silently.
-
-    ``timeout`` bounds the synchronous HF metadata call; latency-sensitive
-    callers (the pre-serve stub notice) pass a tighter cap than the default
-    confirmation-gate deadline.
     """
     try:
-        info = _model_info_with_timeout(repo_id, timeout)
+        info = _model_info_with_timeout(repo_id, _HF_API_TIMEOUT_SECONDS)
     except Exception:
         return None
 
@@ -486,21 +472,18 @@ def weightless_stub_notice(repo_id: str) -> str | None:
     BEFORE the normal download path runs; it does NOT gate or change
     download behaviour (finding ⑥ asks only to surface the surprise, not
     block it).
+
+    Deliberately size-FREE: computing a byte figure here would fire a
+    SECOND synchronous HF metadata request on the startup path, redundant
+    with the download path's own size lookup (``_ensure_model_downloaded``)
+    and adding latency before boot. The download reports its own progress,
+    so the notice just names the surprise without a round-trip.
     """
     if not is_weightless_stub(repo_id):
         return None
-    # Tight deadline: the notice is informational, so never let a slow HF
-    # metadata call delay startup — fall back to the size-free message.
-    size_bytes = estimate_repo_size_bytes(
-        repo_id, timeout=_STUB_NOTICE_SIZE_TIMEOUT_SECONDS
-    )
-    if size_bytes:
-        tail = f"downloading ~{_format_size(size_bytes)} of weights first."
-    else:
-        tail = "downloading the missing weights first."
     return (
         f"  Note: {repo_id} has its config cached but its model weights are "
-        f"missing — serving will start by {tail}"
+        f"missing — serving will start by downloading the missing weights first."
     )
 
 

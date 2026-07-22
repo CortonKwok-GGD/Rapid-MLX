@@ -2314,8 +2314,18 @@ def serve_command(args):
     # diagnostic must never break serve.
     try:
         from vllm_mlx._download_gate import weightless_stub_notice
+        from vllm_mlx.model_aliases import resolve_model as _resolve_model
 
-        _stub_notice = weightless_stub_notice(args.model)
+        # Canonicalize alias → ``org/repo`` BEFORE probing the cache. A
+        # shorthand alias (``gemma-4-12b``) has its config-only stub on disk
+        # under the RESOLVED HF id, so probing the raw alias string would
+        # miss the cache dir and the notice would silently no-op for the
+        # common naive-user invocation. ``resolve_model`` is idempotent for
+        # already-resolved ids / local paths, and mirrors the resolution the
+        # download path (``_ensure_model_downloaded`` on ``args.model``)
+        # relies on.
+        _probe_model = _resolve_model(args.model)
+        _stub_notice = weightless_stub_notice(_probe_model)
         if _stub_notice:
             # stderr + flush: in the exact non-TTY / RAPID_MLX_AUTO_PULL=1
             # case this notice targets, block-buffered stdout may never
