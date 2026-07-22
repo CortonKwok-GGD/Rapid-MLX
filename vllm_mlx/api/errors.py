@@ -44,7 +44,7 @@ def guided_schema_compile_error_detail(
     exc: BaseException,
     param: str | None = None,
 ) -> dict[str, Any]:
-    """Build the canonical OpenAI-shaped 400 envelope for a compile error.
+    """Build the canonical OpenAI-shaped 400 envelope for an invalid schema.
 
     Shared by every route-boundary validator so the 400 body is byte-identical
     across ``/v1/chat/completions`` and ``/v1/responses``. ``param`` locates the
@@ -52,12 +52,16 @@ def guided_schema_compile_error_detail(
     chat/completions API (the default), ``text.format.schema`` on the responses
     API. The message embeds only the schema-level diagnostic carried by ``exc``
     (the caller's own malformed schema, confirmed by an independent validator) —
-    never a server-internal exception.
+    never a server-internal exception. The boundary validator only runs
+    ``check_schema_validity`` (a meta-schema check); it never invokes the
+    llguidance compiler, so the wording says the schema is INVALID rather than
+    that it "failed to compile" (which is reserved for an actual llguidance
+    rejection and no longer flows through this envelope).
     """
     resolved = param if param is not None else CHAT_RESPONSE_FORMAT_PARAM
     return {
         "error": {
-            "message": f"{resolved} failed to compile: {exc}",
+            "message": f"{resolved} is not a valid JSON schema: {exc}",
             "type": "invalid_request_error",
             "code": "invalid_response_format_schema",
             "param": resolved,

@@ -185,7 +185,7 @@ def _assert_invalid_schema_400(resp) -> None:
     assert err["type"] == "invalid_request_error"
     assert err["code"] == "invalid_response_format_schema"
     assert err["param"] == "response_format.json_schema.schema"
-    assert "failed to compile" in err["message"]
+    assert "is not a valid JSON schema" in err["message"]
     assert "notatype" in err["message"]
 
 
@@ -235,7 +235,7 @@ def test_guided_compile_error_detail_envelope_and_param_override():
     assert default["type"] == "invalid_request_error"
     assert default["code"] == "invalid_response_format_schema"
     assert default["param"] == "response_format.json_schema.schema"
-    assert "failed to compile" in default["message"]
+    assert "is not a valid JSON schema" in default["message"]
     assert "notatype" in default["message"]
 
     overridden = guided_schema_compile_error_detail(exc, param="text.format.schema")[
@@ -799,7 +799,7 @@ def test_responses_nonstrict_invalid_schema_returns_400(_rate_limiter_state):
     assert err["type"] == "invalid_request_error"
     assert err["code"] == "invalid_response_format_schema"
     assert err["param"] == "text.format.schema"
-    assert "failed to compile" in err["message"]
+    assert "is not a valid JSON schema" in err["message"]
     assert engine.guided_calls == []
     assert engine.chat_calls == [], "invalid schema must NOT fall back to chat()"
 
