@@ -916,7 +916,15 @@ def _xml_property_representable(
     # consistency, and delimiter-safe wire values, so the enum axis is
     # complete-by-construction too.
     enum = resolved.get("enum")
-    if isinstance(enum, list) and enum:
+    if isinstance(enum, list):
+        if not enum:
+            # An EMPTY enum is UNSATISFIABLE under JSON Schema (no value validates).
+            # Falling through to the type-based path would compile an unrestricted
+            # value and ADMIT schema-invalid output (codex r6 #3). Opt out instead —
+            # faithful-or-opt-out. SHARED guard, so this also closes the latent same
+            # gap on the E3 XML wire; opting out only ever WIDENS the free-form
+            # fallback, so it cannot break a previously-valid grammar.
+            return False
         return _xml_enum_representable(resolved, enum, policy)
     prop_type = resolved.get("type")
     if not isinstance(prop_type, str):

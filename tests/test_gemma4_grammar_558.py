@@ -605,17 +605,61 @@ def _tokenizer_in_cache() -> bool:
     return isinstance(path, str)
 
 
+def _hf_offline_mode() -> bool:
+    """True iff HuggingFace is configured for OFFLINE mode (env or hub constant).
+    Used to skip the uncached tokenizer fetch on an INTENTIONAL offline run
+    regardless of how transformers surfaces the miss (bare OSError included)."""
+    import os
+
+    if os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE"):
+        return True
+    try:
+        from huggingface_hub import constants
+
+        return bool(getattr(constants, "HF_HUB_OFFLINE", False))
+    except Exception:  # pragma: no cover - very old hub
+        return False
+
+
+def _is_connectivity_error(exc: BaseException) -> bool:
+    """True iff exc is a recognized NETWORK/offline connectivity type. A 404 /
+    bad-revision / corrupt error is deliberately NOT here — those must FAIL, not
+    skip (codex r6 #4). Only the transient/offline connectivity path skips."""
+    types: list[type[BaseException]] = []
+    try:
+        from huggingface_hub.errors import (
+            LocalEntryNotFoundError,
+            OfflineModeIsEnabled,
+        )
+
+        types += [LocalEntryNotFoundError, OfflineModeIsEnabled]
+    except Exception:  # pragma: no cover - old hub
+        pass
+    try:
+        from requests.exceptions import ConnectionError as _ReqConnErr
+        from requests.exceptions import Timeout as _ReqTimeout
+
+        types += [_ReqConnErr, _ReqTimeout]
+    except Exception:  # pragma: no cover - requests absent
+        pass
+    return bool(types) and isinstance(exc, tuple(types))
+
+
 @pytest.fixture(scope="module")
 def tok():
+    """Load the pinned gemma4 tokenizer for the enforcement tests.
+
+    PRIMARY gate: cache presence. A CACHED tokenizer must LOAD — if it fails, that
+    is corruption and the test FAILS (any exception propagates on the cached path
+    below). A NOT-cached tokenizer is skip-eligible ONLY when the miss is truly a
+    connectivity/offline one; the offline-vs-real-failure decision is broken by an
+    OFFLINE-INTENT tie-break (``_hf_offline_mode`` OR ``_is_connectivity_error``),
+    NOT a catch-all skip and NOT a message sniff. This resolves the r5<->r6
+    oscillation: skip-on-any-exception (r5) hid a bad revision / 404 / corrupt-
+    partial-cache as a false-GREEN (codex r6 #4), while the pre-r5 type-only skip
+    surfaced a genuine offline miss (bare wrapping ``OSError``) as a false-RED
+    (codex r5 F3). The r3 message-substring heuristic (codex r4 F3) is gone."""
     transformers = pytest.importorskip("transformers")
-    # PRIMARY gate: cache presence. A CACHED tokenizer must LOAD — if it fails, that
-    # is corruption and the test FAILS (any exception propagates on the cached path
-    # below). Only a NOT-cached tokenizer is skip-eligible (genuinely unavailable),
-    # and there ANY load failure means it could not be obtained, so it skips
-    # UNCONDITIONALLY. This replaces the r3 message-substring heuristic, which could
-    # not distinguish a corrupt cached artifact from an offline miss (codex r4 F3),
-    # and drops the r4 type-only skip that made the suite network-dependent when a
-    # real offline miss surfaced as a bare wrapping ``OSError`` (codex r5 F3).
     if _tokenizer_in_cache():
         return transformers.AutoTokenizer.from_pretrained(
             _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
@@ -625,22 +669,23 @@ def tok():
             _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
         )
     except Exception as exc:  # pragma: no cover - offline & uncached
-        # NOT cached (the cache-presence gate above returned False), so there is no
-        # local artifact that could be corrupt: ANY load failure here means the
-        # tokenizer is genuinely unavailable (offline miss / attempted fetch that
-        # could not complete) -> skip UNCONDITIONALLY. This stays SOUND w.r.t. the
-        # r4 false-GREEN fix because a CACHED-but-unloadable tokenizer never reaches
-        # this branch — it loads on the cached path above, where any exception
-        # PROPAGATES and the test FAILS. codex r5: a real offline miss can surface
-        # as a bare wrapping ``OSError`` (not only LocalEntryNotFoundError), so a
-        # type-only skip made the suite network-dependent (false-RED); cache-
-        # presence has ALREADY made the offline-vs-corrupt decision, so no exception
-        # typing is needed here.
-        pytest.skip(
-            f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not cached "
-            f"and could not be fetched ({type(exc).__name__}) — gemma4 "
-            "enforcement tests require it"
-        )
+        # NOT cached (cache-presence gate returned False). Decide offline-vs-real-
+        # failure by OFFLINE INTENT + connectivity TYPE — NOT a catch-all skip
+        # (codex r6 #4: that hid a bad revision / 404 / corrupt-partial-cache as a
+        # false-GREEN) and NOT a message sniff (codex r4 F3). Resolves the r5<->r6
+        # oscillation: skip-on-any (r5) was too broad, type-only (pre-r5) was too
+        # narrow (a genuine offline miss can surface as a bare OSError -> false-RED).
+        # If HF is in offline MODE we skip regardless of how the miss surfaced; if
+        # ONLINE, a load failure is a REAL failure (bad repo/revision/corrupt) and
+        # PROPAGATES so the suite FAILS, except a recognized transient connectivity
+        # error which skips.
+        if _hf_offline_mode() or _is_connectivity_error(exc):
+            pytest.skip(
+                f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not cached "
+                f"and unavailable offline ({type(exc).__name__}) — gemma4 "
+                "enforcement tests require it"
+            )
+        raise
 
 
 @pytest.fixture(scope="module")
@@ -1002,6 +1047,90 @@ def test_gemma4_object_value_via_json_enforced_and_roundtrips(tok, lltok):
     )
     name, args = _parse(wire, GEMMA4_OBJ_TOOL)
     assert name == "place" and args["origin"] == {"x": 3, "y": 4}
+
+
+# A tool with an OBJECT-typed property (rides ``%json``) alongside a plain STRING
+# property (the ``<|"|>`` wire) — used to refute codex r6 #1 (a brace inside a
+# ``%json`` object value's JSON string does NOT terminate the outer call).
+GEMMA4_NESTED_BRACE_TOOL = [
+    {
+        "name": "f",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "meta": {"type": "object"},
+                "name": {"type": "string"},
+            },
+            "required": ["meta", "name"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+# A well-formed decoded wire whose OBJECT (``%json``) value carries a JSON string
+# containing a ``}`` AND a ``,`` — the exact shape codex r6 #1 claimed would close
+# the outer call early. Keys are in DICTSORT order (``meta`` < ``name``).
+_GEMMA4_NESTED_BRACE_WIRE = (
+    '<|tool_call>call:f{meta:{"s":"}","k":"a,b"},name:<|"|>x<|"|>}<tool_call|>'
+)
+
+
+def test_gemma4_nested_json_braces_in_object_value_round_trip():
+    # REFUTES codex r6 #1. ``_scan_gemma4_tool_calls`` tracks ``in_json_string``
+    # WITH escape handling, so a ``}`` / ``,`` / ``"`` inside a ``%json`` object
+    # value's JSON string is IGNORED for brace depth and does NOT close the outer
+    # call. (codex described ``_recover_incomplete_gemma4_calls``, the best-effort
+    # fallback that runs ONLY on the non-streaming finalize path when the balanced
+    # scanner found ZERO complete calls — never for this well-formed wire.)
+    from vllm_mlx.tool_parsers.gemma4_tool_parser import (
+        GEMMA4_TOOL_TRAILER,
+        _scan_gemma4_tool_calls,
+    )
+
+    wire = _GEMMA4_NESTED_BRACE_WIRE
+    matches, opener_count = _scan_gemma4_tool_calls(wire)
+    # Exactly ONE complete call — the inner ``}`` / ``,`` neither spawned a phantom
+    # opener nor split the body into two.
+    assert opener_count == 1
+    assert len(matches) == 1
+    match = matches[0]
+    assert match.name == "f"
+    # The call boundary is the CORRECT OUTER ``}`` (the byte immediately before the
+    # ``<tool_call|>`` trailer), consuming the whole wire — NOT the ``}`` buried in
+    # the ``meta`` JSON string value.
+    assert match.start == 0
+    assert match.end == len(wire)
+    assert wire[match.end - len(GEMMA4_TOOL_TRAILER) - 1] == "}"
+    assert match.arguments == 'meta:{"s":"}","k":"a,b"},name:<|"|>x<|"|>'
+
+    # Both args parse back with the nested object intact — the JSON-string brace
+    # and comma survive as VALUE content, not as structural delimiters.
+    name, args = _parse(wire, GEMMA4_NESTED_BRACE_TOOL)
+    assert name == "f"
+    assert args["name"] == "x"
+    assert args["meta"] == {"s": "}", "k": "a,b"}
+    assert args["meta"]["s"] == "}"
+    assert args["meta"]["k"] == "a,b"
+
+
+@_requires_llguidance
+def test_gemma4_nested_json_braces_object_prop_grammar_accepts(tok, lltok):
+    # Cross-check on the REAL tokenizer: the object-prop (``%json``) grammar ACCEPTS
+    # the same nested-brace wire end to end and reaches a terminal state, so the
+    # brace inside the JSON-string value is a legal ``%json`` byte that never
+    # mis-closes the constrained call (the grammar-side companion to the parser
+    # round-trip above; both refute codex r6 #1).
+    grammar = _gemma4_grammar(GEMMA4_NESTED_BRACE_TOOL, "required", tok)
+    assert grammar is not None
+    accepted, total, accepting = _consume(
+        grammar, lltok, tok, _GEMMA4_NESTED_BRACE_WIRE
+    )
+    assert accepted == total and accepting, (
+        f"nested-brace object value rejected ({accepted}/{total}, "
+        f"accepting={accepting})"
+    )
+    name, args = _parse(_GEMMA4_NESTED_BRACE_WIRE, GEMMA4_NESTED_BRACE_TOOL)
+    assert name == "f" and args["meta"] == {"s": "}", "k": "a,b"}
 
 
 # ==========================================================================
