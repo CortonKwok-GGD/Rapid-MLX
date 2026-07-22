@@ -428,21 +428,45 @@ _XML_STRING_TERMINAL_DECL = (
 )
 
 
-# The gemma4 string-value construct (#558 E4). Unlike the Qwen3-Coder XML wire
-# (E3), whose ``</parameter>`` delimiter is ordinary BYTE TEXT and needs
-# llguidance's ``[lazy]`` lexeme to stop a greedy value at the first close, gemma4
-# wraps a string value in the ``<|"|>`` marker which is a SINGLE SPECIAL TOKEN
-# (id 52 on the target tokenizer). A greedy byte regex CANNOT consume a special
-# token, so maximal-munch stops at the ``<|"|>`` boundary on its own — the value
-# is simply ``<|"|> GEMMA_STR_TEXT <|"|>`` with BOTH ``<|"|>`` as RULE-LEVEL
-# special-token refs. This is a real feasibility result, not a stylistic choice:
-# llguidance REJECTS a special token inside a lexer terminal, so the ``[lazy]``
-# form (``rule[lazy]: TEXT <|"|>``) fails to COMPILE (special tokens cannot be used
-# in terminals), and a byte-literal ``"<|\"|>"`` delimiter COMPILES but can never
-# be satisfied at runtime by the atomic special token (verified on the real
-# tokenizer: the greedy rule-level form accepts a value containing
-# ``<``/``{``/``}``/``,``/quotes/newlines and terminates correctly at the closing
-# ``<|"|>``; both other forms fail).
+# The gemma4 string-value construct (#558 E4). A string value is wrapped in the
+# ``<|"|>`` marker, a SINGLE SPECIAL TOKEN (id 52 on the target tokenizer). The
+# value is a RULE ``<|"|> GEMMA_STR_TEXT <|"|>`` with BOTH ``<|"|>`` as RULE-LEVEL
+# special-token refs — the atomic close token 52 the model actually emits. The
+# close MUST stay a rule-level special-token ref (not a ``[lazy]``/byte construct):
+# llguidance REJECTS a special token inside a lexer terminal, so a lazy form
+# (``rule[lazy]: TEXT <|"|>``) cannot use the special token as its terminator, and a
+# byte-literal ``"<|\"|>"`` close COMPILES but is runtime-DEAD (the atomic token 52
+# never satisfies a byte literal). Both verified on the real tokenizer — the lazy /
+# byte-literal-close forms accept ZERO valid calls.
+#
+# THE CONTENT MUST EXCLUDE THE BYTE SPELLING OF ``<|"|>`` (#558 E4, codex r4 — a
+# REAL under-constraint fix). A bare ``GEMMA_STR_TEXT: /(.|\n)*/`` admits ANY byte
+# sequence, so the model can spell the 5 bytes ``<|"|>`` with ORDINARY tokens (ids
+# 236820/236909/236775/236909/236813 — none is the atomic token 52) INSIDE a value.
+# The gemma4 parser text-SCANS the DECODED output for the byte substring ``<|"|>``:
+# ``_scan_gemma4_tool_calls`` (``tool_parsers/gemma4_tool_parser.py`` line ~97)
+# toggles ``in_gemma_string`` on EVERY ``<|"|>`` occurrence, NOT on token ids — so
+# an ordinary-byte-spelled ``<|"|>`` mid-value is INDISTINGUISHABLE from the atomic
+# close and terminates the string EARLY, desyncing the ``key:value`` framing. We
+# therefore EXCLUDE the byte sequence ``<|"|>`` from the content via llguidance's
+# documented regex And/Not algebra (``docs/syntax.md``):
+# ``GEMMA_STR_TEXT: /(.|\n)*/ & ~/(?s:.*)<\|"\|>(?s:.*)/`` — "any UTF-8 bytes AND
+# NOT (contains ``<|"|>``)". ``~`` (complement) / ``&`` (intersection) are the
+# engine's real operators (no lookahead — which llguidance / Rust ``regex`` lack);
+# intersecting with ``/(.|\n)*/`` keeps the negation UTF-8-safe (``~`` alone may
+# match invalid UTF-8 — this is the syntax doc's own
+# ``/(?s:.*)/ & ~/(?s:.*)AAA(?s:.*)/`` recipe). VERIFIED on the real tokenizer: the
+# terminal accepts values containing ``<``/``>``/``|``/``{``/``}``/``,``/quotes/
+# newlines and even a 4-byte marker PREFIX (``<|"|``) adjacent to the close, yet
+# REJECTS at the exact ``>`` token that would complete an ordinary-byte ``<|"|>``
+# mid-value — keeping the constrained wire and the parser boundary in EXACT
+# agreement (the grammar forbids precisely the byte substring the parser reads as a
+# close). Only ``<|"|>`` needs excluding: while ``in_gemma_string`` the parser skips
+# ALL other bytes (frame tokens ``<|tool_call>``/``<tool_call|>``/``<|channel>``/
+# ``<channel|>``, braces, commas) until the next ``<|"|>``, so a byte-spelling of
+# those inside a value is harmless. Enum values get the same guarantee structurally
+# (``_gemma4_enum_wire_unsafe`` / ``_enum_wire_embeds_special_token`` opt out any
+# value whose wire embeds a structural marker).
 _GEMMA4_STRING_VALUE_TERMINAL = "GEMMA_STR_TEXT"
 _GEMMA4_STRING_VALUE_RULE = "gemma_str_value"
 # The gemma4 string-delimiter marker (``<|"|>``). Declared as a single special
@@ -450,29 +474,20 @@ _GEMMA4_STRING_VALUE_RULE = "gemma_str_value"
 # it passes ``_is_lark_special_token_ref`` (leading ``<``, trailing ``>``, no
 # interior ``<``/``>`` or whitespace — the inner ``|"|`` is fine).
 _GEMMA4_STRING_MARKER = '<|"|>'
-# ``GEMMA_STR_TEXT`` is a fresh terminal (same ``/(.|\n)*/`` pattern as
-# ``XML_PARAM_TEXT``/``TAG_TEXT`` but a DISTINCT name so a mixed tool-set never
-# cross-binds them). The lowercase ``gemma_str_value`` is a RULE (not a terminal),
-# because the special-token markers must live at rule level.
-#
-# DELIBERATE SAFE OVER-CONSTRAINT (#558 E4, codex r2). ``GEMMA_STR_TEXT`` is a
-# BYTE regex, so a free-form string value admits any byte sequence but CANNOT
-# contain a SPECIAL TOKEN — not the ``<|"|>`` delimiter itself, nor the
-# ``<|tool_call>``/``<tool_call|>``/``<|channel>``/``<channel|>`` frame tokens
-# (llguidance emits those atomically, never as their spelled-out bytes). We do NOT
-# widen this terminal to admit the special tokens, and that is INTENTIONAL, not an
-# oversight: the parser's value scanner treats the FIRST ``<|"|>`` after the opener
-# as the string's CLOSE — ``_scan_gemma4_tool_calls`` (``tool_parsers/
-# gemma4_tool_parser.py`` line ~97) toggles ``in_gemma_string`` on every ``<|"|>``
-# — so a ``<|"|>`` injected MID-VALUE would terminate the string EARLY and desync
-# the ``key:value`` framing. Admitting special tokens here would be an UNSAFE
-# UNDER-constraint (structural-marker injection -> parser boundary corruption).
-# Byte-only content is a strictly SAFE over-constraint: the rare value that truly
-# needs a structural special token simply opts the request out (enum values via
-# ``_gemma4_enum_wire_unsafe``; a non-enum free-form string cannot embed one at
-# all), keeping the constrained wire and the parser boundary in exact agreement.
+# The SAME ``<|"|>`` marker as a REGEX-ESCAPED byte literal (the two ``|`` escaped
+# for the regex engine; ``<``/``"``/``>`` are literal), used ONLY in the negated
+# substring that keeps the byte spelling out of string content. Co-located with the
+# special-token-ref spelling so the marker has one obvious source of truth.
+_GEMMA4_STRING_MARKER_RE = r'<\|"\|>'
+# ``GEMMA_STR_TEXT`` is a fresh terminal (a DISTINCT name from
+# ``XML_PARAM_TEXT``/``TAG_TEXT`` so a mixed tool-set never cross-binds them). Its
+# base is the same ``/(.|\n)*/`` any-byte pattern, intersected (``&``) with the
+# complement (``~``) of "contains ``<|"|>``" so the content can never spell the
+# string delimiter (see the block above). The lowercase ``gemma_str_value`` is a
+# RULE (not a terminal) because the special-token markers must live at rule level.
 _GEMMA4_STRING_RULE_DECL = (
-    f"{_GEMMA4_STRING_VALUE_TERMINAL}: /(.|\\n)*/\n"
+    f"{_GEMMA4_STRING_VALUE_TERMINAL}: /(.|\\n)*/ & "
+    f"~/(?s:.*){_GEMMA4_STRING_MARKER_RE}(?s:.*)/\n"
     f"{_GEMMA4_STRING_VALUE_RULE}: {_GEMMA4_STRING_MARKER} "
     f"{_GEMMA4_STRING_VALUE_TERMINAL} {_GEMMA4_STRING_MARKER}\n"
 )
@@ -1182,8 +1197,9 @@ def _emit_gemma4_param_value(subschema: Any, defs: dict[str, Any]) -> str:
         (``json.dumps`` -> ``5`` / ``true``). Per-value wrapping (not an
         all-or-nothing split) faithfully renders a mixed-type enum too.
       * STRING (non-enum) -> the ``gemma_str_value`` rule
-        (``<|"|> GEMMA_STR_TEXT <|"|>`` — greedy content up to the closing
-        special-token marker; see ``_GEMMA4_STRING_RULE_DECL``).
+        (``<|"|> GEMMA_STR_TEXT <|"|>`` — any-byte content EXCEPT the byte spelling
+        of the ``<|"|>`` marker, closed by the atomic special-token marker; see
+        ``_GEMMA4_STRING_RULE_DECL``).
       * EVERYTHING ELSE (integer / number / boolean / object / array) -> ``%json``
         over the sub-schema. ``format_argument`` emits a BARE JSON scalar for
         numbers/bools (``3`` / ``true``) and a JSON container for object/array,

@@ -20,10 +20,15 @@ or a whole-object ``%json``. These tests prove that path WITHOUT a decode loop:
   * THE E4 FEASIBILITY RESULT: a string value is bounded by ``<|"|>`` — a SINGLE
     SPECIAL TOKEN, not a byte string like E3's ``</parameter>``. llguidance rejects
     a special token inside a ``[lazy]`` terminal, and a byte-literal ``<|"|>``
-    cannot match the atomic token at runtime; the working construct is a GREEDY
-    ``gemma_str_value: <|"|> GEMMA_STR_TEXT <|"|>`` (maximal-munch stops at the
-    special-token boundary on its own). A value containing ``<``/``{``/``}``/``,``/
-    quotes/newlines round-trips and terminates correctly;
+    cannot match the atomic token at runtime; the working construct is
+    ``gemma_str_value: <|"|> GEMMA_STR_TEXT <|"|>`` with the close as a rule-level
+    special-token ref. The content terminal EXCLUDES the byte spelling of ``<|"|>``
+    (``GEMMA_STR_TEXT: /(.|\\n)*/ & ~/(?s:.*)<\\|"\\|>(?s:.*)/`` — llguidance's
+    native regex And/Not) so the model cannot spell the marker with ordinary tokens
+    mid-value, which the parser's decoded-text scan would misread as an early close
+    (#558 E4, codex r4). A value containing ``<``/``{``/``}``/``,``/quotes/newlines
+    round-trips and terminates correctly (only the FULL ``<|"|>`` byte sequence is
+    excluded);
   * grammar ENFORCEMENT via llguidance ``LLMatcher`` on the REAL gemma4 tokenizer:
     valid calls accepted + terminal, forced prose masked at token 0, bad enum /
     off-schema scalar rejected, and the comma construction admits exactly the valid
@@ -158,10 +163,15 @@ _GEMMA4_GOLDEN_LARK = (
     "tag_end: TAG_TEXT\n"
     "SEP: /[ \\t\\r\\n]*/\n"
     "TAG_TEXT: /(.|\\n)*/\n"
-    # The gemma4 string-value construct: GEMMA_STR_TEXT admits ANY byte; the RULE
-    # (lowercase) wraps it in the <|"|> special-token markers (greedy — the special
-    # token itself terminates it, so no [lazy] is needed / possible).
-    "GEMMA_STR_TEXT: /(.|\\n)*/\n"
+    # The gemma4 string-value construct: GEMMA_STR_TEXT admits any UTF-8 byte
+    # sequence EXCEPT the byte spelling of the <|"|> marker — the base /(.|\n)*/
+    # intersected (&) with the complement (~) of "contains <|"|>", using llguidance's
+    # native regex And/Not algebra (docs/syntax.md). The RULE (lowercase) wraps the
+    # content in the <|"|> special-token markers; the atomic close is a rule-level
+    # special-token ref (the model's token 52). The exclusion stops the model from
+    # spelling <|"|> with ORDINARY bytes mid-value, which the parser's decoded-text
+    # scan would misread as an early string close (#558 E4, codex r4).
+    'GEMMA_STR_TEXT: /(.|\\n)*/ & ~/(?s:.*)<\\|"\\|>(?s:.*)/\n'
     'gemma_str_value: <|"|> GEMMA_STR_TEXT <|"|>\n'
     "\n"
     # The DICTSORT-ordered comma body, emitted as an O(n)-size RECURSIVE grammar:
@@ -211,14 +221,20 @@ def test_gemma4_lark_frame_and_sentinels():
 
 def test_gemma4_string_value_uses_greedy_rule_not_lazy():
     # THE E4 feasibility result, at the grammar-string level: a string value is the
-    # GREEDY ``gemma_str_value`` RULE wrapping the ``<|"|>`` marker — NOT a
-    # ``[lazy]`` construct (special tokens cannot live in a lazy terminal) and NOT a
-    # byte literal for ``<|"|>`` (the atomic special token can never satisfy it).
+    # ``gemma_str_value`` RULE wrapping the ``<|"|>`` marker — NOT a ``[lazy]``
+    # construct (special tokens cannot live in a lazy terminal) and NOT a byte
+    # literal for ``<|"|>`` (the atomic special token can never satisfy it). The
+    # close is the rule-level special-token ref (token 52). The content terminal
+    # EXCLUDES the byte spelling of ``<|"|>`` via llguidance's native regex And/Not
+    # (``& ~/(?s:.*)<\|"\|>(?s:.*)/``) so the model cannot spell the marker with
+    # ordinary bytes mid-value (codex r4 — the REAL under-constraint fix).
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     lark = build_tool_lark(GEMMA4_TOOLS, "required", [_gemma4_structure_info("run")])
     assert 'gemma_str_value: <|"|> GEMMA_STR_TEXT <|"|>' in lark
-    assert "GEMMA_STR_TEXT: /(.|\\n)*/" in lark
+    # The content terminal is the any-byte base INTERSECTED with the complement of
+    # "contains <|"|>" — the exact llguidance-documented UTF-8-safe exclusion.
+    assert 'GEMMA_STR_TEXT: /(.|\\n)*/ & ~/(?s:.*)<\\|"\\|>(?s:.*)/' in lark
     assert '"code:" gemma_str_value' in lark
     # No lazy construct and no byte-literal marker.
     assert "[lazy]" not in lark
@@ -557,36 +573,46 @@ def test_gemma4_supports_grammar_and_auto_unsafe():
 # --------------------------------------------------------------------------
 # Grammar ENFORCEMENT + ROUND-TRIP on the REAL gemma4 tokenizer.
 # --------------------------------------------------------------------------
-# Message substrings (case-insensitive) that mark a BARE ``OSError`` from
-# ``from_pretrained`` as genuine OFFLINE / cache-unavailability. Transformers wraps
-# an uncached-and-no-network load as a plain ``OSError`` whose message is one of
-# these ("Can't load the configuration of ...", "We couldn't connect to ...",
-# "... offline ..."). A CORRUPT artifact or INVALID REVISION is ALSO an ``OSError``
-# (e.g. a wrapped 404 "<rev> is not a valid git identifier ...") but its message is
-# NOT in this list, so it FAILS instead of skipping — corruption/bad-revision must
-# never be false-green (codex r3 E4).
-_OFFLINE_MSG_SUBSTRINGS = (
-    "offline",
-    "can't load",
-    "couldn't connect",
-    "we couldn't connect",
-    "not a local folder",
-    "connection error",
-    "max retries",
-    "failed to connect",
-    "unable to load",
-)
+# CACHE-PRESENCE gate (codex r4 F3). The offline-vs-corrupt decision is made by
+# whether the pinned tokenizer artifact is present in the LOCAL HF cache — NOT by
+# sniffing ``from_pretrained``'s error message. The r3 heuristic matched substrings
+# like ``"can't load"``, but HF emits "Can't load tokenizer for '...'" for BOTH a
+# genuine offline miss AND a corrupt/missing cached file, so a CORRUPT artifact
+# could be misclassified offline and SKIPPED (false-green — defeating the fix's own
+# goal). With cache-presence there is no ambiguity by construction: NOT cached ->
+# skip (truly unavailable); cached but unloadable -> corruption -> the test FAILS.
+
+
+def _tokenizer_in_cache() -> bool:
+    """True iff the pinned tokenizer artifact is in the LOCAL HF cache.
+
+    ``try_to_load_from_cache`` returns the real on-disk path of a cached file, a
+    ``_CACHED_NO_EXIST`` sentinel for a known-absent file, or ``None`` when the
+    repo/revision was never fetched. Only a genuine ``str`` path counts as cached.
+    Degrades to ``False`` (treat as not cached -> skip-eligible) if the hub helper
+    is unavailable or raises — never masks a real load failure, since the ``tok``
+    fixture only skips on an offline EXCEPTION TYPE in the not-cached branch."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except Exception:  # pragma: no cover - very old hub
+        return False
+    try:
+        path = try_to_load_from_cache(
+            _TOKENIZER_MODEL, "tokenizer_config.json", revision=_TOKENIZER_REVISION
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return isinstance(path, str)
 
 
 def _offline_skip_exc_types():
-    # HF-SPECIFIC offline/connectivity types that ALWAYS mean "skip" regardless of
-    # message text (network / cache unavailability). ``OSError`` is DELIBERATELY NOT
-    # here: a bare ``OSError`` is offline ONLY when its message matches
-    # ``_OFFLINE_MSG_SUBSTRINGS`` (see ``_is_offline_unavailable``). Catching EVERY
-    # ``OSError`` as offline (the old behavior) would SKIP a corrupt artifact /
-    # invalid revision too — a false-green codex r3 flagged. The needle: keep the
-    # genuine-offline OSError skipping (message-gated) WITHOUT masking corruption,
-    # and never regress the prior fix that a plain offline ``OSError`` must skip.
+    # HF-SPECIFIC offline/connectivity exception TYPES (network / cache
+    # unavailability). Used ONLY as a belt-and-suspenders skip in the NOT-cached
+    # branch of the ``tok`` fixture (the load-attempted-while-uncached race). The
+    # PRIMARY offline-vs-corrupt decision is the cache-presence gate
+    # (``_tokenizer_in_cache``); a CACHED-but-unloadable tokenizer always FAILS, so
+    # ``OSError`` is DELIBERATELY not in this type list (catching every ``OSError``
+    # would skip corruption — the false-green codex flagged).
     types: list[type[BaseException]] = []
     try:
         from huggingface_hub.errors import (
@@ -607,34 +633,40 @@ def _offline_skip_exc_types():
 
 
 def _is_offline_unavailable(exc: BaseException) -> bool:
-    """True iff ``exc`` from ``AutoTokenizer.from_pretrained`` indicates genuine
-    OFFLINE / cache-unavailability (skip-worthy), NOT a corrupt artifact / invalid
-    revision (which must FAIL, not skip). Skip when: a specific HF
-    offline/connectivity TYPE (``LocalEntryNotFoundError`` / ``OfflineModeIsEnabled``
-    / ``requests.ConnectionError``), OR a bare ``OSError`` whose message matches the
-    offline allowlist. ANY OTHER ``OSError`` (corruption / bad revision / a wrapped
-    404) returns ``False`` -> the caller re-raises -> the test FAILS (codex r3
-    E4)."""
+    """True iff ``exc`` from ``AutoTokenizer.from_pretrained`` is a genuine HF
+    OFFLINE/connectivity exception TYPE (``LocalEntryNotFoundError`` /
+    ``OfflineModeIsEnabled`` / ``requests.ConnectionError``).
+
+    Type-only — the r3 message-substring heuristic is GONE (codex r4 F3): "Can't
+    load ..." is emitted for both offline AND corrupt artifacts, so a message match
+    could not tell them apart. The cache-presence gate now makes that call, and this
+    predicate is only the belt-and-suspenders skip for the NOT-cached branch (an
+    uncached repo that failed to fetch). Any other error — including a bare
+    ``OSError`` (corruption / bad revision / wrapped 404) — returns ``False`` so the
+    caller re-raises and the test FAILS."""
     offline_types = _offline_skip_exc_types()
-    if offline_types and isinstance(exc, offline_types):
-        return True
-    if isinstance(exc, OSError):
-        msg = str(exc).lower()
-        return any(sub in msg for sub in _OFFLINE_MSG_SUBSTRINGS)
-    return False
+    return bool(offline_types) and isinstance(exc, offline_types)
 
 
 @pytest.fixture(scope="module")
 def tok():
     transformers = pytest.importorskip("transformers")
+    # PRIMARY gate: cache presence. A CACHED tokenizer must LOAD — if it fails, that
+    # is corruption and the test FAILS (any exception propagates). Only a NOT-cached
+    # tokenizer is skip-eligible (genuinely unavailable), and even then only for an
+    # offline EXCEPTION TYPE (belt & suspenders for the attempted-fetch-while-
+    # uncached race); any other error on an uncached repo still surfaces. This
+    # replaces the r3 message-substring heuristic, which could not distinguish a
+    # corrupt cached artifact from an offline miss (codex r4 F3).
+    if _tokenizer_in_cache():
+        return transformers.AutoTokenizer.from_pretrained(
+            _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
+        )
     try:
         return transformers.AutoTokenizer.from_pretrained(
             _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
         )
     except Exception as exc:  # pragma: no cover - offline & uncached
-        # SKIP only a genuine offline/cache-miss; RE-RAISE (FAIL) a corrupt artifact
-        # / invalid revision — both are ``OSError`` but only the former is
-        # skip-worthy, so corruption is never silently false-green (codex r3 E4).
         if not _is_offline_unavailable(exc):
             raise
         pytest.skip(
@@ -770,6 +802,110 @@ def test_gemma4_string_value_with_special_chars_is_accepted(code, tok, lltok):
         f"special-char string value rejected ({accepted}/{total}) for {code!r}"
     )
     assert accepting, f"special-char value {code!r} is not a terminal state"
+
+
+def _decompose_marker(tok):
+    """Spell the 5 bytes of ``<|"|>`` with ORDINARY tokens (never the atomic id 52).
+
+    ``tok.encode('<|"|>')`` collapses the marker to the single special token 52
+    (the legitimate string close). To exercise the F1 gap we need the SAME 5 bytes
+    emitted as ORDINARY vocabulary tokens — what a model would produce if it "typed"
+    the delimiter inside a value — so we encode each character on its own and
+    concatenate."""
+    ids = []
+    for ch in '<|"|>':
+        ids += tok.encode(ch, add_special_tokens=False)
+    return ids
+
+
+def _consume_ids(grammar, lltok, ids):
+    """Like ``_consume`` but drives an EXPLICIT token-id list (so a manually
+    decomposed ``<|"|>`` is fed as ordinary tokens, not re-encoded to id 52)."""
+    from llguidance.mlx import LLMatcher
+
+    matcher = LLMatcher(lltok, grammar)
+    assert not matcher.get_error(), matcher.get_error()
+    accepted = 0
+    for tid in ids:
+        if not matcher.consume_tokens([tid]):
+            break
+        accepted += 1
+    return accepted, len(ids), matcher.is_accepting()
+
+
+@_requires_llguidance
+def test_gemma4_ordinary_byte_spelled_marker_rejected_in_string_value(tok, lltok):
+    # THE codex-r4 F1 GUARANTEE. ``<|"|>`` is DUAL-NATURE: the atomic string-close
+    # token (id 52) AND a 5-byte sequence. The gemma4 parser text-SCANS the DECODED
+    # output for the byte substring ``<|"|>`` (``gemma4_tool_parser.py:97`` toggles
+    # ``in_gemma_string`` on every occurrence, NOT on token ids), so an
+    # ORDINARY-byte-spelled ``<|"|>`` mid-value is indistinguishable from the atomic
+    # close and would terminate the string EARLY -> parser desync. The content
+    # terminal excludes that byte sequence (``& ~/(?s:.*)<\|"\|>(?s:.*)/``), so the
+    # grammar must REJECT it.
+    grammar = _gemma4_grammar(GEMMA4_TOOLS, "required", tok)
+    assert grammar is not None
+
+    decomposed = _decompose_marker(tok)
+    # The decomposition is genuinely ORDINARY tokens (never the atomic id 52) yet
+    # decodes back to the exact marker bytes — otherwise the test would be probing
+    # the legitimate atomic close instead of the byte spelling.
+    assert 52 not in decomposed, decomposed
+    assert tok.decode(decomposed) == '<|"|>'
+
+    atom = tok.encode('<|"|>', add_special_tokens=False)
+    assert atom == [52]
+
+    def enc(s):
+        return tok.encode(s, add_special_tokens=False)
+
+    # Wire: call:run{code:<|"|>a‹ordinary <|"|>›b<|"|>,lang:<|"|>python<|"|>}
+    # The INNER ``<|"|>`` (around index of ``a``…``b``) is the ordinary-byte spelling.
+    ids = (
+        enc("<|tool_call>call:run{code:")
+        + atom  # real open of the code value
+        + enc("a")
+        + decomposed
+        + enc("b")  # value "a<|"|>b" with an ORDINARY marker
+        + atom  # real close of the code value
+        + enc(",lang:")
+        + atom
+        + enc("python")
+        + atom
+        + enc("}")
+        + enc("<tool_call|>")
+    )
+    accepted, total, accepting = _consume_ids(grammar, lltok, ids)
+    assert accepted < total, (
+        'grammar ACCEPTED an ordinary-byte-spelled <|"|> inside a string value — '
+        "the F1 under-constraint is back (the parser would misread it as an early "
+        "string close and desync the key:value framing)"
+    )
+    assert not accepting, "injected byte-spelled marker reached a terminal state"
+
+    # Positive control on the SAME grammar: a value with raw ``<``/``>``/``|`` that
+    # never forms the FULL ``<|"|>`` marker still round-trips and terminates — the
+    # exclusion is scoped to the exact 5-byte sequence, not to ``<``/``>``/``|``.
+    ok_accepted, ok_total, ok_accepting = _consume(
+        grammar, lltok, tok, _wire("a < b | c > d <|x|>", lang="cpp")
+    )
+    assert ok_accepted == ok_total and ok_accepting, (
+        f"raw </>/| (non-full-marker) value wrongly rejected ({ok_accepted}/{ok_total})"
+    )
+
+    # CROSS-CHECK grammar<->parser agreement: had the grammar allowed the injected
+    # marker, the parser (scanning decoded text for <|"|>) would read the value only
+    # up to the FIRST inner <|"|> and read back a DIFFERENT value than intended —
+    # exactly the desync the grammar now structurally prevents.
+    desynced_decoded = (
+        '<|tool_call>call:run{code:<|"|>a<|"|>b<|"|>,lang:<|"|>python<|"|>}<tool_call|>'
+    )
+    name, args = _parse(desynced_decoded, GEMMA4_TOOLS)
+    assert name == "run"
+    assert args.get("code") != 'a<|"|>b', (
+        'parser cross-check invalid: an inner <|"|> did NOT desync the value — the '
+        "grammar exclusion would be unnecessary"
+    )
 
 
 @_requires_llguidance
