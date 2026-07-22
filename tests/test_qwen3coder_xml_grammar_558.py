@@ -462,12 +462,30 @@ def tok():
 def lltok(tok):
     """Build an llguidance LLTokenizer from the fast (Rust) tokenizer via the
     module's own resolver (the spike-proven candidate-3 direct build handles the
-    transformers ``from_tokenizer`` isinstance gotcha ``guided.py`` trips on)."""
-    from vllm_mlx.api.tool_grammar import build_lltokenizer
+    transformers ``from_tokenizer`` isinstance gotcha ``guided.py`` trips on).
 
+    FINDING 5: a blanket ``skip when build_lltokenizer() is None`` let the whole
+    enforcement/round-trip suite go GREEN even if the production
+    tokenizer->llguidance integration was BROKEN. We now sanction the skip ONLY
+    when the runtime bridge is genuinely UNAVAILABLE (``HAS_LL_TOKENIZER`` False —
+    ``llguidance.hf`` / ``LLTokenizer`` not importable, the same narrow
+    unavailability the ``tok`` fixture treats as an offline skip). When the bridge
+    IS importable AND ``tok`` loaded (cached) but ``build_lltokenizer`` returns
+    ``None``, that is a broken integration and MUST FAIL — never silently pass."""
+    from vllm_mlx.api.tool_grammar import HAS_LL_TOKENIZER, build_lltokenizer
+
+    if not HAS_LL_TOKENIZER:
+        pytest.skip(
+            "llguidance runtime bridge (llguidance.hf / LLTokenizer) not "
+            "installed — XML enforcement tests require it"
+        )
     built = build_lltokenizer(tok)
-    if built is None:
-        pytest.skip("could not build an LLTokenizer for the Qwen3-Coder tokenizer")
+    assert built is not None, (
+        "build_lltokenizer() returned None for the CACHED Qwen3-Coder tokenizer "
+        "with the llguidance runtime bridge available — the production "
+        "tokenizer->llguidance integration is BROKEN (finding 5: this must FAIL, "
+        "not skip)."
+    )
     return built
 
 
@@ -508,6 +526,24 @@ def _wire(code, *, language="python", timeout=None, verbose=None):
         s += f"<parameter=verbose>\n{verbose}\n</parameter>\n"
     s += "</function>\n</tool_call>"
     return s
+
+
+@_requires_llguidance
+def test_finding5_tokenizer_llguidance_integration_not_broken(tok):
+    # FINDING 5: with llguidance importable AND the tokenizer loaded (cached), the
+    # production ``build_lltokenizer`` MUST yield a real ``LLTokenizer`` — a
+    # ``None`` here means the tokenizer->llguidance integration is broken and the
+    # enforcement suite would silently pass on skips. Assert it directly so the
+    # breakage surfaces as a FAILURE (only ``tok``'s narrow offline/cache-miss
+    # path is a sanctioned skip; we are here only because ``tok`` loaded).
+    from vllm_mlx.api.tool_grammar import HAS_LL_TOKENIZER, build_lltokenizer
+
+    if not HAS_LL_TOKENIZER:
+        pytest.skip("llguidance runtime bridge (llguidance.hf / LLTokenizer) absent")
+    assert build_lltokenizer(tok) is not None, (
+        "build_lltokenizer() returned None despite an available runtime bridge "
+        "and a loaded tokenizer — broken integration (finding 5), not a skip."
+    )
 
 
 @_requires_llguidance
@@ -675,13 +711,19 @@ def test_roundtrip_nested_object_value():
 
 
 # ==========================================================================
-# FAITHFUL-OR-OPT-OUT (#558 E3, codex converge). The XML arg emitter is a
+# FAITHFUL-OR-OPT-OUT via a STRICT ALLOWLIST (#558 E3). The XML arg emitter is a
 # best-effort OPT-IN: when it cannot FAITHFULLY represent a schema the WHOLE
 # request opts out of grammar (``build_tool_grammar`` -> ``None``, free-form
 # fallback) rather than emit a grammar that silently allows schema-invalid or
-# mis-typed output. One test per BLOCKING finding (F1/F2/F4/F5 as opt-out, F3 as
-# a REAL fix). Pure-Python guard tests always run; the ``build_tool_grammar``
-# integration tests skip only on genuine tokenizer/llguidance unavailability.
+# mis-typed output. The guard is a CLOSED POSITIVE SET (``_xml_schema_representable``
+# returns ``True`` only when every part of the schema uses exclusively an
+# enumerated known-safe keyword/shape), so it is complete BY CONSTRUCTION — no
+# unknown JSON-Schema keyword can slip through. F1/F2/F4/F5 + the codex round-2
+# shapes (minProperties/propertyNames/required-undeclared/false-schema/$ref-with-
+# siblings/additionalProperties-schema/…) are all subsumed as "not in the
+# allowlist"; F3 stays a REAL fix. Pure-Python guard tests always run; the
+# ``build_tool_grammar`` integration tests skip only on genuine tokenizer/
+# llguidance unavailability.
 # ==========================================================================
 
 
@@ -770,6 +812,123 @@ def test_representable_unresolvable_ref_opts_out():
     # A property `$ref` that does not resolve locally is unrepresentable.
     assert rep({"properties": {"c": {"$ref": "#/$defs/missing"}, "$defs": {}}}) is False
     assert rep({"properties": {"c": {"$ref": "http://remote/x"}}}) is False
+
+
+# ---- STRICT ALLOWLIST (codex round-2): closed positive set ends whack-a-mole --
+# The guard is now an ALLOWLIST — representable ONLY when every part of the schema
+# uses exclusively a known-safe, enumerated keyword/shape. These prove the five
+# round-2 shapes a blacklist missed all opt out BY CONSTRUCTION (they are simply
+# not in the allowlist), plus a positive control that the common case is intact.
+def test_representable_allowlist_positive_control():
+    # The normal shape a blacklist would let through unchanged MUST still be fully
+    # constrained: typed scalars + string + enum + a nested OBJECT via `$ref` +
+    # required ⊆ properties + closed additionalProperties. Guards against the
+    # allowlist over-opting-out the common case.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string"},
+            "language": {"type": "string", "enum": ["python", "cpp"]},
+            "retries": {"type": "integer"},
+            "verbose": {"type": "boolean"},
+            "origin": {"$ref": "#/$defs/point"},
+        },
+        "required": ["code", "language"],
+        "additionalProperties": False,
+        "$defs": {
+            "point": {
+                "type": "object",
+                "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                "required": ["x", "y"],
+                "additionalProperties": False,
+            }
+        },
+    }
+    assert rep(schema) is True
+
+
+def test_representable_rejects_round2_minmax_properties():
+    # A blacklist keyed on `dependentRequired`/composition MISSED these object-size
+    # keywords; the allowlist opts out because they are not top-level-allowed keys.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    base = {"type": "object", "properties": {"a": {"type": "string"}}}
+    assert rep({**base, "minProperties": 1}) is False
+    assert rep({**base, "maxProperties": 2}) is False
+
+
+def test_representable_rejects_round2_required_undeclared_property():
+    # `required` names a property that is NOT declared -> it would never be emitted
+    # and thus silently unenforced -> opt out (finding 3). (Distinct from the F1
+    # property-less case: here real properties ARE present.)
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert (
+        rep(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a", "b"],  # `b` undeclared
+            }
+        )
+        is False
+    )
+
+
+def test_representable_rejects_round2_property_schema_false():
+    # A property schema that is literally `false` (accepts NO value) is not a dict
+    # in the allowlist -> opt out (finding 1). `true` likewise.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert rep({"type": "object", "properties": {"a": False}}) is False
+    assert rep({"type": "object", "properties": {"a": True}}) is False
+
+
+def test_representable_rejects_round2_ref_with_sibling_enum():
+    # A `$ref` carrying SIBLING keys (here `enum`) would DROP those siblings on
+    # resolution -> opt out (finding 4), never silently ignore the enum.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert (
+        rep(
+            {
+                "type": "object",
+                "properties": {"a": {"$ref": "#/$defs/x", "enum": ["p", "q"]}},
+                "$defs": {"x": {"type": "string"}},
+            }
+        )
+        is False
+    )
+
+
+def test_representable_rejects_round2_additional_properties_schema():
+    # `additionalProperties` as a SCHEMA (or `True`) can't be constrained on the
+    # XML wire -> opt out; only a literal `False` is representable.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    base = {"type": "object", "properties": {"a": {"type": "string"}}}
+    assert rep({**base, "additionalProperties": {"type": "string"}}) is False
+    assert rep({**base, "additionalProperties": True}) is False
+    assert rep({**base, "additionalProperties": False}) is True  # control
+
+
+def test_representable_rejects_round2_property_names():
+    # `propertyNames` constrains KEY names — unenforceable on the delimiter wire
+    # and not a top-level-allowed key -> opt out.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert (
+        rep(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "propertyNames": {"pattern": "^[a-z]+$"},
+            }
+        )
+        is False
+    )
 
 
 # ---- F3 REAL FIX: $ref resolved BEFORE the string-vs-%json decision ------

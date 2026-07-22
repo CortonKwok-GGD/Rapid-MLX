@@ -422,56 +422,80 @@ _XML_STRING_TERMINAL_DECL = (
 
 
 # ------------------------------------------------------------------------
-# FAITHFUL-OR-OPT-OUT representability guard for the Qwen3-Coder XML arg wire
-# (#558 E3, codex converge). The XML emitter (``_emit_xml_arg_body`` /
-# ``_emit_xml_param_value``) is a BEST-EFFORT OPT-IN: it can faithfully
-# constrain the common tool schema (typed top-level ``properties``, enums,
-# nested objects/arrays via ``%json``, required + optional ``( )?``), but a
-# handful of schema shapes CANNOT be represented on the delimiter-based XML
-# wire without silently permitting schema-invalid or mis-typed output. When a
-# request contains ANY such shape on an XML-arg tool, the whole request must
-# OPT OUT of grammar (``build_tool_grammar`` returns ``None`` -> free-form-
-# then-parse, the safe existing path) rather than emit a lax grammar.
+# STRICT-ALLOWLIST representability guard for the Qwen3-Coder XML arg wire
+# (#558 E3). The XML emitter (``_emit_xml_arg_body`` / ``_emit_xml_param_value``)
+# is a BEST-EFFORT OPT-IN: it can faithfully constrain the common tool schema
+# (typed top-level ``properties``, enums, nested objects/arrays via ``%json``,
+# required + optional ``( )?``), but MANY JSON-Schema shapes CANNOT be
+# represented on the delimiter-based XML wire without silently permitting
+# schema-invalid or mis-typed output.
 #
-# The unrepresentable shapes (mirroring the 5 codex BLOCKING findings):
-#   * F1 — a property-less BUT non-trivial top-level schema (``required`` /
-#     top-level ``$ref`` / non-object ``type``; ``false`` / composition / ``not``
-#     are caught by the checks below) would collapse to an EMPTY body (``{}``),
-#     which is wrong for a schema that requires fields or accepts no instance.
-#   * F2 — a top-level string property carrying ``const`` / ``pattern`` /
-#     ``minLength`` / ``maxLength`` / ``format`` cannot be enforced by the raw
-#     lazy value path (it admits ANY text), so those constraints are silently
-#     ignored. (Enum IS enforced — an alternation — so it stays representable.)
-#   * F4 — object-level relational keywords (``dependentRequired`` /
-#     ``dependencies`` / ``if`` / ``then`` / ``else`` / ``not`` /
-#     ``patternProperties``) and top-level composition (``allOf`` / ``anyOf`` /
-#     ``oneOf``) are emitted-around, not enforced, so e.g. ``dependentRequired``
-#     would let an ``a`` block appear without its required ``b``.
-#   * F5 — a property KEY that is not delimiter-safe (contains ``< > { } : ,`` or
-#     whitespace) would be inserted RAW into ``<parameter=KEY>`` and parsed back
-#     as a DIFFERENT key.
-# (F3 is a REAL fix, not an opt-out: ``_emit_xml_param_value`` resolves a local
-# ``$ref`` BEFORE the string-vs-``%json`` decision so a ``$ref``->string
-# round-trips without quotes; only an UNRESOLVABLE ``$ref`` opts out here.)
-_XML_UNSUPPORTED_OBJECT_KEYWORDS: tuple[str, ...] = (
-    "dependentRequired",
-    "dependencies",
-    "if",
-    "then",
-    "else",
-    "not",
-    "patternProperties",
-    "allOf",
-    "anyOf",
-    "oneOf",
+# WHY AN ALLOWLIST (closed positive set), NOT A BLACKLIST. JSON Schema has
+# dozens of keywords; an opt-out-on-known-bad-keywords BLACKLIST is inherently
+# incomplete — a reviewer can always name "one more" unsupported shape
+# (``minProperties`` / ``propertyNames`` / ``contains`` / ``unevaluatedProperties``
+# / a ``false`` schema / a ``$ref`` with siblings / …). We instead REQUIRE the
+# schema to use EXCLUSIVELY an explicitly-enumerated, known-safe set of
+# keywords/shapes: ``_xml_schema_representable`` returns ``True`` ONLY when every
+# part of the schema falls inside that closed set; ANYTHING outside → opt out.
+# This is complete BY CONSTRUCTION (no unknown keyword can be faithfully
+# constrained, so any unknown keyword safely opts out) and ends the whack-a-mole.
+# When a request contains ANY non-allowlisted shape on an XML-arg tool, the whole
+# request OPTS OUT of grammar (``build_tool_grammar`` returns ``None`` ->
+# free-form-then-parse, the safe existing path) rather than emit a lax grammar.
+#
+# THE ALLOWLIST (see ``_xml_schema_representable`` / ``_xml_property_representable``):
+#   * TOP-LEVEL: a dict whose keys ⊆ ``_XML_ALLOWED_TOPLEVEL_KEYS``; ``type`` (if
+#     present) == ``"object"``; ``additionalProperties`` (if present) is literally
+#     ``False`` (a schema value OR ``True`` opts out — extra props can't be
+#     constrained); ``set(required) ⊆ set(properties)``; a genuine no-arg tool
+#     (no ``properties`` + no ``required``) stays representable (empty body).
+#   * EACH PROPERTY (after resolving a single-level local ``$ref``): a non-empty
+#     ``enum`` (alternation), OR ``type=="string"`` with keys ⊆
+#     ``_XML_ALLOWED_STRING_KEYS`` (no ``const``/``pattern``/``minLength``/
+#     ``maxLength``/``format``), OR ``type in {integer,number,boolean}`` (bare
+#     terminal), OR ``type in {object,array}`` (``%json`` — llguidance's JSON
+#     grammar handles the inner keywords), OR else opt out (a ``false``/``true``
+#     bool schema, a ``null``/absent/union ``type``, an unresolved ``$ref``).
+# F3 remains a REAL fix, not an opt-out: ``_emit_xml_param_value`` resolves a
+# local ``$ref`` BEFORE the string-vs-``%json`` decision so a ``$ref``->string
+# round-trips without quotes; only an UNRESOLVABLE ``$ref`` (or one with siblings)
+# opts out.
+#
+# The closed positive sets. Membership is REQUIRED (not merely tolerated): any
+# key outside these opts the request out.
+_XML_ALLOWED_TOPLEVEL_KEYS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "description",
+        "title",
+        "$defs",
+        "definitions",
+        "additionalProperties",
+    }
 )
-_XML_UNSUPPORTED_STRING_KEYWORDS: tuple[str, ...] = (
-    "const",
-    "pattern",
-    "minLength",
-    "maxLength",
-    "format",
+# Keys a ``type=="string"`` property may carry. Anything else (``const`` /
+# ``pattern`` / ``minLength`` / ``maxLength`` / ``format`` / any unknown facet)
+# cannot be enforced by the raw lazy value path -> opt out. ``enum`` is listed
+# for completeness though the enum-first branch handles a non-empty enum before
+# the string-type check is reached.
+_XML_ALLOWED_STRING_KEYS = frozenset(
+    {
+        "type",
+        "enum",
+        "description",
+        "title",
+        "default",
+    }
 )
+# Property ``type`` values that render as a bare JSON terminal (the parser
+# type-converts VALUE per int/float/bool paths).
+_XML_SCALAR_TERMINAL_TYPES = frozenset({"integer", "number", "boolean"})
+# Property ``type`` values that ride ``%json`` (llguidance's JSON grammar
+# enforces the whole sub-schema, inner keywords included — do NOT recurse).
+_XML_JSON_SUBSCHEMA_TYPES = frozenset({"object", "array"})
 # Characters that would break out of the ``<parameter=KEY>`` delimiter wire (or
 # collide with the JSON-ish surfaces the parser round-trips). OpenAI tool
 # parameter names are normally ``[\w-]+``; be conservative.
@@ -504,7 +528,7 @@ def _xml_key_is_delimiter_safe(key: Any) -> bool:
 
 
 def _resolve_local_ref(subschema: Any, defs: dict[str, Any]) -> Any:
-    """Resolve a single-level local ``$ref`` against ``defs`` (F3).
+    """Resolve a single-level local ``$ref`` against ``defs`` (F3 / finding 4).
 
     ``defs`` is the ``{"$defs": {...}, "definitions": {...}}`` mapping
     ``_collect_xml_defs`` returns. Handles ONLY a single-level local pointer
@@ -512,7 +536,14 @@ def _resolve_local_ref(subschema: Any, defs: dict[str, Any]) -> Any:
 
       * a schema WITHOUT a ``$ref`` is returned UNCHANGED (the caller decides its
         type as before);
-      * a resolvable single-level local ``$ref`` returns the target dict;
+      * a resolvable single-level local ``$ref`` (with NO sibling keys) returns
+        the target dict;
+      * a ``$ref`` object carrying SIBLING keys beyond ``$ref`` (e.g.
+        ``{"$ref": "#/$defs/x", "enum": [...]}``) returns ``None`` — the sibling
+        keywords would be SILENTLY DROPPED if we resolved to the bare target
+        (finding 4), so we opt out rather than under-constrain. (Cleanly merging
+        the siblings into the resolved target is possible but the safe choice is
+        to opt out.)
       * an unresolvable / unsupported ``$ref`` (remote, non-local, multi-hop, or
         a missing/ non-dict target) returns ``None`` — the caller treats that as
         UNREPRESENTABLE and opts the request out.
@@ -522,6 +553,10 @@ def _resolve_local_ref(subschema: Any, defs: dict[str, Any]) -> Any:
     ref = subschema.get("$ref")
     if ref is None:
         return subschema
+    # Finding 4: a ``$ref`` alongside OTHER keys would drop those siblings on
+    # resolution. Opt out (return ``None``) rather than silently ignore them.
+    if len(subschema) != 1:
+        return None
     if not isinstance(ref, str) or not ref.startswith("#/"):
         return None
     parts = ref[2:].split("/")
@@ -538,75 +573,121 @@ def _resolve_local_ref(subschema: Any, defs: dict[str, Any]) -> Any:
     return resolved
 
 
+def _xml_property_representable(subschema: Any, defs: dict[str, Any]) -> bool:
+    """True iff ONE property schema is inside the XML emitter's closed allowlist.
+
+    After resolving a single-level local ``$ref`` (``_resolve_local_ref`` — an
+    unresolvable ``$ref``, a ``$ref`` with siblings, or a non-dict such as a
+    ``false``/``true`` bool schema returns ``None`` -> opt out), the resolved
+    schema is representable ONLY as one of the enumerated shapes:
+
+      * a non-empty ``enum`` list — rendered as a literal ALTERNATION (the
+        tightest possible constraint; facets are irrelevant next to it), OR
+      * ``type == "string"`` whose keys ⊆ ``_XML_ALLOWED_STRING_KEYS`` — the raw
+        lazy value path (a ``const``/``pattern``/``minLength``/``maxLength``/
+        ``format`` or ANY unknown facet it cannot enforce opts out), OR
+      * ``type in {integer,number,boolean}`` — a bare JSON terminal, OR
+      * ``type in {object,array}`` — ``%json`` over the sub-schema (llguidance's
+        JSON grammar enforces the inner keywords; we do NOT recurse/restrict), OR
+      * else opt out (a ``null``/absent/union/non-string ``type``).
+    """
+    resolved = _resolve_local_ref(subschema, defs)
+    if not isinstance(resolved, dict):
+        # Unresolvable/sibling ``$ref`` (None) or a ``false``/``true`` bool schema
+        # / non-dict -> not representable.
+        return False
+    # Enum-first: a non-empty enum renders as an alternation of literals — the
+    # tightest constraint, so it is representable regardless of ``type``/facets.
+    enum = resolved.get("enum")
+    if isinstance(enum, list) and enum:
+        return True
+    prop_type = resolved.get("type")
+    if not isinstance(prop_type, str):
+        # Absent / union (list) / non-string ``type`` -> opt out.
+        return False
+    t = prop_type.strip().lower()
+    if t == "string":
+        # Only annotation keys may accompany a string; any facet the raw lazy
+        # value path cannot enforce (or an unknown key) opts out.
+        return set(resolved.keys()) <= _XML_ALLOWED_STRING_KEYS
+    if t in _XML_SCALAR_TERMINAL_TYPES:
+        return True
+    if t in _XML_JSON_SUBSCHEMA_TYPES:
+        return True
+    # ``null`` or any unknown type -> opt out.
+    return False
+
+
 def _xml_schema_representable(params: Any) -> bool:
     """True iff the XML arg emitter can FAITHFULLY constrain ``params`` (#558 E3).
 
-    Returns ``False`` -> the request OPTS OUT of grammar (free-form fallback) for
-    the unrepresentable schema shapes described in the module block above
-    (F1/F2/F4/F5, plus an unresolvable ``$ref``). Returns ``True`` for the common
-    case (typed top-level ``properties``, enums, nested objects/arrays, required +
-    optional) AND for a genuine no-argument tool (no ``properties``, no
-    ``required``, no ``$ref``, object/absent top-level ``type``) — whose empty
-    body IS the faithful representation.
+    STRICT ALLOWLIST (closed positive set — see the module block above): returns
+    ``True`` ONLY when every part of ``params`` uses exclusively a known-safe,
+    explicitly-enumerated keyword/shape; ANYTHING outside opts the request out
+    (``False`` -> free-form fallback). Complete by construction, so no unknown
+    JSON-Schema keyword can slip a lax grammar through.
+
+    Representable ``True`` iff ALL hold:
+      * ``params`` is a dict whose keys ⊆ ``_XML_ALLOWED_TOPLEVEL_KEYS``;
+      * ``type`` (if present) is ``"object"``;
+      * ``additionalProperties`` (if present) is literally ``False`` (a schema
+        value or ``True`` opts out — extra props can't be constrained);
+      * ``properties`` (if present) is a dict;
+      * ``set(required) ⊆ set(properties)`` (a required name with no declared
+        property opts out — finding 3);
+      * every property key is delimiter-safe (``_xml_key_is_delimiter_safe``, F5)
+        AND every property schema is in the per-property allowlist
+        (``_xml_property_representable``).
+    A genuine no-argument tool (no ``properties`` + no ``required``) is
+    representable — its empty body IS the faithful representation.
     """
-    # F1: a ``false`` schema (accepts NO instance) — or any non-dict — cannot be
-    # rendered as an empty XML body; opt out.
+    # A ``false``/``true`` bool schema — or any non-dict — cannot be rendered as
+    # an XML parameter body; opt out.
     if not isinstance(params, dict):
         return False
-    # Lazy import: keep this module importable independently of api.tool_calling.
-    from .tool_calling import _schema_type
-
-    # F4: object-level relational keywords + top-level composition are emitted
-    # AROUND, never enforced. Reject them whether or not ``properties`` is present.
-    for kw in _XML_UNSUPPORTED_OBJECT_KEYWORDS:
-        if kw in params:
+    # CLOSED top-level key set: any key outside the allowlist (``minProperties`` /
+    # ``maxProperties`` / ``propertyNames`` / ``patternProperties`` /
+    # ``dependentRequired`` / ``dependencies`` / ``if`` / ``then`` / ``else`` /
+    # ``not`` / ``allOf`` / ``anyOf`` / ``oneOf`` / ``contains`` /
+    # ``unevaluatedProperties`` / a top-level ``$ref`` / … ) opts out. This single
+    # check subsumes the former object-keyword + composition + top-level-``$ref``
+    # blacklists — completely, since membership is required not merely tolerated.
+    if not set(params.keys()) <= _XML_ALLOWED_TOPLEVEL_KEYS:
+        return False
+    # ``type``, if present, must be exactly ``object`` (a non-object top-level
+    # type has no XML parameter-body representation).
+    top_type = params.get("type")
+    if top_type is not None:
+        if not isinstance(top_type, str) or top_type.strip().lower() != "object":
             return False
-
-    defs = _collect_xml_defs(params)
+    # ``additionalProperties``: absent OK; literal ``False`` OK; a schema value or
+    # ``True`` opts out (the XML wire cannot constrain undeclared extra props).
+    if "additionalProperties" in params and params["additionalProperties"] is not False:
+        return False
     props = params.get("properties")
-    has_props = isinstance(props, dict) and bool(props)
-
-    if not has_props:
-        # F1: property-less BUT non-trivial -> the empty body would misrepresent
-        # it. (Composition / ``not`` already rejected above.)
-        required = params.get("required")
-        if isinstance(required, list) and required:
+    if props is not None and not isinstance(props, dict):
+        return False
+    prop_map: dict[str, Any] = props if isinstance(props, dict) else {}
+    # ``required`` must be a list naming ONLY declared properties (finding 3) — an
+    # undeclared required name would never be emitted, silently unenforced. This
+    # also opts out the property-less-but-``required`` case (empty body wrong).
+    required = params.get("required")
+    if required is not None:
+        if not isinstance(required, list):
             return False
-        if "$ref" in params:
+        if not set(required) <= set(prop_map.keys()):
             return False
-        # A non-object top-level ``type`` (array / string / number / ...) has no
-        # XML parameter-body representation; the empty body would misrepresent it.
-        top_type = params.get("type")
-        if isinstance(top_type, str) and top_type.strip().lower() not in (
-            "object",
-            "null",
-        ):
-            return False
-        if isinstance(top_type, list):
-            norm = {t.strip().lower() for t in top_type if isinstance(t, str)}
-            if norm - {"object", "null"}:
-                return False
-        # Genuine no-argument tool -> empty body is correct.
-        return True
-
-    # Has ``properties``: validate each TOP-LEVEL property (nested schemas ride
-    # ``%json`` and are enforced there, so only the top level needs guarding).
-    for key, subschema in props.items():
+    # Validate each TOP-LEVEL property against the closed per-property allowlist
+    # (nested object/array schemas ride ``%json`` and are enforced there, so only
+    # the top level needs the key-safety + shape guard). An empty ``prop_map`` (no
+    # arguments) skips the loop and stays representable.
+    defs = _collect_xml_defs(params)
+    for key, subschema in prop_map.items():
         # F5: the key is emitted RAW into ``<parameter=KEY>`` -> must be safe.
         if not _xml_key_is_delimiter_safe(key):
             return False
-        # F3: resolve a single-level local ``$ref`` first; an unresolvable ref is
-        # unrepresentable.
-        resolved = _resolve_local_ref(subschema, defs)
-        if resolved is None:
+        if not _xml_property_representable(subschema, defs):
             return False
-        # F2: a top-level string property takes the RAW lazy value path, which
-        # cannot enforce these facets -> opt out. (Enum is enforced separately as
-        # an alternation, so an enum WITHOUT these facets stays representable.)
-        if _schema_type(resolved) == "string":
-            for kw in _XML_UNSUPPORTED_STRING_KEYWORDS:
-                if kw in resolved:
-                    return False
     return True
 
 
