@@ -99,12 +99,25 @@ class StructureInfo:
     ``ToolParser.structure_info()``. ``sentinels`` lists literal substrings
     inside ``begin``/``end`` that are single special tokens for this family
     and must be emitted as Lark special-token refs, not byte strings.
+
+    ``arg_style`` selects how the tool's ARGUMENTS are constrained between
+    ``begin`` and ``end``:
+
+      * ``"json"`` (default) — a single JSON object constrained by the tool's
+        JSON Schema via ``%json`` (hermes / qwen / harmony wire).
+      * ``"xml"`` — a Qwen3-Coder XML arg body: one
+        ``<parameter=KEY>\nVALUE\n</parameter>`` block per property, each VALUE
+        constrained per its sub-schema (raw text for strings, ``%json`` for
+        scalars/objects/arrays, an alternation for enums). See
+        ``_emit_xml_arg_body``. Default stays ``"json"`` so hermes/qwen/harmony
+        (and any out-of-tree JSON-body family) are byte-identical to before.
     """
 
     begin: str
     end: str
     trigger: str
     sentinels: tuple[str, ...] = field(default=())
+    arg_style: str = "json"
 
 
 def _is_registered_added_token(tokenizer: Any, tok_id: int) -> bool:
@@ -373,6 +386,96 @@ def _emit_literal_with_sentinels(text: str, sentinels: tuple[str, ...]) -> str:
             parts.append(_lark_escape(text[i:j]))
             i = j
     return " ".join(p for p in parts if p)
+
+
+# The raw-string value terminal used by the XML arg body (see
+# ``_emit_xml_param_value``). ``/[^<]*/`` matches the RAW (unquoted) parameter
+# value up to — but not including — the ``<`` that opens ``</parameter>``, so it
+# also absorbs the single ``\n`` the wire puts BEFORE ``</parameter>`` (the
+# qwen3_coder parser strips that trailing newline). Consequence: a string value
+# containing a literal ``<`` (e.g. a ``code`` argument with XML) cannot be
+# expressed by this terminal and is a known constrained-mode limitation —
+# ``RAPID_MLX_CONSTRAIN_TOOLS=0`` restores free-form for such tools.
+_XML_STRING_TERMINAL_NAME = "XMLSTR"
+_XML_STRING_TERMINAL_DECL = f"{_XML_STRING_TERMINAL_NAME}: /[^<]*/\n"
+
+
+def _emit_xml_param_value(subschema: Any, defs: dict[str, Any]) -> str:
+    """Return the Lark for one XML parameter's VALUE plus its closing literal.
+
+    The Qwen3-Coder wire is ``<parameter=KEY>\\nVALUE\\n</parameter>\\n`` and the
+    ``qwen3_coder`` parser type-converts VALUE per the tool schema, so the
+    grammar must emit each value in the SAME surface form the parser round-trips:
+
+      * ENUM -> an alternation of the literal enum values (raw string form for
+        string enums, JSON scalar for numeric/bool enums), then the
+        ``\\n</parameter>\\n`` close.
+      * STRING (non-enum) -> the RAW (unquoted) ``XMLSTR`` terminal, NOT ``%json``
+        (whose surrounding quotes the parser keeps verbatim, yielding
+        ``"\\"Paris\\""``). ``XMLSTR: /[^<]*/`` absorbs the value AND the trailing
+        ``\\n``, so the close literal here is ``</parameter>\\n`` with NO leading
+        newline.
+      * EVERYTHING ELSE (number / integer / boolean / object / array / null) ->
+        JSON-constrained via ``%json`` (these surface forms match the parser's
+        int / float / bool / ``json.loads`` paths), then the ``\\n</parameter>\\n``
+        close (leading newline preserved — ``%json`` does not consume it).
+
+    ``defs`` (the parent schema's ``$defs`` / ``definitions``) is merged into each
+    ``%json`` value sub-schema so an internal ``$ref`` still resolves.
+    """
+    close_json = _lark_escape("\n</parameter>\n")
+    close_raw = _lark_escape("</parameter>\n")  # XMLSTR already ate the newline
+    if not isinstance(subschema, dict):
+        return f"{_XML_STRING_TERMINAL_NAME} {close_raw}"
+    enum = subschema.get("enum")
+    if isinstance(enum, list) and enum:
+        alts = []
+        for value in enum:
+            literal = value if isinstance(value, str) else json.dumps(value)
+            alts.append(_lark_escape(literal))
+        return f"({' | '.join(alts)}) {close_json}"
+    # Lazy import: keep this module importable independently of api.tool_calling
+    # (no cycle today, but the lazy import future-proofs it).
+    from .tool_calling import _schema_type
+
+    if _schema_type(subschema) == "string":
+        return f"{_XML_STRING_TERMINAL_NAME} {close_raw}"
+    value_schema = dict(subschema)
+    for def_key, def_val in defs.items():
+        value_schema.setdefault(def_key, def_val)
+    return f"%json {json.dumps(value_schema)} {close_json}"
+
+
+def _emit_xml_arg_body(params: Any) -> str:
+    """Emit the Lark for a Qwen3-Coder XML argument body from a JSON Schema.
+
+    One property renders as ``<parameter=KEY>\\n<value>\\n</parameter>\\n``.
+    REQUIRED properties are mandatory; the rest are OPTIONAL (``( ... )?``).
+    Properties are emitted in schema order — any-order permutation is DEFERRED
+    (a forced grammar makes the model follow this order, which real Qwen3-Coder
+    already does for its own schemas). Returns ``""`` for a no-argument tool
+    (empty / absent ``properties``), which the caller renders as the bare
+    ``<function=NAME>\\n</function>`` frame.
+    """
+    if not isinstance(params, dict):
+        return ""
+    props = params.get("properties")
+    if not isinstance(props, dict) or not props:
+        return ""
+    required = params.get("required")
+    required_set = set(required) if isinstance(required, list) else set()
+    defs: dict[str, Any] = {}
+    for def_key in ("$defs", "definitions"):
+        d = params.get(def_key)
+        if isinstance(d, dict):
+            defs[def_key] = d
+    frags: list[str] = []
+    for key, subschema in props.items():
+        open_lit = _lark_escape(f"<parameter={key}>\n")
+        value_lark = _emit_xml_param_value(subschema, defs)
+        block = f"{open_lit} {value_lark}"
+        frags.append(block if key in required_set else f"( {block} )?")
+    return " ".join(frags)
 
 
 def build_tool_lark(
@@ -665,6 +768,12 @@ def build_tool_lark(
         )
         prefix_ref = "bal_prefix"
 
+    # Declare the raw-string value terminal ONCE, iff any tag uses the XML arg
+    # body (``arg_style == "xml"``). A JSON-only tool-set (hermes/qwen/harmony)
+    # never emits it, so its grammar is byte-identical to before this change.
+    if any(getattr(si, "arg_style", "json") == "xml" for si in structure_infos):
+        lark += _XML_STRING_TERMINAL_DECL
+
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
         # Only substitute the default when ``parameters`` is ABSENT. A
         # falsy-but-present schema ({} = allow-any, false = allow-none) is a
@@ -682,15 +791,25 @@ def build_tool_lark(
                 "properties": {},
                 "additionalProperties": False,
             }
-        schema = json.dumps(params)
         begin_body = _emit_literal_with_sentinels(si.begin, si.sentinels)
         end_body = _emit_literal_with_sentinels(si.end, si.sentinels)
+        # ARG BODY: a JSON object (``%json`` over the whole schema) for the
+        # default JSON wire, OR a Qwen3-Coder XML per-parameter body when the
+        # family's ``structure_info`` declares ``arg_style="xml"``. The XML body
+        # may be EMPTY (a no-argument tool), in which case the tag is just the
+        # ``begin``/``end`` frame with no argument region.
+        if getattr(si, "arg_style", "json") == "xml":
+            arg_body = _emit_xml_arg_body(params)
+        else:
+            arg_body = f"%json {json.dumps(params)}"
         # ``prefix_ref`` is empty on the forced-non-reasoning path (the first call
         # sits AT the trigger; ``SEP`` in ``start`` separates repeats), non-empty
         # otherwise (``TAG_TEXT`` / ``bal_prefix``). Omit the leading space when
         # empty so the tag rule starts cleanly at the begin literal.
         pfx = f"{prefix_ref} " if prefix_ref else ""
-        lark += f"\ntag_{i}: {pfx}{begin_body} %json {schema}"
+        lark += f"\ntag_{i}: {pfx}{begin_body}"
+        if arg_body:
+            lark += f" {arg_body}"
         if end_body:
             lark += f" {end_body}"
         lark += "\n"
