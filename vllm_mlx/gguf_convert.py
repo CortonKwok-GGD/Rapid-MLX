@@ -648,6 +648,49 @@ def _base_model_repo(reader: Any) -> str | None:
     return None
 
 
+def _base_repo_from_hub_tags(repo_id: str) -> str | None:
+    """Extract a base-model repo from an HF repo's ``base_model:*`` tags.
+
+    Fine-tune authors increasingly record provenance in hub tags rather than
+    GGUF kv metadata (verified: neither Qwen's nor yuxinlu1's gemma4 GGUFs
+    carry ``general.base_model.*``, but both repos tag the base). The
+    ``base_model:quantized:`` and ``base_model:adapter:`` namespaces point at
+    derived artifacts, not the architecture source — skip them.
+    """
+    from huggingface_hub import HfApi
+
+    try:
+        tags = HfApi().model_info(repo_id).tags or []
+    except Exception:
+        return None
+    for tag in tags:
+        if tag.startswith(("base_model:quantized:", "base_model:adapter:")):
+            continue
+        if tag.startswith("base_model:"):
+            candidate = tag.split(":", 1)[1]
+            if re.fullmatch(r"[\w.-]+/[\w.-]+", candidate):
+                return candidate
+    return None
+
+
+def _flatten_unified_text_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Flatten unified (multimodal) configs that nest text params.
+
+    google/gemma-4-* publishes top ``model_type=gemma4`` with the
+    language-model fields (``num_key_value_heads`` scalar pair,
+    ``layer_types``, ``num_kv_shared_layers``, …) inside ``text_config``.
+    A text-only artifact needs them at top level so downstream consumers —
+    this converter's own planning pass and mlx-lm's ``gemma4_text``
+    ModelArgs — can read them without unified-config awareness.
+    """
+    text_cfg = config.get("text_config")
+    if not isinstance(text_cfg, dict):
+        return config
+    flat = {k: v for k, v in config.items() if k != "text_config"}
+    flat.update(text_cfg)
+    return flat
+
+
 def _fetch_base_aux(repo_id: str, out_dir: Path) -> dict[str, Any] | None:
     """Download config/tokenizer artifacts from the base model repo.
 
@@ -720,6 +763,14 @@ def _build_name_map(reader: Any) -> tuple[dict[str, str], str]:
     prefer_mlp = kv_prefix in _MLP_STYLE_MOE_GGUF_ARCHES
 
     def pick(cands: list[str], ggml_base: str) -> str | None:
+        # The output projection must be bare ``lm_head`` (what mlx-lm
+        # instantiates for untied models). gguf's candidate table also
+        # carries legacy names like ``model.transformer.ff_out`` that the
+        # generic "model.* first" rule below would wrongly prefer — the
+        # Dolphin3.0 llama GGUF (untied, vocab 128258) hit exactly this.
+        # Only exercised by untied models: tied ones have no output.weight.
+        if ggml_base == "output" and "lm_head" in cands:
+            return "lm_head"
         # Attention q/k-norm: mlx-lm (and HF qwen3/cohere) call these
         # ``q_norm``/``k_norm``, but gguf's candidate table lists the
         # persimmon ``*_layernorm`` variant first, so the generic
@@ -791,18 +842,56 @@ def _postprocess_tensor(
     """Per-arch value adjustments, mirroring transformers' TENSOR_PROCESSORS.
 
     * llama: reverse-permute ``self_attn.{q,k}_proj`` (see above).
-    * gemma2/3/4 (text): ggml stores RMSNorm weights as ``1 + w`` (gemma's
+    * gemma2/3 (text): ggml stores RMSNorm weights as ``1 + w`` (gemma's
       kernel folds the +1 into the scale), HF/mlx-lm store raw ``w``.
+      **gemma4 is NOT adjusted**: llama.cpp stopped folding +1 there —
+      measured on yuxinlu1/gemma-4-12B-coder Q8_0 vs google/gemma-4-12B-it,
+      ``layers.0.input_layernorm.weight`` means match to 0.0000 (GGUF holds
+      raw ``w``). Subtracting 1 anyway zeroed near-zero entries and left
+      the model outputting ``<unused>`` gibberish (ppl 3.7e19).
     """
     if model_type == "llama":
         if "self_attn.q_proj." in hf_name:
             return _reverse_permute_qk(arr, n_head, n_head)
         if "self_attn.k_proj." in hf_name:
             return _reverse_permute_qk(arr, n_head, n_kv_heads)
-    elif model_type in ("gemma2", "gemma3_text", "gemma4_text"):
+    elif model_type in ("gemma2", "gemma3_text"):
         if hf_name.endswith("norm.weight"):
             return arr - 1
     return arr
+
+
+def _scalar_int(value: Any, default: int) -> int:
+    """Coerce a config value to int; some archs store per-layer lists.
+
+    gemma4-class GGUFs record ``num_key_value_heads`` as a per-layer list
+    (sliding=8 / full=1 for the 12B). The head counts here only feed the
+    llama-family q/k reverse-permutation, which is gated off for every
+    other arch — collapsing a list to its max is safe for that sole use.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        return int(max(value)) if value else default
+    return int(value)
+
+
+def _adjust_hf_name(hf_name: str, model_type: str) -> str:
+    """Per-arch HF-name corrections that gguf's mapping gets wrong for mlx-lm.
+
+    gemma4: transformers' convention (what gguf's table yields) writes the
+    MLP as ``feed_forward.*`` and the per-layer scalar as
+    ``layer_scalar.weight``, but mlx-lm's ``gemma4_text`` instantiates
+    ``mlp.*`` and stores the scalar *bare* — official
+    mlx-community/gemma-4-12B-it: ``layers.N.mlp.up_proj`` and
+    ``layers.N.layer_scalar`` (no ``.weight``). Loading otherwise rejects
+    both as "parameters not in model".
+    """
+    if model_type == "gemma4_text":
+        hf_name = hf_name.replace(".feed_forward.", ".mlp.")
+        if hf_name.endswith(".layer_scalar.weight"):
+            hf_name = hf_name[: -len(".weight")]
+    return hf_name
 
 
 def _stream_weights(
@@ -827,8 +916,8 @@ def _stream_weights(
     mx_dtype = getattr(mx, dtype)
     itemsize = _DTYPE_ITEMSIZE[dtype]
     model_type = str(config.get("model_type", ""))
-    n_head = int(config.get("num_attention_heads") or 1)
-    n_kv_heads = int(config.get("num_key_value_heads") or n_head)
+    n_head = _scalar_int(config.get("num_attention_heads"), 1)
+    n_kv_heads = _scalar_int(config.get("num_key_value_heads"), n_head)
 
     # ---- planning pass -------------------------------------------------
     plan: list[tuple[str, int, int]] = []  # (hf_name, tensor_idx, out_nbytes)
@@ -847,7 +936,7 @@ def _stream_weights(
         if hf_base is None:
             skipped.append((t.name, "no HF-convention name known for this tensor"))
             continue
-        hf_name = f"{hf_base}.{suffix}"
+        hf_name = _adjust_hf_name(f"{hf_base}.{suffix}", model_type)
         if hf_name in seen_hf:
             skipped.append((t.name, f"duplicate mapping to {hf_name}"))
             continue
@@ -1065,6 +1154,17 @@ def convert_gguf(
         config_source = ""
         base_cfg: dict[str, Any] | None = None
         base_repo = _base_model_repo(reader)
+        if base_repo is None:
+            # GGUF kv carries no provenance (the common case for community
+            # quants) — fall back to the hub repo's base_model:* tags. Any
+            # non-local source form counts: ``org/repo`` and
+            # ``org/repo:file.gguf`` alike (the earlier endswith(".gguf")
+            # check wrongly excluded the latter — the gemma4 sample hit it).
+            source_str = str(source)
+            if not Path(source_str).is_file():
+                hub_candidate = source_str.split(":", 1)[0]
+                if "/" in hub_candidate:
+                    base_repo = _base_repo_from_hub_tags(hub_candidate)
         if base_repo is not None:
             base_cfg = _fetch_base_aux(base_repo, hf_dir)
         if base_cfg:
@@ -1073,7 +1173,7 @@ def convert_gguf(
                 None,
                 n_layers_gguf,
             ):
-                config = base_cfg
+                config = _flatten_unified_text_config(base_cfg)
                 config["model_type"] = model_type
                 config_source = f"base model {base_repo}"
         if config is None:

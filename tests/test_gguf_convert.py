@@ -625,6 +625,143 @@ def test_resolve_rejects_garbage_source():
         _resolve_source("definitely-not-a-repo-or-file")
 
 
+# ----- hub-tags base-model detection + unified config flattening -----------
+
+
+def test_base_repo_from_hub_tags(monkeypatch):
+    from vllm_mlx import gguf_convert as gc
+
+    def fake_api(tags):
+        return SimpleNamespace(model_info=lambda _r: SimpleNamespace(tags=tags))
+
+    monkeypatch.setattr(
+        "huggingface_hub.HfApi",
+        lambda: fake_api(
+            [
+                "gguf",
+                "base_model:google/gemma-4-12B-it",
+                "base_model:quantized:google/gemma-4-12B-it",
+            ]
+        ),
+    )
+    assert gc._base_repo_from_hub_tags("org/repo") == "google/gemma-4-12B-it"
+
+    # quantized:/adapter: namespaces point at derived artifacts, not the base.
+    monkeypatch.setattr(
+        "huggingface_hub.HfApi",
+        lambda: fake_api(
+            ["base_model:quantized:org/derived", "base_model:adapter:org/lora"]
+        ),
+    )
+    assert gc._base_repo_from_hub_tags("org/repo") is None
+
+    # Hub errors (offline, gated repo) degrade to None → next strategy.
+    monkeypatch.setattr(
+        "huggingface_hub.HfApi",
+        lambda: SimpleNamespace(
+            model_info=lambda _r: (_ for _ in ()).throw(RuntimeError("boom"))
+        ),
+    )
+    assert gc._base_repo_from_hub_tags("org/repo") is None
+
+
+def test_flatten_unified_text_config():
+    from vllm_mlx.gguf_convert import _flatten_unified_text_config
+
+    unified = {
+        "model_type": "gemma4",
+        "text_config": {"num_key_value_heads": 8, "num_hidden_layers": 48},
+        "other": 1,
+    }
+    flat = _flatten_unified_text_config(unified)
+    assert flat["num_key_value_heads"] == 8
+    assert flat["num_hidden_layers"] == 48
+    assert flat["other"] == 1
+    assert "text_config" not in flat
+    # Non-nested configs pass through untouched.
+    assert _flatten_unified_text_config({"a": 1}) == {"a": 1}
+
+
+def test_scalar_int_coercions():
+    from vllm_mlx.gguf_convert import _scalar_int
+
+    assert _scalar_int(8, 1) == 8
+    assert _scalar_int(None, 1) == 1
+    # gemma4's per-layer KV-head list collapses to its max (see helper note).
+    assert _scalar_int([8, 8, 1], 1) == 8
+    assert _scalar_int([], 3) == 3
+
+
+def test_untied_output_maps_to_bare_lm_head(tmp_path):
+    """Untied models: ggml ``output.weight`` must map to bare ``lm_head``.
+
+    gguf's candidate table also lists the legacy ``model.transformer.ff_out``
+    name, which the generic "model.* first" rule preferred — mlx-lm then
+    rejects the artifact at load time (Dolphin3.0 llama GGUF, untied).
+    """
+    from vllm_mlx.gguf_convert import _build_name_map
+
+    gg = tmp_path / "untied.gguf"
+    tensors = _make_tensors()
+    w = GGUFWriter(str(gg), arch="llama")
+    w.add_embedding_length(_DIM)
+    w.add_block_count(_LAYERS)
+    w.add_head_count(_HEADS)
+    w.add_head_count_kv(_KV_HEADS)
+    for name, kind, _shape in _LAYOUT:
+        data, _ = tensors[name]
+        if kind == "q4_0":
+            w.add_tensor(name, data, raw_dtype=GGMLQuantizationType.Q4_0)
+        else:
+            w.add_tensor(name, data)
+    w.add_tensor("output.weight", np.zeros((_VOCAB, _DIM), dtype=np.float16))
+    w.open_output_file()
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    from gguf import GGUFReader
+
+    mapping, _ = _build_name_map(GGUFReader(str(gg)))
+    assert mapping["output"] == "lm_head"
+
+
+def test_adjust_hf_name_gemma4():
+    """gemma4: transformers' names → mlx-lm's (mlp.*, bare layer_scalar)."""
+    from vllm_mlx.gguf_convert import _adjust_hf_name
+
+    assert (
+        _adjust_hf_name("model.layers.0.feed_forward.up_proj.weight", "gemma4_text")
+        == "model.layers.0.mlp.up_proj.weight"
+    )
+    assert (
+        _adjust_hf_name("model.layers.0.layer_scalar.weight", "gemma4_text")
+        == "model.layers.0.layer_scalar"
+    )
+    # Other archs pass through untouched.
+    assert (
+        _adjust_hf_name("model.layers.0.feed_forward.up_proj.weight", "llama")
+        == "model.layers.0.feed_forward.up_proj.weight"
+    )
+
+
+def test_postprocess_norm_minus_one_gating():
+    """gemma2/3 norms get −1; gemma4 norms must pass through untouched.
+
+    Measured ground truth: gemma4 GGUF stores raw ``w`` (layers.0
+    input_layernorm mean matches google/gemma-4-12B-it to 0.0000), so the
+    gemma2/3 +1-fold rule must not fire for gemma4_text.
+    """
+    from vllm_mlx.gguf_convert import _postprocess_tensor
+
+    w = np.array([0.5, 1.0, 2.0], dtype=np.float32)
+    out3 = _postprocess_tensor(w, "model.layers.0.input_layernorm.weight", "gemma3_text", 1, 1)
+    np.testing.assert_allclose(out3, w - 1)
+    out4 = _postprocess_tensor(w, "model.layers.0.input_layernorm.weight", "gemma4_text", 1, 1)
+    np.testing.assert_array_equal(out4, w)
+
+
 def test_resolve_repo_single_gguf(tmp_path, tiny_gguf):
     fake_hub = tmp_path / "hub"
     fake_hub.mkdir()
