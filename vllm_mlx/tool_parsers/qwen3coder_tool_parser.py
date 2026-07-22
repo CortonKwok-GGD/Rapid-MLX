@@ -187,9 +187,7 @@ class Qwen3CoderToolParser(ToolParser):
             are_single_special_tokens,
         )
 
-        if not are_single_special_tokens(
-            self.model_tokenizer, self._GRAMMAR_SENTINELS
-        ):
+        if not are_single_special_tokens(self.model_tokenizer, self._GRAMMAR_SENTINELS):
             return None
 
         def _info(name: str):
