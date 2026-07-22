@@ -35,16 +35,27 @@ PRESERVED. One additional test exercises the guided layer directly when the
 from __future__ import annotations
 
 import json
+import os
+import types
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from vllm_mlx.api.guided import GuidedSchemaCompileError, is_guided_available
+# Import from the DEPENDENCY-FREE errors module — and assert it is the SAME
+# class the guided module re-exports, so the whole chain agrees on identity.
+from vllm_mlx.api.errors import (
+    GuidedSchemaCompileError,
+    guided_schema_compile_error_detail,
+)
+from vllm_mlx.api.guided import GuidedSchemaCompileError as _GuidedErrFromGuided
+from vllm_mlx.api.guided import is_guided_available
 from vllm_mlx.config import reset_config
 from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.middleware.exception_handlers import install_exception_handlers
 from vllm_mlx.routes.chat import router as chat_router
+
+assert _GuidedErrFromGuided is GuidedSchemaCompileError  # re-export identity
 
 _VALID_PAYLOAD = '{"answer": 42}'
 _SCHEMA = {
@@ -55,6 +66,40 @@ _SCHEMA = {
 }
 _INVALID_SCHEMA = {"type": "notatype"}
 _COMPILE_ERR = GuidedSchemaCompileError("Invalid type: notatype")
+
+_QWEN_TOK_CACHE = os.path.expanduser(
+    "~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-4B-MLX-4bit/snapshots"
+)
+
+
+def _load_real_fast_tokenizer():
+    """Load the cached Qwen FAST tokenizer (no model weights, no download) and
+    wrap it the way ``GuidedGenerator`` expects (``._tokenizer`` = the HF fast
+    tokenizer). Returns ``None`` when unavailable so tests skip gracefully.
+    """
+    if not is_guided_available() or not os.path.isdir(_QWEN_TOK_CACHE):
+        return None
+    try:
+        from transformers import AutoTokenizer
+
+        snaps = [
+            d
+            for d in os.listdir(_QWEN_TOK_CACHE)
+            if os.path.isdir(os.path.join(_QWEN_TOK_CACHE, d))
+        ]
+        if not snaps:
+            return None
+        hf = AutoTokenizer.from_pretrained(os.path.join(_QWEN_TOK_CACHE, snaps[0]))
+        if not getattr(hf, "is_fast", False):
+            return None
+        return types.SimpleNamespace(
+            _tokenizer=hf, bos_token_id=getattr(hf, "bos_token_id", None)
+        )
+    except Exception:
+        return None
+
+
+_REAL_TOK = _load_real_fast_tokenizer()
 
 
 class _Engine:
@@ -173,6 +218,61 @@ def _assert_invalid_schema_400(resp) -> None:
     assert err["param"] == "response_format.json_schema.schema"
     assert "failed to compile" in err["message"]
     assert "notatype" in err["message"]
+
+
+# ---------------------------------------------------------------------------
+# Dependency-free errors module (Round-3 NIT #4): the envelope builder lives in
+# ``vllm_mlx.api.errors`` with NO mlx/llguidance import, so the exception
+# handlers and routes can build the 400 body without triggering engine init.
+# ---------------------------------------------------------------------------
+
+
+def test_errors_module_is_dependency_free():
+    """``vllm_mlx.api.errors`` must not drag in the heavy engine stack — that
+    is the whole point of splitting it out of ``api.guided`` (which imports
+    mlx/llguidance). If either becomes importable-through-errors, importing the
+    module for the envelope builder would boot the engine on every handler.
+
+    Runs in a FRESH subprocess: an in-process ``importlib.reload`` would mint a
+    NEW ``GuidedSchemaCompileError`` class object and poison the ``isinstance``
+    identity the rest of this suite (and the live handlers) depend on. A clean
+    interpreter both avoids that and proves the import graph from a cold start,
+    which is what a real handler process sees.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; import vllm_mlx.api.errors as e;"
+        "assert hasattr(e, 'GuidedSchemaCompileError');"
+        "assert hasattr(e, 'guided_schema_compile_error_detail');"
+        "assert 'mlx.core' not in sys.modules, sorted(m for m in sys.modules "
+        "if m.startswith('mlx'));"
+        "assert 'llguidance' not in sys.modules;"
+        "print('OK')"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "OK", proc.stdout
+
+
+def test_guided_compile_error_detail_envelope_and_param_override():
+    """The envelope builder produces the canonical OpenAI-style body and honors
+    the ``param`` override the ``/v1/responses`` route uses
+    (``text.format.schema`` vs the chat default)."""
+    exc = GuidedSchemaCompileError("Invalid type: notatype")
+
+    default = guided_schema_compile_error_detail(exc)["error"]
+    assert default["type"] == "invalid_request_error"
+    assert default["code"] == "invalid_response_format_schema"
+    assert default["param"] == "response_format.json_schema.schema"
+    assert "failed to compile" in default["message"]
+    assert "notatype" in default["message"]
+
+    overridden = guided_schema_compile_error_detail(exc, param="text.format.schema")[
+        "error"
+    ]
+    assert overridden["param"] == "text.format.schema"
 
 
 # ---------------------------------------------------------------------------
@@ -392,14 +492,15 @@ def test_generate_json_raises_on_schema_compile_failure(monkeypatch):
 @pytest.mark.skipif(
     not is_guided_available(), reason="requires the [guided] (llguidance) extra"
 )
-def test_generate_json_internal_error_not_misreported_as_400(monkeypatch):
-    """Issue-2 narrowing: an INTERNAL / operational failure (e.g. a
-    ``RuntimeError`` resource failure) on the compile call must NOT be
-    misclassified as invalid client input. Only a ``ValueError`` (genuine
-    unparseable schema) becomes ``GuidedSchemaCompileError`` (→ 400); a
-    ``RuntimeError`` propagates as itself to the runtime-failure / 5xx path,
-    so no server-internal diagnostic is ever leaked into a 400 body on a
-    VALID schema.
+def test_generate_json_internal_error_on_valid_schema_degrades_to_none(monkeypatch):
+    """Discriminator, operational arm: an INTERNAL / operational failure (e.g.
+    a ``RuntimeError`` resource failure) on the compile call for a schema a
+    standard validator ACCEPTS must NOT be misclassified as invalid client
+    input. The discriminator (``_schema_invalid_reason`` = ``None`` for a valid
+    schema) sends it to the runtime-failure path — ``generate_json`` returns
+    ``None`` (best-effort fallback / strict 502), NEVER a 400 that would tell
+    the caller to fix a perfectly valid schema and leak a server-internal
+    diagnostic into the body.
     """
     from vllm_mlx.api import guided as guided_mod
 
@@ -412,8 +513,85 @@ def test_generate_json_internal_error_not_misreported_as_400(monkeypatch):
         staticmethod(_internal_boom),
     )
     gen = guided_mod.GuidedGenerator(model=None, tokenizer=None)
-    with pytest.raises(RuntimeError):
-        gen.generate_json(prompt="hi", json_schema=_SCHEMA, max_tokens=8)
+    # _SCHEMA is valid → schema_invalid_reason is None → the RuntimeError is an
+    # operational failure caught by the broad `except Exception -> None` arm.
+    assert gen.generate_json(prompt="hi", json_schema=_SCHEMA, max_tokens=8) is None
+
+
+@pytest.mark.skipif(
+    not is_guided_available(), reason="requires the [guided] (llguidance) extra"
+)
+def test_generate_json_valueerror_on_invalid_schema_raises_400(monkeypatch):
+    """Discriminator, client-fault arm: an EAGER ``ValueError`` from
+    ``grammar_from_json_schema`` on a schema a standard validator REJECTS is a
+    caller fault → ``GuidedSchemaCompileError`` (→ 400). This pins the eager
+    ``except ValueError`` branch that mirrors the lazy ``get_error()`` one."""
+    from vllm_mlx.api import guided as guided_mod
+
+    def _unparseable(*_a, **_k):
+        raise ValueError("expected ident at line 1 column 2")
+
+    monkeypatch.setattr(
+        guided_mod.LLMatcher, "grammar_from_json_schema", staticmethod(_unparseable)
+    )
+    gen = guided_mod.GuidedGenerator(model=None, tokenizer=None)
+    # _INVALID_SCHEMA is invalid → schema_invalid_reason is non-None → 400.
+    with pytest.raises(GuidedSchemaCompileError):
+        gen.generate_json(prompt="hi", json_schema=_INVALID_SCHEMA, max_tokens=8)
+
+
+@pytest.mark.skipif(
+    _REAL_TOK is None,
+    reason="requires the [guided] extra AND the cached Qwen fast tokenizer",
+)
+def test_generate_json_real_llguidance_get_error_raises_400():
+    """Round-3 #2 — drive the REAL, load-bearing ``matcher.get_error()`` path
+    with NO mock at the grammar-compile layer.
+
+    ``{"type": "notatype"}`` is a schema llguidance accepts EAGERLY at
+    ``grammar_from_json_schema`` but rejects LAZILY at ``LLMatcher`` construction
+    (``get_error()`` → "Invalid type: notatype"). The route-level mocks stand in
+    a ``GuidedSchemaCompileError`` at ``generate_with_schema``; this test proves
+    the real llguidance stack actually PRODUCES that exception, so the whole
+    400 contract rests on observed behaviour, not an assumed one.
+
+    Uses the cached Qwen FAST tokenizer (no weights, no download); ``model`` is
+    an ``object()`` because the raise happens at matcher construction, before
+    any forward pass. The jsonschema discriminator confirms the schema invalid,
+    so ``generate_json`` re-raises rather than degrading to ``None``.
+    """
+    from vllm_mlx.api.guided import GuidedGenerator
+
+    gen = GuidedGenerator(model=object(), tokenizer=_REAL_TOK)
+    with pytest.raises(GuidedSchemaCompileError) as excinfo:
+        gen.generate_json(prompt="hi", json_schema=_INVALID_SCHEMA, max_tokens=8)
+    assert "notatype" in str(excinfo.value)
+
+
+@pytest.mark.skipif(
+    _REAL_TOK is None,
+    reason="requires the [guided] extra AND the cached Qwen fast tokenizer",
+)
+def test_generate_json_real_llguidance_get_error_on_valid_schema_degrades(monkeypatch):
+    """Round-3 discriminator, real-stack operational arm: if the REAL
+    ``matcher.get_error()`` fires (via a monkeypatched ``_decode_constrained``
+    that re-raises ``GuidedSchemaCompileError``) on a schema a standard
+    validator ACCEPTS, ``generate_json`` must degrade to ``None`` (operational),
+    NOT raise a 400. This guards the exact false-positive the discriminator was
+    added to prevent: an llguidance-unsupported-but-valid construct must not be
+    reported to the caller as a malformed schema."""
+    from vllm_mlx.api.guided import GuidedGenerator
+
+    gen = GuidedGenerator(model=object(), tokenizer=_REAL_TOK)
+
+    def _fake_decode(**_kw):
+        # Simulate llguidance rejecting a structurally-valid schema at
+        # matcher construction (get_error) — the operational case.
+        raise GuidedSchemaCompileError("some llguidance-internal limit")
+
+    monkeypatch.setattr(gen, "_decode_constrained", _fake_decode)
+    # _SCHEMA is valid → discriminator None → operational → None, not a raise.
+    assert gen.generate_json(prompt="hi", json_schema=_SCHEMA, max_tokens=8) is None
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +763,123 @@ def test_responses_invalid_schema_returns_400(_rate_limiter_state):
     assert err["param"] == "text.format.schema"
     assert "failed to compile" in err["message"]
     assert engine.chat_calls == [], "compile error must NOT fall back to chat()"
+
+
+def test_responses_strict_stream_rejected_before_generation(_rate_limiter_state):
+    """Round-3 #3 pin: ``/v1/responses`` NEVER has the chat streaming's silent
+    gap because a strict schema with ``stream=true`` is rejected UP-FRONT with
+    a 400 (``strict_stream_unsupported``) — constrained decoding on this surface
+    is buffered-only, so ``_stream_responses`` never calls
+    ``generate_with_schema`` and no compile error can surface mid-SSE. This is
+    the structural reason the compile-error 400 for ``/v1/responses`` lives only
+    on the non-stream path (``test_responses_invalid_schema_returns_400``).
+
+    Guarding this here means a future change that lets strict schemas stream on
+    ``/v1/responses`` (re-opening the silent-degrade hole) turns this test red.
+    ``guided_raises`` is set so that IF generation were (wrongly) reached, the
+    engine would blow up — but it must not be reached at all.
+    """
+    engine = _Engine(guided_raises=_COMPILE_ERR)
+    client = _make_responses_client(engine)
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "stream": True,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "x",
+                    "schema": _SCHEMA,
+                    "strict": True,
+                }
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "strict_stream_unsupported"
+    assert engine.guided_calls == [], (
+        "strict+stream must be rejected before any generation is attempted"
+    )
+    assert engine.chat_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Round-3 #5: the TaskGroup / thread-boundary safety net must recover a
+# GuidedSchemaCompileError even when a 3.11+ ``TaskGroup`` re-raises it wrapped
+# in a (possibly nested) ``ExceptionGroup``, which a bare ``isinstance`` check
+# in the dedicated handler would miss — it would fall through to a sanitized
+# 500 and re-hide the caller's invalid schema behind an opaque server error.
+# ---------------------------------------------------------------------------
+
+
+def _exc_group(*excs: BaseException) -> BaseException:
+    """Build a real ``ExceptionGroup`` on 3.11+, else skip the group tests
+    (3.10 has no builtin ``ExceptionGroup``; the safety net degrades to a plain
+    ``isinstance`` there, which is correct because TaskGroups can't wrap on
+    3.10)."""
+    try:
+        return ExceptionGroup("boom", list(excs))  # noqa: F821 (3.11+ builtin)
+    except NameError:  # pragma: no cover - 3.10 path
+        pytest.skip("ExceptionGroup requires Python 3.11+")
+
+
+def _group_raising_app(exc: BaseException) -> TestClient:
+    app = FastAPI()
+    install_exception_handlers(app)
+
+    @app.get("/boom")
+    async def _boom():
+        raise exc
+
+    # raise_server_exceptions=False: the generic ``Exception`` handler
+    # (ServerErrorMiddleware) always re-raises after sending its response, so
+    # to OBSERVE the 400 it produced we must stop TestClient from propagating
+    # that re-raise into the test body.
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_exception_group_wrapped_compile_error_maps_to_400():
+    """A ``GuidedSchemaCompileError`` wrapped in an ``ExceptionGroup`` (the
+    3.11+ TaskGroup shape) reaching the generic handler is unwrapped via
+    ``_extract_from_group`` and mapped to the clean 400, NOT a sanitized 500."""
+    group = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
+    client = _group_raising_app(group)
+    resp = client.get("/boom")
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_response_format_schema"
+    assert "notatype" in err["message"]
+
+
+def test_nested_exception_group_wrapped_compile_error_maps_to_400():
+    """The unwrap is RECURSIVE: a compile error nested two ``ExceptionGroup``
+    levels deep (group-of-group, e.g. nested TaskGroups) is still recovered to
+    the 400 rather than leaking as a 500."""
+    inner = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
+    outer = _exc_group(inner)
+    client = _group_raising_app(outer)
+    resp = client.get("/boom")
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_response_format_schema"
+
+
+def test_exception_group_without_compile_error_stays_500():
+    """A safety guard: an ``ExceptionGroup`` that does NOT contain a
+    ``GuidedSchemaCompileError`` must NOT be coerced into a 400 — it stays a
+    sanitized 500. This pins that ``_extract_from_group`` returns ``None`` (no
+    false-positive 400s) for unrelated grouped failures."""
+    group = _exc_group(RuntimeError("some unrelated internal failure"))
+    client = _group_raising_app(group)
+    resp = client.get("/boom")
+    assert resp.status_code == 500, resp.text
+    # The sanitized 500 body carries no ``code`` — the point is only that the
+    # unrelated group was NOT coerced into the compile-error 400 envelope.
+    assert resp.json().get("error", {}).get("code") != "invalid_response_format_schema"
 
 
 if __name__ == "__main__":

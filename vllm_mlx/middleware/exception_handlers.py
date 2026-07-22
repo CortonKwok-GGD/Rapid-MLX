@@ -944,12 +944,40 @@ def _guided_compile_error_response(exc: BaseException) -> JSONResponse:
     (the caller's own malformed schema) — the raise sites narrow to genuine
     schema-invalid signals, so no server-internal detail reaches this body.
     """
-    from ..api.guided import guided_schema_compile_error_detail
+    from ..api.errors import guided_schema_compile_error_detail
 
     return JSONResponse(
         status_code=400,
         content=guided_schema_compile_error_detail(exc),
     )
+
+
+# ``BaseExceptionGroup`` is a builtin only on Python 3.11+. On 3.10 there are
+# no ExceptionGroups to unwrap, so bind an empty tuple that makes every
+# ``isinstance`` check against it False.
+try:
+    _BASE_EXCEPTION_GROUP = BaseExceptionGroup
+except NameError:  # pragma: no cover - Python 3.10
+    _BASE_EXCEPTION_GROUP = ()
+
+
+def _extract_from_group(exc: BaseException, cls: type) -> BaseException | None:
+    """Return the first ``cls`` instance reachable from ``exc``.
+
+    On Python 3.11+ an ``asyncio.TaskGroup`` (and ``except*``) wraps child
+    exceptions in a ``BaseExceptionGroup``, so a bare ``isinstance(exc, cls)``
+    misses a ``GuidedSchemaCompileError`` raised inside a task. Recurse into
+    nested group members so the safety-net handler still catches it; returns
+    ``None`` when no member matches.
+    """
+    if isinstance(exc, cls):
+        return exc
+    if _BASE_EXCEPTION_GROUP and isinstance(exc, _BASE_EXCEPTION_GROUP):
+        for sub in exc.exceptions:
+            found = _extract_from_group(sub, cls)
+            if found is not None:
+                return found
+    return None
 
 
 def _recursion_error_response() -> JSONResponse:
@@ -1077,11 +1105,10 @@ def install_exception_handlers(app: FastAPI) -> None:
     """
     _register_canonical_request_models()
 
-    # Imported here (not at module load) so registering the handler does not
-    # force the heavy ``api.guided`` (mlx / llguidance) import at app-setup
-    # time on installs that never reach guided decoding. The class is always
-    # importable — ``api.guided`` degrades gracefully without the extra.
-    from ..api.guided import GuidedSchemaCompileError
+    # Imported from the DEPENDENCY-FREE ``api.errors`` module (no mlx /
+    # llguidance) so registering the handler never triggers native module init
+    # at app-setup time on installs that never reach guided decoding.
+    from ..api.errors import GuidedSchemaCompileError
 
     @app.exception_handler(GuidedSchemaCompileError)
     async def _guided_compile_handler(
@@ -1222,11 +1249,14 @@ def install_exception_handlers(app: FastAPI) -> None:
         if isinstance(exc, StarletteHTTPException):
             response = _http_error_response(exc)
             return _wrap_for_anthropic(response) if anthropic else response
-        if isinstance(exc, GuidedSchemaCompileError):
+        _guided_exc = _extract_from_group(exc, GuidedSchemaCompileError)
+        if _guided_exc is not None:
             # Same rationale as the dedicated handler above — reroute here in
-            # case a TaskGroup / thread boundary lands the compile error on
-            # the generic handler instead of the dedicated one.
-            response = _guided_compile_error_response(exc)
+            # case a TaskGroup / thread boundary lands the compile error on the
+            # generic handler, INCLUDING when it is wrapped in a (nested)
+            # ``BaseExceptionGroup`` (3.11+ ``TaskGroup``), which would fail a
+            # bare ``isinstance`` check.
+            response = _guided_compile_error_response(_guided_exc)
             return _wrap_for_anthropic(response) if anthropic else response
         if isinstance(exc, RecursionError):
             # ``isinstance(RecursionError) before isinstance(Exception)``:

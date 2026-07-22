@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
-from ..api.guided import GuidedSchemaCompileError, guided_schema_compile_error_detail
+from ..api.errors import GuidedSchemaCompileError, guided_schema_compile_error_detail
 from ..api.models import (
     AssistantMessage,
     ChatCompletionChoice,

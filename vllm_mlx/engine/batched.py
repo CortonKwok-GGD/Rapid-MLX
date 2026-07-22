@@ -635,24 +635,19 @@ def _compute_metal_cache_limit(soft_limit_bytes: int) -> int:
     return min(cache, soft_limit_bytes) if soft_limit_bytes > 0 else cache
 
 
+# ``GuidedSchemaCompileError`` lives in the dependency-free ``api.errors``
+# module, so it is always importable even when the ``[guided]`` extra (and the
+# heavy ``api.guided`` import below) is absent — no placeholder shim needed.
+from ..api.errors import GuidedSchemaCompileError
+
 # Check for guided generation availability
 try:
-    from ..api.guided import (
-        GuidedGenerator,
-        GuidedSchemaCompileError,
-        is_guided_available,
-    )
+    from ..api.guided import GuidedGenerator, is_guided_available
 
     HAS_GUIDED = is_guided_available()
 except ImportError:
     HAS_GUIDED = False
     GuidedGenerator = None
-
-    # Placeholder so ``except GuidedSchemaCompileError`` below never NameErrors
-    # when the ``[guided]`` extra is absent. Guided decoding is unavailable in
-    # that case, so no real compile error is ever raised to match against it.
-    class GuidedSchemaCompileError(Exception):  # type: ignore[no-redef]
-        pass
 
 
 def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:

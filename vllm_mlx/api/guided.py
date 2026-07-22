@@ -28,56 +28,49 @@ Two constraint modes are supported, matching the two the OpenAI
 import logging
 from typing import Any
 
+# Re-exported from the dependency-free ``errors`` module so lightweight
+# consumers (the app-startup exception handler, route modules) never have to
+# import THIS module — which triggers native MLX / llguidance init — just to
+# reference the exception or its 400 envelope. Kept importable here for
+# backward compatibility.
+from .errors import GuidedSchemaCompileError, guided_schema_compile_error_detail
+
+__all__ = [
+    "GuidedGenerator",
+    "GuidedSchemaCompileError",
+    "generate_with_schema",
+    "guided_schema_compile_error_detail",
+    "is_guided_available",
+]
+
 logger = logging.getLogger(__name__)
 
 
-class GuidedSchemaCompileError(Exception):
-    """A caller-supplied structured-output schema/grammar failed to compile.
+def _schema_invalid_reason(json_schema: Any) -> str | None:
+    """Return a short reason iff ``json_schema`` is NOT a valid JSON Schema.
 
-    This is distinct from a *generic* guided-generation failure (a transient
-    runtime error, a missing ``[guided]`` extra, a slow/absent fast tokenizer,
-    or a parse truncated by ``max_tokens``). Those degrade to ``None`` and,
-    for best-effort/suggestion-only requests, MAY fall back to unconstrained
-    generation.
+    This is the llguidance-AGNOSTIC discriminator between a genuine client
+    fault (→ HTTP 400) and an operational llguidance failure on a
+    structurally-valid schema (→ the runtime-failure path, NOT a 400). It runs
+    the caller's schema through the same dynamic-draft ``jsonschema``
+    ``check_schema`` the strict-route preflight uses, so both surfaces agree
+    on what "invalid schema" means.
 
-    A compile error means the CLIENT's own
-    ``response_format.json_schema.schema`` is invalid — a deterministic,
-    request-level fault (e.g. ``{"type": "notatype"}``). The route layer
-    translates it into an HTTP 400 (non-streaming) or a terminal SSE error
-    envelope (streaming) instead of silently degrading to unconstrained
-    output, so a caller who asked for a hard schema guarantee is never left
-    believing their output is constrained when it is not.
-
-    Defined ABOVE the optional ``llguidance`` import block so it is always
-    importable, even on installs without the ``[guided]`` extra.
+    A missing/broken ``jsonschema`` (a SERVER dependency failure) or any
+    non-schema error is treated as "cannot confirm invalid" → ``None``, so a
+    server-side problem is NEVER fabricated into a client 400.
     """
+    try:
+        from .tool_calling import check_schema_validity
 
-
-def guided_schema_compile_error_detail(
-    exc: BaseException,
-    param: str = "response_format.json_schema.schema",
-) -> dict[str, Any]:
-    """Build the canonical OpenAI-shaped 400 envelope for a compile error.
-
-    Shared by EVERY endpoint that constrains output to a caller schema (and
-    the centralized exception handler) so the 400 body is byte-identical
-    across ``/v1/chat/completions`` and ``/v1/responses``. ``param`` locates
-    the offending field per surface: ``response_format.json_schema.schema``
-    on the chat/completions API, ``text.format.schema`` on the responses API.
-
-    The message embeds only the schema-level diagnostic carried by
-    ``GuidedSchemaCompileError`` (which describes the CALLER's own malformed
-    schema) — never a server-internal exception, because the raise sites
-    narrow to genuine schema-invalid signals before constructing it.
-    """
-    return {
-        "error": {
-            "message": f"{param} failed to compile: {exc}",
-            "type": "invalid_request_error",
-            "code": "invalid_response_format_schema",
-            "param": param,
-        }
-    }
+        ok, reason = check_schema_validity(json_schema)
+    except Exception:
+        # jsonschema import failure / unexpected error: do not claim the
+        # client's schema is invalid on a server-side fault.
+        return None
+    if ok:
+        return None
+    return reason or "invalid JSON Schema document"
 
 
 # MUST install the MLX hardware-compat shim BEFORE the `mlx_lm` import below.
@@ -408,14 +401,17 @@ class GuidedGenerator:
         matcher = LLMatcher(lltok, grammar)
         err = matcher.get_error()
         if err:
-            # A non-empty error here means the grammar the caller asked us to
-            # enforce does not compile (e.g. an invalid JSON-schema ``type``).
-            # This is a deterministic, caller-visible fault — raise rather than
-            # returning ``None`` so it is DISTINGUISHABLE from a benign
-            # guided-unavailable / truncated-parse ``None``. Returning ``None``
-            # here previously let the engine swallow an invalid schema into a
-            # silent unconstrained fallback (HTTP 200 with free-form text); the
-            # route now surfaces the compile error as an HTTP 400.
+            # A non-empty error here means llguidance rejected the grammar at
+            # matcher construction (e.g. an invalid JSON-schema ``type``).
+            # Raise rather than returning ``None`` so it is DISTINGUISHABLE
+            # from a benign guided-unavailable / truncated-parse ``None`` (that
+            # ``None`` previously let the engine swallow the failure into a
+            # silent unconstrained fallback). The CLASSIFICATION of this signal
+            # — genuine client-invalid schema (→ HTTP 400) vs an operational
+            # llguidance failure on a structurally-valid schema (→ runtime
+            # path) — is decided by ``generate_json`` (which holds the schema
+            # dict and consults ``_schema_invalid_reason``); this layer only
+            # reports that llguidance could not build the matcher.
             logger.error("llguidance grammar/compile error: %s", err)
             raise GuidedSchemaCompileError(str(err))
 
@@ -561,42 +557,23 @@ class GuidedGenerator:
 
         schema_str = _json.dumps(json_schema)
 
-        # Compile the schema FIRST, in its own try. A failure to turn the
-        # caller's schema into a grammar (llguidance raising, or an unparseable
-        # schema) is an invalid REQUEST, not a transient runtime fault — surface
-        # it as ``GuidedSchemaCompileError`` so the route returns HTTP 400
-        # instead of silently degrading to unconstrained generation.
+        # SINGLE DISCRIMINATOR (computed once, consulted at every llguidance
+        # failure below): is the caller's schema itself a valid JSON Schema
+        # document? A non-``None`` reason means it is genuinely INVALID —
+        # llguidance failures on it are the caller's fault → HTTP 400. If the
+        # schema is valid but llguidance still fails (unsupported construct,
+        # tokenizer/model-compat, internal compiler limit), that is an
+        # OPERATIONAL failure → the runtime-failure path (``None`` →
+        # best-effort fallback / strict 502), NEVER a misleading 400 that
+        # would leak a server-internal diagnostic and tell the caller to fix a
+        # perfectly valid schema.
+        schema_invalid_reason = _schema_invalid_reason(json_schema)
+
         try:
             grammar = LLMatcher.grammar_from_json_schema(
                 schema_str,
                 overrides={"whitespace_flexible": True},
             )
-        except ValueError as e:
-            # llguidance raises ``ValueError`` for a schema it cannot parse
-            # into a grammar (malformed JSON / grammar input) — a genuine
-            # invalid-schema fault attributable to the caller. Narrow the
-            # catch to ``ValueError`` ONLY (NOT a broad ``except Exception``):
-            # an internal / operational failure (RuntimeError, MemoryError,
-            # …) on a VALID schema must NOT be misclassified as invalid client
-            # input — that would emit a 400 leaking a server-internal
-            # diagnostic. Such failures propagate to the runtime-failure path
-            # (``None`` → best-effort fallback / strict 502) instead.
-            #
-            # NOTE: the common invalid-schema case (e.g. ``{"type":
-            # "notatype"}``) does NOT raise here — llguidance compiles it
-            # lazily and the error surfaces at matcher construction inside
-            # ``_decode_constrained`` (``matcher.get_error()``), which raises
-            # ``GuidedSchemaCompileError`` directly. This ``ValueError`` arm
-            # covers only the eagerly-rejected (unparseable) schemas.
-            logger.error("llguidance schema compile error: %s", e)
-            raise GuidedSchemaCompileError(str(e)) from e
-
-        # Decode. ``_decode_constrained`` may ALSO raise
-        # ``GuidedSchemaCompileError`` (the invalid-schema error surfaces at
-        # matcher construction, not at ``grammar_from_json_schema``) — let it
-        # propagate. Any OTHER failure is a runtime/decode problem that stays a
-        # graceful ``None`` (guided-unavailable) for best-effort callers.
-        try:
             return self._decode_constrained(
                 grammar=grammar,
                 prompt=prompt,
@@ -604,8 +581,33 @@ class GuidedGenerator:
                 temperature=temperature,
             )
         except GuidedSchemaCompileError:
-            raise
+            # llguidance rejected the schema LAZILY at matcher construction
+            # (``matcher.get_error()`` in ``_decode_constrained``). 400 only if
+            # a standard validator ALSO rejects it.
+            if schema_invalid_reason is not None:
+                raise
+            logger.error(
+                "guided decode: llguidance rejected a schema a standard "
+                "JSON-Schema validator accepts — treating as operational and "
+                "degrading to the runtime-failure path (None), not a 400."
+            )
+            return None
+        except ValueError as e:
+            # llguidance rejected the schema EAGERLY at
+            # ``grammar_from_json_schema`` (unparseable). Same discrimination:
+            # confirmed-invalid → 400, else operational → None.
+            if schema_invalid_reason is not None:
+                logger.error("llguidance schema compile error: %s", e)
+                raise GuidedSchemaCompileError(str(e)) from e
+            logger.exception(
+                "Guided generation: operational ValueError on a schema a "
+                "standard validator accepts — degrading to the runtime-failure "
+                "path (None), not a 400."
+            )
+            return None
         except Exception:
+            # Any other runtime/decode failure stays a graceful ``None``
+            # (guided-unavailable) for best-effort callers.
             logger.exception("Guided generation failed")
             return None
 
