@@ -356,14 +356,17 @@ class GuidedGenerator:
         guided failure: under strict mode the route surfaces a sanitized 502
         ``strict_schema_violation`` (a server-side inability to honor the
         constraint), and under non-strict mode it degrades to a best-effort
-        unconstrained 200. (This is distinct from an INVALID caller schema,
-        which is a 400 — see the ``GuidedSchemaCompileError`` note below.)
+        unconstrained 200.
 
-        Raises ``GuidedSchemaCompileError`` when the grammar itself fails to
-        compile (invalid caller schema). This is deliberately NOT folded into
-        the ``None`` return: an invalid schema is a caller fault the route
-        must surface as an HTTP 400, not silently degrade to unconstrained
-        output.
+        Raises ``GuidedSchemaCompileError`` when llguidance rejects the grammar
+        at matcher construction. ``generate_json`` CATCHES it and degrades to
+        ``None`` — the SAME operational path as above (strict 502 / non-strict
+        best-effort 200), NOT a 400: the structural validity of the caller
+        schema is already settled UPSTREAM at the route boundary, so a rejection
+        that reaches this layer is an operational llguidance failure on an
+        already-valid schema, not a caller fault. The dedicated exception type
+        is retained only so the rejection is distinguishable in logs from a
+        benign truncated-parse ``None``.
         """
         from mlx_lm.models.cache import make_prompt_cache
 
@@ -538,23 +541,22 @@ class GuidedGenerator:
         """
         import json as _json
 
-        schema_str = _json.dumps(json_schema)
-
         # STRUCTURAL VALIDATION HAPPENS ONCE, AT THE ROUTE BOUNDARY
         # (``nonstrict_json_schema_boundary_error`` for non-strict +
         # ``check_schema_validity`` strict pre-flight). Any schema reaching this
         # method is therefore already structurally VALID, so this layer does NO
         # structural re-check (validate-once — no duplicate work, nothing run on
-        # the event-loop/executor thread twice). Consequently EVERY llguidance
-        # failure here is OPERATIONAL — an unsupported-but-valid construct, a
-        # tokenizer/model-compat issue, an internal compiler limit, or a
-        # truncated parse — NOT a caller fault. All arms degrade to ``None``,
-        # which the engine turns into the operational path (strict → sanitized
-        # 502, non-strict → best-effort unconstrained 200), NEVER a 400. (The
-        # engine-layer + route-level ``GuidedSchemaCompileError`` handling
-        # remains only as defense-in-depth for any future path that reaches the
-        # guided layer without the boundary check.)
+        # the event-loop/executor thread twice). Consequently EVERY failure in
+        # this block is OPERATIONAL — a serialization edge case, an
+        # unsupported-but-valid construct, a tokenizer/model-compat issue, an
+        # internal compiler limit, or a truncated parse — NOT a caller fault.
+        # All arms degrade to ``None``, which the engine turns into the
+        # operational path (strict → sanitized 502, non-strict → best-effort
+        # unconstrained 200), NEVER a 400. ``json.dumps`` is kept INSIDE the
+        # ``try`` so a serialization failure follows that same graceful ``None``
+        # path rather than escaping as an unhandled error.
         try:
+            schema_str = _json.dumps(json_schema)
             grammar = LLMatcher.grammar_from_json_schema(
                 schema_str,
                 overrides={"whitespace_flexible": True},

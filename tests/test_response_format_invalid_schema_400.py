@@ -682,6 +682,57 @@ def test_run_guided_generation_degrades_failure_to_none(monkeypatch):
     )
 
 
+async def test_generate_with_schema_operational_none_raises_no_chat_fallback(
+    monkeypatch,
+):
+    """The strict-502 guarantee now rests ENTIRELY on the REAL
+    ``BatchedEngine.generate_with_schema(..., raise_on_failure=True)`` raising when
+    guided decoding returns ``None`` — once the compile-error propagation machinery
+    was deleted, ``None`` is the ONLY operational-failure signal. This exercises
+    the real wrapper (NOT a mock that raises directly, which would stay green even
+    if the wrapper silently fell back): stub ``_run_guided_generation`` to return
+    ``None``, then assert the wrapper RAISES (the route maps this to 502) and NEVER
+    calls unconstrained ``chat()``. Without ``raise_on_failure`` this same ``None``
+    is the best-effort fallback; with it (strict), the silent degrade is refused."""
+    from vllm_mlx.engine import batched as batched_mod
+
+    eng = batched_mod.BatchedEngine.__new__(batched_mod.BatchedEngine)
+    eng._model = object()
+    eng._tokenizer = object()
+    eng._is_mllm = False  # → supports_guided_generation is True (llguidance core)
+    eng._loaded = True
+    eng._model_name = "test-model"
+    # None → the wrapper uses asyncio.to_thread; our stub touches no model/GPU.
+    eng._model_load_executor = None
+    # Guided decoding degrades to None (operational failure — the only signal now
+    # that structural validity is settled at the route boundary).
+    monkeypatch.setattr(eng, "_run_guided_generation", lambda **_kw: None)
+    monkeypatch.setattr(
+        batched_mod, "shared_apply_chat_template", lambda *a, **k: "PROMPT"
+    )
+
+    chat_calls: list = []
+
+    async def _spy_chat(**kwargs):
+        chat_calls.append(kwargs)
+        return GenerationOutput(
+            text="FALLBACK", new_text="FALLBACK", finish_reason="stop"
+        )
+
+    eng.chat = _spy_chat
+
+    with pytest.raises(RuntimeError):
+        await eng.generate_with_schema(
+            messages=[{"role": "user", "content": "hi"}],
+            json_schema=_SCHEMA,
+            raise_on_failure=True,
+        )
+    assert chat_calls == [], (
+        "strict (raise_on_failure=True) must NOT silently fall back to "
+        "unconstrained chat() when guided decoding returns None"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Non-chat endpoint coverage (Issue 1): /v1/responses must ALSO reject an invalid
 # schema at the ROUTE BOUNDARY (HTTP 400, not the strict 502, not a silent 200).
