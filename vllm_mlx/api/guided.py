@@ -386,10 +386,14 @@ class GuidedGenerator:
             # ``None`` previously let the engine swallow the failure into a
             # silent unconstrained fallback). The CLASSIFICATION of this signal
             # — genuine client-invalid schema (→ HTTP 400) vs an operational
-            # llguidance failure on a structurally-valid schema (→ runtime
-            # path) — is decided by ``generate_json`` (which holds the schema
-            # dict and consults ``_schema_invalid_reason``); this layer only
-            # reports that llguidance could not build the matcher.
+            # llguidance failure on a structurally-valid schema (→ 502) — is
+            # NOT decided here: structural validity is already settled ONCE at
+            # the route boundary (``nonstrict_json_schema_boundary_error`` for
+            # non-strict, the strict pre-flight for strict), so any error that
+            # reaches this layer is treated as OPERATIONAL by ``generate_json``
+            # (returns ``None`` → strict raises 502, non-strict best-effort).
+            # This layer only reports that llguidance could not build the
+            # matcher.
             logger.error("llguidance grammar/compile error: %s", err)
             raise GuidedSchemaCompileError(str(err))
 
