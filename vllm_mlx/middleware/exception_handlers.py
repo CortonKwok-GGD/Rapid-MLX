@@ -961,23 +961,41 @@ except NameError:  # pragma: no cover - Python 3.10
     _BASE_EXCEPTION_GROUP = ()
 
 
-def _extract_from_group(exc: BaseException, cls: type) -> BaseException | None:
-    """Return the first ``cls`` instance reachable from ``exc``.
+def _iter_leaves(exc: BaseException):
+    """Yield every non-group LEAF exception reachable from ``exc``.
 
-    On Python 3.11+ an ``asyncio.TaskGroup`` (and ``except*``) wraps child
-    exceptions in a ``BaseExceptionGroup``, so a bare ``isinstance(exc, cls)``
-    misses a ``GuidedSchemaCompileError`` raised inside a task. Recurse into
-    nested group members so the safety-net handler still catches it; returns
-    ``None`` when no member matches.
+    Flattens (possibly nested) ``BaseExceptionGroup`` members on Python 3.11+;
+    on 3.10 (no ExceptionGroup) ``exc`` is itself the only leaf.
     """
-    if isinstance(exc, cls):
-        return exc
     if _BASE_EXCEPTION_GROUP and isinstance(exc, _BASE_EXCEPTION_GROUP):
         for sub in exc.exceptions:
-            found = _extract_from_group(sub, cls)
-            if found is not None:
-                return found
-    return None
+            yield from _iter_leaves(sub)
+    else:
+        yield exc
+
+
+def _extract_all_leaves_are(exc: BaseException, cls: type) -> BaseException | None:
+    """Return a representative ``cls`` instance IFF ``exc`` is a ``cls`` or a
+    group whose EVERY leaf is a ``cls``; otherwise ``None``.
+
+    This is deliberately ALL-leaves, not any-leaf. A ``TaskGroup`` can bundle a
+    ``GuidedSchemaCompileError`` (client 400) together with an unrelated
+    internal failure (``MemoryError``/``RuntimeError``, a 5xx). Mapping the whole
+    group to 400 because ONE leaf is a compile error would mask the internal
+    failure and mislead the client into "fix your schema" when the server also
+    broke. So we only collapse to the 400 when there is no non-``cls`` leaf to
+    hide; a mixed group falls through to the sanitized 5xx.
+    """
+    leaves = list(_iter_leaves(exc))
+    if not leaves:
+        return None
+    representative: BaseException | None = None
+    for leaf in leaves:
+        if not isinstance(leaf, cls):
+            return None
+        if representative is None:
+            representative = leaf
+    return representative
 
 
 def _recursion_error_response() -> JSONResponse:
@@ -1249,13 +1267,16 @@ def install_exception_handlers(app: FastAPI) -> None:
         if isinstance(exc, StarletteHTTPException):
             response = _http_error_response(exc)
             return _wrap_for_anthropic(response) if anthropic else response
-        _guided_exc = _extract_from_group(exc, GuidedSchemaCompileError)
+        _guided_exc = _extract_all_leaves_are(exc, GuidedSchemaCompileError)
         if _guided_exc is not None:
             # Same rationale as the dedicated handler above — reroute here in
             # case a TaskGroup / thread boundary lands the compile error on the
             # generic handler, INCLUDING when it is wrapped in a (nested)
             # ``BaseExceptionGroup`` (3.11+ ``TaskGroup``), which would fail a
-            # bare ``isinstance`` check.
+            # bare ``isinstance`` check. ALL-leaves check: a MIXED group (a
+            # compile error bundled with an unrelated internal failure) is NOT
+            # collapsed to 400 — it falls through to the sanitized 5xx below so
+            # the server-side failure is never masked as a client schema fault.
             response = _guided_compile_error_response(_guided_exc)
             return _wrap_for_anthropic(response) if anthropic else response
         if isinstance(exc, RecursionError):

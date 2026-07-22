@@ -383,8 +383,12 @@ class GuidedGenerator:
         (fully-satisfied) state; ``None`` otherwise — i.e. if the tokenizer
         was unavailable, generation was truncated by ``max_tokens``
         mid-object, or a token was rejected mid-parse. An incomplete result is
-        never returned to the caller, which treats ``None`` as
-        guided-unavailable (strict-mode 422).
+        never returned to the caller, which treats ``None`` as an OPERATIONAL
+        guided failure: under strict mode the route surfaces a sanitized 502
+        ``strict_schema_violation`` (a server-side inability to honor the
+        constraint), and under non-strict mode it degrades to a best-effort
+        unconstrained 200. (This is distinct from an INVALID caller schema,
+        which is a 400 — see the ``GuidedSchemaCompileError`` note below.)
 
         Raises ``GuidedSchemaCompileError`` when the grammar itself fails to
         compile (invalid caller schema). This is deliberately NOT folded into
@@ -515,8 +519,9 @@ class GuidedGenerator:
         # is True iff the matcher is in a state where the grammar is fully
         # satisfied and could terminate here. If we fell out of the loop on
         # ``max_tokens`` with an unclosed object, the parse is incomplete —
-        # return None so the caller degrades to guided-unavailable / 422
-        # rather than leaking a truncated JSON fragment.
+        # return None so the caller degrades on the OPERATIONAL path (strict →
+        # sanitized 502, non-strict → best-effort 200) rather than leaking a
+        # truncated JSON fragment.
         if not generated or not matcher.is_accepting():
             return None
         return tokenizer.decode(generated)

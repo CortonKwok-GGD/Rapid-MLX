@@ -2427,6 +2427,33 @@ async def _create_chat_completion_impl(
     # without any signal.
     _validate_response_format(request.response_format)
 
+    # ROUTE-BOUNDARY schema validation (0.10.16 dogfood P1-③). A
+    # structurally-invalid ``response_format.json_schema.schema`` is a
+    # deterministic CLIENT fault and must return 400 on EVERY path — BEFORE the
+    # guided-capability check, any fallback, or engine dispatch, and regardless
+    # of stream/non-stream. Without this gate a NON-strict json_schema request
+    # on a guided-UNSUPPORTED engine (``supports_guided_generation=False``)
+    # never reaches the in-generator validate and silently degrades to an
+    # unconstrained HTTP 200 — the exact P1-③ hole. Strict requests are skipped
+    # here because the strict pre-flight below owns their (more specific)
+    # ``invalid_strict_schema`` 400; this closes the non-strict / capability-
+    # independent gap with the shared ``invalid_response_format_schema``
+    # envelope. The in-generator + engine-layer raises remain as defense-in-depth.
+    _rf_boundary = request.response_format
+    if _rf_boundary is not None and not is_strict_json_schema(_rf_boundary):
+        _boundary_schema = extract_json_schema_for_guided(_rf_boundary)
+        if _boundary_schema:
+            _b_ok, _b_reason = check_schema_validity(_boundary_schema)
+            if not _b_ok:
+                raise HTTPException(
+                    status_code=400,
+                    detail=guided_schema_compile_error_detail(
+                        GuidedSchemaCompileError(
+                            _b_reason or "invalid JSON Schema document"
+                        )
+                    ),
+                )
+
     # --- Detailed request logging ---
     n_msgs = len(request.messages)
     msg_roles = [m.role for m in request.messages]

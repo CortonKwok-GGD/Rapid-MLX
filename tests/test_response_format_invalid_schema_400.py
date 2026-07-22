@@ -248,8 +248,10 @@ def test_guided_compile_error_detail_envelope_and_param_override():
 
 
 def test_sync_invalid_schema_returns_400_not_silent_200():
-    """The core P1-③ repro: invalid schema → 400, NOT a silent 200 with
-    unconstrained text. The unconstrained ``chat`` fallback must NOT run."""
+    """The core P1-③ repro: a NON-strict invalid schema → 400 at the ROUTE
+    BOUNDARY, NOT a silent 200 with unconstrained text. The route rejects the
+    malformed schema BEFORE any engine dispatch, so neither the guided path nor
+    the unconstrained ``chat`` fallback runs."""
     engine = _Engine(guided_raises=_COMPILE_ERR)
     client = _make_client(engine)
     resp = client.post(
@@ -262,25 +264,74 @@ def test_sync_invalid_schema_returns_400_not_silent_200():
         },
     )
     _assert_invalid_schema_400(resp)
-    assert engine.guided_calls, "guided path must have been attempted"
+    assert engine.guided_calls == [], (
+        "route-boundary validation must reject before engine dispatch"
+    )
     assert engine.chat_calls == [], (
         "invalid schema must NOT silently fall back to unconstrained chat"
     )
 
 
-def test_sync_invalid_schema_strict_also_returns_400_not_502():
-    """Under ``strict=true`` a grammar-compile failure surfacing at
-    generation time is a 400 (malformed request), NOT the strict-mode 502
-    ``strict_schema_violation`` — the schema itself is the fault, not a
-    server-side soundness breach.
+def test_sync_invalid_schema_unsupported_guided_engine_returns_400_not_200():
+    """Round-4 #1 regression — the exact hole the route-boundary check closes:
+    an engine that CANNOT guide (``supports_guided_generation=False``) never
+    calls ``generate_json`` on a non-strict request, so pre-fix an invalid
+    schema slipped through to unconstrained HTTP 200. The boundary check now
+    returns 400 regardless of engine capability."""
+    engine = _Engine(supports_guided=False)
+    client = _make_client(engine)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": _response_format(_INVALID_SCHEMA),
+        },
+    )
+    _assert_invalid_schema_400(resp)
+    assert engine.guided_calls == []
+    assert engine.chat_calls == [], (
+        "guided-unsupported engine must STILL 400 an invalid schema, not fall "
+        "back to unconstrained generation (the P1-③ silent-degrade)"
+    )
 
-    The request carries a valid-SHAPED object schema (so it clears the
-    earlier strict ``check_schema_validity`` pre-flight), but the engine
-    reports a ``GuidedSchemaCompileError`` at compile time — the case of an
-    llguidance-unsupported construct the shape check accepts. This must map
-    to my 400, not fall through to the strict 502 arm.
-    """
+
+def test_sync_invalid_schema_strict_returns_400():
+    """Under ``strict=true`` a structurally-INVALID schema is rejected 400 by
+    the strict pre-flight (``invalid_strict_schema``), before any generation —
+    the schema itself is the fault. (Only a validator-INVALID schema is a 400;
+    the validator-valid-but-compiler-rejected case is the 502 path — see
+    ``test_sync_valid_schema_strict_operational_failure_returns_502``.)"""
     engine = _Engine(guided_raises=_COMPILE_ERR)
+    client = _make_client(engine)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": _response_format(_INVALID_SCHEMA, strict=True),
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_strict_schema"
+    assert engine.guided_calls == []
+    assert engine.chat_calls == []
+
+
+def test_sync_valid_schema_strict_operational_failure_returns_502():
+    """Corrected strict contract (codex Round-4 #3): a validator-VALID schema
+    that the guided path fails to honor OPERATIONALLY (llguidance reject /
+    runtime failure → ``None`` → ``raise_on_failure``) is the strict-failure
+    path — a sanitized 502 ``strict_schema_violation`` (server could not honor
+    the constraint), NOT a 400 (the schema is not the fault) and NOT a silent
+    unconstrained 200. This is the case a previous test WRONGLY asserted as a
+    400 by fabricating a compile error from a valid schema; production returns
+    None → 502 here."""
+    engine = _Engine(guided_raises=RuntimeError("operational llguidance failure"))
     client = _make_client(engine)
     resp = client.post(
         "/v1/chat/completions",
@@ -291,8 +342,13 @@ def test_sync_invalid_schema_strict_also_returns_400_not_502():
             "response_format": _response_format(_SCHEMA, strict=True),
         },
     )
-    _assert_invalid_schema_400(resp)
-    assert engine.chat_calls == []
+    assert resp.status_code == 502, resp.text
+    err = resp.json()["error"]
+    assert err["code"] == "strict_schema_violation"
+    assert engine.chat_calls == [], (
+        "strict mode must refuse the unconstrained fallback on an operational "
+        "guided failure"
+    )
 
 
 def test_sync_valid_schema_still_returns_200():
@@ -360,31 +416,17 @@ def test_sync_generic_guided_failure_still_falls_back_non_strict():
 
 
 # ---------------------------------------------------------------------------
-# Streaming (SSE — the 200 status is already committed, so a compile error
-# surfaces as a terminal error envelope, NEVER a silent unconstrained fallback)
+# Streaming. The route-boundary schema validation runs BEFORE the stream/non-
+# stream split, so an invalid schema is rejected as a clean HTTP 400 BEFORE the
+# SSE response opens — better than a 200-status SSE error envelope, and it can
+# never silently fall back to unconstrained streaming.
 # ---------------------------------------------------------------------------
 
 
-def _assert_stream_compile_error(resp, engine: _Engine) -> None:
-    assert resp.status_code == 200, resp.text  # SSE always opens 200
-    events, saw_done = _parse_sse_events(resp.text)
-    assert saw_done, "stream must terminate with [DONE]"
-    err_events = [e for e in events if e.get("error")]
-    assert len(err_events) == 1, f"expected exactly one error envelope; got {events}"
-    err = err_events[0]["error"]
-    assert err["type"] == "invalid_request_error"
-    assert err["code"] == "invalid_response_format_schema"
-    assert err["param"] == "response_format.json_schema.schema"
-    assert "failed to compile" in err["message"]
-    assert engine.stream_calls == [], (
-        "invalid schema must NOT silently fall back to unconstrained streaming"
-    )
-
-
-def test_stream_invalid_schema_emits_error_envelope_no_fallback():
-    """Streaming, ``strict=false``: an invalid schema must emit an
-    ``invalid_request_error`` SSE envelope + DONE, NOT silently fall back to
-    the unconstrained ``stream_chat`` helper."""
+def test_stream_invalid_schema_returns_400_at_boundary():
+    """Streaming, ``strict=false``: an invalid schema is rejected 400 at the
+    route boundary, BEFORE the SSE stream opens — never a silent unconstrained
+    stream. The engine's streaming helper is never reached."""
     engine = _Engine(guided_raises=_COMPILE_ERR)
     client = _make_client(engine)
     resp = client.post(
@@ -397,19 +439,18 @@ def test_stream_invalid_schema_emits_error_envelope_no_fallback():
             "response_format": _response_format(_INVALID_SCHEMA, strict=False),
         },
     )
-    _assert_stream_compile_error(resp, engine)
+    _assert_invalid_schema_400(resp)
+    assert engine.stream_calls == [], (
+        "invalid schema must NOT reach the unconstrained streaming helper"
+    )
+    assert engine.guided_calls == []
 
 
-def test_stream_invalid_schema_strict_emits_error_envelope():
-    """Streaming, ``strict=true``: a compile failure surfacing at generation
-    time emits the terminal ``invalid_request_error`` envelope (NOT a silent
-    unconstrained-streaming fallback, NOT the strict 502 arm).
-
-    Uses a valid-SHAPED schema (clears the strict ``check_schema_validity``
-    pre-flight, which would otherwise 400 a malformed-shape schema cleanly
-    before the SSE stream opens) with the engine reporting a compile error —
-    the llguidance-unsupported-construct case.
-    """
+def test_stream_invalid_schema_strict_returns_400_at_boundary():
+    """Streaming, ``strict=true``: an invalid schema is rejected 400
+    (``invalid_strict_schema``) by the strict pre-flight, BEFORE the SSE stream
+    opens. Only a validator-INVALID schema is a 400; validator-valid +
+    operational failure is the 502 path (non-streaming strict)."""
     engine = _Engine(guided_raises=_COMPILE_ERR)
     client = _make_client(engine)
     resp = client.post(
@@ -419,10 +460,15 @@ def test_stream_invalid_schema_strict_emits_error_envelope():
             "stream": True,
             "max_tokens": 32,
             "messages": [{"role": "user", "content": "hi"}],
-            "response_format": _response_format(_SCHEMA, strict=True),
+            "response_format": _response_format(_INVALID_SCHEMA, strict=True),
         },
     )
-    _assert_stream_compile_error(resp, engine)
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_strict_schema"
+    assert engine.stream_calls == []
+    assert engine.guided_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -728,13 +774,78 @@ def _make_responses_client(engine: _Engine) -> TestClient:
     return TestClient(app)
 
 
-def test_responses_invalid_schema_returns_400(_rate_limiter_state):
-    """/v1/responses strict + a schema that fails to compile at guided time →
-    HTTP 400 (param ``text.format.schema``), NOT the strict 502 and NOT a
-    silent 200. Uses a valid-SHAPED schema so it clears the strict
-    ``check_schema_validity`` pre-flight and reaches ``generate_with_schema``,
-    where the (mock) engine reports the compile failure."""
+def test_responses_nonstrict_invalid_schema_returns_400(_rate_limiter_state):
+    """/v1/responses, NON-strict json_schema with a structurally-invalid schema
+    → HTTP 400 at the ROUTE BOUNDARY (param ``text.format.schema``), NOT a
+    silent 200. ``/v1/responses`` only guides STRICT json_schema, so without the
+    boundary check a non-strict invalid schema would skip validation entirely
+    and degrade to unconstrained output. Engine is never dispatched."""
     engine = _Engine(guided_raises=_COMPILE_ERR)
+    client = _make_responses_client(engine)
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "x",
+                    "schema": _INVALID_SCHEMA,
+                }
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_response_format_schema"
+    assert err["param"] == "text.format.schema"
+    assert "failed to compile" in err["message"]
+    assert engine.guided_calls == []
+    assert engine.chat_calls == [], "invalid schema must NOT fall back to chat()"
+
+
+def test_responses_strict_invalid_schema_returns_400(_rate_limiter_state):
+    """/v1/responses, STRICT json_schema with a structurally-invalid schema →
+    400 ``invalid_strict_schema`` from the strict pre-flight, before any
+    generation. Only a validator-INVALID schema is a 400."""
+    engine = _Engine(guided_raises=_COMPILE_ERR)
+    client = _make_responses_client(engine)
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "x",
+                    "schema": _INVALID_SCHEMA,
+                    "strict": True,
+                }
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_strict_schema"
+    assert err["param"] == "text.format.schema"
+    assert engine.guided_calls == []
+    assert engine.chat_calls == []
+
+
+def test_responses_strict_valid_schema_operational_failure_returns_502(
+    _rate_limiter_state,
+):
+    """Corrected strict contract (codex Round-4 #3) on /v1/responses: a
+    validator-VALID schema that the guided path fails OPERATIONALLY (runtime
+    failure) is the strict-failure path → 502 ``strict_schema_violation`` (param
+    ``text.format.strict``), NOT a 400. Uses a valid-SHAPED schema so it clears
+    the strict pre-flight and reaches ``generate_with_schema``, where the (mock)
+    engine reports a non-compile operational failure."""
+    engine = _Engine(guided_raises=RuntimeError("operational llguidance failure"))
     client = _make_responses_client(engine)
     resp = client.post(
         "/v1/responses",
@@ -751,13 +862,10 @@ def test_responses_invalid_schema_returns_400(_rate_limiter_state):
             },
         },
     )
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 502, resp.text
     err = resp.json()["error"]
-    assert err["type"] == "invalid_request_error"
-    assert err["code"] == "invalid_response_format_schema"
-    assert err["param"] == "text.format.schema"
-    assert "failed to compile" in err["message"]
-    assert engine.chat_calls == [], "compile error must NOT fall back to chat()"
+    assert err["code"] == "strict_schema_violation"
+    assert engine.chat_calls == [], "strict mode must not fall back to chat()"
 
 
 def test_responses_strict_stream_rejected_before_generation(_rate_limiter_state):
@@ -767,7 +875,7 @@ def test_responses_strict_stream_rejected_before_generation(_rate_limiter_state)
     is buffered-only, so ``_stream_responses`` never calls
     ``generate_with_schema`` and no compile error can surface mid-SSE. This is
     the structural reason the compile-error 400 for ``/v1/responses`` lives only
-    on the non-stream path (``test_responses_invalid_schema_returns_400``).
+    on the non-stream path (``test_responses_nonstrict_invalid_schema_returns_400``).
 
     Guarding this here means a future change that lets strict schemas stream on
     ``/v1/responses`` (re-opening the silent-degrade hole) turns this test red.
@@ -838,9 +946,9 @@ def _group_raising_app(exc: BaseException) -> TestClient:
 
 
 def test_exception_group_wrapped_compile_error_maps_to_400():
-    """A ``GuidedSchemaCompileError`` wrapped in an ``ExceptionGroup`` (the
-    3.11+ TaskGroup shape) reaching the generic handler is unwrapped via
-    ``_extract_from_group`` and mapped to the clean 400, NOT a sanitized 500.
+    """A group whose EVERY leaf is a ``GuidedSchemaCompileError`` (the 3.11+
+    TaskGroup shape) reaching the generic handler is unwrapped via
+    ``_extract_all_leaves_are`` and mapped to the clean 400, NOT a sanitized 500.
 
     An UNSTAMPED error (``param is None``) renders the chat default locator."""
     group = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
@@ -854,12 +962,11 @@ def test_exception_group_wrapped_compile_error_maps_to_400():
     assert err["param"] == CHAT_RESPONSE_FORMAT_PARAM
 
 
-def test_nested_exception_group_wrapped_compile_error_maps_to_400():
-    """The unwrap is RECURSIVE: a compile error nested two ``ExceptionGroup``
-    levels deep (group-of-group, e.g. nested TaskGroups) is still recovered to
-    the 400 rather than leaking as a 500."""
+def test_nested_all_compile_exception_group_maps_to_400():
+    """The all-leaves unwrap is RECURSIVE: a group-of-group whose EVERY leaf is
+    a compile error is still recovered to the 400 rather than leaking as 500."""
     inner = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
-    outer = _exc_group(inner)
+    outer = _exc_group(inner, GuidedSchemaCompileError("also bad"))
     client = _group_raising_app(outer)
     resp = client.get("/boom")
     assert resp.status_code == 400, resp.text
@@ -869,14 +976,43 @@ def test_nested_exception_group_wrapped_compile_error_maps_to_400():
 def test_exception_group_without_compile_error_stays_500():
     """A safety guard: an ``ExceptionGroup`` that does NOT contain a
     ``GuidedSchemaCompileError`` must NOT be coerced into a 400 — it stays a
-    sanitized 500. This pins that ``_extract_from_group`` returns ``None`` (no
-    false-positive 400s) for unrelated grouped failures."""
+    sanitized 500. This pins that ``_extract_all_leaves_are`` returns ``None``
+    (no false-positive 400s) for unrelated grouped failures."""
     group = _exc_group(RuntimeError("some unrelated internal failure"))
     client = _group_raising_app(group)
     resp = client.get("/boom")
     assert resp.status_code == 500, resp.text
     # The sanitized 500 body carries no ``code`` — the point is only that the
     # unrelated group was NOT coerced into the compile-error 400 envelope.
+    assert resp.json().get("error", {}).get("code") != "invalid_response_format_schema"
+
+
+def test_mixed_exception_group_is_not_flattened_to_400():
+    """Round-4 #2 — a MIXED group (a ``GuidedSchemaCompileError`` bundled with an
+    unrelated internal failure) must NOT be collapsed to 400: doing so would
+    mask the server-side failure and mislead the client into "fix your schema".
+    The all-leaves check requires EVERY leaf to be a compile error, so a mixed
+    group falls through to the sanitized 5xx."""
+    group = _exc_group(
+        GuidedSchemaCompileError("Invalid type: notatype"),
+        RuntimeError("an unrelated internal failure that must not be masked"),
+    )
+    client = _group_raising_app(group)
+    resp = client.get("/boom")
+    assert resp.status_code >= 500, resp.text
+    # Must NOT be reported as a client schema fault.
+    assert resp.json().get("error", {}).get("code") != "invalid_response_format_schema"
+
+
+def test_mixed_nested_exception_group_is_not_flattened_to_400():
+    """The mixed-group guard holds through NESTING: an inner all-compile group
+    combined with an outer non-compile leaf is still a mixed group overall →
+    5xx, not 400."""
+    inner = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
+    outer = _exc_group(inner, MemoryError("out of memory"))
+    client = _group_raising_app(outer)
+    resp = client.get("/boom")
+    assert resp.status_code >= 500, resp.text
     assert resp.json().get("error", {}).get("code") != "invalid_response_format_schema"
 
 
