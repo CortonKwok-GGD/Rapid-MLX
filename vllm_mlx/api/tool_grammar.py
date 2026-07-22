@@ -451,7 +451,9 @@ _XML_STRING_TERMINAL_DECL = (
 #     constrained); ``set(required) ⊆ set(properties)``; a genuine no-arg tool
 #     (no ``properties`` + no ``required``) stays representable (empty body).
 #   * EACH PROPERTY (after resolving a single-level local ``$ref``): a non-empty
-#     ``enum`` (alternation), OR ``type=="string"`` with keys ⊆
+#     ``enum`` (alternation) whose keys are annotation-only, whose values are
+#     type-consistent, and whose wire form is delimiter-safe
+#     (``_xml_enum_representable`` — codex r3 #2/#3), OR ``type=="string"`` with keys ⊆
 #     ``_XML_ALLOWED_STRING_KEYS`` (no ``const``/``pattern``/``minLength``/
 #     ``maxLength``/``format``), OR ``type in {integer,number,boolean}`` (bare
 #     terminal), OR ``type in {object,array}`` (``%json`` — llguidance's JSON
@@ -478,9 +480,10 @@ _XML_ALLOWED_TOPLEVEL_KEYS = frozenset(
 )
 # Keys a ``type=="string"`` property may carry. Anything else (``const`` /
 # ``pattern`` / ``minLength`` / ``maxLength`` / ``format`` / any unknown facet)
-# cannot be enforced by the raw lazy value path -> opt out. ``enum`` is listed
-# for completeness though the enum-first branch handles a non-empty enum before
-# the string-type check is reached.
+# cannot be enforced by the raw lazy value path -> opt out. This annotation-only
+# set is ALSO the allowlist for an ENUM property's keys (``_xml_enum_representable``):
+# a validation sibling (``minLength`` / ``pattern`` / …) next to an ``enum`` is
+# not enforced by a bare literal alternation, so it opts out too.
 _XML_ALLOWED_STRING_KEYS = frozenset(
     {
         "type",
@@ -573,6 +576,77 @@ def _resolve_local_ref(subschema: Any, defs: dict[str, Any]) -> Any:
     return resolved
 
 
+def _enum_value_matches_declared_type(value: Any, declared: str) -> bool:
+    """True iff ``value``'s JSON type is consistent with a declared scalar ``type``.
+
+    Maps the four JSON-Schema scalar types to their Python instance test
+    (string→``str``, integer→``int``, number→``int``|``float``, boolean→``bool``),
+    excluding ``bool`` from the numeric types (a Python ``bool`` is an ``int``
+    subclass). ANY other declared type — ``object`` / ``array`` / ``null`` / an
+    unknown string — carrying an enum returns ``False`` so the caller opts out:
+    the delimiter-based XML value wire cannot faithfully constrain a non-scalar
+    enum.
+    """
+    t = declared.strip().lower()
+    if t == "string":
+        return isinstance(value, str)
+    if t == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if t == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if t == "boolean":
+        return isinstance(value, bool)
+    return False
+
+
+def _xml_enum_representable(resolved: dict[str, Any], enum: list[Any]) -> bool:
+    """True iff an ENUM property is inside the XML emitter's closed allowlist.
+
+    Routes the enum-first branch THROUGH the allowlist (codex r3 #2/#3) so the
+    enum axis is complete-by-construction like the rest of the guard, instead of
+    blanket-accepting ANY non-empty ``enum``. Representable ONLY when ALL hold:
+
+      * keys ⊆ the annotation-only set (``_XML_ALLOWED_STRING_KEYS`` =
+        ``{type, enum, description, title, default}``): any VALIDATION sibling
+        (``minLength`` / ``pattern`` / ``minItems`` / ``const`` / a size facet /
+        any unknown key) is NOT enforced by a bare literal alternation, so it
+        opts out rather than being silently ignored (codex r3 #2 —
+        ``{"enum": ["a", "bb"], "minLength": 2}``);
+      * if ``type`` is present it must be a STRING and EVERY enum value's JSON
+        type must be consistent with it (codex r3 #2 —
+        ``{"type": "integer", "enum": ["x"]}`` opts out on the value/type
+        mismatch; an ``object``/``array``/``null`` declared type opts out);
+      * NO enum value's WIRE form carries a delimiter-breaking byte (``<`` / ``>``
+        / CR / LF). The wire form mirrors ``_emit_xml_param_value`` EXACTLY (the
+        raw text for a string value, ``json.dumps`` otherwise), so a value such as
+        ``"a</parameter>b"`` — grammar-accepted but truncated at the parser's
+        FIRST ``</parameter>`` — is rejected here rather than emitted (codex r3
+        #3).
+    """
+    # (a) annotation-only keys: a validation sibling cannot be enforced next to a
+    # bare literal alternation, so its presence must opt out (never be dropped).
+    if not set(resolved.keys()) <= _XML_ALLOWED_STRING_KEYS:
+        return False
+    declared = resolved.get("type")
+    if declared is not None and not isinstance(declared, str):
+        # A non-string ``type`` (union list / bool / …) alongside an enum is not a
+        # shape we can verify -> opt out.
+        return False
+    for value in enum:
+        # (b) value/type consistency when a scalar ``type`` is declared.
+        if isinstance(declared, str) and not _enum_value_matches_declared_type(
+            value, declared
+        ):
+            return False
+        # (c) delimiter safety on the EXACT wire form the emitter would produce
+        # (raw for a string value, ``json.dumps`` otherwise — enum values come
+        # from parsed client JSON, so ``json.dumps`` is total and never raises).
+        wire = value if isinstance(value, str) else json.dumps(value)
+        if any(c in "<>\r\n" for c in wire):
+            return False
+    return True
+
+
 def _xml_property_representable(subschema: Any, defs: dict[str, Any]) -> bool:
     """True iff ONE property schema is inside the XML emitter's closed allowlist.
 
@@ -581,8 +655,9 @@ def _xml_property_representable(subschema: Any, defs: dict[str, Any]) -> bool:
     ``false``/``true`` bool schema returns ``None`` -> opt out), the resolved
     schema is representable ONLY as one of the enumerated shapes:
 
-      * a non-empty ``enum`` list — rendered as a literal ALTERNATION (the
-        tightest possible constraint; facets are irrelevant next to it), OR
+      * a non-empty ``enum`` list — rendered as a literal ALTERNATION, admitted
+        ONLY through ``_xml_enum_representable`` (annotation-only keys, value/
+        declared-type consistency, delimiter-safe wire values — codex r3 #2/#3), OR
       * ``type == "string"`` whose keys ⊆ ``_XML_ALLOWED_STRING_KEYS`` — the raw
         lazy value path (a ``const``/``pattern``/``minLength``/``maxLength``/
         ``format`` or ANY unknown facet it cannot enforce opts out), OR
@@ -596,11 +671,14 @@ def _xml_property_representable(subschema: Any, defs: dict[str, Any]) -> bool:
         # Unresolvable/sibling ``$ref`` (None) or a ``false``/``true`` bool schema
         # / non-dict -> not representable.
         return False
-    # Enum-first: a non-empty enum renders as an alternation of literals — the
-    # tightest constraint, so it is representable regardless of ``type``/facets.
+    # Enum-first: a non-empty enum renders as an alternation of literals. Route it
+    # THROUGH the allowlist (codex r3 #2/#3) rather than blanket-accepting any
+    # non-empty enum — validate annotation-only keys, value/declared-type
+    # consistency, and delimiter-safe wire values, so the enum axis is
+    # complete-by-construction too.
     enum = resolved.get("enum")
     if isinstance(enum, list) and enum:
-        return True
+        return _xml_enum_representable(resolved, enum)
     prop_type = resolved.get("type")
     if not isinstance(prop_type, str):
         # Absent / union (list) / non-string ``type`` -> opt out.
@@ -673,7 +751,16 @@ def _xml_schema_representable(params: Any) -> bool:
     # also opts out the property-less-but-``required`` case (empty body wrong).
     required = params.get("required")
     if required is not None:
-        if not isinstance(required, list):
+        # TOTAL guard (codex r3 #4): ``required`` must be a list of STRINGS. A
+        # non-list, or ANY non-str member (a client-supplied list/dict is
+        # UNHASHABLE), would otherwise make ``set(required)`` below raise
+        # ``TypeError`` — and this guard runs OUTSIDE the builder's exception
+        # handling, so an arbitrary-client-JSON ``required`` would 500. Validate
+        # the shape first and opt out gracefully; only then is ``set(required)``
+        # provably safe. (The guard must NEVER raise on arbitrary client JSON.)
+        if not isinstance(required, list) or not all(
+            isinstance(r, str) for r in required
+        ):
             return False
         if not set(required) <= set(prop_map.keys()):
             return False
@@ -740,6 +827,11 @@ def _emit_xml_param_value(subschema: Any, defs: dict[str, Any]) -> str:
         resolved = subschema
     enum = resolved.get("enum")
     if isinstance(enum, list) and enum:
+        # Every value's wire form here is already delimiter-safe and type-consistent:
+        # ``_xml_enum_representable`` (in the representability guard) opted the whole
+        # request out otherwise (codex r3 #2/#3), so this raw emission cannot break
+        # the ``</parameter>`` framing. Keep the wire form byte-identical to that
+        # guard's check (raw for a string value, ``json.dumps`` otherwise).
         alts = []
         for value in enum:
             literal = value if isinstance(value, str) else json.dumps(value)
@@ -772,9 +864,30 @@ def _emit_xml_arg_body(params: Any) -> str:
         return ""
     props = params.get("properties")
     if not isinstance(props, dict) or not props:
+        # INTENTIONAL tool-calling-domain choice (codex r3 #1), NOT an oversight:
+        # a tool whose ``parameters`` declares no properties takes NO arguments, so
+        # the EMPTY body IS the correct, desired constraint — it forces a no-arg
+        # call. JSON-Schema's default-OPEN-object semantics (where ``{}`` /
+        # ``{"type": "object"}`` permit arbitrary properties) are DELIBERATELY not
+        # applied on the tool-call wire: opting out here would leave a no-arg tool
+        # LESS constrained (the model could emit arbitrary ``<parameter=…>``
+        # blocks). The genuinely-OPEN case — an EXPLICIT ``additionalProperties:
+        # true`` (or a schema value) — is already opted out UPSTREAM by
+        # ``_xml_schema_representable`` (only a literal ``additionalProperties:
+        # false`` / absent reaches here), so a truly-open object never collapses to
+        # an empty body while the common no-arg shape stays fully constrained.
         return ""
     required = params.get("required")
-    required_set = set(required) if isinstance(required, list) else set()
+    # Only STRING members can name a property (mirrors the total guard in
+    # ``_xml_schema_representable`` — codex r3 #4); a non-str member is unhashable
+    # and would raise in a bare ``set(required)``. The representability guard has
+    # already opted out any malformed ``required`` before we reach here, but stay
+    # total regardless of caller.
+    required_set = (
+        {r for r in required if isinstance(r, str)}
+        if isinstance(required, list)
+        else set()
+    )
     defs = _collect_xml_defs(params)
     frags: list[str] = []
     for key, subschema in props.items():

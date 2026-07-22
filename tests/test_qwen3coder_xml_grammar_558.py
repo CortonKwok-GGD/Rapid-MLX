@@ -931,6 +931,93 @@ def test_representable_rejects_round2_property_names():
     )
 
 
+# ---- STRICT ALLOWLIST (codex round-3): enum axis + total required guard ------
+# Round-3 folded the ENUM branch INTO the allowlist (it previously blanket-accepted
+# ANY non-empty enum) and made the ``required`` guard TOTAL (it previously crashed
+# on an unhashable member). These prove the three holes opt out BY CONSTRUCTION
+# (no raise), plus a positive control that a clean string enum stays constrained.
+def test_representable_enum_positive_control_clean_string_enum():
+    # A clean string enum with only annotation keys stays representable (a literal
+    # alternation — the tightest constraint). Guards against over-opting-out.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert rep(
+        {"properties": {"u": {"type": "string", "enum": ["celsius", "fahrenheit"]}}}
+    )
+    # A type-less enum (the values fix the alternation) also stays representable.
+    assert rep({"properties": {"u": {"enum": ["a", "b"]}}}) is True
+    # A numeric enum consistent with its declared type stays representable.
+    assert rep({"properties": {"n": {"type": "number", "enum": [1.5, 2]}}}) is True
+
+
+def test_representable_enum_value_type_mismatch_opts_out():
+    # codex r3 #2: an enum whose declared type contradicts its values is
+    # schema-invalid on the wire -> opt out.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert rep({"properties": {"n": {"type": "integer", "enum": ["x"]}}}) is False
+    # bool is NOT an integer here (excluded from int/number).
+    assert rep({"properties": {"n": {"type": "integer", "enum": [True]}}}) is False
+    assert rep({"properties": {"n": {"type": "number", "enum": ["1.5"]}}}) is False
+    assert rep({"properties": {"b": {"type": "boolean", "enum": [1]}}}) is False
+    # An object/array declared type carrying an enum has no scalar wire -> opt out.
+    assert rep({"properties": {"o": {"type": "object", "enum": [{"a": 1}]}}}) is False
+
+
+def test_representable_enum_unsupported_sibling_opts_out():
+    # codex r3 #2: a validation sibling next to an enum (``minLength`` / ``pattern``
+    # / ``minItems`` / any non-annotation key) is NOT enforced by a bare
+    # alternation -> opt out rather than silently drop it.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert rep({"properties": {"s": {"enum": ["a", "bb"], "minLength": 2}}}) is False
+    assert (
+        rep({"properties": {"s": {"type": "string", "enum": ["a"], "pattern": "^a$"}}})
+        is False
+    )
+    assert rep({"properties": {"s": {"enum": ["a"], "minItems": 1}}}) is False
+
+
+def test_representable_enum_delimiter_bearing_value_opts_out():
+    # codex r3 #3: an enum value carrying the close delimiter (or any ``<``/``>``/
+    # newline) is grammar-accepted but truncates at the parser's FIRST
+    # ``</parameter>`` -> opt out rather than emit a wire-breaking literal.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert (
+        rep({"properties": {"s": {"type": "string", "enum": ["a</parameter>b"]}}})
+        is False
+    )
+    assert (
+        rep({"properties": {"s": {"type": "string", "enum": ["ok", "<x>"]}}}) is False
+    )
+    assert rep({"properties": {"s": {"type": "string", "enum": ["a\nb"]}}}) is False
+    # A non-string enum value whose json.dumps embeds a delimiter also opts out.
+    assert rep({"properties": {"o": {"enum": [{"k": "</parameter>"}]}}}) is False
+
+
+def test_representable_total_required_guard_never_raises():
+    # codex r3 #4 (REAL CRASH): a malformed ``required`` must OPT OUT, never raise.
+    # ``set(required)`` on an UNHASHABLE member (list/dict) raised ``TypeError``
+    # OUTSIDE the builder's exception handling -> a 500 on arbitrary client JSON.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    base = {"type": "object", "properties": {"a": {"type": "string"}}}
+    # ``required`` not a list -> opt out (no raise).
+    assert rep({**base, "required": "a"}) is False
+    assert rep({**base, "required": 123}) is False
+    assert rep({**base, "required": {"a": True}}) is False
+    # ``required`` containing an UNHASHABLE member (list / dict) -> opt out, and
+    # CRITICALLY does not raise ``TypeError`` from ``set(required)``.
+    assert rep({**base, "required": [["a"]]}) is False
+    assert rep({**base, "required": [{"k": "v"}]}) is False
+    assert rep({**base, "required": ["a", ["nested"]]}) is False
+    # A non-str hashable member (int) also opts out (cannot name a property).
+    assert rep({**base, "required": [1, 2]}) is False
+    # Control: a well-formed required ⊆ properties stays representable.
+    assert rep({**base, "required": ["a"]}) is True
+
+
 # ---- F3 REAL FIX: $ref resolved BEFORE the string-vs-%json decision ------
 def test_xml_ref_to_string_uses_raw_lazy_path_not_json():
     # Grammar-string level: a `$ref` -> string property emits the LAZY raw value
@@ -1051,3 +1138,61 @@ def test_build_tool_grammar_opts_out_f5_unsafe_key(tok):
         }
     ]
     assert _xml_grammar(bad_key_tool, "required", tok) is None
+
+
+# ---- codex round-3: end-to-end opt-out (real parser) — no crash on bad input --
+@_requires_llguidance
+def test_build_tool_grammar_opts_out_r3_malformed_required_no_crash(tok):
+    # codex r3 #4: a malformed `required` (non-list, or a list with an UNHASHABLE
+    # member) must opt out to free-form (None) WITHOUT raising — `set(required)`
+    # in the guard previously raised `TypeError` OUTSIDE the builder's exception
+    # handling (a 500). Reaching `build_tool_grammar` at all exercises the guard
+    # site that crashed.
+    for bad_required in ("code", [["code"]], [{"k": "v"}], 7):
+        tool = [
+            {
+                "name": "run_code",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string"}},
+                    "required": bad_required,
+                },
+            }
+        ]
+        assert _xml_grammar(tool, "required", tok) is None, bad_required
+
+
+@_requires_llguidance
+def test_build_tool_grammar_opts_out_r3_bad_enum(tok):
+    # codex r3 #2/#3: an enum type-mismatch / unsupported sibling / delimiter-bearing
+    # value each opt the whole request out of grammar; a clean string enum builds.
+    def _tool(enum_schema):
+        return [
+            {
+                "name": "run_code",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string"}, "e": enum_schema},
+                    "required": ["code"],
+                },
+            }
+        ]
+
+    assert (
+        _xml_grammar(_tool({"type": "integer", "enum": ["x"]}), "required", tok) is None
+    )
+    assert (
+        _xml_grammar(_tool({"enum": ["a", "bb"], "minLength": 2}), "required", tok)
+        is None
+    )
+    assert (
+        _xml_grammar(
+            _tool({"type": "string", "enum": ["a</parameter>b"]}), "required", tok
+        )
+        is None
+    )
+    # Control: a clean string enum still builds a grammar (not a generic failure).
+    assert (
+        _xml_grammar(_tool({"type": "string", "enum": ["ok", "no"]}), "required", tok)
+        is not None
+    )
