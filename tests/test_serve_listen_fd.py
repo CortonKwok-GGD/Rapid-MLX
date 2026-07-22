@@ -276,7 +276,9 @@ def stub_heavy_serve_deps(monkeypatch):
     # — same "after an application has started" failure as CORS (#1167).
     from vllm_mlx.middleware import request_logging as reqlog_mod
 
-    monkeypatch.setattr(reqlog_mod, "install_request_logging_middleware", lambda *a: None)
+    monkeypatch.setattr(
+        reqlog_mod, "install_request_logging_middleware", lambda *a: None
+    )
     return monkeypatch
 
 
