@@ -39,9 +39,11 @@ list of "sentinel" substrings that must render as special-token refs.
 
 import json
 import logging
+import re
 import threading
 import weakref
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -111,6 +113,11 @@ class StructureInfo:
         scalars/objects/arrays, an alternation for enums). See
         ``_emit_xml_arg_body``. Default stays ``"json"`` so hermes/qwen/harmony
         (and any out-of-tree JSON-body family) are byte-identical to before.
+      * ``"gemma4"`` (#558 E4) — the Gemma-4 native arg body:
+        ``call:NAME{k1:v1,k2:v2,...}`` with DICTSORT-ordered, COMMA-separated
+        ``key:VALUE`` pairs, string values wrapped in the ``<|"|>`` special-token
+        marker, bare scalars/booleans, ``%json`` objects/arrays, and an
+        alternation for enums. See ``_emit_gemma4_arg_body``.
     """
 
     begin: str
@@ -421,6 +428,39 @@ _XML_STRING_TERMINAL_DECL = (
 )
 
 
+# The gemma4 string-value construct (#558 E4). Unlike the Qwen3-Coder XML wire
+# (E3), whose ``</parameter>`` delimiter is ordinary BYTE TEXT and needs
+# llguidance's ``[lazy]`` lexeme to stop a greedy value at the first close, gemma4
+# wraps a string value in the ``<|"|>`` marker which is a SINGLE SPECIAL TOKEN
+# (id 52 on the target tokenizer). A greedy byte regex CANNOT consume a special
+# token, so maximal-munch stops at the ``<|"|>`` boundary on its own — the value
+# is simply ``<|"|> GEMMA_STR_TEXT <|"|>`` with BOTH ``<|"|>`` as RULE-LEVEL
+# special-token refs. This is a real feasibility result, not a stylistic choice:
+# llguidance REJECTS a special token inside a lexer terminal, so the ``[lazy]``
+# form (``rule[lazy]: TEXT <|"|>``) fails to COMPILE (special tokens cannot be used
+# in terminals), and a byte-literal ``"<|\"|>"`` delimiter COMPILES but can never
+# be satisfied at runtime by the atomic special token (verified on the real
+# tokenizer: the greedy rule-level form accepts a value containing
+# ``<``/``{``/``}``/``,``/quotes/newlines and terminates correctly at the closing
+# ``<|"|>``; both other forms fail).
+_GEMMA4_STRING_VALUE_TERMINAL = "GEMMA_STR_TEXT"
+_GEMMA4_STRING_VALUE_RULE = "gemma_str_value"
+# The gemma4 string-delimiter marker (``<|"|>``). Declared as a single special
+# token by ``Gemma4ToolParser`` and referenced as a bare Lark special-token ref;
+# it passes ``_is_lark_special_token_ref`` (leading ``<``, trailing ``>``, no
+# interior ``<``/``>`` or whitespace — the inner ``|"|`` is fine).
+_GEMMA4_STRING_MARKER = '<|"|>'
+# ``GEMMA_STR_TEXT`` is a fresh terminal (same ``/(.|\n)*/`` pattern as
+# ``XML_PARAM_TEXT``/``TAG_TEXT`` but a DISTINCT name so a mixed tool-set never
+# cross-binds them). The lowercase ``gemma_str_value`` is a RULE (not a terminal),
+# because the special-token markers must live at rule level.
+_GEMMA4_STRING_RULE_DECL = (
+    f"{_GEMMA4_STRING_VALUE_TERMINAL}: /(.|\\n)*/\n"
+    f"{_GEMMA4_STRING_VALUE_RULE}: {_GEMMA4_STRING_MARKER} "
+    f"{_GEMMA4_STRING_VALUE_TERMINAL} {_GEMMA4_STRING_MARKER}\n"
+)
+
+
 # ------------------------------------------------------------------------
 # STRICT-ALLOWLIST representability guard for the Qwen3-Coder XML arg wire
 # (#558 E3). The XML emitter (``_emit_xml_arg_body`` / ``_emit_xml_param_value``)
@@ -530,6 +570,74 @@ def _xml_key_is_delimiter_safe(key: Any) -> bool:
     return not any(c.isspace() for c in key)
 
 
+# gemma4 emits a property key BARE in the ``KEY:`` wire position and the parser
+# reads it back with ``GEMMA4_KEY_PATTERN`` (``\w+``), so only a ``\w+`` key
+# round-trips faithfully. This is STRICTER than the XML key check (which allows
+# ``-``/``.``): a ``my-key`` would be read back as just ``my`` (the parser stops
+# at ``-``) and desync the pair. A leading digit is fine (``\w`` admits it).
+_GEMMA4_KEY_RE = re.compile(r"\w+")
+
+
+def _gemma4_key_is_safe(key: Any) -> bool:
+    """True iff ``key`` round-trips through gemma4's BARE ``KEY:`` wire position."""
+    return isinstance(key, str) and _GEMMA4_KEY_RE.fullmatch(key) is not None
+
+
+def _xml_enum_wire_unsafe(wire: str) -> bool:
+    """XML enum-value wire is unsafe iff it carries a delimiter-breaking byte.
+
+    An XML string value truncates at the FIRST ``</parameter>`` and a ``<``/``>``
+    desyncs the tag; a CR/LF splits the wire's own ``\\n`` framing.
+    """
+    return any(c in "<>\r\n" for c in wire)
+
+
+def _gemma4_enum_wire_unsafe(wire: str) -> bool:
+    """gemma4 enum-value wire is unsafe iff it contains the ``<|"|>`` marker.
+
+    A gemma4 string value is bounded ONLY by the ``<|"|>`` marker, so a value that
+    literally contains it would close early / retokenize as the special token.
+    ``<``/``>``/CR/LF/commas/braces are all SAFE inside the ``<|"|>`` pair
+    (verified on the real tokenizer), so — unlike XML — they must NOT opt out.
+    """
+    return _GEMMA4_STRING_MARKER in wire
+
+
+@dataclass(frozen=True)
+class _ArgWirePolicy:
+    """Per-wire representability policy for the delimiter-based arg guards (E4).
+
+    The strict-allowlist representability guard (``_arg_schema_representable`` /
+    ``_arg_property_representable`` / ``_arg_enum_representable``) is IDENTICAL
+    across the delimiter-based arg wires (E3 Qwen3-Coder XML, E4 gemma4) EXCEPT for
+    two leaf checks that depend on the wire's concrete delimiters:
+
+      * ``key_safe`` — whether a property key can be inserted RAW into the wire's
+        key position (XML ``<parameter=KEY>`` rejects ``<>{},:``+whitespace; gemma4
+        ``KEY:`` round-trips only a ``\\w+`` key).
+      * ``enum_wire_unsafe`` — whether an enum value's WIRE form carries a byte
+        that breaks the value framing (XML: ``<>\\r\\n``; gemma4: only the
+        ``<|"|>`` marker).
+
+    Everything else (top-level key allowlist, ``additionalProperties`` /
+    ``required`` totality, ``$ref`` resolution, scalar/object/array/string
+    dispatch, string-facet allowlist) is wire-independent and SHARED — so the two
+    families cannot drift into inconsistent (weaker) guards. ``_xml_*`` /
+    ``_gemma4_*`` are thin wrappers that bind their policy.
+    """
+
+    key_safe: Callable[[Any], bool]
+    enum_wire_unsafe: Callable[[str], bool]
+
+
+_XML_WIRE_POLICY = _ArgWirePolicy(
+    key_safe=_xml_key_is_delimiter_safe, enum_wire_unsafe=_xml_enum_wire_unsafe
+)
+_GEMMA4_WIRE_POLICY = _ArgWirePolicy(
+    key_safe=_gemma4_key_is_safe, enum_wire_unsafe=_gemma4_enum_wire_unsafe
+)
+
+
 def _resolve_local_ref(subschema: Any, defs: dict[str, Any]) -> Any:
     """Resolve a single-level local ``$ref`` against ``defs`` (F3 / finding 4).
 
@@ -599,8 +707,15 @@ def _enum_value_matches_declared_type(value: Any, declared: str) -> bool:
     return False
 
 
-def _xml_enum_representable(resolved: dict[str, Any], enum: list[Any]) -> bool:
-    """True iff an ENUM property is inside the XML emitter's closed allowlist.
+def _xml_enum_representable(
+    resolved: dict[str, Any], enum: list[Any], policy: _ArgWirePolicy = _XML_WIRE_POLICY
+) -> bool:
+    """True iff an ENUM property is inside the emitter's closed allowlist.
+
+    Shared across the delimiter-based arg wires; ``policy`` selects the concrete
+    wire's enum-value delimiter check (``policy.enum_wire_unsafe`` — XML by
+    default, gemma4 via ``_GEMMA4_WIRE_POLICY``). The XML-specific prose below
+    describes the default policy.
 
     Routes the enum-first branch THROUGH the allowlist (codex r3 #2/#3) so the
     enum axis is complete-by-construction like the rest of the guard, instead of
@@ -641,14 +756,21 @@ def _xml_enum_representable(resolved: dict[str, Any], enum: list[Any]) -> bool:
         # (c) delimiter safety on the EXACT wire form the emitter would produce
         # (raw for a string value, ``json.dumps`` otherwise — enum values come
         # from parsed client JSON, so ``json.dumps`` is total and never raises).
+        # The concrete unsafe-byte set is the wire's (``policy.enum_wire_unsafe``).
         wire = value if isinstance(value, str) else json.dumps(value)
-        if any(c in "<>\r\n" for c in wire):
+        if policy.enum_wire_unsafe(wire):
             return False
     return True
 
 
-def _xml_property_representable(subschema: Any, defs: dict[str, Any]) -> bool:
-    """True iff ONE property schema is inside the XML emitter's closed allowlist.
+def _xml_property_representable(
+    subschema: Any, defs: dict[str, Any], policy: _ArgWirePolicy = _XML_WIRE_POLICY
+) -> bool:
+    """True iff ONE property schema is inside the emitter's closed allowlist.
+
+    Shared across the delimiter-based arg wires; ``policy`` threads to the enum
+    check (XML default, gemma4 via ``_GEMMA4_WIRE_POLICY``). The prose below
+    describes the default XML policy.
 
     After resolving a single-level local ``$ref`` (``_resolve_local_ref`` — an
     unresolvable ``$ref``, a ``$ref`` with siblings, or a non-dict such as a
@@ -678,7 +800,7 @@ def _xml_property_representable(subschema: Any, defs: dict[str, Any]) -> bool:
     # complete-by-construction too.
     enum = resolved.get("enum")
     if isinstance(enum, list) and enum:
-        return _xml_enum_representable(resolved, enum)
+        return _xml_enum_representable(resolved, enum, policy)
     prop_type = resolved.get("type")
     if not isinstance(prop_type, str):
         # Absent / union (list) / non-string ``type`` -> opt out.
@@ -696,8 +818,18 @@ def _xml_property_representable(subschema: Any, defs: dict[str, Any]) -> bool:
     return False
 
 
-def _xml_schema_representable(params: Any) -> bool:
-    """True iff the XML arg emitter can FAITHFULLY constrain ``params`` (#558 E3).
+def _xml_schema_representable(
+    params: Any, policy: _ArgWirePolicy = _XML_WIRE_POLICY
+) -> bool:
+    """True iff a delimiter-arg emitter can FAITHFULLY constrain ``params``.
+
+    Shared strict-allowlist guard for the delimiter-based arg wires (#558 E3 XML,
+    E4 gemma4). ``policy`` (default ``_XML_WIRE_POLICY``) selects the two
+    wire-specific leaf checks — key safety and enum-value delimiter safety — while
+    every structural rule (top-level keys, ``additionalProperties`` / ``required``
+    totality, ``$ref``, per-property dispatch) is shared, so no family can drift to
+    a weaker guard. ``_gemma4_schema_representable`` binds the gemma4 policy; the
+    prose below describes the default XML policy (#558 E3).
 
     STRICT ALLOWLIST (closed positive set — see the module block above): returns
     ``True`` ONLY when every part of ``params`` uses exclusively a known-safe,
@@ -770,12 +902,24 @@ def _xml_schema_representable(params: Any) -> bool:
     # arguments) skips the loop and stays representable.
     defs = _collect_xml_defs(params)
     for key, subschema in prop_map.items():
-        # F5: the key is emitted RAW into ``<parameter=KEY>`` -> must be safe.
-        if not _xml_key_is_delimiter_safe(key):
+        # The key is emitted RAW into the wire's key position -> must be safe for
+        # THIS wire (XML ``<parameter=KEY>`` vs gemma4 bare ``KEY:``).
+        if not policy.key_safe(key):
             return False
-        if not _xml_property_representable(subschema, defs):
+        if not _xml_property_representable(subschema, defs, policy):
             return False
     return True
+
+
+def _gemma4_schema_representable(params: Any) -> bool:
+    """True iff the gemma4 arg emitter can FAITHFULLY constrain ``params`` (E4).
+
+    Thin binding of the shared strict-allowlist guard to the gemma4 wire policy
+    (``\\w+`` bare keys; only the ``<|"|>`` marker is an unsafe enum-value byte).
+    Reuses the SAME structural allowlist as XML — a request opts out of grammar
+    (``build_tool_grammar`` -> ``None`` -> free-form) on any unrepresentable shape.
+    """
+    return _xml_schema_representable(params, _GEMMA4_WIRE_POLICY)
 
 
 def _emit_xml_param_value(subschema: Any, defs: dict[str, Any]) -> str:
@@ -896,6 +1040,152 @@ def _emit_xml_arg_body(params: Any) -> str:
         block = f"{open_lit} {value_lark}"
         frags.append(block if key in required_set else f"( {block} )?")
     return " ".join(frags)
+
+
+def _emit_gemma4_param_value(subschema: Any, defs: dict[str, Any]) -> str:
+    """Return the Lark for ONE gemma4 property VALUE (no key, no comma).
+
+    The gemma4 wire (``chat_template.jinja``'s ``format_argument``) serialises a
+    value by JSON type:
+
+      * ENUM -> a literal ALTERNATION, each value rendered in its OWN wire form:
+        a STRING value is wrapped in the ``<|"|>`` marker
+        (``<|"|> "python" <|"|>``), a numeric/boolean value is BARE
+        (``json.dumps`` -> ``5`` / ``true``). Per-value wrapping (not an
+        all-or-nothing split) faithfully renders a mixed-type enum too.
+      * STRING (non-enum) -> the ``gemma_str_value`` rule
+        (``<|"|> GEMMA_STR_TEXT <|"|>`` — greedy content up to the closing
+        special-token marker; see ``_GEMMA4_STRING_RULE_DECL``).
+      * EVERYTHING ELSE (integer / number / boolean / object / array) -> ``%json``
+        over the sub-schema. ``format_argument`` emits a BARE JSON scalar for
+        numbers/bools (``3`` / ``true``) and a JSON container for object/array,
+        all of which ``%json`` produces and the lenient gemma4 parser
+        (``_Gemma4ArgumentParser``) round-trips (its ``_parse_value`` accepts a
+        bare JSON object/array and a JSON string, so the standard-JSON surface
+        ``%json`` emits parses back correctly).
+
+    ``defs`` is merged into the ``%json`` sub-schema so an internal ``$ref``
+    resolves (mirrors ``_emit_xml_param_value``). ``_resolve_local_ref`` is applied
+    FIRST so a ``$ref`` -> string takes the raw ``<|"|>`` path (not quoted
+    ``%json``); a ``None`` (unresolvable) is defensive — the representability guard
+    already opted such a request out — and falls back to ``%json``.
+    """
+    if not isinstance(subschema, dict):
+        return _GEMMA4_STRING_VALUE_RULE
+    resolved = _resolve_local_ref(subschema, defs)
+    if resolved is None:
+        resolved = subschema
+    enum = resolved.get("enum")
+    if isinstance(enum, list) and enum:
+        # Every value's wire form is already delimiter-safe (the representability
+        # guard opted the request out otherwise). Wrap each STRING value in the
+        # ``<|"|>`` marker, emit every other value BARE via ``json.dumps``.
+        alts = []
+        for value in enum:
+            if isinstance(value, str):
+                alts.append(
+                    f"{_GEMMA4_STRING_MARKER} {_lark_escape(value)} "
+                    f"{_GEMMA4_STRING_MARKER}"
+                )
+            else:
+                alts.append(_lark_escape(json.dumps(value)))
+        return f"({' | '.join(alts)})"
+    # Lazy import: keep this module importable independently of api.tool_calling.
+    from .tool_calling import _schema_type
+
+    if _schema_type(resolved) == "string":
+        return _GEMMA4_STRING_VALUE_RULE
+    value_schema = dict(subschema)
+    for def_key, def_val in defs.items():
+        value_schema.setdefault(def_key, def_val)
+    return f"%json {json.dumps(value_schema)}"
+
+
+def _emit_gemma4_arg_body(params: Any) -> str:
+    """Emit the Lark for a gemma4 arg body (the part BETWEEN ``{`` and ``}``).
+
+    The gemma4 wire is ``call:NAME{k1:v1,k2:v2,...}`` where keys are emitted in
+    DICTSORT (alphabetical) order and separated by COMMAS
+    (``chat_template.jinja``'s ``found_first`` logic — a comma precedes every pair
+    except the FIRST PRESENT one). Required properties are mandatory; optional ones
+    may be omitted.
+
+    Because commas are SEPARATORS (not per-field terminators), a naive per-field
+    ``( )?`` misplaces the comma when an early optional field is absent (it would
+    emit a leading ``,`` or a doubled ``,,``). We instead build a FIRST-PRESENT
+    construction:
+
+      * ``_cont(i)`` — every field from position ``i`` on, each with a LEADING
+        comma (required: ``"," k:v``; optional: ``( "," k:v )?``). Used AFTER the
+        first present field, so a comma always separates two present pairs.
+      * the body is an ALTERNATION over WHICH field is first-present: for each
+        candidate first field ``j`` (reachable only if every earlier field is
+        optional, i.e. ``j`` is at or before the first REQUIRED field) emit
+        ``kj:vj`` with NO leading comma, then ``_cont(j+1)``.
+      * if EVERY field is optional the whole body is additionally ``( ... )?`` so
+        an empty ``{}`` body (no args emitted) is admitted.
+
+    The whole body is wrapped in a single ``( ... )`` group so an alternation binds
+    correctly when embedded as ``... "{" <body> "}" ...``. Returns ``""`` for a
+    no-argument tool (empty/absent ``properties``) -> the caller renders the bare
+    ``call:NAME{}`` frame.
+    """
+    if not isinstance(params, dict):
+        return ""
+    props = params.get("properties")
+    if not isinstance(props, dict) or not props:
+        # A no-argument tool: the EMPTY body IS the faithful constraint (forces a
+        # ``{}`` call). Mirrors ``_emit_xml_arg_body`` — a truly-open object is
+        # already opted out upstream by ``_gemma4_schema_representable``.
+        return ""
+    required = params.get("required")
+    # Only STRING members can name a property (mirrors the total guard in the
+    # representability check); a non-str member is unhashable in a bare ``set``.
+    required_set = (
+        {r for r in required if isinstance(r, str)}
+        if isinstance(required, list)
+        else set()
+    )
+    defs = _collect_xml_defs(params)
+    # DICTSORT order — matches how the chat template renders arguments, so a forced
+    # grammar constrains the model to the ordering it was trained to emit.
+    keys = sorted(props.keys())
+    fields = [
+        (key, _emit_gemma4_param_value(props[key], defs), key in required_set)
+        for key in keys
+    ]
+
+    def _kv(idx: int, *, leading_comma: bool) -> str:
+        key, value_lark, _ = fields[idx]
+        kv = f"{_lark_escape(key + ':')} {value_lark}"
+        return f'"," {kv}' if leading_comma else kv
+
+    def _cont(start: int) -> str:
+        parts: list[str] = []
+        for j in range(start, len(fields)):
+            frag = _kv(j, leading_comma=True)
+            parts.append(frag if fields[j][2] else f"( {frag} )?")
+        return " ".join(parts)
+
+    # Index of the first REQUIRED field (or len(fields) if all optional): the
+    # first-present field can be any field at or before it (earlier fields, being
+    # optional, may be absent — a required field can never be skipped).
+    first_required = len(fields)
+    for j, (_key, _val, req) in enumerate(fields):
+        if req:
+            first_required = j
+            break
+
+    alts: list[str] = []
+    for j in range(min(first_required + 1, len(fields))):
+        head = _kv(j, leading_comma=False)
+        tail = _cont(j + 1)
+        alts.append(f"{head} {tail}" if tail else head)
+    body = " | ".join(alts)
+    if first_required == len(fields):
+        # No required field -> the empty ``{}`` body is also valid.
+        return f"( {body} )?"
+    return f"( {body} )"
 
 
 def build_tool_lark(
@@ -1197,6 +1487,11 @@ def build_tool_lark(
     # per-param string check would need a second schema walk for no benefit.
     if any(getattr(si, "arg_style", "json") == "xml" for si in structure_infos):
         lark += _XML_STRING_TERMINAL_DECL
+    # Same for the gemma4 string-value rule (``<|"|> GEMMA_STR_TEXT <|"|>``),
+    # declared once iff any tag uses the gemma4 arg body. A JSON/XML-only tool-set
+    # never emits it, so those grammars stay byte-identical.
+    if any(getattr(si, "arg_style", "json") == "gemma4" for si in structure_infos):
+        lark += _GEMMA4_STRING_RULE_DECL
 
     for i, (tool, si) in enumerate(zip(tools, structure_infos)):
         # Only substitute the default when ``parameters`` is ABSENT. A
@@ -1217,13 +1512,17 @@ def build_tool_lark(
             }
         begin_body = _emit_literal_with_sentinels(si.begin, si.sentinels)
         end_body = _emit_literal_with_sentinels(si.end, si.sentinels)
-        # ARG BODY: a JSON object (``%json`` over the whole schema) for the
-        # default JSON wire, OR a Qwen3-Coder XML per-parameter body when the
-        # family's ``structure_info`` declares ``arg_style="xml"``. The XML body
-        # may be EMPTY (a no-argument tool), in which case the tag is just the
+        # ARG BODY, per the family's ``arg_style``: a JSON object (``%json`` over
+        # the whole schema) for the default JSON wire, a Qwen3-Coder XML
+        # per-parameter body for ``"xml"`` (E3), or the Gemma-4 comma-separated
+        # ``key:VALUE`` body for ``"gemma4"`` (E4). The XML/gemma4 body may be
+        # EMPTY (a no-argument tool), in which case the tag is just the
         # ``begin``/``end`` frame with no argument region.
-        if getattr(si, "arg_style", "json") == "xml":
+        arg_style = getattr(si, "arg_style", "json")
+        if arg_style == "xml":
             arg_body = _emit_xml_arg_body(params)
+        elif arg_style == "gemma4":
+            arg_body = _emit_gemma4_arg_body(params)
         else:
             arg_body = f"%json {json.dumps(params)}"
         # ``prefix_ref`` is empty on the forced-non-reasoning path (the first call
@@ -1620,7 +1919,8 @@ def build_tool_grammar(
     # and applies ONLY to ``arg_style != "json"`` tools — the JSON-body families
     # (hermes / qwen / harmony) are ``%json <schema>`` and stay byte-identical.
     for tool, si in zip(tools, structure_infos):
-        if getattr(si, "arg_style", "json") == "json":
+        arg_style = getattr(si, "arg_style", "json")
+        if arg_style == "json":
             continue
         # Resolve ``parameters`` EXACTLY as ``build_tool_lark`` does (a genuine
         # no-arg tool gets the closed default, which IS representable).
@@ -1632,10 +1932,19 @@ def build_tool_grammar(
                 "properties": {},
                 "additionalProperties": False,
             }
-        if not _xml_schema_representable(params):
+        # Same strict-allowlist guard, per-wire policy (E3 XML / E4 gemma4). An
+        # unknown non-json arg_style is treated conservatively (opt out).
+        if arg_style == "gemma4":
+            representable = _gemma4_schema_representable(params)
+        elif arg_style == "xml":
+            representable = _xml_schema_representable(params)
+        else:
+            representable = False
+        if not representable:
             logger.debug(
-                "tool-grammar: XML arg schema for tool %r not faithfully "
+                "tool-grammar: %s arg schema for tool %r not faithfully "
                 "representable; opting request out of grammar (free-form)",
+                arg_style,
                 tool.get("name"),
             )
             return None
