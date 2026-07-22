@@ -932,6 +932,43 @@ def test_gemma4_enum_delimiter_safety_differs_from_xml():
     )
 
 
+def test_gemma4_enum_all_structural_markers_opt_out():
+    # FIX #1 (codex r2): the enum-wire guard must reject EVERY gemma4 structural
+    # special token, not only ``<|"|>``. Each — the string delimiter ``<|"|>`` AND
+    # the ``<|tool_call>``/``<tool_call|>`` frame tokens AND the reasoning-channel
+    # ``<|channel>``/``<channel|>`` tokens — is a SINGLE special token, so a byte
+    # rendering of it inside an enum value can never be produced at runtime and would
+    # compile to a DEAD alternation branch. Faithful-or-opt-out: opt the whole
+    # request out instead of emitting an unreachable branch.
+    from vllm_mlx.api.tool_grammar import (
+        _GEMMA4_STRUCTURAL_MARKERS,
+    )
+    from vllm_mlx.api.tool_grammar import (
+        _gemma4_schema_representable as g_rep,
+    )
+
+    # The guard's marker set is exactly the five documented structural tokens.
+    assert set(_GEMMA4_STRUCTURAL_MARKERS) == {
+        "<|tool_call>",
+        "<tool_call|>",
+        '<|"|>',
+        "<|channel>",
+        "<channel|>",
+    }
+    for marker in _GEMMA4_STRUCTURAL_MARKERS:
+        schema = {"properties": {"s": {"type": "string", "enum": [f"a{marker}b"]}}}
+        assert g_rep(schema) is False, marker
+        # A marker at the very start / end of the value opts out too.
+        assert g_rep({"properties": {"s": {"enum": [marker], "type": "string"}}}) is False
+    # Control: values containing the markers' INDIVIDUAL safe bytes (``<``/``>``/
+    # ``|``) but NOT a full marker substring stay representable (gemma4 permits raw
+    # ``<``/``>`` inside the ``<|"|>`` pair — the whole point vs XML).
+    assert (
+        g_rep({"properties": {"s": {"type": "string", "enum": ["a<b>c", "x|y", "|>", "<|"]}}})
+        is True
+    )
+
+
 def test_gemma4_enum_type_consistency_shared():
     # The shared enum guard still rejects value/declared-type mismatch and
     # unsupported siblings.
@@ -975,3 +1012,32 @@ def test_gemma4_build_tool_grammar_opts_out_string_pattern(tok):
         }
     ]
     assert _gemma4_grammar(pat_tool, "required", tok) is None
+
+
+@_requires_llguidance
+@pytest.mark.parametrize(
+    "marker", ["<|tool_call>", "<tool_call|>", '<|"|>', "<|channel>", "<channel|>"]
+)
+def test_gemma4_build_tool_grammar_opts_out_enum_with_structural_marker(marker, tok):
+    # FIX #1 (codex r2), end-to-end on the REAL tokenizer: an enum value whose wire
+    # form embeds ANY gemma4 structural special token would compile to a DEAD
+    # byte-literal alternation branch (the token is emitted atomically, never as its
+    # bytes). ``build_tool_grammar`` must OPT OUT (return None -> free-form), never
+    # ship an unreachable branch. A clean enum (``lang`` in GEMMA4_TOOLS) still builds
+    # (control below), so the opt-out is specific to the marker-bearing value.
+    assert _gemma4_grammar(GEMMA4_TOOLS, "required", tok) is not None  # clean enum builds
+    bad_enum_tool = [
+        {
+            "name": "run",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "lang": {"type": "string", "enum": ["python", f"c{marker}pp"]},
+                },
+                "required": ["code", "lang"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    assert _gemma4_grammar(bad_enum_tool, "required", tok) is None, marker

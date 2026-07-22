@@ -454,6 +454,23 @@ _GEMMA4_STRING_MARKER = '<|"|>'
 # ``XML_PARAM_TEXT``/``TAG_TEXT`` but a DISTINCT name so a mixed tool-set never
 # cross-binds them). The lowercase ``gemma_str_value`` is a RULE (not a terminal),
 # because the special-token markers must live at rule level.
+#
+# DELIBERATE SAFE OVER-CONSTRAINT (#558 E4, codex r2). ``GEMMA_STR_TEXT`` is a
+# BYTE regex, so a free-form string value admits any byte sequence but CANNOT
+# contain a SPECIAL TOKEN — not the ``<|"|>`` delimiter itself, nor the
+# ``<|tool_call>``/``<tool_call|>``/``<|channel>``/``<channel|>`` frame tokens
+# (llguidance emits those atomically, never as their spelled-out bytes). We do NOT
+# widen this terminal to admit the special tokens, and that is INTENTIONAL, not an
+# oversight: the parser's value scanner treats the FIRST ``<|"|>`` after the opener
+# as the string's CLOSE — ``_scan_gemma4_tool_calls`` (``tool_parsers/
+# gemma4_tool_parser.py`` line ~97) toggles ``in_gemma_string`` on every ``<|"|>``
+# — so a ``<|"|>`` injected MID-VALUE would terminate the string EARLY and desync
+# the ``key:value`` framing. Admitting special tokens here would be an UNSAFE
+# UNDER-constraint (structural-marker injection -> parser boundary corruption).
+# Byte-only content is a strictly SAFE over-constraint: the rare value that truly
+# needs a structural special token simply opts the request out (enum values via
+# ``_gemma4_enum_wire_unsafe``; a non-enum free-form string cannot embed one at
+# all), keeping the constrained wire and the parser boundary in exact agreement.
 _GEMMA4_STRING_RULE_DECL = (
     f"{_GEMMA4_STRING_VALUE_TERMINAL}: /(.|\\n)*/\n"
     f"{_GEMMA4_STRING_VALUE_RULE}: {_GEMMA4_STRING_MARKER} "
@@ -592,15 +609,46 @@ def _xml_enum_wire_unsafe(wire: str) -> bool:
     return any(c in "<>\r\n" for c in wire)
 
 
-def _gemma4_enum_wire_unsafe(wire: str) -> bool:
-    """gemma4 enum-value wire is unsafe iff it contains the ``<|"|>`` marker.
+# The FULL set of gemma4 structural special-token markers. Each is a SINGLE
+# SPECIAL TOKEN on the gemma4 tokenizer (verified ids on
+# ``mlx-community/gemma-4-e2b-it-4bit``): the tool-call frame ``<|tool_call>`` (48)
+# / ``<tool_call|>`` (49), the string delimiter ``<|"|>`` (52), and the
+# reasoning-channel frame ``<|channel>`` (100) / ``<channel|>`` (101). The first
+# three mirror ``Gemma4ToolParser._GRAMMAR_SENTINELS`` — the parser is the single
+# source of truth for the sentinel triple; the channel pair is documented there in
+# prose (``TOOL_GRAMMAR_AUTO_SAFE`` comment) but has no constant, so it is
+# enumerated here. Kept in THIS module (not imported from the parser) because the
+# dependency direction is parsers -> tool_grammar; ``_GEMMA4_STRING_MARKER`` is
+# reused so the ``<|"|>`` spelling has one definition.
+_GEMMA4_STRUCTURAL_MARKERS = (
+    "<|tool_call>",
+    "<tool_call|>",
+    _GEMMA4_STRING_MARKER,  # ``<|"|>``
+    "<|channel>",
+    "<channel|>",
+)
 
-    A gemma4 string value is bounded ONLY by the ``<|"|>`` marker, so a value that
-    literally contains it would close early / retokenize as the special token.
-    ``<``/``>``/CR/LF/commas/braces are all SAFE inside the ``<|"|>`` pair
-    (verified on the real tokenizer), so — unlike XML — they must NOT opt out.
+
+def _gemma4_enum_wire_unsafe(wire: str) -> bool:
+    """gemma4 enum-value wire is unsafe iff it embeds a STRUCTURAL special token.
+
+    An enum value's WIRE form is rendered as BYTE LITERALS (a ``<|"|>``-wrapped
+    string alt or a bare ``json.dumps`` scalar). Every gemma4 structural marker in
+    ``_GEMMA4_STRUCTURAL_MARKERS`` — the ``<|"|>`` string delimiter AND the
+    ``<|tool_call>``/``<tool_call|>``/``<|channel>``/``<channel|>`` frame tokens —
+    is a SINGLE SPECIAL TOKEN, which llguidance emits atomically and NEVER as its
+    spelled-out bytes. So a value whose wire form contains one compiles to a DEAD
+    byte-literal alternation branch the model can never reach (the same
+    runtime-unsatisfiable reason a byte-literal ``<|"|>`` delimiter cannot match
+    the atomic token); were such a value ever to reach the wire it would also
+    corrupt the parser's ``<|"|>`` boundary or the call frame. Faithful-or-opt-out:
+    reject it so the whole request opts out (return ``None`` -> free-form),
+    mirroring E3's ``_xml_enum_wire_unsafe``. Ordinary ``<``/``>``/CR/LF/commas/
+    braces are SAFE inside the ``<|"|>`` pair (verified on the real tokenizer), so —
+    unlike XML — a bare ``<``/``>`` must NOT opt out; only a FULL marker substring
+    does.
     """
-    return _GEMMA4_STRING_MARKER in wire
+    return any(marker in wire for marker in _GEMMA4_STRUCTURAL_MARKERS)
 
 
 @dataclass(frozen=True)
