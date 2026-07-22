@@ -224,10 +224,16 @@ def resolve_pflash_mode_default(
         # has full-attention layers with standard KV to compress and is a
         # verified PFlash target.
         if is_multimodal:
-            logging.getLogger(__name__).info(
-                "PFlash default: alias %r is multimodal — leaving PFlash off "
-                "(PFlash cannot serve the MLLM/VLM lane). Pass --pflash always "
-                "to override.",
+            # Do NOT advise ``--pflash always`` here: PFlash genuinely cannot
+            # serve the MLLM/VLM lane, so forcing it on would only be rejected
+            # at startup by ``validate_model_support``. Keep the user's mental
+            # model correct — state that PFlash is unavailable for this model,
+            # and that an explicit override would error (codex #2 nit on #1178).
+            logger.info(
+                "PFlash default: alias %r is multimodal — leaving PFlash off. "
+                "PFlash cannot serve the MLLM/VLM lane, so it is unavailable "
+                "for this model (an explicit --pflash always/auto would be "
+                "rejected at startup).",
                 model_name,
             )
             return "off"
@@ -237,7 +243,7 @@ def resolve_pflash_mode_default(
         # uniform across ``serve``/``bench`` by design, but the bench
         # workflow specifically expects to see what mode is being
         # measured (codex r4 BLOCKING called out this surprise).
-        logging.getLogger(__name__).info(
+        logger.info(
             "PFlash default: alias %r is pflash_tier=verified — "
             "engine defaults to --pflash always. Pass --pflash off to "
             "compare against the no-compression baseline.",
