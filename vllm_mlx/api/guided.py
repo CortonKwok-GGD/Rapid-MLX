@@ -658,10 +658,10 @@ def generate_with_schema(
             max_tokens=max_tokens,
             temperature=temperature,
         )
-    except GuidedSchemaCompileError:
-        # Invalid caller schema — propagate so the route can 400 rather than
-        # swallow it into a silent unconstrained fallback.
-        raise
     except Exception as e:
+        # ``generate_json`` already degrades EVERY failure (compile-reject
+        # included) to ``None`` internally, so nothing schema-specific escapes
+        # here; this stays only as a last-resort guard for a wiring failure in
+        # ``GuidedGenerator`` construction.
         logger.error(f"generate_with_schema failed: {e}")
         return None

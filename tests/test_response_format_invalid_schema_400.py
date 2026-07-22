@@ -17,19 +17,23 @@ guided-unavailable / truncated-parse ``None``. ``BatchedEngine.
 generate_with_schema`` swallowed that ``None`` into a silent
 ``self.chat(...)`` fallback (HTTP 200, unconstrained).
 
-Fix: the guided layer now raises ``GuidedSchemaCompileError`` for a
-caller-schema compile failure. The batched engine propagates it instead
-of falling back, and the chat route maps it to a clean HTTP 400
-(non-streaming) or a terminal ``invalid_request_error`` SSE envelope
-(streaming) — in BOTH strict and non-strict mode, because an invalid
-schema is malformed input regardless of the strictness flag.
+Fix: structural validity of a caller schema is settled ONCE, at the ROUTE
+BOUNDARY — a single shared validator (``nonstrict_json_schema_boundary_error``
+for non-strict json_schema; the strict ``check_schema_validity`` pre-flight for
+strict) returns a clean HTTP 400 BEFORE any engine dispatch, on chat and
+responses alike, streaming or not. ``/v1/completions`` rejects json_schema
+up-front as unsupported. Downstream, the guided layer treats EVERY llguidance
+failure as OPERATIONAL — it degrades to ``None`` (→ strict 502, non-strict
+best-effort 200), never a 400 — so there is no schema-specific propagation path
+to a handler anymore (the vestigial engine/route/handler machinery for that was
+removed once the boundary became the single structural-validation point).
 
-These tests pin the route-level contract with a mock engine (no model /
-llguidance needed). A ``GuidedSchemaCompileError``-raising engine stands in
-for a real invalid-schema compile failure; a generic ``RuntimeError`` stands
-in for a transient guided-decode failure whose best-effort fallback must be
-PRESERVED. One additional test exercises the guided layer directly when the
-``[guided]`` extra is installed.
+These tests pin the contract with a mock engine (no model / llguidance needed):
+an invalid schema is rejected at the boundary (engine never dispatched); a valid
+schema that fails OPERATIONALLY (``RuntimeError``) is a strict 502 / non-strict
+best-effort 200. A few tests exercise the guided layer directly; llguidance is a
+CORE dependency (promoted out of the ``[guided]`` extra in 0.10.15), so they run
+UNCONDITIONALLY and fail loudly if it is unavailable rather than silently skip.
 """
 
 from __future__ import annotations
@@ -47,10 +51,8 @@ from vllm_mlx.api.errors import (
     RESPONSES_TEXT_FORMAT_PARAM,
     GuidedSchemaCompileError,
     guided_schema_compile_error_detail,
-    stamp_compile_error_param,
 )
 from vllm_mlx.api.guided import GuidedSchemaCompileError as _GuidedErrFromGuided
-from vllm_mlx.api.guided import is_guided_available
 from vllm_mlx.config import reset_config
 from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.middleware.exception_handlers import install_exception_handlers
@@ -546,23 +548,20 @@ class _StubMatcher:
         return self._error
 
 
-@pytest.mark.skipif(
-    not is_guided_available(), reason="requires the [guided] (llguidance) extra"
-)
 def test_decode_constrained_raises_on_matcher_get_error(monkeypatch):
     """Round-4 #2 — DETERMINISTIC coverage of the load-bearing
     ``matcher.get_error()`` raise, with NO HF-cache dependency.
 
     ``_decode_constrained`` builds an ``LLMatcher`` and, when ``get_error()``
-    is non-empty, MUST raise ``GuidedSchemaCompileError`` (not ``return None``,
-    which is indistinguishable from a benign guided-unavailable None and let the
-    original silent unconstrained 200 through). We stub ``LLMatcher`` so its
+    is non-empty, MUST raise ``GuidedSchemaCompileError`` (which ``generate_json``
+    then catches → ``None`` → operational path). We stub ``LLMatcher`` so its
     ``get_error()`` returns an error string and stub ``_get_lltokenizer`` so the
     method reaches the matcher check; the raise happens before any real
     tokenizer/model use, so ``model``/``tokenizer`` are bare objects.
 
-    Reverting the raise to ``return None`` turns this test red in clean CI —
-    which the previous HF-cache-gated test could not do.
+    Runs UNCONDITIONALLY: llguidance is a CORE dependency (0.10.15+), so this
+    load-bearing guided-decoder regression must never silently skip — reverting
+    the raise to ``return None`` (or a broken llguidance import) turns it red.
     """
     from vllm_mlx.api import guided as guided_mod
 
@@ -592,9 +591,6 @@ def test_generate_json_has_no_inengine_structural_validation():
     )
 
 
-@pytest.mark.skipif(
-    not is_guided_available(), reason="requires the [guided] (llguidance) extra"
-)
 def test_generate_json_treats_any_llguidance_reject_as_operational_none(monkeypatch):
     """Round-5 — with structural validation owned by the route boundary,
     ``generate_json`` no longer discriminates schema validity: EVERY llguidance
@@ -623,9 +619,6 @@ def test_generate_json_treats_any_llguidance_reject_as_operational_none(monkeypa
     )
 
 
-@pytest.mark.skipif(
-    not is_guided_available(), reason="requires the [guided] (llguidance) extra"
-)
 def test_generate_json_operational_runtime_error_degrades_to_none(monkeypatch):
     """Operational arm: an INTERNAL failure (e.g. a ``RuntimeError`` /  eager
     ``ValueError`` from ``grammar_from_json_schema``) degrades to ``None`` (the
@@ -645,12 +638,11 @@ def test_generate_json_operational_runtime_error_degrades_to_none(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Engine path (Issue 3): the REAL BatchedEngine must PROPAGATE a compile error
-# from the guided layer, NOT swallow it into a silent chat() fallback. The
-# mock is injected at the GuidedGenerator layer (not at generate_with_schema),
-# so these tests exercise BatchedEngine._run_guided_generation /
-# generate_with_schema — deleting the engine-layer propagation would turn them
-# red while the route-level mock tests above stayed green.
+# Engine path: with structural validation owned by the route boundary, the REAL
+# BatchedEngine treats EVERY guided-layer failure as operational and degrades it
+# to ``None`` (→ strict 502 / non-strict best-effort). It no longer discriminates
+# a compile error, so there is no schema-specific propagation to assert; this
+# pins that the sync guided worker degrades a raised failure to ``None``.
 # ---------------------------------------------------------------------------
 
 
@@ -676,22 +668,11 @@ def _bare_engine(monkeypatch, gen_exc: Exception):
     return eng, batched_mod
 
 
-def test_run_guided_generation_propagates_compile_error(monkeypatch):
-    """The sync guided worker re-raises ``GuidedSchemaCompileError`` instead
-    of returning ``None`` — the load-bearing line at batched.py that stops the
-    silent fallback."""
-    eng, _ = _bare_engine(
-        monkeypatch, GuidedSchemaCompileError("Invalid type: notatype")
-    )
-    with pytest.raises(GuidedSchemaCompileError):
-        eng._run_guided_generation(
-            prompt="p", json_schema=_INVALID_SCHEMA, max_tokens=8, temperature=0.0
-        )
-
-
-def test_run_guided_generation_generic_failure_returns_none(monkeypatch):
-    """A transient (non-compile) guided failure stays a graceful ``None`` so
-    the best-effort fallback is preserved — only compile errors propagate."""
+def test_run_guided_generation_degrades_failure_to_none(monkeypatch):
+    """The sync guided worker degrades ANY guided-layer failure to a graceful
+    ``None`` (the operational path — strict 502 / non-strict best-effort). It no
+    longer re-raises a compile error: structural validity is settled at the route
+    boundary, so nothing schema-specific propagates out of the engine."""
     eng, _ = _bare_engine(monkeypatch, RuntimeError("transient blip"))
     assert (
         eng._run_guided_generation(
@@ -701,52 +682,9 @@ def test_run_guided_generation_generic_failure_returns_none(monkeypatch):
     )
 
 
-async def test_generate_with_schema_propagates_compile_error_no_chat_fallback(
-    monkeypatch,
-):
-    """End-to-end through the REAL async ``generate_with_schema`` wrapper: a
-    compile error must propagate to the caller (which the route maps to 400)
-    and MUST NOT silently fall back to unconstrained ``chat()``. Deleting the
-    engine-layer propagation would make this fail — ``chat()`` would run and
-    no exception would surface (the exact production silent-degrade)."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    eng, batched_mod = _bare_engine(
-        monkeypatch, GuidedSchemaCompileError("Invalid type: notatype")
-    )
-    monkeypatch.setattr(
-        batched_mod, "shared_apply_chat_template", lambda *a, **k: "PROMPT"
-    )
-    eng._loaded = True
-    eng._model_name = "test-model"
-    chat_calls: list = []
-
-    async def _spy_chat(**kwargs):
-        chat_calls.append(kwargs)
-        return GenerationOutput(
-            text="FALLBACK", new_text="FALLBACK", finish_reason="stop"
-        )
-
-    eng.chat = _spy_chat
-    executor = ThreadPoolExecutor(max_workers=1)
-    eng._model_load_executor = executor
-    try:
-        with pytest.raises(GuidedSchemaCompileError):
-            await eng.generate_with_schema(
-                messages=[{"role": "user", "content": "hi"}],
-                json_schema=_INVALID_SCHEMA,
-                # raise_on_failure=False is the non-streaming default that,
-                # pre-fix, silently fell back to chat() on a None result.
-                raise_on_failure=False,
-            )
-        assert chat_calls == [], "compile error must NOT trigger a chat() fallback"
-    finally:
-        executor.shutdown(wait=False)
-
-
 # ---------------------------------------------------------------------------
-# Non-chat endpoint coverage (Issue 1): /v1/responses must ALSO surface a
-# compile error as HTTP 400 (not the strict 502, not a silent 200 / 500).
+# Non-chat endpoint coverage (Issue 1): /v1/responses must ALSO reject an invalid
+# schema at the ROUTE BOUNDARY (HTTP 400, not the strict 502, not a silent 200).
 # ---------------------------------------------------------------------------
 
 
@@ -968,213 +906,6 @@ def test_responses_strict_stream_rejected_before_generation(_rate_limiter_state)
         "strict+stream must be rejected before any generation is attempted"
     )
     assert engine.chat_calls == []
-
-
-# ---------------------------------------------------------------------------
-# Round-3 #5: the TaskGroup / thread-boundary safety net must recover a
-# GuidedSchemaCompileError even when a 3.11+ ``TaskGroup`` re-raises it wrapped
-# in a (possibly nested) ``ExceptionGroup``, which a bare ``isinstance`` check
-# in the dedicated handler would miss — it would fall through to a sanitized
-# 500 and re-hide the caller's invalid schema behind an opaque server error.
-# ---------------------------------------------------------------------------
-
-
-def _exc_group(*excs: BaseException) -> BaseException:
-    """Build a real ``ExceptionGroup`` on 3.11+, else skip the group tests
-    (3.10 has no builtin ``ExceptionGroup``; the safety net degrades to a plain
-    ``isinstance`` there, which is correct because TaskGroups can't wrap on
-    3.10)."""
-    try:
-        return ExceptionGroup("boom", list(excs))  # noqa: F821 (3.11+ builtin)
-    except NameError:  # pragma: no cover - 3.10 path
-        pytest.skip("ExceptionGroup requires Python 3.11+")
-
-
-def _group_raising_app(exc: BaseException) -> TestClient:
-    app = FastAPI()
-    install_exception_handlers(app)
-
-    @app.get("/boom")
-    async def _boom():
-        raise exc
-
-    # raise_server_exceptions=False: the generic ``Exception`` handler
-    # (ServerErrorMiddleware) always re-raises after sending its response, so
-    # to OBSERVE the 400 it produced we must stop TestClient from propagating
-    # that re-raise into the test body.
-    return TestClient(app, raise_server_exceptions=False)
-
-
-def test_exception_group_wrapped_compile_error_maps_to_400():
-    """A group whose EVERY leaf is a ``GuidedSchemaCompileError`` (the 3.11+
-    TaskGroup shape) reaching the generic handler is unwrapped via
-    ``_extract_all_leaves_are`` and mapped to the clean 400, NOT a sanitized 500.
-
-    An UNSTAMPED error (``param is None``) renders the chat default locator."""
-    group = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
-    client = _group_raising_app(group)
-    resp = client.get("/boom")
-    assert resp.status_code == 400, resp.text
-    err = resp.json()["error"]
-    assert err["type"] == "invalid_request_error"
-    assert err["code"] == "invalid_response_format_schema"
-    assert "notatype" in err["message"]
-    assert err["param"] == CHAT_RESPONSE_FORMAT_PARAM
-
-
-def test_nested_all_compile_exception_group_maps_to_400():
-    """The all-leaves unwrap is RECURSIVE: a group-of-group whose EVERY leaf is
-    a compile error is still recovered to the 400 rather than leaking as 500."""
-    inner = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
-    outer = _exc_group(inner, GuidedSchemaCompileError("also bad"))
-    client = _group_raising_app(outer)
-    resp = client.get("/boom")
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["code"] == "invalid_response_format_schema"
-
-
-def test_exception_group_without_compile_error_stays_500():
-    """A safety guard: an ``ExceptionGroup`` that does NOT contain a
-    ``GuidedSchemaCompileError`` must NOT be coerced into a 400 — it stays a
-    sanitized 500. This pins that ``_extract_all_leaves_are`` returns ``None``
-    (no false-positive 400s) for unrelated grouped failures."""
-    group = _exc_group(RuntimeError("some unrelated internal failure"))
-    client = _group_raising_app(group)
-    resp = client.get("/boom")
-    assert resp.status_code == 500, resp.text
-    # The sanitized 500 body carries no ``code`` — the point is only that the
-    # unrelated group was NOT coerced into the compile-error 400 envelope.
-    assert resp.json().get("error", {}).get("code") != "invalid_response_format_schema"
-
-
-def test_mixed_exception_group_is_not_flattened_to_400():
-    """Round-4 #2 — a MIXED group (a ``GuidedSchemaCompileError`` bundled with an
-    unrelated internal failure) must NOT be collapsed to 400: doing so would
-    mask the server-side failure and mislead the client into "fix your schema".
-    The all-leaves check requires EVERY leaf to be a compile error, so a mixed
-    group falls through to the sanitized 5xx."""
-    group = _exc_group(
-        GuidedSchemaCompileError("Invalid type: notatype"),
-        RuntimeError("an unrelated internal failure that must not be masked"),
-    )
-    client = _group_raising_app(group)
-    resp = client.get("/boom")
-    assert resp.status_code >= 500, resp.text
-    # Must NOT be reported as a client schema fault.
-    assert resp.json().get("error", {}).get("code") != "invalid_response_format_schema"
-
-
-def test_mixed_nested_exception_group_is_not_flattened_to_400():
-    """The mixed-group guard holds through NESTING: an inner all-compile group
-    combined with an outer non-compile leaf is still a mixed group overall →
-    5xx, not 400."""
-    inner = _exc_group(GuidedSchemaCompileError("Invalid type: notatype"))
-    outer = _exc_group(inner, MemoryError("out of memory"))
-    client = _group_raising_app(outer)
-    resp = client.get("/boom")
-    assert resp.status_code >= 500, resp.text
-    assert resp.json().get("error", {}).get("code") != "invalid_response_format_schema"
-
-
-# ---------------------------------------------------------------------------
-# Round-4 #3: the surface-correct ``param`` is carried ON the exception and the
-# handler reads ``exc.param``, so /v1/responses renders ``text.format.schema``
-# (not the chat default) even on the ExceptionGroup escape path that bypasses
-# the route's local ``except`` and lands on the generic handler.
-# ---------------------------------------------------------------------------
-
-
-def test_guided_compile_error_carries_param():
-    """The exception carries ``param``; the default (unset) is ``None`` so the
-    envelope builder falls back to the chat locator, and an explicit value is
-    preserved for the handler to read."""
-    assert GuidedSchemaCompileError("boom").param is None
-    tagged = GuidedSchemaCompileError("boom", param=RESPONSES_TEXT_FORMAT_PARAM)
-    assert tagged.param == RESPONSES_TEXT_FORMAT_PARAM
-    # Builder with no explicit param reads exc.param.
-    assert (
-        guided_schema_compile_error_detail(tagged)["error"]["param"]
-        == RESPONSES_TEXT_FORMAT_PARAM
-    )
-    # Explicit param argument still wins over the stamped one.
-    assert (
-        guided_schema_compile_error_detail(tagged, param="override.path")["error"][
-            "param"
-        ]
-        == "override.path"
-    )
-
-
-async def test_stamp_compile_error_param_tags_bare_and_grouped():
-    """``stamp_compile_error_param`` (what the responses route wraps its engine
-    coroutine with) tags the surface param on an escaping compile error —
-    whether it propagates bare or already ``ExceptionGroup``-wrapped — and never
-    swallows. It also leaves an already-tagged inner error untouched."""
-
-    async def _raise_bare():
-        raise GuidedSchemaCompileError("boom")
-
-    with pytest.raises(GuidedSchemaCompileError) as ei:
-        await stamp_compile_error_param(_raise_bare(), RESPONSES_TEXT_FORMAT_PARAM)
-    assert ei.value.param == RESPONSES_TEXT_FORMAT_PARAM
-
-    async def _raise_grouped():
-        raise _exc_group(GuidedSchemaCompileError("boom"))
-
-    with pytest.raises(BaseException) as ei2:
-        await stamp_compile_error_param(_raise_grouped(), RESPONSES_TEXT_FORMAT_PARAM)
-    from vllm_mlx.api.errors import _first_compile_error
-
-    inner = _first_compile_error(ei2.value)
-    assert inner is not None and inner.param == RESPONSES_TEXT_FORMAT_PARAM
-
-    async def _raise_already_tagged():
-        raise GuidedSchemaCompileError("boom", param="already.set")
-
-    with pytest.raises(GuidedSchemaCompileError) as ei3:
-        await stamp_compile_error_param(
-            _raise_already_tagged(), RESPONSES_TEXT_FORMAT_PARAM
-        )
-    assert ei3.value.param == "already.set"
-
-    # A non-compile error passes straight through, unmodified, never swallowed.
-    async def _raise_other():
-        raise RuntimeError("unrelated")
-
-    with pytest.raises(RuntimeError):
-        await stamp_compile_error_param(_raise_other(), RESPONSES_TEXT_FORMAT_PARAM)
-
-
-def test_responses_surface_exception_group_renders_text_format_param():
-    """End-to-end composition of the /v1/responses escape path: the route wraps
-    its engine coroutine with ``stamp_compile_error_param(..., text.format.schema)``;
-    an upstream TaskGroup then wraps the (now-stamped) error in an
-    ``ExceptionGroup`` that bypasses the route's bare ``except`` and reaches the
-    generic handler. The handler must render ``text.format.schema`` — NOT the
-    chat default — because the param rode along on the exception."""
-    app = FastAPI()
-    install_exception_handlers(app)
-
-    @app.get("/boom")
-    async def _boom():
-        async def _engine_coro():
-            # The engine raises surface-agnostic (param=None).
-            raise GuidedSchemaCompileError("Invalid type: notatype")
-
-        try:
-            # Exactly what routes/responses.py wraps generate_with_schema with.
-            await stamp_compile_error_param(_engine_coro(), RESPONSES_TEXT_FORMAT_PARAM)
-        except GuidedSchemaCompileError as e:
-            # Simulate an upstream 3.11+ TaskGroup wrapping the stamped error,
-            # so it escapes the local bare-except and hits the generic handler.
-            raise _exc_group(e) from None
-
-    client = TestClient(app, raise_server_exceptions=False)
-    resp = client.get("/boom")
-    assert resp.status_code == 400, resp.text
-    err = resp.json()["error"]
-    assert err["code"] == "invalid_response_format_schema"
-    assert err["param"] == RESPONSES_TEXT_FORMAT_PARAM
 
 
 if __name__ == "__main__":

@@ -635,11 +635,6 @@ def _compute_metal_cache_limit(soft_limit_bytes: int) -> int:
     return min(cache, soft_limit_bytes) if soft_limit_bytes > 0 else cache
 
 
-# ``GuidedSchemaCompileError`` lives in the dependency-free ``api.errors``
-# module, so it is always importable even when the ``[guided]`` extra (and the
-# heavy ``api.guided`` import below) is absent — no placeholder shim needed.
-from ..api.errors import GuidedSchemaCompileError
-
 # Check for guided generation availability
 try:
     from ..api.guided import GuidedGenerator, is_guided_available
@@ -2961,14 +2956,11 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
-        except GuidedSchemaCompileError:
-            # The caller's schema does not compile — this is an invalid request,
-            # NOT a transient guided-decode failure. Propagate it so
-            # ``generate_with_schema`` re-raises instead of returning ``None``
-            # and silently falling back to unconstrained ``self.chat(...)`` (an
-            # HTTP 200 with free-form text). The route maps this to HTTP 400.
-            raise
         except Exception as e:
+            # ``generate_json`` already degrades every failure — compile-reject
+            # (structural validity is settled at the route boundary) and
+            # transient guided failure alike — to ``None``. This stays only as a
+            # last-resort guard for a wiring failure in the setup above.
             logger.error(f"Guided generation error: {e}")
             return None
 
