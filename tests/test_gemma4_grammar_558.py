@@ -591,7 +591,8 @@ def _tokenizer_in_cache() -> bool:
     repo/revision was never fetched. Only a genuine ``str`` path counts as cached.
     Degrades to ``False`` (treat as not cached -> skip-eligible) if the hub helper
     is unavailable or raises — never masks a real load failure, since the ``tok``
-    fixture only skips on an offline EXCEPTION TYPE in the not-cached branch."""
+    fixture loads a present cache with ``local_files_only=True`` so a corrupt or
+    partial cache raises loudly (the test FAILS) rather than being skipped."""
     try:
         from huggingface_hub import try_to_load_from_cache
     except Exception:  # pragma: no cover - very old hub
@@ -605,87 +606,24 @@ def _tokenizer_in_cache() -> bool:
     return isinstance(path, str)
 
 
-def _hf_offline_mode() -> bool:
-    """True iff HuggingFace is configured for OFFLINE mode (env or hub constant).
-    Used to skip the uncached tokenizer fetch on an INTENTIONAL offline run
-    regardless of how transformers surfaces the miss (bare OSError included)."""
-    import os
-
-    if os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE"):
-        return True
-    try:
-        from huggingface_hub import constants
-
-        return bool(getattr(constants, "HF_HUB_OFFLINE", False))
-    except Exception:  # pragma: no cover - very old hub
-        return False
-
-
-def _is_connectivity_error(exc: BaseException) -> bool:
-    """True iff exc is a recognized NETWORK/offline connectivity type. A 404 /
-    bad-revision / corrupt error is deliberately NOT here — those must FAIL, not
-    skip (codex r6 #4). Only the transient/offline connectivity path skips."""
-    types: list[type[BaseException]] = []
-    try:
-        from huggingface_hub.errors import (
-            LocalEntryNotFoundError,
-            OfflineModeIsEnabled,
-        )
-
-        types += [LocalEntryNotFoundError, OfflineModeIsEnabled]
-    except Exception:  # pragma: no cover - old hub
-        pass
-    try:
-        from requests.exceptions import ConnectionError as _ReqConnErr
-        from requests.exceptions import Timeout as _ReqTimeout
-
-        types += [_ReqConnErr, _ReqTimeout]
-    except Exception:  # pragma: no cover - requests absent
-        pass
-    return bool(types) and isinstance(exc, tuple(types))
-
-
 @pytest.fixture(scope="module")
 def tok():
-    """Load the pinned gemma4 tokenizer for the enforcement tests.
-
-    PRIMARY gate: cache presence. A CACHED tokenizer must LOAD — if it fails, that
-    is corruption and the test FAILS (any exception propagates on the cached path
-    below). A NOT-cached tokenizer is skip-eligible ONLY when the miss is truly a
-    connectivity/offline one; the offline-vs-real-failure decision is broken by an
-    OFFLINE-INTENT tie-break (``_hf_offline_mode`` OR ``_is_connectivity_error``),
-    NOT a catch-all skip and NOT a message sniff. This resolves the r5<->r6
-    oscillation: skip-on-any-exception (r5) hid a bad revision / 404 / corrupt-
-    partial-cache as a false-GREEN (codex r6 #4), while the pre-r5 type-only skip
-    surfaced a genuine offline miss (bare wrapping ``OSError``) as a false-RED
-    (codex r5 F3). The r3 message-substring heuristic (codex r4 F3) is gone."""
     transformers = pytest.importorskip("transformers")
-    if _tokenizer_in_cache():
-        return transformers.AutoTokenizer.from_pretrained(
-            _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
+    # CACHE-ONLY (codex r7 #1). These enforcement tests NEVER hit the network: the
+    # offline-vs-corrupt decision is made entirely by cache presence, so there is no
+    # live download to fail on a firewalled/offline CI and no wrapped-exception
+    # classification to get wrong. NOT cached -> skip (genuinely unavailable);
+    # cached -> load with ``local_files_only=True`` so a partial/corrupt cache raises
+    # immediately (the test FAILS) instead of silently triggering a download.
+    if not _tokenizer_in_cache():
+        pytest.skip(
+            f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not in the local "
+            "HF cache — gemma4 enforcement tests are cache-only (no network). "
+            "Pre-cache the tokenizer to run them."
         )
-    try:
-        return transformers.AutoTokenizer.from_pretrained(
-            _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
-        )
-    except Exception as exc:  # pragma: no cover - offline & uncached
-        # NOT cached (cache-presence gate returned False). Decide offline-vs-real-
-        # failure by OFFLINE INTENT + connectivity TYPE — NOT a catch-all skip
-        # (codex r6 #4: that hid a bad revision / 404 / corrupt-partial-cache as a
-        # false-GREEN) and NOT a message sniff (codex r4 F3). Resolves the r5<->r6
-        # oscillation: skip-on-any (r5) was too broad, type-only (pre-r5) was too
-        # narrow (a genuine offline miss can surface as a bare OSError -> false-RED).
-        # If HF is in offline MODE we skip regardless of how the miss surfaced; if
-        # ONLINE, a load failure is a REAL failure (bad repo/revision/corrupt) and
-        # PROPAGATES so the suite FAILS, except a recognized transient connectivity
-        # error which skips.
-        if _hf_offline_mode() or _is_connectivity_error(exc):
-            pytest.skip(
-                f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not cached "
-                f"and unavailable offline ({type(exc).__name__}) — gemma4 "
-                "enforcement tests require it"
-            )
-        raise
+    return transformers.AutoTokenizer.from_pretrained(
+        _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION, local_files_only=True
+    )
 
 
 @pytest.fixture(scope="module")
@@ -789,6 +727,65 @@ def test_gemma4_valid_call_accepted_and_terminates(tok, lltok):
     accepted, total, accepting = _consume(grammar, lltok, tok, _wire("print(1)"))
     assert accepted == total, f"valid gemma4 call rejected ({accepted}/{total})"
     assert accepting, "valid complete gemma4 call is not a terminal state"
+
+
+@_requires_llguidance
+def test_gemma4_chat_template_wire_matches_grammar_and_parser(tok, lltok):
+    """GROUND-TRUTH anchor (codex r7 #3): render a tool call through the pinned
+    tokenizer's REAL ``apply_chat_template`` and prove the E4 wire premise against
+    it, so the whole enforcement suite can no longer stay green on a handwritten
+    ``_wire`` that disagrees with the model's actual chat template.
+
+    The pinned gemma-4 ``chat_template`` DOES render an assistant ``tool_calls``
+    turn — its assistant branch emits, verbatim,
+    ``<|tool_call>call:<name>{<k>:<format_argument(v)>,...}<tool_call|>`` with keys
+    in ``| dictsort`` order and ``format_argument(value, escape_keys=False)`` so a
+    string value becomes ``<|"|>v<|"|>``, a bool becomes ``true``/``false`` and an
+    int is emitted bare (the exact ``%json`` scalar surface). We build a ``run``
+    call whose args cover BOTH wire shapes: ``code``/``lang`` (``<|"|>``-wrapped
+    strings) plus ``timeout`` (bare ``%json`` int) and ``verbose`` (bare bool)."""
+    args = {"code": "print(1)", "lang": "python", "timeout": 30, "verbose": True}
+    messages = [
+        {"role": "user", "content": "run print(1)"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"type": "function", "function": {"name": "run", "arguments": args}}
+            ],
+        },
+    ]
+    rendered = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+
+    # Extract the wire span the template rendered between the two special markers.
+    begin, end = "<|tool_call>", "<tool_call|>"
+    i = rendered.find(begin)
+    assert i != -1, f"chat_template did not render a tool call: {rendered!r}"
+    j = rendered.find(end, i)
+    assert j != -1, f"chat_template tool call is not terminated: {rendered!r}"
+    wire = rendered[i : j + len(end)]
+
+    # (0) The handwritten ``_wire`` helper the enforcement suite is built on IS the
+    # ground-truth wire (verbose="true" == the bool ``true`` the template emits).
+    assert wire == _wire("print(1)", lang="python", timeout=30, verbose="true"), (
+        f"handwritten _wire disagrees with the real chat_template render: {wire!r}"
+    )
+
+    # (i) The gemma4 parser recovers the tool name + args EXACTLY from the render.
+    name, parsed = _parse(wire, GEMMA4_TOOLS)
+    assert name == "run"
+    assert parsed == args, f"parser did not round-trip the rendered wire: {parsed!r}"
+
+    # (ii) The generated grammar ACCEPTS the rendered wire and reaches a terminal
+    # state — proving grammar <-> real-template agreement end to end.
+    grammar = _gemma4_grammar(GEMMA4_TOOLS, "required", tok)
+    assert grammar is not None
+    accepted, total, accepting = _consume(grammar, lltok, tok, wire)
+    assert accepted == total, (
+        f"grammar rejected the real chat_template wire ({accepted}/{total}): {wire!r}"
+    )
+    assert accepting, f"real chat_template wire is not a terminal state: {wire!r}"
 
 
 @_requires_llguidance
