@@ -24,7 +24,12 @@ from collections.abc import AsyncIterator, Mapping
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
-from ..api.errors import GuidedSchemaCompileError, guided_schema_compile_error_detail
+from ..api.errors import (
+    RESPONSES_TEXT_FORMAT_PARAM,
+    GuidedSchemaCompileError,
+    guided_schema_compile_error_detail,
+    stamp_compile_error_param,
+)
 from ..api.models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -912,11 +917,20 @@ async def _non_stream(
             k: v for k, v in chat_kwargs.items() if k != "raise_on_failure"
         }
         try:
-            _guided_coro = engine.generate_with_schema(
-                messages=messages,
-                json_schema=_strict_schema,
-                raise_on_failure=True,
-                **_guided_kwargs,
+            # Stamp the responses-surface param onto any GuidedSchemaCompileError
+            # the moment it escapes generation, BEFORE an upstream TaskGroup
+            # could wrap it in an ExceptionGroup that slips past the bare
+            # ``except GuidedSchemaCompileError`` below and lands on the generic
+            # handler — which would otherwise render the default chat locator
+            # instead of ``text.format.schema``.
+            _guided_coro = stamp_compile_error_param(
+                engine.generate_with_schema(
+                    messages=messages,
+                    json_schema=_strict_schema,
+                    raise_on_failure=True,
+                    **_guided_kwargs,
+                ),
+                RESPONSES_TEXT_FORMAT_PARAM,
             )
         except HTTPException:
             raise
@@ -935,7 +949,7 @@ async def _non_stream(
             raise HTTPException(
                 status_code=400,
                 detail=guided_schema_compile_error_detail(
-                    compile_err, param="text.format.schema"
+                    compile_err, param=RESPONSES_TEXT_FORMAT_PARAM
                 ),
             ) from compile_err
         except Exception as guided_err:
@@ -1007,7 +1021,7 @@ async def _non_stream(
                 raise HTTPException(
                     status_code=400,
                     detail=guided_schema_compile_error_detail(
-                        compile_err, param="text.format.schema"
+                        compile_err, param=RESPONSES_TEXT_FORMAT_PARAM
                     ),
                 ) from compile_err
             except Exception as guided_err:
