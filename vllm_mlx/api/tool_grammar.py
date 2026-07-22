@@ -44,7 +44,7 @@ import threading
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any
 
@@ -632,6 +632,14 @@ _GEMMA4_STRUCTURAL_MARKERS = (
 def _gemma4_enum_wire_unsafe(wire: str) -> bool:
     """gemma4 enum-value wire is unsafe iff it embeds a STRUCTURAL special token.
 
+    This is the STRUCTURAL, TOKENIZER-FREE fallback (the ``tokenizer is None``
+    degraded / warmup path). The COMPLETE, complete-by-construction check lives in
+    ``_gemma4_schema_representable`` (codex r3 E4): when the model tokenizer is
+    available it ALSO rejects an enum value that tokenizes through ANY registered
+    special token (``_enum_wire_embeds_special_token``), not just the five hard-coded
+    markers below. This function stays a cheap fast-path there (belt & suspenders)
+    and the sole check when no tokenizer is present.
+
     An enum value's WIRE form is rendered as BYTE LITERALS (a ``<|"|>``-wrapped
     string alt or a bare ``json.dumps`` scalar). Every gemma4 structural marker in
     ``_GEMMA4_STRUCTURAL_MARKERS`` — the ``<|"|>`` string delimiter AND the
@@ -651,6 +659,45 @@ def _gemma4_enum_wire_unsafe(wire: str) -> bool:
     return any(marker in wire for marker in _GEMMA4_STRUCTURAL_MARKERS)
 
 
+def _enum_wire_embeds_special_token(tokenizer: Any, wire: str) -> bool:
+    """True iff ``wire``'s BYTE content tokenizes THROUGH a registered special token.
+
+    Completes the gemma4 enum guard BY CONSTRUCTION (codex r3 E4). The 5-marker
+    ``_gemma4_enum_wire_unsafe`` substring BLACKLIST is inherently incomplete — a
+    reviewer can always name one more special token (on the pinned gemma-4
+    tokenizer ``<bos>`` / ``<eos>`` / ``<pad>`` / ``<unk>`` are single registered
+    tokens outside the five markers). This check is TOKENIZER-DRIVEN, so it opts out
+    a value ONLY when it ACTUALLY collapses to a registered token on THIS tokenizer
+    (a surface like ``<start_of_turn>`` that tokenizes to ordinary multi-token text
+    is a REACHABLE byte-literal and correctly kept). A gemma4 enum
+    value is emitted as a BYTE-LITERAL alternation branch (the raw ``wire`` bytes
+    between ``<|"|>`` markers, or a bare ``json.dumps`` scalar); if ANY of those
+    bytes resolves to a REGISTERED added/special token on ``tokenizer``, llguidance
+    emits that token ATOMICALLY, never as its spelled-out bytes, so the branch is
+    unreachable/unsatisfiable and the model can never produce it. Report it unsafe
+    so the whole request opts out (return ``None`` -> free-form) — the same
+    faithful-or-opt-out policy as the structural-marker check, now closed over the
+    tokenizer's FULL special-token set rather than five hard-coded strings.
+
+    Reuses ``_is_registered_added_token`` — the EXACT predicate
+    ``are_single_special_tokens`` uses — so "registered special token" means one
+    consistent thing across the module (do NOT reinvent). Encodes with
+    ``add_special_tokens=False`` so no BOS/EOS is auto-prepended; a value collapses
+    to a special token ONLY when it literally spells one. Degrades to ``False`` (the
+    cheap 5-marker structural fallback still applies) when the tokenizer lacks
+    ``encode`` / raises — grammar constraint is best-effort opt-in, never a hard
+    requirement.
+    """
+    encode = getattr(tokenizer, "encode", None)
+    if encode is None:
+        return False
+    try:
+        ids = encode(wire, add_special_tokens=False)
+    except Exception:
+        return False
+    return any(_is_registered_added_token(tokenizer, tok_id) for tok_id in ids)
+
+
 @dataclass(frozen=True)
 class _ArgWirePolicy:
     """Per-wire representability policy for the delimiter-based arg guards (E4).
@@ -664,8 +711,15 @@ class _ArgWirePolicy:
         key position (XML ``<parameter=KEY>`` rejects ``<>{},:``+whitespace; gemma4
         ``KEY:`` round-trips only a ``\\w+`` key).
       * ``enum_wire_unsafe`` — whether an enum value's WIRE form carries a byte
-        that breaks the value framing (XML: ``<>\\r\\n``; gemma4: only the
-        ``<|"|>`` marker).
+        sequence that breaks the value framing. XML: any ``<>\\r\\n`` byte. gemma4:
+        ANY of the five structural special-token markers
+        (``<|tool_call>`` / ``<tool_call|>`` / ``<|"|>`` / ``<|channel>`` /
+        ``<channel|>``) AND — when ``build_tool_grammar`` threads the model
+        tokenizer into ``_gemma4_schema_representable`` — ANY tokenizer-registered
+        special token the value tokenizes through (``<bos>`` / ``<eos>`` /
+        ``<pad>`` / …), so the gemma4 enum guard is COMPLETE BY CONSTRUCTION, not a
+        five-string blacklist (codex r3 E4). Without a tokenizer it falls back to
+        the five structural markers alone.
 
     Everything else (top-level key allowlist, ``additionalProperties`` /
     ``required`` totality, ``$ref`` resolution, scalar/object/array/string
@@ -959,15 +1013,41 @@ def _xml_schema_representable(
     return True
 
 
-def _gemma4_schema_representable(params: Any) -> bool:
+def _gemma4_schema_representable(params: Any, *, tokenizer: Any = None) -> bool:
     """True iff the gemma4 arg emitter can FAITHFULLY constrain ``params`` (E4).
 
     Thin binding of the shared strict-allowlist guard to the gemma4 wire policy
-    (``\\w+`` bare keys; only the ``<|"|>`` marker is an unsafe enum-value byte).
-    Reuses the SAME structural allowlist as XML — a request opts out of grammar
+    (``\\w+`` bare keys; an enum value is unsafe iff it embeds a structural marker
+    OR — when ``tokenizer`` is given — ANY registered special token). Reuses the
+    SAME structural allowlist as XML — a request opts out of grammar
     (``build_tool_grammar`` -> ``None`` -> free-form) on any unrepresentable shape.
+
+    ``tokenizer`` (the model tokenizer, read off the parser by
+    ``build_tool_grammar``) makes the enum guard COMPLETE BY CONSTRUCTION (codex r3
+    E4): the five-marker ``_gemma4_enum_wire_unsafe`` substring blacklist cannot
+    enumerate every special token, so when a tokenizer is available the per-request
+    policy ALSO rejects any enum value that tokenizes through a registered special
+    token (``_enum_wire_embeds_special_token``) — an enum such as ``["<bos>"]`` /
+    ``["<eos>"]`` compiles to an unreachable byte-literal branch and opts the
+    request out. When ``tokenizer is None`` (degraded / warmup, which uses a
+    fixed NO-enum tool) the guard falls back to the five-marker structural subset —
+    a safe under-approximation that never bites the warmup path. The cheap 5-marker
+    check runs FIRST inside the composed check (belt & suspenders) even when a
+    tokenizer is present.
     """
-    return _xml_schema_representable(params, _GEMMA4_WIRE_POLICY)
+    if tokenizer is None:
+        policy = _GEMMA4_WIRE_POLICY
+    else:
+
+        def _enum_wire_unsafe(wire: str) -> bool:
+            # Complete-by-construction: the cheap structural 5-marker check FIRST,
+            # then the tokenizer-complete registered-special-token check.
+            return _gemma4_enum_wire_unsafe(wire) or _enum_wire_embeds_special_token(
+                tokenizer, wire
+            )
+
+        policy = replace(_GEMMA4_WIRE_POLICY, enum_wire_unsafe=_enum_wire_unsafe)
+    return _xml_schema_representable(params, policy)
 
 
 def _emit_xml_param_value(subschema: Any, defs: dict[str, Any]) -> str:
@@ -2008,6 +2088,16 @@ def build_tool_grammar(
     # existing opt-outs (``structure_info() -> None`` / ``TOOL_GRAMMAR_AUTO_SAFE``)
     # and applies ONLY to ``arg_style != "json"`` tools — the JSON-body families
     # (hermes / qwen / harmony) are ``%json <schema>`` and stay byte-identical.
+    #
+    # The model tokenizer (stored on every ``ToolParser`` as ``model_tokenizer``,
+    # constructed ``parser_cls(tokenizer=...)`` on the chat route / warmup) makes
+    # the gemma4 ENUM guard COMPLETE BY CONSTRUCTION (codex r3 E4): an enum value
+    # that tokenizes through ANY registered special token — not just the five
+    # hard-coded structural markers — compiles to an unreachable byte-literal branch
+    # and opts the request out. ``None`` (no tokenizer / degraded) falls back to the
+    # structural 5-marker subset; the XML wire is unaffected (it already rejects
+    # ``<``/``>``).
+    tok = getattr(parser, "model_tokenizer", None)
     for tool, si in zip(tools, structure_infos):
         arg_style = getattr(si, "arg_style", "json")
         if arg_style == "json":
@@ -2025,7 +2115,7 @@ def build_tool_grammar(
         # Same strict-allowlist guard, per-wire policy (E3 XML / E4 gemma4). An
         # unknown non-json arg_style is treated conservatively (opt out).
         if arg_style == "gemma4":
-            representable = _gemma4_schema_representable(params)
+            representable = _gemma4_schema_representable(params, tokenizer=tok)
         elif arg_style == "xml":
             representable = _xml_schema_representable(params)
         else:

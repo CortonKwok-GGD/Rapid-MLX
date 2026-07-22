@@ -557,15 +557,37 @@ def test_gemma4_supports_grammar_and_auto_unsafe():
 # --------------------------------------------------------------------------
 # Grammar ENFORCEMENT + ROUND-TRIP on the REAL gemma4 tokenizer.
 # --------------------------------------------------------------------------
+# Message substrings (case-insensitive) that mark a BARE ``OSError`` from
+# ``from_pretrained`` as genuine OFFLINE / cache-unavailability. Transformers wraps
+# an uncached-and-no-network load as a plain ``OSError`` whose message is one of
+# these ("Can't load the configuration of ...", "We couldn't connect to ...",
+# "... offline ..."). A CORRUPT artifact or INVALID REVISION is ALSO an ``OSError``
+# (e.g. a wrapped 404 "<rev> is not a valid git identifier ...") but its message is
+# NOT in this list, so it FAILS instead of skipping — corruption/bad-revision must
+# never be false-green (codex r3 E4).
+_OFFLINE_MSG_SUBSTRINGS = (
+    "offline",
+    "can't load",
+    "couldn't connect",
+    "we couldn't connect",
+    "not a local folder",
+    "connection error",
+    "max retries",
+    "failed to connect",
+    "unable to load",
+)
+
+
 def _offline_skip_exc_types():
-    # ``OSError`` is included UNCONDITIONALLY: Transformers commonly wraps an
-    # unavailable tokenizer/cache as a plain ``OSError`` ("Can't load ... offline"),
-    # so a genuinely-offline run must SKIP (not FAIL) on it. The previous
-    # ``tuple(types) or (OSError,)`` dropped ``OSError`` whenever either optional
-    # import below succeeded — turning an offline run into a failure. The narrower
-    # connectivity exceptions are appended (still skip-worthy, more specific) but
-    # never displace ``OSError``.
-    types: list[type[BaseException]] = [OSError]
+    # HF-SPECIFIC offline/connectivity types that ALWAYS mean "skip" regardless of
+    # message text (network / cache unavailability). ``OSError`` is DELIBERATELY NOT
+    # here: a bare ``OSError`` is offline ONLY when its message matches
+    # ``_OFFLINE_MSG_SUBSTRINGS`` (see ``_is_offline_unavailable``). Catching EVERY
+    # ``OSError`` as offline (the old behavior) would SKIP a corrupt artifact /
+    # invalid revision too — a false-green codex r3 flagged. The needle: keep the
+    # genuine-offline OSError skipping (message-gated) WITHOUT masking corruption,
+    # and never regress the prior fix that a plain offline ``OSError`` must skip.
+    types: list[type[BaseException]] = []
     try:
         from huggingface_hub.errors import (
             LocalEntryNotFoundError,
@@ -584,6 +606,24 @@ def _offline_skip_exc_types():
     return tuple(types)
 
 
+def _is_offline_unavailable(exc: BaseException) -> bool:
+    """True iff ``exc`` from ``AutoTokenizer.from_pretrained`` indicates genuine
+    OFFLINE / cache-unavailability (skip-worthy), NOT a corrupt artifact / invalid
+    revision (which must FAIL, not skip). Skip when: a specific HF
+    offline/connectivity TYPE (``LocalEntryNotFoundError`` / ``OfflineModeIsEnabled``
+    / ``requests.ConnectionError``), OR a bare ``OSError`` whose message matches the
+    offline allowlist. ANY OTHER ``OSError`` (corruption / bad revision / a wrapped
+    404) returns ``False`` -> the caller re-raises -> the test FAILS (codex r3
+    E4)."""
+    offline_types = _offline_skip_exc_types()
+    if offline_types and isinstance(exc, offline_types):
+        return True
+    if isinstance(exc, OSError):
+        msg = str(exc).lower()
+        return any(sub in msg for sub in _OFFLINE_MSG_SUBSTRINGS)
+    return False
+
+
 @pytest.fixture(scope="module")
 def tok():
     transformers = pytest.importorskip("transformers")
@@ -591,7 +631,12 @@ def tok():
         return transformers.AutoTokenizer.from_pretrained(
             _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
         )
-    except _offline_skip_exc_types():  # pragma: no cover - offline & uncached
+    except Exception as exc:  # pragma: no cover - offline & uncached
+        # SKIP only a genuine offline/cache-miss; RE-RAISE (FAIL) a corrupt artifact
+        # / invalid revision — both are ``OSError`` but only the former is
+        # skip-worthy, so corruption is never silently false-green (codex r3 E4).
+        if not _is_offline_unavailable(exc):
+            raise
         pytest.skip(
             f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not cached "
             "and no network — gemma4 enforcement tests require it"
@@ -989,6 +1034,39 @@ def test_gemma4_enum_type_consistency_shared():
     assert rep({"properties": {"n": {"type": "number", "enum": [1.5, 2]}}}) is True
 
 
+def test_gemma4_enum_tokenizer_complete_opt_out_and_none_fallback():
+    # FIX (codex r3 E4): the enum guard is COMPLETE BY CONSTRUCTION when a tokenizer
+    # is threaded in — it rejects an enum value that tokenizes through ANY registered
+    # special token, not only the five hard-coded structural markers. ``<bos>`` is a
+    # registered special token but NOT one of the five markers, so it is caught ONLY
+    # by the tokenizer-complete check, not the 5-marker substring blacklist.
+    from vllm_mlx.api.tool_grammar import _gemma4_schema_representable as rep
+
+    # A fake tokenizer that registers ``<bos>`` as a single added token (id 2) — the
+    # same surface ``_is_registered_added_token`` probes. ``<bos>`` is deliberately
+    # NOT in ``_GEMMA4_STRUCTURAL_MARKERS``.
+    fake = _FakeTokenizer(added={"<bos>": 2})
+    bos_enum = {"properties": {"s": {"type": "string", "enum": ["<bos>"]}}}
+    clean_enum = {"properties": {"s": {"type": "string", "enum": ["python"]}}}
+
+    # WITH tokenizer: ``<bos>`` opts out (unreachable byte-literal branch); a clean
+    # value that tokenizes to ordinary (non-registered) ids stays representable.
+    assert rep(bos_enum, tokenizer=fake) is False
+    assert rep(clean_enum, tokenizer=fake) is True
+
+    # WITHOUT tokenizer (degraded / warmup): the guard falls back to the 5-marker
+    # STRUCTURAL subset, which does NOT know ``<bos>`` — so it stays representable.
+    # This proves the None path uses exactly the structural blacklist (a safe
+    # under-approximation the warmup's fixed no-enum tool never exercises).
+    assert rep(bos_enum, tokenizer=None) is True
+    assert rep(bos_enum) is True  # default tokenizer=None
+    # The 5-marker structural check STILL fires on the None path for a real marker.
+    marker_enum = {"properties": {"s": {"type": "string", "enum": ['a<|"|>b']}}}
+    assert rep(marker_enum, tokenizer=None) is False
+    # And WITH a tokenizer the structural marker is still rejected (belt & braces).
+    assert rep(marker_enum, tokenizer=fake) is False
+
+
 # ---- OPT-OUT through build_tool_grammar (real parser) --------------------
 @_requires_llguidance
 def test_gemma4_build_tool_grammar_opts_out_bad_key(tok):
@@ -1051,3 +1129,68 @@ def test_gemma4_build_tool_grammar_opts_out_enum_with_structural_marker(marker, 
         }
     ]
     assert _gemma4_grammar(bad_enum_tool, "required", tok) is None, marker
+
+
+def _enum_tool(*enum_values):
+    """A ``run``-shaped tool whose ``lang`` enum is ``enum_values``."""
+    return [
+        {
+            "name": "run",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "lang": {"type": "string", "enum": list(enum_values)},
+                },
+                "required": ["code", "lang"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+
+
+@_requires_llguidance
+@pytest.mark.parametrize("special", ["<bos>", "<eos>", "<pad>", "<unk>"])
+def test_gemma4_build_tool_grammar_opts_out_enum_with_any_special_token(special, tok):
+    # FIX (codex r3 E4), end-to-end on the REAL tokenizer: the enum guard is COMPLETE
+    # BY CONSTRUCTION, not a five-marker blacklist. ``<bos>``/``<eos>``/``<pad>``/
+    # ``<unk>`` are REGISTERED single special tokens on the gemma-4 tokenizer (ids
+    # 2/1/0/3) but are NOT among ``_GEMMA4_STRUCTURAL_MARKERS`` — an enum value equal
+    # to one compiles to a DEAD byte-literal branch (llguidance emits the token
+    # atomically, never its bytes). ``build_tool_grammar`` must OPT OUT (None ->
+    # free-form) once the model tokenizer is threaded into the guard, even though the
+    # structural 5-marker check alone would MISS these. A clean enum still builds.
+    from vllm_mlx.api.tool_grammar import _GEMMA4_STRUCTURAL_MARKERS
+
+    # Precondition: OUTSIDE the hard-coded marker set (only the tokenizer-complete
+    # check can reject it) AND a single registered special token on THIS tokenizer
+    # (otherwise the value would be a reachable byte-literal and correctly kept).
+    assert special not in _GEMMA4_STRUCTURAL_MARKERS
+    ids = tok.encode(special, add_special_tokens=False)
+    assert len(ids) == 1, (special, ids)
+
+    assert _gemma4_grammar(GEMMA4_TOOLS, "required", tok) is not None  # clean builds
+    assert _gemma4_grammar(_enum_tool("python", special), "required", tok) is None, (
+        special
+    )
+
+
+@_requires_llguidance
+@pytest.mark.parametrize(
+    "multitoken", ["<start_of_turn>", "<end_of_turn>", "<unused0>"]
+)
+def test_gemma4_build_tool_grammar_keeps_enum_with_multitoken_pseudo_special(
+    multitoken, tok
+):
+    # Complete-by-construction is a PRECISE opt-out, not a blanket ``<...>`` reject:
+    # a value opts out ONLY when it is genuinely UNREACHABLE. On this pinned 4bit
+    # tokenizer ``<start_of_turn>``/``<end_of_turn>``/``<unused0>`` are NOT single
+    # special tokens — they tokenize to ordinary multi-token text (verified below),
+    # so a byte-literal alternation branch for them IS reachable and MUST be kept
+    # (opting out here would needlessly drop the grammar for a representable enum).
+    # This guards the guard against over-rejecting on a bare ``<``/``>``.
+    ids = tok.encode(multitoken, add_special_tokens=False)
+    assert len(ids) > 1, (multitoken, ids)  # genuinely multi-token, hence reachable
+    assert (
+        _gemma4_grammar(_enum_tool("python", multitoken), "required", tok) is not None
+    )
