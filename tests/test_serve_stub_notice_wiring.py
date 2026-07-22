@@ -93,15 +93,25 @@ def _seed_alias_cache(monkeypatch, tmp_path, *, with_weights: bool):
 
 @pytest.fixture
 def _quiet_version_check(monkeypatch):
-    """Stub the interactive upgrade / staleness prompts so the prologue
-    reaches the notice block deterministically without touching the network
-    or stdin."""
-    from vllm_mlx import _version_check
+    """Neutralise serve_command's interactive upgrade prompt deterministically.
 
-    monkeypatch.setattr(_version_check, "prompt_upgrade_if_available", lambda: False)
-    monkeypatch.setattr(
-        _version_check, "print_staleness_warning_if_any", lambda: None, raising=False
-    )
+    serve_command reaches the upgrade prompt via a FUNCTION-SCOPE import —
+    ``from vllm_mlx._version_check import prompt_upgrade_if_available``
+    (cli.py) — so the name is looked up on ``vllm_mlx._version_check`` at call
+    time, NOT bound into the ``cli`` module namespace. Patching either
+    ``cli`` (no such attribute — a no-op) or a specific module is therefore
+    fragile / import-target-dependent.
+
+    The robust, import-target-AGNOSTIC neutralisation is the version check's
+    own documented opt-out: ``RAPID_MLX_DISABLE_VERSION_CHECK`` makes the real
+    ``prompt_upgrade_if_available`` return ``False`` immediately (``_disabled()``
+    short-circuit — no network, no prompt, no ``sys.exit``) wherever it is
+    looked up. That keeps the prologue deterministic regardless of how the
+    symbol is imported. (``_ensure_model_downloaded`` IS a module-level ``cli``
+    function called unqualified, so it is correctly patched on ``cli`` in
+    :func:`_capture_stderr_at_download`.)
+    """
+    monkeypatch.setenv("RAPID_MLX_DISABLE_VERSION_CHECK", "1")
     return monkeypatch
 
 
