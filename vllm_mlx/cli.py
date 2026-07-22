@@ -2302,6 +2302,25 @@ def serve_command(args):
     if prompt_upgrade_if_available():
         sys.exit(0)
 
+    # Finding ⑥ (0.10.16 dogfood): a "weightless stub" cache — config.json
+    # present but ``model*.safetensors`` absent (a warm cache commonly holds
+    # ~20 Gemma-4 repos in exactly this state, from a metadata-only config
+    # probe or an interrupted pull) — LOOKS cached, so ``serve`` eats a
+    # surprise multi-GB download with no upfront signal. Surface a one-line
+    # notice BEFORE the prefetch. Purely informational and unconditional
+    # (fires even in non-TTY / RAPID_MLX_AUTO_PULL=1 runs where the B2
+    # confirmation gate self-skips); it does NOT gate or change the download
+    # (that stays with ``_ensure_model_downloaded``). Best-effort — a
+    # diagnostic must never break serve.
+    try:
+        from vllm_mlx._download_gate import weightless_stub_notice
+
+        _stub_notice = weightless_stub_notice(args.model)
+        if _stub_notice:
+            print(_stub_notice)
+    except Exception:
+        pass
+
     # Pre-fetch the model via the R2 mirror (with HF fallback) BEFORE the
     # heavy server boot. Without this, ``serve`` falls into
     # ``mlx_lm.load`` → ``huggingface_hub.snapshot_download`` directly and

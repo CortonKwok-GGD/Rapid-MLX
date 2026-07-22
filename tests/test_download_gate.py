@@ -908,4 +908,170 @@ def test_module_imports_without_hf_call():
     assert hasattr(gate, "estimate_repo_size_bytes")
     assert hasattr(gate, "confirm_or_abort")
     assert hasattr(gate, "is_repo_cached")
+    assert hasattr(gate, "is_weightless_stub")
+    assert hasattr(gate, "weightless_stub_notice")
     assert os.path.basename(gate.__file__) == "_download_gate.py"
+
+
+# ---------------------------------------------------------------------------
+# is_weightless_stub / weightless_stub_notice (0.10.16 dogfood finding ⑥):
+# a config-only "weightless stub" cache (config.json present, model shards
+# absent) LOOKS cached but makes ``serve`` eat a surprise multi-GB download.
+# ---------------------------------------------------------------------------
+
+
+def _patch_try_to_load(monkeypatch, return_value):
+    """Force ``huggingface_hub.try_to_load_from_cache`` to a fixed result.
+
+    ``is_weightless_stub`` does ``from huggingface_hub import
+    try_to_load_from_cache`` at call time, so setting the attribute on the
+    package re-binds what the in-function import resolves to.
+    """
+    import huggingface_hub
+
+    monkeypatch.setattr(
+        huggingface_hub, "try_to_load_from_cache", lambda *a, **k: return_value
+    )
+
+
+def test_is_weightless_stub_true_config_cached_weights_missing(monkeypatch):
+    """config.json cached (str path) + weights missing (is_repo_cached False)
+    → the stub state that finding ⑥ warns about."""
+    _patch_try_to_load(monkeypatch, "/hf/cache/.../config.json")
+    monkeypatch.setattr(gate, "is_repo_cached", lambda _r: False)
+
+    assert gate.is_weightless_stub("mlx-community/gemma-4-e4b-it-4bit") is True
+
+
+def test_is_weightless_stub_false_when_fully_cached(monkeypatch):
+    """config cached AND weights present → a complete cache, not a stub."""
+    _patch_try_to_load(monkeypatch, "/hf/cache/.../config.json")
+    monkeypatch.setattr(gate, "is_repo_cached", lambda _r: True)
+
+    assert gate.is_weightless_stub("mlx-community/complete-4bit") is False
+
+
+def test_is_weightless_stub_false_when_config_absent(monkeypatch):
+    """No config in the cache (``None``) → a totally-absent repo, not a
+    config-only stub. ``is_repo_cached`` must not even be consulted."""
+    _patch_try_to_load(monkeypatch, None)
+    monkeypatch.setattr(
+        gate,
+        "is_repo_cached",
+        lambda _r: pytest.fail("is_repo_cached must not run when config absent"),
+    )
+
+    assert gate.is_weightless_stub("mlx-community/never-touched") is False
+
+
+def test_is_weightless_stub_false_on_cached_no_exist_sentinel(monkeypatch):
+    """``try_to_load_from_cache`` returns the ``_CACHED_NO_EXIST`` sentinel
+    (a non-str object) when the file is known-absent — must NOT be read as
+    'config present'."""
+    from huggingface_hub import _CACHED_NO_EXIST
+
+    _patch_try_to_load(monkeypatch, _CACHED_NO_EXIST)
+    monkeypatch.setattr(gate, "is_repo_cached", lambda _r: False)
+
+    assert gate.is_weightless_stub("mlx-community/known-absent") is False
+
+
+def test_is_weightless_stub_false_for_local_path(tmp_path, monkeypatch):
+    """A local directory path short-circuits to False without touching HF —
+    ``serve /path/to/model`` is never a 'stub'."""
+    _patch_try_to_load(
+        monkeypatch,
+        None,
+    )
+    # Even a real dir on disk must return False by the os.path.exists guard.
+    assert gate.is_weightless_stub(str(tmp_path)) is False
+
+
+def test_is_weightless_stub_false_on_internal_error(monkeypatch):
+    """A best-effort diagnostic must never raise — any internal failure
+    yields False so an otherwise-fine serve is not broken."""
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("cache probe blew up")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _boom)
+
+    assert gate.is_weightless_stub("mlx-community/anything") is False
+
+
+def test_is_weightless_stub_real_tree(tmp_path, monkeypatch):
+    """End-to-end against a REAL on-disk cache tree (config.json symlink +
+    refs/main, zero safetensors) — the exact shape of the ~20 Gemma-4
+    config-only stubs a warm cache holds. Exercises the real
+    ``try_to_load_from_cache`` + ``is_repo_cached`` together."""
+    cache_root = tmp_path / "hf-cache"
+    repo_root = cache_root / "models--mlx-community--gemma-4-e4b-it-4bit"
+    sha = "475b9088d29754a3379866cf5aeb6b41acd313c2"
+    snap = repo_root / "snapshots" / sha
+    snap.mkdir(parents=True)
+    blobs = repo_root / "blobs"
+    blobs.mkdir()
+    blob = blobs / "cfgblob"
+    blob.write_text("{}")
+    # Cache layout stores config.json as a symlink into blobs/.
+    (snap / "config.json").symlink_to(blob)
+    _seed_refs_main(repo_root, sha)
+    # NOTE: zero model*.safetensors → weightless stub.
+
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache_root))
+    # try_to_load_from_cache resolves its default cache dir from
+    # huggingface_hub.file_download.HF_HUB_CACHE — point it at the fake tree
+    # too so the real helper reads our on-disk stub.
+    import huggingface_hub.file_download as _fd
+
+    monkeypatch.setattr(_fd, "HF_HUB_CACHE", str(cache_root), raising=False)
+
+    # is_repo_cached (real) sees no weights → False; config.json (real) is
+    # resolvable → is_weightless_stub is True.
+    assert gate.is_repo_cached("mlx-community/gemma-4-e4b-it-4bit") is False
+    assert gate.is_weightless_stub("mlx-community/gemma-4-e4b-it-4bit") is True
+
+    # Drop a real weight shard → no longer a stub.
+    (snap / "model.safetensors").write_bytes(b"w" * 4096)
+    assert gate.is_weightless_stub("mlx-community/gemma-4-e4b-it-4bit") is False
+
+
+def test_weightless_stub_notice_with_size(monkeypatch):
+    """The one-line notice names the repo, says config is cached / weights
+    missing, and carries the human-readable download size."""
+    monkeypatch.setattr(gate, "is_weightless_stub", lambda _r: True)
+    monkeypatch.setattr(gate, "estimate_repo_size_bytes", lambda _r: 3 * 1024**3)
+
+    notice = gate.weightless_stub_notice("mlx-community/gemma-4-e4b-it-4bit")
+    assert notice is not None
+    assert "mlx-community/gemma-4-e4b-it-4bit" in notice
+    assert "config cached" in notice
+    assert "weights are missing" in notice
+    assert "3.0 GiB" in notice
+
+
+def test_weightless_stub_notice_unknown_size(monkeypatch):
+    """When the size lookup fails the notice still fires (download is still
+    about to happen) — just without a byte figure."""
+    monkeypatch.setattr(gate, "is_weightless_stub", lambda _r: True)
+    monkeypatch.setattr(gate, "estimate_repo_size_bytes", lambda _r: None)
+
+    notice = gate.weightless_stub_notice("mlx-community/gemma-4-e4b-it-4bit")
+    assert notice is not None
+    assert "config cached" in notice
+    assert "weights" in notice
+
+
+def test_weightless_stub_notice_none_when_not_stub(monkeypatch):
+    """A fully-cached (or absent) repo yields no notice — the warning must
+    not fire on the warm-cache happy path."""
+    monkeypatch.setattr(gate, "is_weightless_stub", lambda _r: False)
+    monkeypatch.setattr(
+        gate,
+        "estimate_repo_size_bytes",
+        lambda _r: pytest.fail("size lookup must be skipped for non-stubs"),
+    )
+
+    assert gate.weightless_stub_notice("mlx-community/complete-4bit") is None

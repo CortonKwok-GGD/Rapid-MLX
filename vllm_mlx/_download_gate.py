@@ -423,6 +423,69 @@ def is_repo_cached(repo_id: str) -> bool:
     return False
 
 
+def is_weightless_stub(repo_id: str) -> bool:
+    """True if ``repo_id``'s config is cached but its weight shards are NOT.
+
+    The "config-only stub" state (0.10.16 dogfood finding ⑥):
+    ``config.json`` (and often the tokenizer) sit in the HF cache — from a
+    metadata-only ``AutoConfig`` / ``mlx-vlm`` config probe, or an
+    interrupted pull that fetched the small files first — while
+    ``model*.safetensors`` are absent. To the user the model *looks*
+    cached, so ``rapid-mlx serve <alias>`` silently kicks off a multi-GB
+    download they didn't expect. (A warm cache commonly holds ~20 Gemma-4
+    repos in exactly this state.)
+
+    Distinct from :func:`is_repo_cached`, which is ``False`` for BOTH a
+    stub AND a totally-absent repo. This narrows to the stub case so a
+    caller can surface "config cached, weights missing — will download"
+    instead of a generic notice. Local paths and never-touched repos
+    return ``False``.
+
+    Returns ``False`` on any internal error — a best-effort diagnostic
+    must never break an otherwise-fine serve.
+    """
+    try:
+        if os.path.exists(repo_id):
+            return False
+        from huggingface_hub import try_to_load_from_cache
+
+        # ``try_to_load_from_cache`` returns a str path when the file is
+        # in the cache, the ``_CACHED_NO_EXIST`` sentinel when it's known
+        # absent, or ``None`` when the repo/file was never fetched. Only
+        # a real cached path (str) counts as "config present".
+        cached_config = try_to_load_from_cache(repo_id, "config.json")
+        if not isinstance(cached_config, str):
+            return False
+        # Config is on disk; the stub is exactly "config present but the
+        # loader's weight glob (model*.safetensors) is not satisfied".
+        return not is_repo_cached(repo_id)
+    except Exception:
+        return False
+
+
+def weightless_stub_notice(repo_id: str) -> str | None:
+    """One-line pre-serve notice when ``repo_id`` is a weightless stub.
+
+    Returns a human-readable heads-up string when
+    :func:`is_weightless_stub` is True (config cached, weight shards
+    missing), else ``None``. Purely informational: the caller prints it
+    BEFORE the normal download path runs; it does NOT gate or change
+    download behaviour (finding ⑥ asks only to surface the surprise, not
+    block it).
+    """
+    if not is_weightless_stub(repo_id):
+        return None
+    size_bytes = estimate_repo_size_bytes(repo_id)
+    if size_bytes:
+        tail = f"downloading ~{_format_size(size_bytes)} of weights first."
+    else:
+        tail = "downloading the missing weights first."
+    return (
+        f"  Note: {repo_id} has its config cached but its model weights are "
+        f"missing — serving will start by {tail}"
+    )
+
+
 def confirm_or_abort(
     repo_id: str,
     estimated_bytes: int | None,
