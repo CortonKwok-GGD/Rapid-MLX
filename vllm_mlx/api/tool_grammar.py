@@ -1101,43 +1101,67 @@ def _emit_gemma4_param_value(subschema: Any, defs: dict[str, Any]) -> str:
     return f"%json {json.dumps(value_schema)}"
 
 
-def _emit_gemma4_arg_body(params: Any) -> str:
+def _emit_gemma4_arg_body(params: Any, rule_prefix: str) -> tuple[str, str]:
     """Emit the Lark for a gemma4 arg body (the part BETWEEN ``{`` and ``}``).
 
+    Returns ``(inline_body, extra_rules)``: ``inline_body`` is spliced into the
+    ``tag_i`` rule (``""`` for a no-argument tool), and ``extra_rules`` is the block
+    of generated ``<rule_prefix>_rest<i>`` nonterminal definitions that ``inline_body``
+    references (the caller appends it to the grammar; ``""`` when none are needed).
+
     The gemma4 wire is ``call:NAME{k1:v1,k2:v2,...}`` where keys are emitted in
-    DICTSORT (alphabetical) order and separated by COMMAS
-    (``chat_template.jinja``'s ``found_first`` logic — a comma precedes every pair
-    except the FIRST PRESENT one). Required properties are mandatory; optional ones
-    may be omitted.
+    DICTSORT order and separated by COMMAS (``chat_template.jinja``'s ``found_first``
+    logic — a comma precedes every pair except the FIRST PRESENT one). Required
+    properties are mandatory; optional ones may be omitted.
 
     Because commas are SEPARATORS (not per-field terminators), a naive per-field
     ``( )?`` misplaces the comma when an early optional field is absent (it would
-    emit a leading ``,`` or a doubled ``,,``). We instead build a FIRST-PRESENT
-    construction:
+    emit a leading ``,`` or a doubled ``,,``). We build a FIRST-PRESENT construction
+    whose comma-prefixed SUFFIXES are SHARED via named nonterminals, so the grammar
+    is O(n)-size. (An earlier inline version regenerated the entire remaining suffix
+    for EVERY first-present alternative, making a request-controlled all-optional
+    schema O(n^2) in grammar size AND construction time — a mild DoS amplifier.)
 
-      * ``_cont(i)`` — every field from position ``i`` on, each with a LEADING
-        comma (required: ``"," k:v``; optional: ``( "," k:v )?``). Used AFTER the
-        first present field, so a comma always separates two present pairs.
+      * ``<rule_prefix>_rest<i>`` — a NAMED nonterminal for "fields ``i..n-1``, each
+        as a LEADING-comma continuation" (required: ``"," k:v``; optional:
+        ``( "," k:v )?``). ``rest_i`` ENDS in a reference to ``rest_{i+1}`` (right
+        recursion), so the whole suffix chain is ``n-1`` rules of O(1) size — NOT
+        O(n) inline text copied into each alternative. Used AFTER the first present
+        field, so a comma always separates two present pairs. The final field has an
+        empty tail, so there is no ``rest_n`` rule.
       * the body is an ALTERNATION over WHICH field is first-present: for each
         candidate first field ``j`` (reachable only if every earlier field is
         optional, i.e. ``j`` is at or before the first REQUIRED field) emit
-        ``kj:vj`` with NO leading comma, then ``_cont(j+1)``.
+        ``kj:vj`` with NO leading comma, then a REFERENCE to ``rest_{j+1}``. This
+        alternation is emitted ONCE (O(n) total), not per-suffix.
       * if EVERY field is optional the whole body is additionally ``( ... )?`` so
         an empty ``{}`` body (no args emitted) is admitted.
 
     The whole body is wrapped in a single ``( ... )`` group so an alternation binds
-    correctly when embedded as ``... "{" <body> "}" ...``. Returns ``""`` for a
+    correctly when embedded as ``... "{" <body> "}" ...``. Returns ``("", "")`` for a
     no-argument tool (empty/absent ``properties``) -> the caller renders the bare
     ``call:NAME{}`` frame.
+
+    The accepted LANGUAGE is IDENTICAL to the previous inline construction — any
+    subset of the optionals in dictsort order, required fields mandatory, no leading/
+    trailing/doubled comma, empty ``{}`` iff all-optional — only the grammar SIZE
+    drops from O(n^2) to O(n).
     """
     if not isinstance(params, dict):
-        return ""
+        return "", ""
     props = params.get("properties")
     if not isinstance(props, dict) or not props:
         # A no-argument tool: the EMPTY body IS the faithful constraint (forces a
         # ``{}`` call). Mirrors ``_emit_xml_arg_body`` — a truly-open object is
-        # already opted out upstream by ``_gemma4_schema_representable``.
-        return ""
+        # already opted out upstream by ``_gemma4_schema_representable``. This is a
+        # deliberate TOOL-CALLING-DOMAIN choice, consistent with the E3 XML path's
+        # identical decision (#1170): a tool whose ``parameters`` declares no
+        # properties takes NO arguments, so forcing ``call:NAME{}`` is the desired
+        # constraint. JSON-Schema's default-open-object semantics (an empty/omitted
+        # ``properties`` "permits arbitrary properties") are DELIBERATELY not applied
+        # on the wire — opting out here would make a no-arg tool LESS constrained
+        # (free-form body), the opposite of what tool-calling wants.
+        return "", ""
     required = params.get("required")
     # Only STRING members can name a property (mirrors the total guard in the
     # representability check); a non-str member is unhashable in a bare ``set``.
@@ -1147,45 +1171,56 @@ def _emit_gemma4_arg_body(params: Any) -> str:
         else set()
     )
     defs = _collect_xml_defs(params)
-    # DICTSORT order — matches how the chat template renders arguments, so a forced
-    # grammar constrains the model to the ordering it was trained to emit.
-    keys = sorted(props.keys())
+    # DICTSORT order — matches how the chat template renders arguments (``properties
+    # | dictsort``), so a forced grammar constrains the model to the ordering it was
+    # trained to emit. Jinja's ``dictsort`` defaults to ``case_sensitive=False``, so
+    # the sort key is the LOWERCASED key; Python's ``sorted`` is STABLE, so a
+    # case-insensitive collision (``a`` vs ``A``) keeps the schema's insertion order
+    # — EXACTLY the tiebreak ``dictsort`` uses. (A secondary case-sensitive sort would
+    # force ``A`` before ``a``, diverging from the model's actual emission order.)
+    keys = sorted(props.keys(), key=lambda k: k.lower())
     fields = [
         (key, _emit_gemma4_param_value(props[key], defs), key in required_set)
         for key in keys
     ]
+    n = len(fields)
 
     def _kv(idx: int, *, leading_comma: bool) -> str:
         key, value_lark, _ = fields[idx]
         kv = f"{_lark_escape(key + ':')} {value_lark}"
         return f'"," {kv}' if leading_comma else kv
 
-    def _cont(start: int) -> str:
-        parts: list[str] = []
-        for j in range(start, len(fields)):
-            frag = _kv(j, leading_comma=True)
-            parts.append(frag if fields[j][2] else f"( {frag} )?")
-        return " ".join(parts)
+    def _rest_ref(i: int) -> str:
+        # Reference to the suffix nonterminal for fields ``i..n-1``; empty past the
+        # last field (no ``rest_n`` rule exists).
+        return f"{rule_prefix}_rest{i}" if i < n else ""
 
-    # Index of the first REQUIRED field (or len(fields) if all optional): the
-    # first-present field can be any field at or before it (earlier fields, being
-    # optional, may be absent — a required field can never be skipped).
-    first_required = len(fields)
+    # Emit each comma-prefixed SUFFIX exactly ONCE as a named nonterminal, chained by
+    # right recursion (``rest_i -> elem_i rest_{i+1}``) for an O(n)-size grammar.
+    rest_rules: list[str] = []
+    for i in range(1, n):
+        frag = _kv(i, leading_comma=True)
+        elem = frag if fields[i][2] else f"( {frag} )?"
+        rest_rules.append(f"{rule_prefix}_rest{i}: {elem} {_rest_ref(i + 1)}".rstrip())
+
+    # Index of the first REQUIRED field (or ``n`` if all optional): the first-present
+    # field can be any field at or before it (earlier fields, being optional, may be
+    # absent — a required field can never be skipped).
+    first_required = n
     for j, (_key, _val, req) in enumerate(fields):
         if req:
             first_required = j
             break
 
     alts: list[str] = []
-    for j in range(min(first_required + 1, len(fields))):
+    for j in range(min(first_required + 1, n)):
         head = _kv(j, leading_comma=False)
-        tail = _cont(j + 1)
+        tail = _rest_ref(j + 1)
         alts.append(f"{head} {tail}" if tail else head)
     body = " | ".join(alts)
-    if first_required == len(fields):
-        # No required field -> the empty ``{}`` body is also valid.
-        return f"( {body} )?"
-    return f"( {body} )"
+    inline = f"( {body} )?" if first_required == n else f"( {body} )"
+    extra_rules = ("\n".join(rest_rules) + "\n") if rest_rules else ""
+    return inline, extra_rules
 
 
 def build_tool_lark(
@@ -1519,10 +1554,14 @@ def build_tool_lark(
         # EMPTY (a no-argument tool), in which case the tag is just the
         # ``begin``/``end`` frame with no argument region.
         arg_style = getattr(si, "arg_style", "json")
+        # ``gemma4_extra_rules`` collects the O(n) suffix nonterminals the gemma4 body
+        # references (empty for JSON/XML tags and for a no-arg gemma4 tool); appended
+        # to the grammar after the tag rule below.
+        gemma4_extra_rules = ""
         if arg_style == "xml":
             arg_body = _emit_xml_arg_body(params)
         elif arg_style == "gemma4":
-            arg_body = _emit_gemma4_arg_body(params)
+            arg_body, gemma4_extra_rules = _emit_gemma4_arg_body(params, f"g{i}")
         else:
             arg_body = f"%json {json.dumps(params)}"
         # ``prefix_ref`` is empty on the forced-non-reasoning path (the first call
@@ -1536,6 +1575,9 @@ def build_tool_lark(
         if end_body:
             lark += f" {end_body}"
         lark += "\n"
+        # Append the gemma4 body's generated suffix nonterminals (rule order is
+        # irrelevant in Lark; ``""`` when the tag emits none).
+        lark += gemma4_extra_rules
     return lark
 
 

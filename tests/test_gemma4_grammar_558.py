@@ -164,14 +164,21 @@ _GEMMA4_GOLDEN_LARK = (
     "GEMMA_STR_TEXT: /(.|\\n)*/\n"
     'gemma_str_value: <|"|> GEMMA_STR_TEXT <|"|>\n'
     "\n"
-    # The DICTSORT-ordered comma body: required code+lang first (no comma before
-    # code; a comma separates lang), then each optional field carries its OWN
-    # leading comma inside a ``( ... )?`` group. String -> the greedy rule; enum ->
-    # per-value <|"|>-wrapped alternation; scalar -> bare %json.
-    'tag_0: <|tool_call> "call:run{" ( "code:" gemma_str_value "," "lang:" '
-    '(<|"|> "python" <|"|> | <|"|> "cpp" <|"|>) '
-    '( "," "timeout:" %json {"type": "integer"} )? '
-    '( "," "verbose:" %json {"type": "boolean"} )? ) "}" <tool_call|>\n'
+    # The DICTSORT-ordered comma body, emitted as an O(n)-size RECURSIVE grammar:
+    # the first-present head (required ``code`` at index 0, so it is the only
+    # first-present candidate) sits in ``tag_0`` with NO leading comma, then defers
+    # its comma-prefixed SUFFIX to the ``g0_rest<i>`` chain — each suffix nonterminal
+    # is emitted ONCE and references the next (right recursion), so the grammar does
+    # NOT regenerate the tail per alternative (previously O(n^2)). ``g0_rest1``
+    # carries the required ``lang`` (bare comma separator + per-value <|"|>-wrapped
+    # enum alternation); ``g0_rest2``/``g0_rest3`` carry each optional field's OWN
+    # leading comma inside a ``( ... )?`` group (string -> greedy rule; scalar ->
+    # bare %json).
+    'tag_0: <|tool_call> "call:run{" ( "code:" gemma_str_value g0_rest1 ) "}" '
+    "<tool_call|>\n"
+    'g0_rest1: "," "lang:" (<|"|> "python" <|"|> | <|"|> "cpp" <|"|>) g0_rest2\n'
+    'g0_rest2: ( "," "timeout:" %json {"type": "integer"} )? g0_rest3\n'
+    'g0_rest3: ( "," "verbose:" %json {"type": "boolean"} )?\n'
 )
 
 
@@ -190,7 +197,11 @@ def test_gemma4_lark_frame_and_sentinels():
 
     lark = build_tool_lark(GEMMA4_TOOLS, "required", [_gemma4_structure_info("run")])
     assert " <|tool_call> " in lark  # bare trigger ref
-    assert lark.rstrip().endswith("<tool_call|>")  # bare closing ref
+    # The tag frame closes with a BARE ``<tool_call|>`` ref. (The O(n) suffix chain
+    # emits ``g0_rest<i>`` rules AFTER the tag, so the grammar no longer ends on this
+    # line — assert against the ``tag_0`` rule itself, not the whole grammar.)
+    tag0_line = next(ln for ln in lark.splitlines() if ln.startswith("tag_0:"))
+    assert tag0_line.endswith("<tool_call|>")  # bare closing ref
     assert '"<|tool_call>"' not in lark  # NOT quoted literals
     assert '"<tool_call|>"' not in lark
     assert '"<|\\"|>"' not in lark  # the <|"|> marker is a ref, never a byte literal
@@ -217,12 +228,18 @@ def test_gemma4_string_value_uses_greedy_rule_not_lazy():
 def test_gemma4_comma_and_required_optional_framing():
     # Required fields come first with a bare comma separator; each optional field
     # carries its OWN leading comma inside a ``( ... )?`` group (first-present
-    # construction). ``code``/``lang`` required; ``timeout``/``verbose`` optional.
+    # construction, now emitted as an O(n) ``g0_rest<i>`` suffix chain).
+    # ``code``/``lang`` required; ``timeout``/``verbose`` optional.
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     lark = build_tool_lark(GEMMA4_TOOLS, "required", [_gemma4_structure_info("run")])
-    # Required pair separated by a bare comma (no leading/optional wrapper).
-    assert '"code:" gemma_str_value "," "lang:"' in lark
+    # Required ``code`` is the first-present head (no leading comma), deferring its
+    # comma-prefixed suffix to the shared ``g0_rest1`` nonterminal.
+    assert '( "code:" gemma_str_value g0_rest1 )' in lark
+    # The required ``lang`` suffix carries a BARE comma separator (never an optional
+    # ``( )?`` wrapper — a required field can't be skipped).
+    assert 'g0_rest1: "," "lang:"' in lark
+    assert '( "," "lang:"' not in lark
     # Each optional scalar carries its own leading comma inside ``( ... )?``.
     assert '( "," "timeout:" %json {"type": "integer"} )?' in lark
     assert '( "," "verbose:" %json {"type": "boolean"} )?' in lark
@@ -238,17 +255,123 @@ def test_gemma4_enum_is_per_value_wrapped_alternation():
 
 
 def test_gemma4_all_optional_wraps_body_in_optional_group():
-    # A tool with NO required field wraps the whole comma alternation in ``( ... )?``
-    # so an empty ``{}`` body is admitted.
+    # A tool with NO required field wraps the whole first-present alternation in an
+    # outer ``( ... )?`` so an empty ``{}`` body is admitted.
     from vllm_mlx.api.tool_grammar import build_tool_lark
 
     lark = build_tool_lark(GEMMA4_OPT_TOOL, "required", [_gemma4_structure_info("cfg")])
-    # First-present alternation over {a-first, b-first}, wrapped in an outer ``?``.
+    # First-present alternation over {a-first, b-first}, wrapped in an outer ``?``;
+    # the a-first branch defers b's comma-suffix to the shared ``g0_rest1`` rule.
     assert (
-        '"call:cfg{" ( "a:" gemma_str_value ( "," "b:" %json {"type": "integer"} )? '
+        '"call:cfg{" ( "a:" gemma_str_value g0_rest1 '
         '| "b:" %json {"type": "integer"} )? "}" <tool_call|>' in lark
     )
-    assert lark.rstrip().endswith(')? "}" <tool_call|>')
+    assert 'g0_rest1: ( "," "b:" %json {"type": "integer"} )?' in lark
+    # The comma-prefixed suffix lives ONLY in the shared rule, never inlined into the
+    # first-present alternation (that inlining was the O(n^2) construction).
+    assert 'gemma_str_value ( "," "b:"' not in lark
+    # The body group closes with the outer ``?`` right before the ``}`` frame.
+    assert ')? "}" <tool_call|>' in lark
+
+
+def test_gemma4_optional_grammar_is_linear_size_not_quadratic():
+    # FIX #2 (codex r1): the first-present body must be an O(n)-size RECURSIVE
+    # grammar — each comma-prefixed suffix emitted ONCE as a ``g0_rest<i>``
+    # nonterminal — NOT the old inline construction that regenerated the entire
+    # remaining suffix for every first-present alternative (O(n^2) grammar size AND
+    # construction time, a request-controlled CPU/memory amplifier).
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    def _build(n):
+        props = {f"p{i:02d}": {"type": "integer"} for i in range(n)}
+        tool = [
+            {
+                "name": "cfg",
+                "parameters": {
+                    "type": "object",
+                    "properties": props,
+                    "additionalProperties": False,
+                },
+            }
+        ]
+        lark = build_tool_lark(tool, "required", [_gemma4_structure_info("cfg")])
+        rest_defs = sum(
+            1 for ln in lark.splitlines() if ln.startswith("g0_rest") and ":" in ln
+        )
+        frag = lark.count('%json {"type": "integer"}')
+        return lark, rest_defs, frag
+
+    lark2, rest2, frag2 = _build(2)
+    lark8, rest8, frag8 = _build(8)
+
+    # Exactly n-1 suffix nonterminals -> each suffix emitted ONCE (linear rule count,
+    # not one regenerated copy per alternative).
+    assert (rest2, rest8) == (1, 7)
+    # Each field's value fragment appears O(1) times (first-present head + its suffix
+    # rule) -> exactly 2n-1: LINEAR. The old inline body was n(n+1)/2: QUADRATIC.
+    assert (frag2, frag8) == (3, 15)
+    assert frag8 < 8 * (8 + 1) // 2  # 15 < 36 (the would-be quadratic count)
+    # 4x the fields must not blow up super-linearly: linear grows ~5x here, quadratic
+    # would be ~12x. Guard the growth ratio well under quadratic.
+    assert frag8 <= 6 * frag2  # 15 <= 18 holds for linear; quadratic (36) would fail
+    # Byte size also grows sub-quadratically (each added field adds a bounded chunk).
+    assert len(lark8) < 4 * len(lark2)
+
+
+def test_gemma4_dictsort_order_is_case_insensitive():
+    # FIX #4 (codex r1): property order must match Gemma's chat template, which uses
+    # Jinja ``dictsort`` (default ``case_sensitive=False``) -> sort by the LOWERCASED
+    # key. A case-SENSITIVE ``sorted`` would order uppercase keys before lowercase
+    # ones and force the model off the order it was trained to emit.
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    props = {  # insertion order deliberately NEITHER sorted order
+        "Zebra": {"type": "string"},
+        "apple": {"type": "string"},
+        "Mango": {"type": "string"},
+    }
+    tool = [
+        {
+            "name": "cfg",
+            "parameters": {
+                "type": "object",
+                "properties": props,
+                "required": ["Zebra", "apple", "Mango"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    lark = build_tool_lark(tool, "required", [_gemma4_structure_info("cfg")])
+    # dictsort (case-insensitive): apple (a) < Mango (m) < Zebra (z).
+    i_apple, i_mango, i_zebra = (
+        lark.index(f'"{k}:"') for k in ("apple", "Mango", "Zebra")
+    )
+    assert i_apple < i_mango < i_zebra
+    # Case-SENSITIVE ``sorted`` would put uppercase Mango/Zebra before lowercase
+    # ``apple`` (M, Z < a) -> the exact bug this guards. Assert we are NOT there.
+    assert not (i_mango < i_apple)
+
+
+def test_gemma4_dictsort_case_collision_is_stable_insertion_order():
+    # A case-insensitive collision (``a`` vs ``A``) keeps the schema's INSERTION
+    # order via Python's stable sort -> EXACTLY Jinja ``dictsort``'s tiebreak (a
+    # secondary case-sensitive sort would instead force ``A`` before ``a``).
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    props = {"a": {"type": "string"}, "A": {"type": "string"}}  # 'a' inserted first
+    tool = [
+        {
+            "name": "cfg",
+            "parameters": {
+                "type": "object",
+                "properties": props,
+                "required": ["a", "A"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    lark = build_tool_lark(tool, "required", [_gemma4_structure_info("cfg")])
+    assert lark.index('"a:"') < lark.index('"A:"')
 
 
 def test_gemma4_noarg_tool_has_empty_body():
@@ -435,7 +558,14 @@ def test_gemma4_supports_grammar_and_auto_unsafe():
 # Grammar ENFORCEMENT + ROUND-TRIP on the REAL gemma4 tokenizer.
 # --------------------------------------------------------------------------
 def _offline_skip_exc_types():
-    types: list[type[BaseException]] = []
+    # ``OSError`` is included UNCONDITIONALLY: Transformers commonly wraps an
+    # unavailable tokenizer/cache as a plain ``OSError`` ("Can't load ... offline"),
+    # so a genuinely-offline run must SKIP (not FAIL) on it. The previous
+    # ``tuple(types) or (OSError,)`` dropped ``OSError`` whenever either optional
+    # import below succeeded — turning an offline run into a failure. The narrower
+    # connectivity exceptions are appended (still skip-worthy, more specific) but
+    # never displace ``OSError``.
+    types: list[type[BaseException]] = [OSError]
     try:
         from huggingface_hub.errors import (
             LocalEntryNotFoundError,
@@ -451,7 +581,7 @@ def _offline_skip_exc_types():
         types.append(_ReqConnErr)
     except Exception:  # pragma: no cover - requests not present
         pass
-    return tuple(types) or (OSError,)
+    return tuple(types)
 
 
 @pytest.fixture(scope="module")
