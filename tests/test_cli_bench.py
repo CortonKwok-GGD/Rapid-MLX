@@ -173,30 +173,21 @@ def test_bench_command_proceeds_when_mirror_prefetch_is_silent_noop(
     assert load_called == ["mlx-community/Qwen3-1.7B-4bit"]
 
 
-def test_bench_command_hybrid_vlm_benches_on_text_lane(monkeypatch, capsys) -> None:
-    """BLOCKING (#1178 codex r4): a hybrid VLM alias must bench on the TEXT
-    lane. ``bench`` has no MLLM/continuous-batching engine — it always loads
-    the text model via ``mlx_lm.load`` — so the effective serving lane it feeds
-    to PFlash defaulting/validation must be the RESOLVED lane (text for a hybrid
-    VLM that auto-downgrades, #352), never the raw multimodal classification.
-    Assert PFlash sees ``is_multimodal=False`` and the auto-downgrade is
-    surfaced to the user.
-    """
-    cli = importlib.import_module("vllm_mlx.cli")
-    from vllm_mlx.api import utils as api_utils
-
-    # Hybrid VLM: resolver returns (is_mllm_lane=False, auto_text_fallback=True).
-    monkeypatch.setattr(
-        api_utils, "resolve_serving_lane", lambda name, **kw: (False, True)
-    )
-
+def _capture_bench_lane_signals(monkeypatch, cli):
+    """Wire the bench PFlash default + validation seams to record the
+    ``is_multimodal`` / ``is_mllm`` they receive, and abort before the heavy
+    engine boot. Returns the ``seen`` dict."""
     seen: dict[str, object] = {}
 
-    def _capture_pflash(args, *, model_name, is_multimodal=False):
-        seen["is_multimodal"] = is_multimodal
+    def _capture_default(args, *, model_name, is_multimodal=False):
+        seen["default_is_multimodal"] = is_multimodal
         return "off"
 
-    monkeypatch.setattr("vllm_mlx.pflash.resolve_pflash_mode_default", _capture_pflash)
+    def _capture_validate(config, *, model_name, is_mllm):
+        seen["validate_is_mllm"] = is_mllm
+
+    monkeypatch.setattr("vllm_mlx.pflash.resolve_pflash_mode_default", _capture_default)
+    monkeypatch.setattr("vllm_mlx.pflash.validate_model_support", _capture_validate)
     monkeypatch.setattr(cli, "_check_disk_space", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda name: None)
@@ -207,18 +198,64 @@ def test_bench_command_hybrid_vlm_benches_on_text_lane(monkeypatch, capsys) -> N
         raise ValueError("test-abort after lane resolution")
 
     _patch_mlx_lm_load(monkeypatch, _fake_load)
+    return seen
+
+
+def test_bench_command_hybrid_vlm_benches_on_text_lane(monkeypatch, capsys) -> None:
+    """BLOCKING (#1178 codex r4): a hybrid VLM alias must bench on the TEXT
+    lane. ``bench`` has no MLLM/continuous-batching engine — it always loads
+    the text model via ``mlx_lm.load`` — so PFlash defaulting/validation run on
+    the text lane (``is_mllm=False``) and the auto-downgrade is surfaced to the
+    user for lane attribution (#352).
+    """
+    cli = importlib.import_module("vllm_mlx.cli")
+    from vllm_mlx.api import utils as api_utils
+
+    # Hybrid VLM: resolver returns (is_mllm_lane=False, auto_text_fallback=True).
+    monkeypatch.setattr(
+        api_utils, "resolve_serving_lane", lambda name, **kw: (False, True)
+    )
+    seen = _capture_bench_lane_signals(monkeypatch, cli)
 
     args = _make_freeform_bench_args("some/hybrid-vlm-4bit")
-
     with pytest.raises(SystemExit):
         cli.bench_command(args)
 
-    # PFlash defaulting saw the EFFECTIVE (text) lane, not the raw multimodal
-    # classification — a hybrid VLM is PFlash-capable on the text lane.
-    assert seen.get("is_multimodal") is False
+    # PFlash defaulting AND validation ran on the text lane.
+    assert seen.get("default_is_multimodal") is False
+    assert seen.get("validate_is_mllm") is False
     # And the auto-downgrade is attributed to the right lane for the user.
     out = capsys.readouterr().out
     assert "hybrid VLM" in out and "text-only" in out
+
+
+def test_bench_command_genuine_vlm_validates_on_text_lane(monkeypatch, capsys) -> None:
+    """NIT (#1178 codex r5): an ordinary (non-hybrid) VLM resolves to
+    ``is_mllm=True`` on the serve path, but ``bench`` is text-only-by-
+    construction — it has no MLLM lane for which PFlash is unavailable. So
+    PFlash defaulting AND validation must use ``is_mllm=False`` UNCONDITIONALLY,
+    never rejecting a PFlash option as if an MLLM lane were in use. No
+    auto-downgrade note fires for a genuine VLM (it is not a #352 downgrade).
+    """
+    cli = importlib.import_module("vllm_mlx.cli")
+    from vllm_mlx.api import utils as api_utils
+
+    # Genuine VLM: resolver returns (is_mllm_lane=True, auto_text_fallback=False).
+    monkeypatch.setattr(
+        api_utils, "resolve_serving_lane", lambda name, **kw: (True, False)
+    )
+    seen = _capture_bench_lane_signals(monkeypatch, cli)
+
+    args = _make_freeform_bench_args("some/genuine-vlm-4bit")
+    with pytest.raises(SystemExit):
+        cli.bench_command(args)
+
+    # Despite resolve saying is_mllm=True, bench validates against the text lane.
+    assert seen.get("default_is_multimodal") is False
+    assert seen.get("validate_is_mllm") is False
+    # No hybrid auto-downgrade note for a genuine VLM.
+    out = capsys.readouterr().out
+    assert "hybrid VLM" not in out
 
 
 # ---------- --submit community-bench path (_run_submit_flow) ----------------

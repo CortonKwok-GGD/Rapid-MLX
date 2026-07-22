@@ -1334,6 +1334,7 @@ def _ensure_routing_config(model_name: str) -> None:
     if os.path.exists(model_name):
         return
 
+    _prefetch_exc: Exception | None = None
     try:
         from .cli import _ensure_model_downloaded
 
@@ -1342,13 +1343,16 @@ def _ensure_routing_config(model_name: str) -> None:
         # ``_ensure_model_downloaded`` may exit(1) on a hard disk-space gate —
         # that is an intentional fail-fast; let it propagate.
         raise
-    except Exception as _e:  # noqa: BLE001 — re-verified below, not swallowed
+    except Exception as _e:  # noqa: BLE001 — preserved below, not swallowed
+        _prefetch_exc = _e
         logger.debug("routing-config prefetch raised (will re-verify): %r", _e)
 
     # VERIFY the prefetch actually put the config on disk. If it did not, the
     # routing probes would fall back to a guess and could misroute a hybrid VLM
     # into the MLLM engine that cannot serve it (#352). Fail fast with an
-    # actionable message instead of silently guess-routing.
+    # actionable message instead of silently guess-routing — and chain the
+    # original prefetch error so its real cause (auth / network / 404) is not
+    # lost.
     if read_model_metadata(model_name) is None:
         raise RuntimeError(
             f"Could not materialize the checkpoint config for {model_name!r} "
@@ -1358,6 +1362,19 @@ def _ensure_routing_config(model_name: str) -> None:
             "cannot serve it (GH #352). Check network / HuggingFace access / "
             "disk space and retry, or pass --no-mllm to force the text-only "
             "lane (or --mllm to force the multimodal lane)."
+        ) from _prefetch_exc
+    if _prefetch_exc is not None:
+        # Config landed, so we CAN resolve the lane — but the prefetch still
+        # errored (e.g. a partial download: config.json present, weights
+        # incomplete, or a late auth/network fault). Don't discard that cause;
+        # surface it at WARNING so a later weight-load failure is attributable
+        # instead of appearing as an unrelated error downstream.
+        logger.warning(
+            "routing-config prefetch for %r reported an error even though its "
+            "config materialized; the model may be partially downloaded and "
+            "fail to load its weights later. Original error: %r",
+            model_name,
+            _prefetch_exc,
         )
 
 
@@ -2526,18 +2543,27 @@ Examples:
     # switch to ``always`` when the user passes no ``--pflash`` flag; all
     # other aliases keep the conservative ``off``. Explicit overrides win.
     #
-    # Resolve the FINAL serving lane once (after materializing the checkpoint
-    # config so the offline probes have real evidence — this standalone entry
-    # does not pre-download like the CLI does). PFlash defaulting and
+    # Resolve the FINAL serving lane once. PFlash defaulting and
     # ``validate_model_support`` must both see the effective lane, NOT the raw
     # multimodal classification: a hybrid VLM that auto-downgrades to the
     # text-only lane is PFlash-capable there, exactly as an explicit
     # ``--text-only`` run would be (#352 dogfood P1-②).
-    _ensure_routing_config(args.model)
+    #
+    # Only materialize the checkpoint config when we actually need to
+    # AUTO-detect the lane (neither ``--mllm`` nor ``--no-mllm`` given). An
+    # explicit lane flag short-circuits ``resolve_serving_lane`` before it reads
+    # any config, so materializing there is unnecessary — and running the
+    # ``_ensure_routing_config`` fail-fast would DENY the very ``--no-mllm``
+    # escape hatch its own error message advertises when the config cannot be
+    # fetched. Mirror ``load_model()``'s flag-first skip (codex BLOCKING #1178).
+    _srv_force_mllm = getattr(args, "mllm", False)
+    _srv_force_text = getattr(args, "no_mllm", False)
+    if not _srv_force_mllm and not _srv_force_text:
+        _ensure_routing_config(args.model)
     _srv_is_mllm, _ = resolve_serving_lane(
         args.model,
-        force_mllm=getattr(args, "mllm", False),
-        force_text=getattr(args, "no_mllm", False),
+        force_mllm=_srv_force_mllm,
+        force_text=_srv_force_text,
     )
     args.pflash = _server_pflash_resolve_default(
         args, model_name=args.model, is_multimodal=_srv_is_mllm

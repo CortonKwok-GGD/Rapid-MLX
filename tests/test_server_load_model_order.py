@@ -189,10 +189,13 @@ def test_ensure_routing_config_raises_when_prefetch_does_not_materialize(monkeyp
     monkeypatch.setattr(mm, "read_model_metadata", lambda name: None)
     called = {"prefetch": False}
 
-    def _noop_prefetch(name):
-        called["prefetch"] = True  # ran, but didn't put a config on disk
+    original_err = OSError("network unreachable")
 
-    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _noop_prefetch)
+    def _failing_prefetch(name):
+        called["prefetch"] = True  # ran, but errored + put no config on disk
+        raise original_err
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _failing_prefetch)
 
     with pytest.raises(RuntimeError) as excinfo:
         server._ensure_routing_config(model)
@@ -203,6 +206,46 @@ def test_ensure_routing_config_raises_when_prefetch_does_not_materialize(monkeyp
     # Actionable: names the routing consequence and the escape hatches.
     assert "--no-mllm" in msg
     assert "#352" in msg
+    # NIT (#1178 codex r5): the real prefetch cause is preserved via chaining,
+    # not discarded.
+    assert excinfo.value.__cause__ is original_err
+
+
+def test_ensure_routing_config_warns_when_prefetch_errors_but_config_lands(
+    monkeypatch, caplog
+):
+    """NIT (#1178 codex r5): if the prefetch raises a concrete error (auth /
+    network / partial download) but config.json is present afterward, don't
+    silently discard that error — resolve the lane (config is readable) but
+    surface the original cause at WARNING so a later weight-load failure is
+    attributable."""
+    import logging
+
+    from vllm_mlx import cli as cli_mod
+    from vllm_mlx import model_metadata as mm
+    from vllm_mlx import server
+
+    state = {"materialized": False}
+    monkeypatch.setattr(
+        mm,
+        "read_model_metadata",
+        lambda name: object() if state["materialized"] else None,
+    )
+
+    def _partial_prefetch(name):
+        # config.json lands, but the download errors out (weights incomplete).
+        state["materialized"] = True
+        raise OSError("connection reset mid-download")
+
+    monkeypatch.setattr(cli_mod, "_ensure_model_downloaded", _partial_prefetch)
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.server"):
+        # Config is readable afterward → no raise.
+        server._ensure_routing_config("some/partially-downloaded-4bit")
+
+    joined = " ".join(rec.message for rec in caplog.records)
+    assert "connection reset mid-download" in joined
+    assert "partially downloaded" in joined
 
 
 def test_ensure_routing_config_succeeds_when_prefetch_materializes(monkeypatch):
