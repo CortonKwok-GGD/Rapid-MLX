@@ -605,59 +605,17 @@ def _tokenizer_in_cache() -> bool:
     return isinstance(path, str)
 
 
-def _offline_skip_exc_types():
-    # HF-SPECIFIC offline/connectivity exception TYPES (network / cache
-    # unavailability). Used ONLY as a belt-and-suspenders skip in the NOT-cached
-    # branch of the ``tok`` fixture (the load-attempted-while-uncached race). The
-    # PRIMARY offline-vs-corrupt decision is the cache-presence gate
-    # (``_tokenizer_in_cache``); a CACHED-but-unloadable tokenizer always FAILS, so
-    # ``OSError`` is DELIBERATELY not in this type list (catching every ``OSError``
-    # would skip corruption — the false-green codex flagged).
-    types: list[type[BaseException]] = []
-    try:
-        from huggingface_hub.errors import (
-            LocalEntryNotFoundError,
-            OfflineModeIsEnabled,
-        )
-
-        types += [LocalEntryNotFoundError, OfflineModeIsEnabled]
-    except Exception:  # pragma: no cover - old hub without these names
-        pass
-    try:
-        from requests.exceptions import ConnectionError as _ReqConnErr
-
-        types.append(_ReqConnErr)
-    except Exception:  # pragma: no cover - requests not present
-        pass
-    return tuple(types)
-
-
-def _is_offline_unavailable(exc: BaseException) -> bool:
-    """True iff ``exc`` from ``AutoTokenizer.from_pretrained`` is a genuine HF
-    OFFLINE/connectivity exception TYPE (``LocalEntryNotFoundError`` /
-    ``OfflineModeIsEnabled`` / ``requests.ConnectionError``).
-
-    Type-only — the r3 message-substring heuristic is GONE (codex r4 F3): "Can't
-    load ..." is emitted for both offline AND corrupt artifacts, so a message match
-    could not tell them apart. The cache-presence gate now makes that call, and this
-    predicate is only the belt-and-suspenders skip for the NOT-cached branch (an
-    uncached repo that failed to fetch). Any other error — including a bare
-    ``OSError`` (corruption / bad revision / wrapped 404) — returns ``False`` so the
-    caller re-raises and the test FAILS."""
-    offline_types = _offline_skip_exc_types()
-    return bool(offline_types) and isinstance(exc, offline_types)
-
-
 @pytest.fixture(scope="module")
 def tok():
     transformers = pytest.importorskip("transformers")
     # PRIMARY gate: cache presence. A CACHED tokenizer must LOAD — if it fails, that
-    # is corruption and the test FAILS (any exception propagates). Only a NOT-cached
-    # tokenizer is skip-eligible (genuinely unavailable), and even then only for an
-    # offline EXCEPTION TYPE (belt & suspenders for the attempted-fetch-while-
-    # uncached race); any other error on an uncached repo still surfaces. This
-    # replaces the r3 message-substring heuristic, which could not distinguish a
-    # corrupt cached artifact from an offline miss (codex r4 F3).
+    # is corruption and the test FAILS (any exception propagates on the cached path
+    # below). Only a NOT-cached tokenizer is skip-eligible (genuinely unavailable),
+    # and there ANY load failure means it could not be obtained, so it skips
+    # UNCONDITIONALLY. This replaces the r3 message-substring heuristic, which could
+    # not distinguish a corrupt cached artifact from an offline miss (codex r4 F3),
+    # and drops the r4 type-only skip that made the suite network-dependent when a
+    # real offline miss surfaced as a bare wrapping ``OSError`` (codex r5 F3).
     if _tokenizer_in_cache():
         return transformers.AutoTokenizer.from_pretrained(
             _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
@@ -667,11 +625,21 @@ def tok():
             _TOKENIZER_MODEL, revision=_TOKENIZER_REVISION
         )
     except Exception as exc:  # pragma: no cover - offline & uncached
-        if not _is_offline_unavailable(exc):
-            raise
+        # NOT cached (the cache-presence gate above returned False), so there is no
+        # local artifact that could be corrupt: ANY load failure here means the
+        # tokenizer is genuinely unavailable (offline miss / attempted fetch that
+        # could not complete) -> skip UNCONDITIONALLY. This stays SOUND w.r.t. the
+        # r4 false-GREEN fix because a CACHED-but-unloadable tokenizer never reaches
+        # this branch — it loads on the cached path above, where any exception
+        # PROPAGATES and the test FAILS. codex r5: a real offline miss can surface
+        # as a bare wrapping ``OSError`` (not only LocalEntryNotFoundError), so a
+        # type-only skip made the suite network-dependent (false-RED); cache-
+        # presence has ALREADY made the offline-vs-corrupt decision, so no exception
+        # typing is needed here.
         pytest.skip(
             f"tokenizer {_TOKENIZER_MODEL}@{_TOKENIZER_REVISION[:8]} not cached "
-            "and no network — gemma4 enforcement tests require it"
+            f"and could not be fetched ({type(exc).__name__}) — gemma4 "
+            "enforcement tests require it"
         )
 
 
