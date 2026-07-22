@@ -114,7 +114,7 @@ from .api.utils import (
     extract_json_from_response,  # noqa: F401
     extract_multimodal_content,  # noqa: F401
     is_mllm_model,  # noqa: F401
-    mllm_backbone_is_hybrid,  # noqa: F401
+    resolve_serving_lane,  # noqa: F401
     sanitize_output,  # noqa: F401
     strip_special_tokens,  # noqa: F401
     strip_thinking_tags,  # noqa: F401
@@ -1298,6 +1298,33 @@ def load_embedding_model(
     cfg.embedding_model_locked = _embedding_model_locked
 
 
+def _ensure_routing_config(model_name: str) -> None:
+    """Materialize the checkpoint config on disk before the offline routing
+    probes run.
+
+    ``resolve_serving_lane`` reads the checkpoint config from the local cache
+    to decide the MLLM-vs-text lane. On a first-time uncached remote startup
+    that config does not exist yet, so a hybrid VLM would probe "not hybrid"
+    and get routed into the MLLM engine that cannot serve it (#352 dogfood
+    P1-②). Pre-fetch the model here (the same canonical mirror/HF fetch the CLI
+    uses) so the probes have real evidence. No-op on local paths and on
+    fully-cached repos; best-effort — a prefetch hiccup must never block load
+    (the engine's own loader still downloads and reports errors). Module-level
+    so tests can substitute it to simulate "config appears only after
+    download".
+    """
+    try:
+        from .cli import _ensure_model_downloaded
+
+        _ensure_model_downloaded(model_name)
+    except SystemExit:
+        # ``_ensure_model_downloaded`` may exit(1) on a hard disk-space gate —
+        # that is an intentional fail-fast; let it propagate.
+        raise
+    except Exception as _e:  # noqa: BLE001 — never block load on a prefetch hiccup
+        logger.debug("routing-config prefetch failed (non-fatal): %r", _e)
+
+
 def load_model(
     model_name: str,
     scheduler_config=None,
@@ -1522,31 +1549,38 @@ def load_model(
     # an ArraysCache backbone (GitHub #352). Left alone, the naive
     # ``rapid-mlx serve <flagship>`` command boots into the MLLM lane and then
     # raises a RuntimeError telling the user to "Drop --mllm" — a flag they
-    # never set. Fall back to the text-only mlx-lm lane HERE, at the routing
-    # layer, with one clear INFO line. The dense text lane serves the
+    # never set. Auto-fall-back to the text-only mlx-lm lane HERE, at the
+    # routing layer, with one clear INFO line. The dense text lane serves the
     # GatedDeltaNet backbone coherently and keeps ``is_hybrid=False`` (avoiding
     # the metal::malloc throttle wedge the 4B/9B/27B dense variants hit under
-    # the hybrid scheduler path — see model_auto_config r6-A R6-C1). Only fires
-    # in auto mode: an explicit ``--mllm`` (force_mllm) is respected so the
+    # the hybrid scheduler path — see model_auto_config r6-A R6-C1).
+    #
+    # The fallback is tracked in ``_auto_text_fallback`` — a state DISTINCT
+    # from the explicit ``force_text`` / ``--no-mllm`` flag — so diagnostics say
+    # "auto-downgraded" and never falsely claim the user passed ``--no-mllm``
+    # (codex #2 on #1178). The materialize-then-probe order is load-bearing:
+    # ``_ensure_routing_config`` must run BEFORE ``resolve_serving_lane`` so a
+    # first-time uncached hybrid VLM has real config evidence and is not routed
+    # into the crashing MLLM engine (codex BLOCKING on #1178). Only fires in
+    # auto mode: an explicit ``--mllm`` (force_mllm) is respected so the
     # operator who insists on the multimodal path gets the engine's own #352
-    # error rather than a silent override. The config probe is offline and
-    # never loads weights. #352 dogfood P1-② (0.10.16).
-    if (
-        not force_text
-        and not force_mllm
-        and is_mllm_model(model_name)
-        and mllm_backbone_is_hybrid(model_name)
-    ):
-        logger.info(
-            "Model %r is a multimodal checkpoint with a hybrid/linear-attention "
-            "language backbone, which the MLLM continuous-batching engine cannot "
-            "serve (GitHub #352). Routing to the text-only mlx-lm lane; the "
-            "vision path is unavailable for this backbone. Pass --mllm to force "
-            "the multimodal engine (it will error), or --no-mllm to silence "
-            "this notice.",
-            model_name,
+    # error rather than a silent override. #352 dogfood P1-② (0.10.16).
+    _auto_text_fallback = False
+    if not force_text and not force_mllm:
+        _ensure_routing_config(model_name)
+        _lane_is_mllm, _auto_text_fallback = resolve_serving_lane(
+            model_name, force_mllm=force_mllm, force_text=force_text
         )
-        force_text = True
+        if _auto_text_fallback:
+            logger.info(
+                "Model %r auto-downgraded to the text-only mlx-lm lane: it is a "
+                "multimodal checkpoint with a hybrid/linear-attention language "
+                "backbone, which the MLLM continuous-batching engine cannot "
+                "serve (GitHub #352). The vision path is unavailable for this "
+                "backbone. Pass --mllm to force the multimodal engine (it will "
+                "error), or --no-mllm to silence this notice.",
+                model_name,
+            )
 
     try:
         gen_cfg = load_generation_config_sampling(model_name)
@@ -1615,6 +1649,12 @@ def load_model(
             "(MLLM auto-detection overridden, #393)"
         )
 
+    # The engine picks the text lane for BOTH an explicit ``--no-mllm``
+    # (``force_text``) and the automatic hybrid-backbone downgrade
+    # (``_auto_text_fallback``). Kept as separate inputs above so the log lines
+    # attribute the reason correctly; combined here to select the final lane.
+    _effective_force_text = force_text or _auto_text_fallback
+
     # Modality dispatch: ``text-diffusion`` aliases route to the
     # discrete-text-diffusion engine (mlx-vlm DiffusionGemma path).
     # Default ``text`` keeps the AR BatchedEngine flow that every
@@ -1657,7 +1697,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
-            force_text=force_text,
+            force_text=_effective_force_text,
             gpu_memory_utilization=gpu_memory_utilization,
             force_hybrid=force_hybrid,
             no_hybrid=no_hybrid,
@@ -2449,11 +2489,20 @@ Examples:
     # Per-alias PFlash default (#287): verified Qwen3.5 / Qwen3.6 aliases
     # switch to ``always`` when the user passes no ``--pflash`` flag; all
     # other aliases keep the conservative ``off``. Explicit overrides win.
-    # Compute the multimodal verdict ONCE: it both suppresses the
-    # verified-tier PFlash auto-enable (PFlash can't serve the MLLM lane —
-    # #352 dogfood P1-②) and drives the explicit-override rejection in
-    # ``validate_model_support``.
-    _srv_is_mllm = getattr(args, "mllm", False) or is_mllm_model(args.model)
+    #
+    # Resolve the FINAL serving lane once (after materializing the checkpoint
+    # config so the offline probes have real evidence — this standalone entry
+    # does not pre-download like the CLI does). PFlash defaulting and
+    # ``validate_model_support`` must both see the effective lane, NOT the raw
+    # multimodal classification: a hybrid VLM that auto-downgrades to the
+    # text-only lane is PFlash-capable there, exactly as an explicit
+    # ``--text-only`` run would be (#352 dogfood P1-②).
+    _ensure_routing_config(args.model)
+    _srv_is_mllm, _ = resolve_serving_lane(
+        args.model,
+        force_mllm=getattr(args, "mllm", False),
+        force_text=getattr(args, "no_mllm", False),
+    )
     args.pflash = _server_pflash_resolve_default(
         args, model_name=args.model, is_multimodal=_srv_is_mllm
     )

@@ -938,6 +938,61 @@ class TestMllmBackboneIsHybrid:
         assert mllm_backbone_is_hybrid("any/llama-like") is False
 
 
+class TestResolveServingLane:
+    """The single lane-decision orchestrator: given the two offline probes and
+    the explicit flags, decide the FINAL (is_mllm_lane, auto_text_fallback)."""
+
+    def _patch_probes(self, monkeypatch, *, is_mllm, hybrid):
+        from vllm_mlx.api import utils as utils_mod
+
+        monkeypatch.setattr(utils_mod, "is_mllm_model", lambda n: is_mllm)
+        monkeypatch.setattr(utils_mod, "mllm_backbone_is_hybrid", lambda n: hybrid)
+
+    def test_hybrid_vlm_auto_downgrades_to_text(self, monkeypatch):
+        from vllm_mlx.api.utils import resolve_serving_lane
+
+        # Multimodal checkpoint + hybrid backbone, no flags → text lane, marked
+        # as an AUTOMATIC fallback (Qwen3.6-27B shape).
+        self._patch_probes(monkeypatch, is_mllm=True, hybrid=True)
+        assert resolve_serving_lane("any/qwen36-27b") == (False, True)
+
+    def test_genuine_vlm_stays_on_mllm_lane(self, monkeypatch):
+        from vllm_mlx.api.utils import resolve_serving_lane
+
+        # Multimodal + sliding/full attention (gemma-4) → MLLM lane, no fallback.
+        self._patch_probes(monkeypatch, is_mllm=True, hybrid=False)
+        assert resolve_serving_lane("any/gemma4-12b") == (True, False)
+
+    def test_pure_text_model_is_text_lane_no_fallback(self, monkeypatch):
+        from vllm_mlx.api.utils import resolve_serving_lane
+
+        # Not multimodal at all → text lane by nature, not an auto-fallback.
+        self._patch_probes(monkeypatch, is_mllm=False, hybrid=False)
+        assert resolve_serving_lane("any/plain-llm") == (False, False)
+
+    def test_explicit_force_text_wins_no_auto_marker(self, monkeypatch):
+        from vllm_mlx.api.utils import resolve_serving_lane
+
+        # Even a hybrid VLM: an explicit --text-only is NOT an auto-fallback, so
+        # diagnostics don't conflate the two. Probes are not consulted.
+        self._patch_probes(monkeypatch, is_mllm=True, hybrid=True)
+        assert resolve_serving_lane("any/qwen36-27b", force_text=True) == (
+            False,
+            False,
+        )
+
+    def test_explicit_force_mllm_keeps_mllm_lane(self, monkeypatch):
+        from vllm_mlx.api.utils import resolve_serving_lane
+
+        # Explicit --mllm on a hybrid VLM keeps the MLLM lane (the engine will
+        # raise its own #352 error naming --mllm — the flag the user set).
+        self._patch_probes(monkeypatch, is_mllm=True, hybrid=True)
+        assert resolve_serving_lane("any/qwen36-27b", force_mllm=True) == (
+            True,
+            False,
+        )
+
+
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content function."""
 

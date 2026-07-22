@@ -2411,18 +2411,24 @@ def serve_command(args):
     # Qwen3.6 aliases, ``"off"`` everywhere else) is materialized into
     # ``args.pflash``. The resolved value then flows through the same
     # validation path the user-explicit case takes.
-    from .api.utils import is_mllm_model
+    from .api.utils import resolve_serving_lane
     from .pflash import (
         config_from_args,
         resolve_pflash_mode_default,
         validate_model_support,
     )
 
-    # Compute the multimodal verdict ONCE: it both suppresses the
-    # verified-tier PFlash auto-enable (PFlash can't serve the MLLM lane —
-    # #352 dogfood P1-②) and drives the explicit-override rejection in
-    # ``validate_model_support``.
-    _serve_is_mllm = getattr(args, "mllm", False) or is_mllm_model(args.model)
+    # Resolve the FINAL serving lane ONCE (the model is already downloaded by
+    # ``_ensure_model_downloaded`` above, so the offline probes have real
+    # evidence). PFlash defaulting and ``validate_model_support`` must both see
+    # the effective lane, NOT the raw multimodal classification: a hybrid VLM
+    # that auto-downgrades to the text-only lane is PFlash-capable there,
+    # exactly as an explicit ``--text-only`` run would be (#352 dogfood P1-②).
+    _serve_is_mllm, _ = resolve_serving_lane(
+        args.model,
+        force_mllm=getattr(args, "mllm", False),
+        force_text=getattr(args, "no_mllm", False),
+    )
     args.pflash = resolve_pflash_mode_default(
         args, model_name=args.model, is_multimodal=_serve_is_mllm
     )
@@ -4077,7 +4083,6 @@ def bench_command(args):
 
     from mlx_lm import load
 
-    from .api.utils import is_mllm_model as _bench_is_mllm_model
     from .engine_core import AsyncEngineCore, EngineConfig
     from .pflash import config_from_args as _pflash_config_from_args
     from .pflash import resolve_pflash_mode_default as _pflash_resolve_default
@@ -4111,7 +4116,17 @@ def bench_command(args):
     # bench previously skipped this check, so ``rapid-mlx bench
     # --pflash always <mllm-alias>`` would admit a combo PFlash
     # explicitly rejects elsewhere).
-    _bench_is_mllm = getattr(args, "mllm", False) or _bench_is_mllm_model(args.model)
+    # Resolve the FINAL serving lane (model already prefetched above): a hybrid
+    # VLM that auto-downgrades to the text-only lane is PFlash-capable there,
+    # so PFlash defaulting/validation must see the effective lane, not the raw
+    # multimodal classification (#352 dogfood P1-②).
+    from .api.utils import resolve_serving_lane as _bench_resolve_serving_lane
+
+    _bench_is_mllm, _ = _bench_resolve_serving_lane(
+        args.model,
+        force_mllm=getattr(args, "mllm", False),
+        force_text=getattr(args, "no_mllm", False),
+    )
     args.pflash = _pflash_resolve_default(
         args, model_name=args.model, is_multimodal=_bench_is_mllm
     )

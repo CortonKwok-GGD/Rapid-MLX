@@ -86,6 +86,91 @@ def test_load_model_enables_native_tool_format_when_parser_supports_it(monkeypat
     assert server._engine.preserve_native_tool_format is True
 
 
+def _stub_routing_globals(monkeypatch, server):
+    """Neutralize the load_model globals that the routing tests don't exercise."""
+    monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
+    monkeypatch.setattr(server, "_engine", None, raising=False)
+    monkeypatch.setattr(server, "_enable_auto_tool_choice", False, raising=False)
+    monkeypatch.setattr(server, "_tool_call_parser", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser_name", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser", None, raising=False)
+    monkeypatch.setattr(server, "_tool_parser_instance", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
+    monkeypatch.setattr(server, "_model_alias", None, raising=False)
+
+
+def test_load_model_materializes_config_before_hybrid_routing_probe(
+    monkeypatch, caplog
+):
+    """BLOCKING (#1178 codex): the hybrid→text-only fallback probe reads the
+    checkpoint config from the local cache. On a first-time uncached remote
+    startup that config is absent, so the probe must run AFTER the model is
+    materialized — otherwise a hybrid VLM probes "not hybrid" and is routed
+    into the MLLM engine that cannot serve it (#352).
+
+    Simulate exactly that race: the hybrid backbone is only "visible" once
+    ``_ensure_routing_config`` has run. Assert the engine is still built for
+    the text lane (``force_text=True``), proving the materialize-then-probe
+    ordering holds — and that the automatic fallback is NOT reported as an
+    explicit ``--no-mllm``.
+    """
+    import logging
+
+    from vllm_mlx import server
+    from vllm_mlx.api import utils as api_utils
+
+    _stub_routing_globals(monkeypatch, server)
+
+    state = {"materialized": False}
+
+    def _fake_ensure(model_name):
+        state["materialized"] = True
+
+    monkeypatch.setattr(server, "_ensure_routing_config", _fake_ensure)
+    # A multimodal checkpoint whose hybrid backbone only becomes visible once
+    # its config has been materialized (i.e. after the download).
+    monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: True)
+    monkeypatch.setattr(
+        api_utils, "mllm_backbone_is_hybrid", lambda name: state["materialized"]
+    )
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.server"):
+        server.load_model("some/uncached-hybrid-vlm-4bit")
+
+    assert server._engine is not None
+    # Materialization ran before the probe → hybrid detected → text lane.
+    assert server._engine.kwargs.get("force_text") is True, (
+        "auto-fallback to the text lane must fire once config is materialized"
+    )
+    # force_mllm must remain False (auto mode, no explicit flag).
+    assert server._engine.kwargs.get("force_mllm") is False
+    joined = " ".join(rec.message for rec in caplog.records)
+    # Diagnostics attribute the reason to the automatic downgrade, NOT --no-mllm.
+    assert "auto-downgraded to the text-only" in joined
+    assert "Force text-only mode enabled via --no-mllm flag" not in joined
+
+
+def test_load_model_genuine_vlm_stays_on_mllm_lane(monkeypatch):
+    """A multimodal checkpoint with a NON-hybrid backbone (gemma-4 shape) must
+    keep its MLLM routing — the auto-fallback fires only for hybrid backbones,
+    so a working VLM is never downgraded."""
+    from vllm_mlx import server
+    from vllm_mlx.api import utils as api_utils
+
+    _stub_routing_globals(monkeypatch, server)
+    monkeypatch.setattr(server, "_ensure_routing_config", lambda name: None)
+    monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: True)
+    monkeypatch.setattr(api_utils, "mllm_backbone_is_hybrid", lambda name: False)
+
+    server.load_model("some/genuine-vlm-4bit")
+
+    assert server._engine is not None
+    # No downgrade → force_text stays False; BatchedEngine does its own MLLM
+    # auto-detection from there.
+    assert server._engine.kwargs.get("force_text") is False
+
+
 def test_load_model_infers_programmatic_max_tokens_explicit(monkeypatch):
     from vllm_mlx import server
     from vllm_mlx.config import get_config, reset_config
