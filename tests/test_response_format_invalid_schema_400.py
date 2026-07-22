@@ -242,6 +242,59 @@ def test_guided_compile_error_detail_envelope_and_param_override():
     assert overridden["param"] == "text.format.schema"
 
 
+def test_nonstrict_json_schema_boundary_error_helper():
+    """Round-5 centralization — the SINGLE shared route-boundary structural
+    validator returns the 400 detail for a structurally-invalid NON-strict
+    json_schema, ``None`` for valid / strict / non-json_schema, and honors the
+    per-surface ``param``. Both chat and responses call THIS one function."""
+    from vllm_mlx.api.tool_calling import nonstrict_json_schema_boundary_error
+
+    rf_invalid = {
+        "type": "json_schema",
+        "json_schema": {"name": "x", "schema": _INVALID_SCHEMA},
+    }
+    err = nonstrict_json_schema_boundary_error(rf_invalid, CHAT_RESPONSE_FORMAT_PARAM)
+    assert err is not None
+    assert err["error"]["code"] == "invalid_response_format_schema"
+    assert err["error"]["param"] == CHAT_RESPONSE_FORMAT_PARAM
+    assert "notatype" in err["error"]["message"]
+
+    # Per-surface param override (responses).
+    err_resp = nonstrict_json_schema_boundary_error(
+        rf_invalid, RESPONSES_TEXT_FORMAT_PARAM
+    )
+    assert err_resp["error"]["param"] == RESPONSES_TEXT_FORMAT_PARAM
+
+    # Valid non-strict schema → None.
+    rf_valid = {"type": "json_schema", "json_schema": {"name": "x", "schema": _SCHEMA}}
+    assert (
+        nonstrict_json_schema_boundary_error(rf_valid, CHAT_RESPONSE_FORMAT_PARAM)
+        is None
+    )
+
+    # STRICT is skipped here (owned by the more specific invalid_strict_schema
+    # pre-flight) even when the schema is invalid.
+    rf_strict = {
+        "type": "json_schema",
+        "json_schema": {"name": "x", "strict": True, "schema": _INVALID_SCHEMA},
+    }
+    assert (
+        nonstrict_json_schema_boundary_error(rf_strict, CHAT_RESPONSE_FORMAT_PARAM)
+        is None
+    )
+
+    # Nothing to validate → None.
+    assert (
+        nonstrict_json_schema_boundary_error(None, CHAT_RESPONSE_FORMAT_PARAM) is None
+    )
+    assert (
+        nonstrict_json_schema_boundary_error(
+            {"type": "json_object"}, CHAT_RESPONSE_FORMAT_PARAM
+        )
+        is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # Non-streaming
 # ---------------------------------------------------------------------------
@@ -525,77 +578,30 @@ def test_decode_constrained_raises_on_matcher_get_error(monkeypatch):
     assert "Invalid type" in str(excinfo.value)
 
 
-@pytest.mark.skipif(
-    not is_guided_available(), reason="requires the [guided] (llguidance) extra"
-)
-def test_generate_json_upfront_invalid_schema_raises_before_llguidance(monkeypatch):
-    """Round-4 #1 (the core hole) — a structurally-invalid schema is rejected
-    UP FRONT, before llguidance is invoked at all, so a tolerant/unavailable
-    compiler cannot let it slip to a silent unconstrained 200.
-
-    We monkeypatch ``grammar_from_json_schema`` to FAIL THE TEST if called: the
-    up-front ``_schema_invalid_reason`` check must raise
-    ``GuidedSchemaCompileError`` before reaching it. This is the deterministic
-    proof that the fix does not depend on llguidance raising."""
+def test_generate_json_has_no_inengine_structural_validation():
+    """Round-5 (validate-once): structural schema validation is centralized at
+    the ROUTE BOUNDARY and runs exactly once. The former in-generator up-front
+    ``_schema_invalid_reason`` structural check is REMOVED, so ``generate_json``
+    does NOT re-validate the schema (no duplicate work, nothing on the
+    executor/event-loop thread twice)."""
     from vllm_mlx.api import guided as guided_mod
 
-    def _must_not_be_called(*_a, **_k):
-        raise AssertionError(
-            "llguidance was invoked on a validator-invalid schema — up-front "
-            "validation must reject it first"
-        )
-
-    monkeypatch.setattr(
-        guided_mod.LLMatcher,
-        "grammar_from_json_schema",
-        staticmethod(_must_not_be_called),
+    assert not hasattr(guided_mod, "_schema_invalid_reason"), (
+        "the in-generator structural validation must be removed — the route "
+        "boundary is the single structural-validation point"
     )
-    gen = guided_mod.GuidedGenerator(model=None, tokenizer=None)
-    with pytest.raises(GuidedSchemaCompileError) as excinfo:
-        gen.generate_json(prompt="hi", json_schema=_INVALID_SCHEMA, max_tokens=8)
-    # The up-front raise carries the validator reason (mentions the bad type)
-    # and NO surface param yet (the route stamps it).
-    assert "notatype" in str(excinfo.value)
-    assert excinfo.value.param is None
 
 
 @pytest.mark.skipif(
     not is_guided_available(), reason="requires the [guided] (llguidance) extra"
 )
-def test_generate_json_tolerant_compiler_on_invalid_schema_still_400(monkeypatch):
-    """Round-4 #1 — the tolerant-compiler variant the fix specifically closes:
-    even if llguidance would SUCCEED (return a grammar) on a validator-invalid
-    schema, the up-front check must still raise → 400. We monkeypatch
-    ``grammar_from_json_schema`` to return a dummy grammar and
-    ``_decode_constrained`` to a plausible completion; the up-front reject means
-    neither is ever reached, so the invalid schema can never silently produce a
-    200."""
-    from vllm_mlx.api import guided as guided_mod
-
-    monkeypatch.setattr(
-        guided_mod.LLMatcher,
-        "grammar_from_json_schema",
-        staticmethod(lambda *_a, **_k: "<tolerant-grammar>"),
-    )
-    gen = guided_mod.GuidedGenerator(model=None, tokenizer=None)
-    monkeypatch.setattr(gen, "_decode_constrained", lambda **_k: '{"whatever": 1}')
-    with pytest.raises(GuidedSchemaCompileError):
-        gen.generate_json(prompt="hi", json_schema=_INVALID_SCHEMA, max_tokens=8)
-
-
-@pytest.mark.skipif(
-    not is_guided_available(), reason="requires the [guided] (llguidance) extra"
-)
-def test_generate_json_valid_schema_get_error_secondary_degrades_to_none(monkeypatch):
-    """Round-4 #1 secondary net — a schema the validator ACCEPTS that
-    llguidance nonetheless rejects at ``get_error()`` (an unsupported-but-valid
-    construct) is OPERATIONAL: ``generate_json`` degrades to ``None`` (→
-    best-effort fallback / strict 502), NOT a misleading 400.
-
-    Deterministic: ``grammar_from_json_schema`` succeeds and
-    ``_decode_constrained`` raises ``GuidedSchemaCompileError`` (the get_error()
-    signal); with a VALID ``_SCHEMA`` the discriminator says None → the arm
-    swallows to None."""
+def test_generate_json_treats_any_llguidance_reject_as_operational_none(monkeypatch):
+    """Round-5 — with structural validation owned by the route boundary,
+    ``generate_json`` no longer discriminates schema validity: EVERY llguidance
+    rejection is OPERATIONAL and degrades to ``None`` (→ strict 502 / best-effort
+    200), NEVER a raised 400. It must NOT raise even for a structurally-INVALID
+    schema (which the boundary normally rejects first) — proving the in-generator
+    layer does no structural gate."""
     from vllm_mlx.api import guided as guided_mod
 
     monkeypatch.setattr(
@@ -606,21 +612,24 @@ def test_generate_json_valid_schema_get_error_secondary_degrades_to_none(monkeyp
     gen = guided_mod.GuidedGenerator(model=None, tokenizer=None)
 
     def _decode_raises(**_k):
-        raise GuidedSchemaCompileError("llguidance-internal limit on a valid schema")
+        raise GuidedSchemaCompileError("llguidance rejected at matcher construction")
 
     monkeypatch.setattr(gen, "_decode_constrained", _decode_raises)
+    # Neither a valid NOR an invalid schema raises — both degrade to None.
     assert gen.generate_json(prompt="hi", json_schema=_SCHEMA, max_tokens=8) is None
+    assert (
+        gen.generate_json(prompt="hi", json_schema=_INVALID_SCHEMA, max_tokens=8)
+        is None
+    )
 
 
 @pytest.mark.skipif(
     not is_guided_available(), reason="requires the [guided] (llguidance) extra"
 )
-def test_generate_json_valid_schema_operational_error_degrades_to_none(monkeypatch):
-    """Secondary net, operational arm: an INTERNAL failure (e.g. a
-    ``RuntimeError`` / eager ``ValueError``) on a schema the validator ACCEPTS
-    must NOT be misclassified as invalid client input — it degrades to ``None``,
-    never a 400 that would leak a server-internal diagnostic and tell the caller
-    to fix a perfectly valid schema."""
+def test_generate_json_operational_runtime_error_degrades_to_none(monkeypatch):
+    """Operational arm: an INTERNAL failure (e.g. a ``RuntimeError`` /  eager
+    ``ValueError`` from ``grammar_from_json_schema``) degrades to ``None`` (the
+    operational path), never a 400."""
     from vllm_mlx.api import guided as guided_mod
 
     def _internal_boom(*_a, **_k):
@@ -866,6 +875,57 @@ def test_responses_strict_valid_schema_operational_failure_returns_502(
     err = resp.json()["error"]
     assert err["code"] == "strict_schema_violation"
     assert engine.chat_calls == [], "strict mode must not fall back to chat()"
+
+
+# ---------------------------------------------------------------------------
+# /v1/completions (Round-5 #1): codex's premise was that the boundary check
+# was missing on completions and an invalid json_schema could reach generation.
+# VERDICT: the legacy completions lane rejects ANY json_schema response_format
+# outright (it never routes through guided generation), so there is no silent
+# 200 to guard against — this test pins that rejection so the surface can never
+# regress into a silent unconstrained 200 for an invalid schema.
+# ---------------------------------------------------------------------------
+
+
+def _make_completions_client(engine: _Engine) -> TestClient:
+    from vllm_mlx.routes.completions import router as completions_router
+
+    cfg = reset_config()
+    cfg.engine = engine
+    cfg.model_name = "test-model"
+    cfg.model_registry = None
+    cfg.no_thinking = True
+    app = FastAPI()
+    install_exception_handlers(app)
+    app.include_router(completions_router)
+    return TestClient(app)
+
+
+def test_completions_json_schema_rejected_never_silent_200():
+    """/v1/completions rejects an (invalid) json_schema response_format up-front
+    with 400 ``unsupported_response_format`` — pointing callers at the chat lane
+    — and NEVER a silent unconstrained 200. Uses a guided-UNSUPPORTED engine to
+    prove the rejection is capability-independent and reaches no generation."""
+    engine = _Engine(supports_guided=False)
+    client = _make_completions_client(engine)
+    resp = client.post(
+        "/v1/completions",
+        json={
+            "model": "test-model",
+            "prompt": "hi",
+            "max_tokens": 8,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": _INVALID_SCHEMA},
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    err = resp.json()["error"]
+    assert err["code"] == "unsupported_response_format"
+    assert err["type"] == "invalid_request_error"
+    assert engine.guided_calls == []
+    assert engine.chat_calls == []
 
 
 def test_responses_strict_stream_rejected_before_generation(_rate_limiter_state):

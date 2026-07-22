@@ -28,54 +28,23 @@ Two constraint modes are supported, matching the two the OpenAI
 import logging
 from typing import Any
 
-# Re-exported from the dependency-free ``errors`` module so lightweight
-# consumers (the app-startup exception handler, route modules) never have to
-# import THIS module — which triggers native MLX / llguidance init — just to
-# reference the exception or its 400 envelope. Kept importable here for
-# backward compatibility.
-from .errors import (
-    GuidedSchemaCompileError,
-    guided_schema_compile_error_detail,
-    stamp_compile_error_param,
-)
-
-__all__ = [
-    "GuidedGenerator",
-    "GuidedSchemaCompileError",
-    "generate_with_schema",
-    "guided_schema_compile_error_detail",
-    "is_guided_available",
-    "stamp_compile_error_param",
-]
+# ``GuidedSchemaCompileError`` originally lived in THIS module; it now lives in
+# the dependency-free ``errors`` module (so the app-startup exception handler
+# and route modules can reference it without triggering native MLX / llguidance
+# init). Re-imported here — it is both used below (``_decode_constrained``
+# raises it) and kept importable as ``vllm_mlx.api.guided.GuidedSchemaCompileError``
+# for backward compatibility. The 400-envelope builder and the param-stamp
+# helper live in ``errors`` and are imported directly from there by consumers.
+#
+# NOTE: deliberately NO ``__all__`` — this module has long exported its public
+# names (``GuidedGenerator``, ``generate_with_schema``, ``is_guided_available``,
+# ``json_schema_to_pydantic``, ``LLMatcher`` …) implicitly via
+# ``from vllm_mlx.api.guided import *``. Adding an ``__all__`` would silently
+# hide every name not listed, breaking existing ``import *`` consumers; leaving
+# it off keeps all module-level public names exported.
+from .errors import GuidedSchemaCompileError
 
 logger = logging.getLogger(__name__)
-
-
-def _schema_invalid_reason(json_schema: Any) -> str | None:
-    """Return a short reason iff ``json_schema`` is NOT a valid JSON Schema.
-
-    This is the llguidance-AGNOSTIC discriminator between a genuine client
-    fault (→ HTTP 400) and an operational llguidance failure on a
-    structurally-valid schema (→ the runtime-failure path, NOT a 400). It runs
-    the caller's schema through the same dynamic-draft ``jsonschema``
-    ``check_schema`` the strict-route preflight uses, so both surfaces agree
-    on what "invalid schema" means.
-
-    A missing/broken ``jsonschema`` (a SERVER dependency failure) or any
-    non-schema error is treated as "cannot confirm invalid" → ``None``, so a
-    server-side problem is NEVER fabricated into a client 400.
-    """
-    try:
-        from .tool_calling import check_schema_validity
-
-        ok, reason = check_schema_validity(json_schema)
-    except Exception:
-        # jsonschema import failure / unexpected error: do not claim the
-        # client's schema is invalid on a server-side fault.
-        return None
-    if ok:
-        return None
-    return reason or "invalid JSON Schema document"
 
 
 # MUST install the MLX hardware-compat shim BEFORE the `mlx_lm` import below.
@@ -565,33 +534,22 @@ class GuidedGenerator:
         """
         import json as _json
 
-        # PRIMARY DEFENSE — validate the schema UP FRONT, before llguidance is
-        # ever invoked. A structurally-invalid JSON Schema is a deterministic
-        # CLIENT fault regardless of what the compiler does with it. If we
-        # deferred this to "llguidance raised", a tolerant or unavailable
-        # compiler that returned ``None`` / succeeded on a validator-invalid
-        # schema would slip straight through to the unconstrained HTTP 200
-        # fallback — the exact P1-③ silent-degrade this fix exists to kill.
-        # Raising here (→ HTTP 400) closes that hole independently of compiler
-        # behaviour.
-        schema_invalid_reason = _schema_invalid_reason(json_schema)
-        if schema_invalid_reason is not None:
-            logger.error(
-                "Invalid response_format JSON Schema (rejected up-front by a "
-                "standard validator, before llguidance): %s",
-                schema_invalid_reason,
-            )
-            raise GuidedSchemaCompileError(schema_invalid_reason)
-
         schema_str = _json.dumps(json_schema)
 
-        # SECONDARY NET — the schema is valid per an independent validator, so
-        # from here ANY llguidance failure is OPERATIONAL (an unsupported
-        # construct the validator tolerates, a tokenizer/model-compat issue, an
-        # internal compiler limit), NOT a caller fault. Every arm degrades to
-        # ``None`` (→ best-effort fallback / strict 502) — NEVER a misleading
-        # 400 that would leak a server-internal diagnostic and tell the caller
-        # to fix a perfectly valid schema.
+        # STRUCTURAL VALIDATION HAPPENS ONCE, AT THE ROUTE BOUNDARY
+        # (``nonstrict_json_schema_boundary_error`` for non-strict +
+        # ``check_schema_validity`` strict pre-flight). Any schema reaching this
+        # method is therefore already structurally VALID, so this layer does NO
+        # structural re-check (validate-once — no duplicate work, nothing run on
+        # the event-loop/executor thread twice). Consequently EVERY llguidance
+        # failure here is OPERATIONAL — an unsupported-but-valid construct, a
+        # tokenizer/model-compat issue, an internal compiler limit, or a
+        # truncated parse — NOT a caller fault. All arms degrade to ``None``,
+        # which the engine turns into the operational path (strict → sanitized
+        # 502, non-strict → best-effort unconstrained 200), NEVER a 400. (The
+        # engine-layer + route-level ``GuidedSchemaCompileError`` handling
+        # remains only as defense-in-depth for any future path that reaches the
+        # guided layer without the boundary check.)
         try:
             grammar = LLMatcher.grammar_from_json_schema(
                 schema_str,
@@ -604,27 +562,18 @@ class GuidedGenerator:
                 temperature=temperature,
             )
         except GuidedSchemaCompileError:
-            # llguidance rejected LAZILY at matcher construction
-            # (``matcher.get_error()``) a schema the validator ACCEPTS → treat
-            # as operational and degrade, do not 400.
+            # llguidance rejected the (structurally-valid) schema LAZILY at
+            # matcher construction (``matcher.get_error()``) → operational.
             logger.error(
-                "guided decode: llguidance rejected a schema a standard "
-                "JSON-Schema validator accepts — treating as operational and "
-                "degrading to the runtime-failure path (None), not a 400."
-            )
-            return None
-        except ValueError:
-            # llguidance rejected EAGERLY at ``grammar_from_json_schema`` a
-            # schema the validator accepts → also operational → None.
-            logger.exception(
-                "Guided generation: operational ValueError on a schema a "
-                "standard validator accepts — degrading to the runtime-failure "
-                "path (None), not a 400."
+                "guided decode: llguidance rejected a structurally-valid schema "
+                "(operational) — degrading to the runtime-failure path (None), "
+                "not a 400."
             )
             return None
         except Exception:
-            # Any other runtime/decode failure stays a graceful ``None``
-            # (guided-unavailable) for best-effort callers.
+            # Any other runtime/decode failure (incl. an eager ``ValueError``
+            # from ``grammar_from_json_schema``) stays a graceful ``None``
+            # (operational / guided-unavailable) for best-effort callers.
             logger.exception("Guided generation failed")
             return None
 

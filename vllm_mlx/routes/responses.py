@@ -64,6 +64,7 @@ from ..api.tool_calling import (
     convert_tools_for_template,
     extract_json_schema_for_guided,
     is_strict_json_schema,
+    nonstrict_json_schema_boundary_error,
     validate_output_against_schema,
 )
 from ..api.utils import (
@@ -383,28 +384,17 @@ async def create_response(request: Request):
         # Counter tick mirrors the chat-route gate so the operator
         # dashboards see uniform traffic shape across both surfaces.
         _rf = getattr(openai_request, "response_format", None)
-        # ROUTE-BOUNDARY schema validation (0.10.16 dogfood P1-③), parity with
-        # the chat route. A structurally-invalid ``text.format.schema`` is a
-        # client fault → 400 on EVERY path, BEFORE the guided-capability check /
-        # fallback / engine dispatch. /v1/responses only guides STRICT
-        # json_schema, so a NON-strict json_schema with an invalid schema would
-        # otherwise skip validation entirely and silently degrade to a 200 with
-        # unconstrained output. Strict requests are handled by the more specific
-        # ``invalid_strict_schema`` gate just below.
-        if _rf is not None and not is_strict_json_schema(_rf):
-            _boundary_schema = extract_json_schema_for_guided(_rf)
-            if _boundary_schema:
-                _b_ok, _b_reason = check_schema_validity(_boundary_schema)
-                if not _b_ok:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=guided_schema_compile_error_detail(
-                            GuidedSchemaCompileError(
-                                _b_reason or "invalid JSON Schema document"
-                            ),
-                            param=RESPONSES_TEXT_FORMAT_PARAM,
-                        ),
-                    )
+        # ROUTE-BOUNDARY schema validation (0.10.16 dogfood P1-③), the SAME
+        # single structural-validation gate the chat route uses. /v1/responses
+        # only guides STRICT json_schema, so a NON-strict json_schema with an
+        # invalid schema would otherwise skip validation entirely and silently
+        # degrade to a 200 with unconstrained output. Strict requests are
+        # handled by the more specific ``invalid_strict_schema`` gate below.
+        _boundary_err = nonstrict_json_schema_boundary_error(
+            _rf, RESPONSES_TEXT_FORMAT_PARAM
+        )
+        if _boundary_err is not None:
+            raise HTTPException(status_code=400, detail=_boundary_err)
         if is_strict_json_schema(_rf):
             _schema = extract_json_schema_for_guided(_rf)
             incr_strict_request()
