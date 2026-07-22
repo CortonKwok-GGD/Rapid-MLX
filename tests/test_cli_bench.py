@@ -111,7 +111,7 @@ def test_bench_command_prefetches_via_mirror_before_hf_load(monkeypatch) -> None
     # detect_model_config). The order test doesn't depend on it.
     monkeypatch.setattr(
         "vllm_mlx.pflash.resolve_pflash_mode_default",
-        lambda args, *, model_name: "off",
+        lambda args, *, model_name, is_multimodal=False: "off",
     )
     # Route the ``from mlx_lm import load`` inside bench_command to
     # our mock. Patching ``mlx_lm.load`` on the module object makes
@@ -160,7 +160,7 @@ def test_bench_command_proceeds_when_mirror_prefetch_is_silent_noop(
     monkeypatch.setattr(cli, "_ensure_model_downloaded", _silent_prefetch)
     monkeypatch.setattr(
         "vllm_mlx.pflash.resolve_pflash_mode_default",
-        lambda args, *, model_name: "off",
+        lambda args, *, model_name, is_multimodal=False: "off",
     )
     _patch_mlx_lm_load(monkeypatch, _fake_load)
 

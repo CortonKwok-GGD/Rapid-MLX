@@ -114,6 +114,7 @@ from .api.utils import (
     extract_json_from_response,  # noqa: F401
     extract_multimodal_content,  # noqa: F401
     is_mllm_model,  # noqa: F401
+    mllm_backbone_is_hybrid,  # noqa: F401
     sanitize_output,  # noqa: F401
     strip_special_tokens,  # noqa: F401
     strip_thinking_tags,  # noqa: F401
@@ -1514,6 +1515,39 @@ def load_model(
                 "pick at most one to override auto-detection. "
                 "(alias pins is_text_only=True but --mllm was also given)"
             )
+
+    # Hybrid/linear-attention VLM checkpoints (e.g. Qwen3.5/3.6 GatedDeltaNet
+    # with a vision tower) auto-route to the MLLM lane on their vision weights,
+    # but the MLLM continuous-batching engine cannot build a BatchKVCache over
+    # an ArraysCache backbone (GitHub #352). Left alone, the naive
+    # ``rapid-mlx serve <flagship>`` command boots into the MLLM lane and then
+    # raises a RuntimeError telling the user to "Drop --mllm" — a flag they
+    # never set. Fall back to the text-only mlx-lm lane HERE, at the routing
+    # layer, with one clear INFO line. The dense text lane serves the
+    # GatedDeltaNet backbone coherently and keeps ``is_hybrid=False`` (avoiding
+    # the metal::malloc throttle wedge the 4B/9B/27B dense variants hit under
+    # the hybrid scheduler path — see model_auto_config r6-A R6-C1). Only fires
+    # in auto mode: an explicit ``--mllm`` (force_mllm) is respected so the
+    # operator who insists on the multimodal path gets the engine's own #352
+    # error rather than a silent override. The config probe is offline and
+    # never loads weights. #352 dogfood P1-② (0.10.16).
+    if (
+        not force_text
+        and not force_mllm
+        and is_mllm_model(model_name)
+        and mllm_backbone_is_hybrid(model_name)
+    ):
+        logger.info(
+            "Model %r is a multimodal checkpoint with a hybrid/linear-attention "
+            "language backbone, which the MLLM continuous-batching engine cannot "
+            "serve (GitHub #352). Routing to the text-only mlx-lm lane; the "
+            "vision path is unavailable for this backbone. Pass --mllm to force "
+            "the multimodal engine (it will error), or --no-mllm to silence "
+            "this notice.",
+            model_name,
+        )
+        force_text = True
+
     try:
         gen_cfg = load_generation_config_sampling(model_name)
     except Exception as _e:  # pragma: no cover — defensive belt-and-suspenders
@@ -2415,13 +2449,20 @@ Examples:
     # Per-alias PFlash default (#287): verified Qwen3.5 / Qwen3.6 aliases
     # switch to ``always`` when the user passes no ``--pflash`` flag; all
     # other aliases keep the conservative ``off``. Explicit overrides win.
-    args.pflash = _server_pflash_resolve_default(args, model_name=args.model)
+    # Compute the multimodal verdict ONCE: it both suppresses the
+    # verified-tier PFlash auto-enable (PFlash can't serve the MLLM lane —
+    # #352 dogfood P1-②) and drives the explicit-override rejection in
+    # ``validate_model_support``.
+    _srv_is_mllm = getattr(args, "mllm", False) or is_mllm_model(args.model)
+    args.pflash = _server_pflash_resolve_default(
+        args, model_name=args.model, is_multimodal=_srv_is_mllm
+    )
     try:
         server_pflash_config = _server_pflash_config_from_args(args)
         _server_pflash_validate(
             server_pflash_config,
             model_name=args.model,
-            is_mllm=getattr(args, "mllm", False) or is_mllm_model(args.model),
+            is_mllm=_srv_is_mllm,
         )
     except ValueError as e:
         parser.error(str(e))

@@ -242,6 +242,27 @@ class TestResolvePFlashModeDefault:
         mode = resolve_pflash_mode_default(self._ns(None), model_name="qwen3.5-4b-4bit")
         assert mode == "always"
 
+    def test_verified_alias_multimodal_suppresses_always(self):
+        # A verified alias that ALSO routes multimodally (a vision-config
+        # Qwen3.6-27B checkpoint is both) must NOT auto-enable PFlash — the
+        # MLLM lane is rejected by validate_model_support, so the naive
+        # default-serve command would otherwise die on a --pflash flag the
+        # user never set (#352 dogfood P1-②). The caller passes the same
+        # is_mllm verdict it feeds validate_model_support.
+        mode = resolve_pflash_mode_default(
+            self._ns(None), model_name="qwen3.5-4b-4bit", is_multimodal=True
+        )
+        assert mode == "off"
+
+    def test_explicit_always_wins_even_when_multimodal(self):
+        # is_multimodal only suppresses the AUTO tier default; an explicit
+        # --pflash always still wins (and is then rejected loudly downstream
+        # by validate_model_support — the user asked for it).
+        mode = resolve_pflash_mode_default(
+            self._ns("always"), model_name="qwen3.5-4b-4bit", is_multimodal=True
+        )
+        assert mode == "always"
+
     def test_unknown_alias_with_no_flag_defaults_to_off(self):
         # qwen3-0.6b-4bit is an explicit non-Qwen3.5/3.6 entry; its
         # default pflash_tier is "unknown".

@@ -2418,13 +2418,20 @@ def serve_command(args):
         validate_model_support,
     )
 
-    args.pflash = resolve_pflash_mode_default(args, model_name=args.model)
+    # Compute the multimodal verdict ONCE: it both suppresses the
+    # verified-tier PFlash auto-enable (PFlash can't serve the MLLM lane —
+    # #352 dogfood P1-②) and drives the explicit-override rejection in
+    # ``validate_model_support``.
+    _serve_is_mllm = getattr(args, "mllm", False) or is_mllm_model(args.model)
+    args.pflash = resolve_pflash_mode_default(
+        args, model_name=args.model, is_multimodal=_serve_is_mllm
+    )
     try:
         pflash_config = config_from_args(args)
         validate_model_support(
             pflash_config,
             model_name=args.model,
-            is_mllm=getattr(args, "mllm", False) or is_mllm_model(args.model),
+            is_mllm=_serve_is_mllm,
         )
     except ValueError as e:
         print(f"Error: {e}")
@@ -4104,13 +4111,16 @@ def bench_command(args):
     # bench previously skipped this check, so ``rapid-mlx bench
     # --pflash always <mllm-alias>`` would admit a combo PFlash
     # explicitly rejects elsewhere).
-    args.pflash = _pflash_resolve_default(args, model_name=args.model)
+    _bench_is_mllm = getattr(args, "mllm", False) or _bench_is_mllm_model(args.model)
+    args.pflash = _pflash_resolve_default(
+        args, model_name=args.model, is_multimodal=_bench_is_mllm
+    )
     try:
         bench_pflash_config = _pflash_config_from_args(args)
         _bench_pflash_validate(
             bench_pflash_config,
             model_name=args.model,
-            is_mllm=getattr(args, "mllm", False) or _bench_is_mllm_model(args.model),
+            is_mllm=_bench_is_mllm,
         )
     except ValueError as e:
         print(f"Error: {e}")

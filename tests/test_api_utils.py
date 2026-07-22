@@ -845,6 +845,99 @@ class TestIsMllmModelCachedMetadata:
         assert _try_read_hub_config_json("just-a-name") is None
 
 
+class TestMllmBackboneIsHybrid:
+    """A multimodal checkpoint whose language backbone is linear-attention /
+    recurrent (ArraysCache) cannot be served by the MLLM continuous-batching
+    engine (#352); the routing layer must be able to detect that offline."""
+
+    @staticmethod
+    def _meta(config):
+        from vllm_mlx.model_metadata import ModelMetadata
+
+        return ModelMetadata(config=config, chat_template=None, snapshot_dir=None)
+
+    def _patch(self, monkeypatch, config):
+        from vllm_mlx.api import utils as utils_mod
+
+        monkeypatch.setattr(
+            utils_mod, "read_model_metadata", lambda name: self._meta(config)
+        )
+
+    def test_gated_deltanet_layer_types_is_hybrid(self, monkeypatch):
+        from vllm_mlx.api.utils import mllm_backbone_is_hybrid
+
+        # Qwen3.5/3.6 shape: linear_attention layers interleaved with
+        # full_attention, config nested under text_config, vision tower present.
+        self._patch(
+            monkeypatch,
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "layer_types": [
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ],
+                },
+            },
+        )
+        assert mllm_backbone_is_hybrid("any/qwen3.5-like") is True
+
+    def test_sliding_and_full_attention_is_not_hybrid(self, monkeypatch):
+        from vllm_mlx.api.utils import mllm_backbone_is_hybrid
+
+        # Gemma-4 shape: sliding_attention + full_attention → RotatingKVCache,
+        # which the MLLM engine handles. NOT a linear-attention backbone.
+        self._patch(
+            monkeypatch,
+            {
+                "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+                "vision_config": {"hidden_size": 1024},
+                "text_config": {
+                    "model_type": "gemma4_unified_text",
+                    "layer_types": [
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                },
+            },
+        )
+        assert mllm_backbone_is_hybrid("any/gemma4-like") is False
+
+    def test_recurrent_model_type_without_layer_types_is_hybrid(self, monkeypatch):
+        from vllm_mlx.api.utils import mllm_backbone_is_hybrid
+
+        # A pure Mamba/recurrent backbone that does not enumerate layer_types.
+        self._patch(
+            monkeypatch,
+            {"architectures": ["SomeVLM"], "model_type": "mamba2_vlm"},
+        )
+        assert mllm_backbone_is_hybrid("any/mamba-vlm") is True
+
+    def test_missing_metadata_returns_false(self, monkeypatch):
+        from vllm_mlx.api import utils as utils_mod
+        from vllm_mlx.api.utils import mllm_backbone_is_hybrid
+
+        # No config → unknown → False (never removes multimodal routing from a
+        # checkpoint we cannot positively classify as hybrid).
+        monkeypatch.setattr(utils_mod, "read_model_metadata", lambda name: None)
+        assert mllm_backbone_is_hybrid("any/unknown") is False
+
+    def test_plain_attention_top_level_config_is_not_hybrid(self, monkeypatch):
+        from vllm_mlx.api.utils import mllm_backbone_is_hybrid
+
+        # Non-nested config, ordinary transformer → not hybrid.
+        self._patch(
+            monkeypatch,
+            {"model_type": "llama", "num_hidden_layers": 32},
+        )
+        assert mllm_backbone_is_hybrid("any/llama-like") is False
+
+
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content function."""
 

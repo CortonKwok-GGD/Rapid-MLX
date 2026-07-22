@@ -154,7 +154,9 @@ def config_from_args(args: Any) -> PFlashConfig:
     ).validate()
 
 
-def resolve_pflash_mode_default(args: Any, *, model_name: str) -> str:
+def resolve_pflash_mode_default(
+    args: Any, *, model_name: str, is_multimodal: bool = False
+) -> str:
     """Resolve ``args.pflash`` when the user passed nothing on the CLI.
 
     Per-alias tier-based default (#287 alias-profile integration):
@@ -167,9 +169,24 @@ def resolve_pflash_mode_default(args: Any, *, model_name: str) -> str:
 
       - ``"verified"`` → ``"always"``  (Qwen3.5 / Qwen3.6 family, bench
         evidence in PR #649: 3.87x-8.5x TTFT speedup at keep_ratio=0.20
-        with 100% needle recall across tested cells).
+        with 100% needle recall across tested cells) — UNLESS the model is
+        multimodal, see below.
       - anything else → ``"off"`` (today's behaviour preserved for every
         alias we haven't measured).
+
+    ``is_multimodal`` — the SAME ``is_mllm`` verdict the caller passes to
+    :func:`validate_model_support` — suppresses the verified-tier
+    ``"always"`` promotion. PFlash cannot serve the MLLM/VLM lane
+    (``validate_model_support`` rejects it), so a verified alias that is
+    ALSO multimodal (a vision-config Qwen3.6-27B checkpoint is both) must
+    NOT auto-enable PFlash — otherwise the naive ``rapid-mlx serve
+    <flagship>`` command dies on ``--pflash is not supported for
+    multimodal models``, a flag the user never set (#352 dogfood P1-②).
+    An explicit ``--pflash always`` still wins via the early return above
+    and, for the MLLM lane, errors loudly in ``validate_model_support`` —
+    the user asked for it, so they get the actionable message. Defaults to
+    ``False`` so callers that don't route multimodally (and the unit tests)
+    keep the pure tier-based behaviour.
 
     The result is the string to assign back to ``args.pflash`` before
     calling :func:`config_from_args`. Splitting resolution from
@@ -196,15 +213,31 @@ def resolve_pflash_mode_default(args: Any, *, model_name: str) -> str:
         return "off"
     cfg = detect_model_config(model_name)
     if cfg is not None and cfg.pflash_tier == "verified":
+        # A multimodal (MLLM/VLM) model can NOT run PFlash — the MLLM lane
+        # is rejected outright by ``validate_model_support``. Auto-enabling
+        # the verified-tier default for such an alias makes the naive
+        # ``rapid-mlx serve <flagship>`` command die on a ``--pflash`` flag
+        # the user never set (a vision-config Qwen3.6-27B checkpoint is
+        # pflash_tier=verified AND multimodal — #352 dogfood P1-②). Leave
+        # PFlash off in that case. Note: this is intentionally scoped to
+        # MULTIMODAL, not hybrid — a hybrid MoE like Qwen3.5-35B-A3B still
+        # has full-attention layers with standard KV to compress and is a
+        # verified PFlash target.
+        if is_multimodal:
+            logging.getLogger(__name__).info(
+                "PFlash default: alias %r is multimodal — leaving PFlash off "
+                "(PFlash cannot serve the MLLM/VLM lane). Pass --pflash always "
+                "to override.",
+                model_name,
+            )
+            return "off"
         # Surface the alias-driven flip at INFO so a developer running
         # ``rapid-mlx bench qwen3.5-4b-4bit`` immediately sees that
         # PFlash is on by default — the verified-tier policy is
         # uniform across ``serve``/``bench`` by design, but the bench
         # workflow specifically expects to see what mode is being
         # measured (codex r4 BLOCKING called out this surprise).
-        import logging as _logging
-
-        _logging.getLogger(__name__).info(
+        logging.getLogger(__name__).info(
             "PFlash default: alias %r is pflash_tier=verified — "
             "engine defaults to --pflash always. Pass --pflash off to "
             "compare against the no-compression baseline.",
