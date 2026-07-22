@@ -30,6 +30,29 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+class GuidedSchemaCompileError(Exception):
+    """A caller-supplied structured-output schema/grammar failed to compile.
+
+    This is distinct from a *generic* guided-generation failure (a transient
+    runtime error, a missing ``[guided]`` extra, a slow/absent fast tokenizer,
+    or a parse truncated by ``max_tokens``). Those degrade to ``None`` and,
+    for best-effort/suggestion-only requests, MAY fall back to unconstrained
+    generation.
+
+    A compile error means the CLIENT's own
+    ``response_format.json_schema.schema`` is invalid — a deterministic,
+    request-level fault (e.g. ``{"type": "notatype"}``). The route layer
+    translates it into an HTTP 400 (non-streaming) or a terminal SSE error
+    envelope (streaming) instead of silently degrading to unconstrained
+    output, so a caller who asked for a hard schema guarantee is never left
+    believing their output is constrained when it is not.
+
+    Defined ABOVE the optional ``llguidance`` import block so it is always
+    importable, even on installs without the ``[guided]`` extra.
+    """
+
+
 # MUST install the MLX hardware-compat shim BEFORE the `mlx_lm` import below.
 # Even though the import is inside a `try`, the body still runs at module
 # load time; on success it triggers `mlx_lm/__init__.py` → `mlx_lm.generate`
@@ -332,11 +355,17 @@ class GuidedGenerator:
              the same cache.
 
         Returns the decoded text ONLY when the grammar reached an accepting
-        (fully-satisfied) state; ``None`` otherwise — i.e. if the grammar
-        failed to compile, the tokenizer was unavailable, generation was
-        truncated by ``max_tokens`` mid-object, or a token was rejected
-        mid-parse. An incomplete result is never returned to the caller,
-        which treats ``None`` as guided-unavailable (strict-mode 422).
+        (fully-satisfied) state; ``None`` otherwise — i.e. if the tokenizer
+        was unavailable, generation was truncated by ``max_tokens``
+        mid-object, or a token was rejected mid-parse. An incomplete result is
+        never returned to the caller, which treats ``None`` as
+        guided-unavailable (strict-mode 422).
+
+        Raises ``GuidedSchemaCompileError`` when the grammar itself fails to
+        compile (invalid caller schema). This is deliberately NOT folded into
+        the ``None`` return: an invalid schema is a caller fault the route
+        must surface as an HTTP 400, not silently degrade to unconstrained
+        output.
         """
         from mlx_lm.models.cache import make_prompt_cache
 
@@ -352,8 +381,16 @@ class GuidedGenerator:
         matcher = LLMatcher(lltok, grammar)
         err = matcher.get_error()
         if err:
+            # A non-empty error here means the grammar the caller asked us to
+            # enforce does not compile (e.g. an invalid JSON-schema ``type``).
+            # This is a deterministic, caller-visible fault — raise rather than
+            # returning ``None`` so it is DISTINGUISHABLE from a benign
+            # guided-unavailable / truncated-parse ``None``. Returning ``None``
+            # here previously let the engine swallow an invalid schema into a
+            # silent unconstrained fallback (HTTP 200 with free-form text); the
+            # route now surfaces the compile error as an HTTP 400.
             logger.error("llguidance grammar/compile error: %s", err)
-            return None
+            raise GuidedSchemaCompileError(str(err))
 
         vocab = lltok.vocab_size
         bitmask = allocate_token_bitmask(1, vocab)
@@ -493,20 +530,40 @@ class GuidedGenerator:
         valid JSON *array* where the schema required an object. The dict is
         handed to llguidance directly.
         """
-        try:
-            import json as _json
+        import json as _json
 
-            schema_str = _json.dumps(json_schema)
+        schema_str = _json.dumps(json_schema)
+
+        # Compile the schema FIRST, in its own try. A failure to turn the
+        # caller's schema into a grammar (llguidance raising, or an unparseable
+        # schema) is an invalid REQUEST, not a transient runtime fault — surface
+        # it as ``GuidedSchemaCompileError`` so the route returns HTTP 400
+        # instead of silently degrading to unconstrained generation.
+        try:
             grammar = LLMatcher.grammar_from_json_schema(
                 schema_str,
                 overrides={"whitespace_flexible": True},
             )
+        except GuidedSchemaCompileError:
+            raise
+        except Exception as e:
+            logger.error("llguidance schema compile error: %s", e)
+            raise GuidedSchemaCompileError(str(e)) from e
+
+        # Decode. ``_decode_constrained`` may ALSO raise
+        # ``GuidedSchemaCompileError`` (the invalid-schema error surfaces at
+        # matcher construction, not at ``grammar_from_json_schema``) — let it
+        # propagate. Any OTHER failure is a runtime/decode problem that stays a
+        # graceful ``None`` (guided-unavailable) for best-effort callers.
+        try:
             return self._decode_constrained(
                 grammar=grammar,
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+        except GuidedSchemaCompileError:
+            raise
         except Exception:
             logger.exception("Guided generation failed")
             return None
@@ -588,6 +645,10 @@ def generate_with_schema(
             max_tokens=max_tokens,
             temperature=temperature,
         )
+    except GuidedSchemaCompileError:
+        # Invalid caller schema — propagate so the route can 400 rather than
+        # swallow it into a silent unconstrained fallback.
+        raise
     except Exception as e:
         logger.error(f"generate_with_schema failed: {e}")
         return None

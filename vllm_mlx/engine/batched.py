@@ -637,12 +637,22 @@ def _compute_metal_cache_limit(soft_limit_bytes: int) -> int:
 
 # Check for guided generation availability
 try:
-    from ..api.guided import GuidedGenerator, is_guided_available
+    from ..api.guided import (
+        GuidedGenerator,
+        GuidedSchemaCompileError,
+        is_guided_available,
+    )
 
     HAS_GUIDED = is_guided_available()
 except ImportError:
     HAS_GUIDED = False
     GuidedGenerator = None
+
+    # Placeholder so ``except GuidedSchemaCompileError`` below never NameErrors
+    # when the ``[guided]`` extra is absent. Guided decoding is unavailable in
+    # that case, so no real compile error is ever raised to match against it.
+    class GuidedSchemaCompileError(Exception):  # type: ignore[no-redef]
+        pass
 
 
 def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
@@ -2956,6 +2966,13 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+        except GuidedSchemaCompileError:
+            # The caller's schema does not compile — this is an invalid request,
+            # NOT a transient guided-decode failure. Propagate it so
+            # ``generate_with_schema`` re-raises instead of returning ``None``
+            # and silently falling back to unconstrained ``self.chat(...)`` (an
+            # HTTP 200 with free-form text). The route maps this to HTTP 400.
+            raise
         except Exception as e:
             logger.error(f"Guided generation error: {e}")
             return None

@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from ..api.guided import GuidedSchemaCompileError
 from ..api.models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -3682,6 +3683,31 @@ async def _create_chat_completion_impl(
                 # strict-contract breach shape. Let them propagate
                 # unchanged so the 408 / 499 / 503 mapping kicks in.
                 raise
+            except GuidedSchemaCompileError as compile_err:
+                # The client EXPLICITLY asked to constrain output to this
+                # ``response_format.json_schema.schema`` but the schema does
+                # not compile (e.g. ``{"type": "notatype"}``). This is a
+                # deterministic REQUEST error: returning HTTP 200 with
+                # unconstrained free-form text would silently drop the
+                # guarantee the client relied on. Surface a clean HTTP 400 —
+                # NOT a strict-mode 502 (the schema itself is the fault, not a
+                # server-side soundness breach) and NEVER a silent fallback.
+                # Applies in both strict and non-strict mode: an invalid schema
+                # is malformed input regardless of the strictness flag.
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "response_format.json_schema.schema failed to "
+                                f"compile: {compile_err}"
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "invalid_response_format_schema",
+                            "param": "response_format.json_schema.schema",
+                        }
+                    },
+                ) from compile_err
             except Exception as guided_err:
                 # Codex r6 BLOCKING parity (non-streaming chat path):
                 # under strict=true, falling back to ``engine.chat``
@@ -5500,6 +5526,35 @@ async def stream_chat_completion_guided(
                 raise_on_failure=True,
                 **_guided_kwargs,
             )
+        except GuidedSchemaCompileError as compile_err:
+            # Invalid caller schema (e.g. ``{"type": "notatype"}``). The SSE
+            # response has already committed HTTP 200, so we cannot send a 400
+            # status — but we MUST NOT silently fall back to unconstrained
+            # streaming (that is the exact silent-degrade this fix closes).
+            # Emit a terminal ``invalid_request_error`` SSE envelope + DONE in
+            # BOTH strict and non-strict mode: an invalid schema is malformed
+            # input regardless of the strictness flag, and the caller gets a
+            # clear signal the constraint was rejected rather than dropped.
+            logger.warning(
+                "Guided streaming generation: caller schema failed to "
+                "compile — emitting SSE error envelope, NOT falling back to "
+                "unconstrained streaming: %s",
+                compile_err,
+            )
+            _compile_err_envelope = {
+                "error": {
+                    "message": (
+                        "response_format.json_schema.schema failed to "
+                        f"compile: {compile_err}"
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "invalid_response_format_schema",
+                    "param": "response_format.json_schema.schema",
+                }
+            }
+            yield f"data: {json.dumps(_compile_err_envelope)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         except Exception as guided_err:
             # Log only the schema's top-level shape, not the full body —
             # user-supplied schemas may embed PII (default values),
