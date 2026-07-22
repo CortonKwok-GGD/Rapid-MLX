@@ -118,6 +118,82 @@ def test_invalid_self_closed_function_does_not_hide_next_tool_call() -> None:
     assert _arguments(result.tool_calls[0]) == {"city": "Paris"}
 
 
+def test_malformed_outer_opener_does_not_swallow_a_nested_valid_call() -> None:
+    """An unclosed ``<function>`` must not consume a later call's close tag.
+
+    ``_function_end`` binds the single ``</function>`` to the outer opener,
+    ``ET.fromstring`` then fails on the malformed span; the scanner must
+    resynchronize at the next opener instead of skipping past the nested
+    well-formed call.
+    """
+    result = MiniCPMToolParser().extract_tool_calls(
+        '<function name="outer"><function name="inner">'
+        '<param name="city">Paris</param></function>',
+        _request(),
+    )
+
+    assert result.tools_called is True
+    assert [call["name"] for call in result.tool_calls] == ["inner"]
+    assert _arguments(result.tool_calls[0]) == {"city": "Paris"}
+
+
+def test_valid_call_after_an_unterminated_opener_is_recovered() -> None:
+    """A dangling opener with no close must not abandon later valid calls."""
+    result = MiniCPMToolParser().extract_tool_calls(
+        '<function name="broken"<function name="ok">'
+        '<param name="city">Rome</param></function>',
+        _request(),
+    )
+
+    assert result.tools_called is True
+    assert [call["name"] for call in result.tool_calls] == ["ok"]
+    assert _arguments(result.tool_calls[0]) == {"city": "Rome"}
+
+
+def test_function_tag_inside_unterminated_cdata_is_not_a_tool_call() -> None:
+    """A complete ``<function>`` literal in a still-open CDATA stays data.
+
+    Resynchronization after the outer opener (whose CDATA has no ``]]>``)
+    must not scan into that CDATA and fabricate an executable call from a
+    string literal — everything after the unterminated CDATA is held.
+    """
+    parser = MiniCPMToolParser()
+    text = (
+        '<function name="outer"><param name="x">'
+        '<![CDATA[<function name="evil"></function>'
+    )
+
+    result = parser.extract_tool_calls(text)
+    assert result.tools_called is False
+    assert result.tool_calls == []
+    assert result.content == text
+    # Streaming holds the whole in-flight call; no markup leaks as content.
+    assert parser.extract_tool_calls_streaming("", text, text) is None
+
+
+def test_function_tag_inside_terminated_cdata_is_a_param_value_not_a_call() -> None:
+    """A closed CDATA carrying a ``<function>`` literal is the param value."""
+    result = MiniCPMToolParser().extract_tool_calls(
+        '<function name="a"><param name="x">'
+        '<![CDATA[<function name="evil"></function>]]></param></function>'
+    )
+    assert [call["name"] for call in result.tool_calls] == ["a"]
+    assert _arguments(result.tool_calls[0]) == {
+        "x": '<function name="evil"></function>'
+    }
+
+
+def test_whitespace_padded_param_name_is_stripped_to_the_schema_key() -> None:
+    """Padded ``name`` attributes normalize like the stripped function name."""
+    result = MiniCPMToolParser().extract_tool_calls(
+        '<function name="weather"><param name=" days ">3</param></function>',
+        _request(),
+    )
+
+    assert result.tools_called is True
+    assert _arguments(result.tool_calls[0]) == {"days": 3}
+
+
 def test_streaming_holds_partial_xml_and_emits_each_completed_call_once() -> None:
     parser = MiniCPMToolParser()
     first = 'Intro <function name="weather"><param name="city">San'
@@ -176,6 +252,59 @@ def test_streaming_flushes_partial_opener_after_completed_tool_call() -> None:
     assert event is not None
     assert event["tool_calls"][0]["function"]["name"] == "weather"
     assert parser.flush_held_content(text) == "<fun"
+
+
+def test_streaming_does_not_leak_outer_markup_when_cdata_holds_a_function_tag() -> None:
+    """A ``<function`` inside an unterminated CDATA must not become the hold point.
+
+    ``rfind`` would latch onto the CDATA occurrence and emit the outer
+    opener as content mid-call; the forward CDATA-aware scan holds from the
+    real outer opener so nothing leaks until the call completes.
+    """
+    parser = MiniCPMToolParser()
+    partial = '<function name="run"><param name="cmd"><![CDATA[echo <function'
+
+    assert parser.has_pending_tool_call(partial) is True
+    # Held from the outer opener at index 0 -> no content leaks.
+    assert parser.extract_tool_calls_streaming("", partial, partial) is None
+
+    full = partial + "]]></param></function>"
+    event = parser.extract_tool_calls_streaming(
+        partial, full, full[len(partial) :], request=_request()
+    )
+    assert event is not None
+    assert event["tool_calls"][0]["function"]["name"] == "run"
+    assert _arguments(event["tool_calls"][0]["function"]) == {"cmd": "echo <function"}
+
+
+def test_streaming_recovers_call_after_malformed_opener_matching_batch() -> None:
+    """Malformed-opener recovery must be identical streaming vs. one-shot."""
+    parser = MiniCPMToolParser()
+    text = (
+        '<function name="broken"<function name="ok">'
+        '<param name="city">Rome</param></function>'
+    )
+    batch = MiniCPMToolParser().extract_tool_calls(text, _request())
+
+    event = parser.extract_tool_calls_streaming("", text, text, request=_request())
+    assert event is not None
+    assert (
+        [tc["function"]["name"] for tc in event["tool_calls"]]
+        == [c["name"] for c in batch.tool_calls]
+        == ["ok"]
+    )
+    assert _arguments(event["tool_calls"][0]["function"]) == {"city": "Rome"}
+
+
+def test_flush_matches_streaming_residual_not_raw_text() -> None:
+    """Final flush is computed from the same call-stripped residual as streaming."""
+    parser = MiniCPMToolParser()
+    # Completed call + trailing partial opener: flush releases only the tail.
+    text = '<function name="weather"><param name="city">Rome</param></function><fun'
+    assert parser.flush_held_content(text) == "<fun"
+    # No pending opener after a fully-formed call: nothing to release.
+    done = '<function name="weather"><param name="city">Rome</param></function> done'
+    assert parser.flush_held_content(done) == ""
 
 
 def test_streaming_content_and_final_flush_behave_like_plain_text() -> None:
