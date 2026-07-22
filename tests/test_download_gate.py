@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -983,15 +983,34 @@ def test_is_weightless_stub_false_on_non_string_cache_sentinel(monkeypatch):
     assert gate.is_weightless_stub("mlx-community/known-absent") is False
 
 
-def test_is_weightless_stub_false_for_local_path(tmp_path, monkeypatch):
-    """A local directory path short-circuits to False without touching HF —
-    ``serve /path/to/model`` is never a 'stub'."""
-    _patch_try_to_load(
-        monkeypatch,
-        None,
+def test_is_weightless_stub_false_for_local_path_without_touching_hf(
+    tmp_path, monkeypatch
+):
+    """A local directory path short-circuits to False via ``os.path.exists``
+    WITHOUT any HF cache lookup — ``serve /path/to/model`` is never a 'stub'.
+
+    Deleting that short-circuit must turn this test RED. The HF loaders are
+    wired to fail-and-record (``side_effect=AssertionError``), and we assert
+    they were never invoked. The recorded-call assertion is the load-bearing
+    check: ``is_weightless_stub`` wraps its body in a broad ``except
+    Exception`` that would swallow the raised AssertionError and still return
+    False, so a raise alone (or the old ``return None`` mock) wouldn't catch
+    the regression — ``assert_not_called`` does."""
+    import huggingface_hub
+
+    load_from_cache = MagicMock(
+        side_effect=AssertionError("must not touch the HF cache for a local path")
     )
-    # Even a real dir on disk must return False by the os.path.exists guard.
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", load_from_cache)
+    repo_cached = MagicMock(
+        side_effect=AssertionError("must not probe weights for a local path")
+    )
+    monkeypatch.setattr(gate, "is_repo_cached", repo_cached)
+
+    # A real directory on disk → the os.path.exists guard returns False first.
     assert gate.is_weightless_stub(str(tmp_path)) is False
+    load_from_cache.assert_not_called()
+    repo_cached.assert_not_called()
 
 
 def test_is_weightless_stub_false_on_internal_error(monkeypatch):
