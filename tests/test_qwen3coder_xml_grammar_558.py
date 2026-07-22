@@ -100,6 +100,25 @@ XML_REF_TOOL = [
 ]
 
 
+# A tool whose ONLY property is a ``$ref`` resolving to a STRING (F3). Before the
+# fix, ``$defs`` were attached only AFTER the string-vs-``%json`` decision, so this
+# ``$ref`` fell through to ``%json`` and emitted QUOTED JSON the parser returned
+# with quotes preserved (``"\\"Paris\\""``). The fix resolves the ``$ref`` FIRST so
+# it takes the RAW lazy path and round-trips WITHOUT quotes.
+XML_REF_STRING_TOOL = [
+    {
+        "name": "geo",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"$ref": "#/$defs/City"}},
+            "required": ["city"],
+            "$defs": {"City": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+]
+
+
 def _xml_structure_info(name: str):
     """The Qwen3-Coder XML wire triple, exactly as ``Qwen3CoderToolParser``
     ships it (``arg_style="xml"``). Declared test-locally so the pure-Python
@@ -653,3 +672,223 @@ def test_roundtrip_nested_object_value():
     name, args = _parse(wire, XML_REF_TOOL)
     assert name == "place"
     assert args["origin"] == {"x": 3, "y": 4}
+
+
+# ==========================================================================
+# FAITHFUL-OR-OPT-OUT (#558 E3, codex converge). The XML arg emitter is a
+# best-effort OPT-IN: when it cannot FAITHFULLY represent a schema the WHOLE
+# request opts out of grammar (``build_tool_grammar`` -> ``None``, free-form
+# fallback) rather than emit a grammar that silently allows schema-invalid or
+# mis-typed output. One test per BLOCKING finding (F1/F2/F4/F5 as opt-out, F3 as
+# a REAL fix). Pure-Python guard tests always run; the ``build_tool_grammar``
+# integration tests skip only on genuine tokenizer/llguidance unavailability.
+# ==========================================================================
+
+
+# ---- Pure-Python representability guard (always runs) --------------------
+def test_representable_common_and_noarg_schemas():
+    # The common case + a genuine no-arg tool MUST stay representable (no
+    # regression): typed properties, enums, required + optional, empty body.
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    assert rep(XML_TOOLS[0]["parameters"]) is True
+    assert rep(XML_REF_TOOL[0]["parameters"]) is True  # $ref -> object
+    assert rep(XML_REF_STRING_TOOL[0]["parameters"]) is True  # $ref -> string
+    assert rep({"type": "object", "properties": {}, "additionalProperties": False})
+    assert rep({}) is True  # allow-any / no-arg
+
+
+def test_representable_rejects_f1_property_less_but_nontrivial():
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    # F1: `false` schema (accepts no instance).
+    assert rep(False) is False
+    # F1: property-less but has `required`.
+    assert rep({"type": "object", "required": ["a"]}) is False
+    # F1: top-level `$ref` with no inline properties.
+    assert rep({"$ref": "#/$defs/x", "$defs": {"x": {"type": "object"}}}) is False
+    # F1 (spirit): a non-object top-level type has no XML parameter body.
+    assert rep({"type": "array"}) is False
+
+
+def test_representable_rejects_f2_string_facets():
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    for facet in ("pattern", "minLength", "maxLength", "format", "const"):
+        params = {
+            "type": "object",
+            "properties": {
+                "s": {"type": "string", facet: "x" if facet != "minLength" else 2}
+            },
+        }
+        assert rep(params) is False, facet
+    # Enum (already enforced as an alternation) stays representable.
+    assert rep({"properties": {"s": {"type": "string", "enum": ["a", "b"]}}}) is True
+    # A `$ref` -> string carrying a facet is caught AFTER resolution (F2 + F3).
+    assert (
+        rep(
+            {
+                "properties": {"c": {"$ref": "#/$defs/C"}},
+                "$defs": {"C": {"type": "string", "pattern": "^x$"}},
+            }
+        )
+        is False
+    )
+
+
+def test_representable_rejects_f4_object_level_keywords():
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    props = {"a": {"type": "string"}, "b": {"type": "string"}}
+    for kw, val in (
+        ("dependentRequired", {"a": ["b"]}),
+        ("dependencies", {"a": ["b"]}),
+        ("if", {}),
+        ("then", {}),
+        ("else", {}),
+        ("not", {}),
+        ("patternProperties", {"^x": {"type": "string"}}),
+        ("allOf", [{}]),
+        ("anyOf", [{}]),
+        ("oneOf", [{}]),
+    ):
+        assert rep({"type": "object", "properties": props, kw: val}) is False, kw
+
+
+def test_representable_rejects_f5_delimiter_unsafe_keys():
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    for bad in ("x>y", "x<y", "a:b", "a,b", "a b", "a\nb", "a{b", "a}b"):
+        assert rep({"properties": {bad: {"type": "string"}}}) is False, bad
+    # A normal [\w-]+ key stays representable.
+    assert rep({"properties": {"my_key-1": {"type": "string"}}}) is True
+
+
+def test_representable_unresolvable_ref_opts_out():
+    from vllm_mlx.api.tool_grammar import _xml_schema_representable as rep
+
+    # A property `$ref` that does not resolve locally is unrepresentable.
+    assert rep({"properties": {"c": {"$ref": "#/$defs/missing"}, "$defs": {}}}) is False
+    assert rep({"properties": {"c": {"$ref": "http://remote/x"}}}) is False
+
+
+# ---- F3 REAL FIX: $ref resolved BEFORE the string-vs-%json decision ------
+def test_xml_ref_to_string_uses_raw_lazy_path_not_json():
+    # Grammar-string level: a `$ref` -> string property emits the LAZY raw value
+    # rule, NOT `%json` (whose quotes the parser would keep). The tool's only
+    # param is a `$ref` -> string, so the whole grammar has NO `%json` at all.
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    lark = build_tool_lark(
+        XML_REF_STRING_TOOL, "required", [_xml_structure_info("geo")]
+    )
+    assert '"<parameter=city>\\n" xml_param_value "\\n"' in lark
+    assert "%json" not in lark
+
+
+def test_xml_ref_to_object_still_uses_json():
+    # The complementary case: a `$ref` -> OBJECT still rides `%json` (over the
+    # original `$ref` + merged `$defs`, which llguidance resolves internally).
+    from vllm_mlx.api.tool_grammar import build_tool_lark
+
+    lark = build_tool_lark(XML_REF_TOOL, "required", [_xml_structure_info("place")])
+    assert '"<parameter=origin>\\n" %json' in lark
+
+
+@_requires_llguidance
+def test_xml_ref_to_string_roundtrips_without_quotes(tok, lltok):
+    # F3 end-to-end on the REAL tokenizer: the grammar for a `$ref` -> string
+    # param ACCEPTS a RAW unquoted value and is terminal (before the fix it forced
+    # a QUOTED `%json` string, so raw `Paris` would be rejected), and the parser
+    # round-trips it to the clean value `Paris` — NOT `"Paris"` (quotes preserved).
+    grammar = _xml_grammar(XML_REF_STRING_TOOL, "required", tok)
+    assert grammar is not None
+    wire = (
+        "<tool_call>\n<function=geo>\n"
+        "<parameter=city>\nParis\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    accepted, total, accepting = _consume(grammar, lltok, tok, wire)
+    assert accepted == total and accepting, (
+        f"$ref->string raw value rejected ({accepted}/{total}, "
+        f"accepting={accepting}) — F3 regression (still on the quoted %json path)"
+    )
+    name, args = _parse(wire, XML_REF_STRING_TOOL)
+    assert name == "geo"
+    assert args["city"] == "Paris"  # no surrounding quotes
+
+
+# ---- F1/F2/F4/F5 OPT-OUT through build_tool_grammar (real parser) --------
+@_requires_llguidance
+def test_build_tool_grammar_opts_out_f1_toplevel_ref(tok):
+    # Control: a representable XML tool DOES build a grammar (proves the opt-out
+    # below is the guard, not a generic build failure).
+    assert _xml_grammar(XML_TOOLS, "required", tok) is not None
+    # F1: a top-level `$ref` (no inline properties) would collapse to an EMPTY
+    # body allowing `{}` even though the schema requires fields -> opt out.
+    ref_tool = [
+        {
+            "name": "run_code",
+            "parameters": {
+                "$ref": "#/$defs/loc",
+                "$defs": {
+                    "loc": {
+                        "type": "object",
+                        "properties": {"x": {"type": "integer"}},
+                        "required": ["x"],
+                    }
+                },
+            },
+        }
+    ]
+    assert _xml_grammar(ref_tool, "required", tok) is None
+
+
+@_requires_llguidance
+def test_build_tool_grammar_opts_out_f2_string_pattern(tok):
+    # F2: a string param with `pattern` cannot be enforced on the raw value path.
+    pat_tool = [
+        {
+            "name": "run_code",
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string", "pattern": "^[a-z]+$"}},
+                "required": ["code"],
+            },
+        }
+    ]
+    assert _xml_grammar(pat_tool, "required", tok) is None
+
+
+@_requires_llguidance
+def test_build_tool_grammar_opts_out_f4_dependent_required(tok):
+    # F4: `dependentRequired` (object-level relation) is emitted-around, not
+    # enforced — it would let `a` appear without its required `b` -> opt out.
+    dep_tool = [
+        {
+            "name": "run_code",
+            "parameters": {
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                "dependentRequired": {"a": ["b"]},
+            },
+        }
+    ]
+    assert _xml_grammar(dep_tool, "required", tok) is None
+
+
+@_requires_llguidance
+def test_build_tool_grammar_opts_out_f5_unsafe_key(tok):
+    # F5: a key containing `>` inserted RAW into `<parameter=KEY>` would be parsed
+    # back as a DIFFERENT key -> opt out.
+    bad_key_tool = [
+        {
+            "name": "run_code",
+            "parameters": {
+                "type": "object",
+                "properties": {"x>y": {"type": "string"}},
+                "required": ["x>y"],
+            },
+        }
+    ]
+    assert _xml_grammar(bad_key_tool, "required", tok) is None
