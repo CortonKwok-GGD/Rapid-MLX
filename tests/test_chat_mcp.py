@@ -424,13 +424,16 @@ def test_server_parameters_keep_npx_bootstrap_output_off_protocol():
 
 
 def test_optional_component_warning_filter_keeps_actionable_warnings(caplog):
+    sdk_logger = logging.getLogger("mcp.client.session_group")
     with (
         caplog.at_level(logging.WARNING),
         _quiet_optional_component_warnings(),
     ):
+        # MCP 1.28 uses logging.warning directly; keep the named-logger path
+        # covered too so a future SDK cleanup cannot reintroduce the noise.
         logging.warning("Could not fetch prompts: Method not found")
-        logging.warning("Could not fetch resources: Method not found")
-        logging.warning("Could not fetch prompts: permission denied")
+        sdk_logger.warning("Could not fetch resources: Method not found")
+        sdk_logger.warning("Could not fetch prompts: permission denied")
 
     assert [record.getMessage() for record in caplog.records] == [
         "Could not fetch prompts: permission denied"

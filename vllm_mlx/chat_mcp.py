@@ -47,13 +47,18 @@ class _OptionalComponentWarningFilter(logging.Filter):
 def _quiet_optional_component_warnings():
     """Temporarily filter known ClientSessionGroup capability-probe noise."""
 
-    root_logger = logging.getLogger()
+    loggers = (
+        logging.getLogger(),
+        logging.getLogger("mcp.client.session_group"),
+    )
     warning_filter = _OptionalComponentWarningFilter()
-    root_logger.addFilter(warning_filter)
+    for logger in loggers:
+        logger.addFilter(warning_filter)
     try:
         yield
     finally:
-        root_logger.removeFilter(warning_filter)
+        for logger in loggers:
+            logger.removeFilter(warning_filter)
 
 
 class ChatMCPRuntime:
