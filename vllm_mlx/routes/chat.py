@@ -2246,6 +2246,21 @@ def _template_generation_prefix(engine, messages, tools, enable_thinking) -> str
     return delta
 
 
+def _valid_head_width(obj) -> int | None:
+    """``weight.shape[0]`` (the vocab dim) if ``obj`` looks like an output-head
+    weight, else ``None``. Still the vocab dim under quantization (qwen3-4bit's
+    ``embed_tokens.weight`` is ``(vocab, packed_hidden)``)."""
+    shape = getattr(obj, "shape", None)
+    if (
+        shape is not None
+        and len(shape) >= 1
+        and isinstance(shape[0], int)
+        and shape[0] > 0
+    ):
+        return int(shape[0])
+    return None
+
+
 def _actual_output_head_width(model) -> int | None:
     """The model's TRUE logits width — the vocab dimension (rows) of the output
     projection weight — or ``None`` if it cannot be inspected.
@@ -2254,32 +2269,60 @@ def _actual_output_head_width(model) -> int | None:
     (codex R12: the declared ``config.vocab_size`` can differ from the real
     lm-head width; validate against the actual head so a processor is never
     installed — and the post-hoc cap never suppressed — for a ``</think>`` id the
-    head cannot emit). Tries the untied ``lm_head`` first, then the tied
-    embedding projected via ``as_linear`` (qwen3 and most MLX text models), each
-    time reading ``weight.shape[0]`` — still the vocab dim under quantization
-    (qwen3-4bit's ``embed_tokens.weight`` is ``(vocab, packed_hidden)``).
+    head cannot emit). Reads ``weight.shape[0]`` off the untied ``lm_head`` or the
+    tied embedding projected via ``as_linear`` (qwen3 and most MLX text models).
+
+    Real checkpoints nest the LM to varying depths — a flat mlx-lm text model
+    exposes ``model.embed_tokens``; a multimodal-capable wrapper (qwen3_5,
+    gemma3n, …) nests it under ``language_model.model.embed_tokens``. Missing the
+    head means ``_engine_output_vocab_size`` returns ``None`` and the budget
+    silently declines to the post-hoc cap (no decode-time force) — the regression
+    that shipped in #1185, where qwen3.5's head at
+    ``language_model.model.embed_tokens.weight`` matched none of the fixed paths.
+    So after the fixed fast paths we FALL BACK to a tree walk that finds the head
+    by module name at any depth. The width stays WEIGHT-derived either way (==
+    the decode logits width), keeping the out-of-range guard provably dead.
     """
     if model is None:
         return None
+    # ALL ``lm_head`` (untied output projection — authoritative) paths are
+    # probed BEFORE any ``embed_tokens`` (tied/input embedding) path, so an untied
+    # nested head is never shadowed by an input embedding of a differing width
+    # (codex). Within each group, shallow → deep.
     for path in (
         ("lm_head", "weight"),
+        ("model", "lm_head", "weight"),
+        ("language_model", "lm_head", "weight"),
+        ("language_model", "model", "lm_head", "weight"),
         ("model", "embed_tokens", "weight"),
         ("embed_tokens", "weight"),
+        ("language_model", "model", "embed_tokens", "weight"),
     ):
         obj = model
         for attr in path:
             obj = getattr(obj, attr, None)
             if obj is None:
                 break
-        shape = getattr(obj, "shape", None)
-        if (
-            shape is not None
-            and len(shape) >= 1
-            and isinstance(shape[0], int)
-            and shape[0] > 0
-        ):
-            return int(shape[0])
-    return None
+        width = _valid_head_width(obj)
+        if width is not None:
+            return width
+    # Fallback: locate the output head / tied embedding ANYWHERE in the module
+    # tree (handles nestings the fixed paths miss). An untied ``lm_head`` is the
+    # authoritative output projection, so it wins immediately; otherwise the tied
+    # ``embed_tokens`` carries the same vocab width. Still weight-derived.
+    try:
+        embed_width: int | None = None
+        for name, mod in model.named_modules():
+            leaf = name.rsplit(".", 1)[-1]
+            if leaf == "lm_head":
+                width = _valid_head_width(getattr(mod, "weight", None))
+                if width is not None:
+                    return width
+            elif leaf == "embed_tokens" and embed_width is None:
+                embed_width = _valid_head_width(getattr(mod, "weight", None))
+        return embed_width
+    except Exception:
+        return None
 
 
 def _engine_output_vocab_size(engine) -> int | None:

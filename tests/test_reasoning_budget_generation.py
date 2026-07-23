@@ -905,6 +905,115 @@ def test_engine_output_vocab_size_prefers_actual_weight_shape():
     assert _engine_output_vocab_size(_E()) == 151936
 
 
+def test_engine_output_vocab_size_resolves_language_model_nested_head():
+    # #1185 REGRESSION: a multimodal-capable wrapper (qwen3_5, gemma3n, …) nests
+    # the LM one level deeper — the head lives at
+    # language_model.model.embed_tokens.weight, matching NONE of the original
+    # three fixed paths, so _actual_output_head_width returned None and the budget
+    # silently declined to the post-hoc cap (no decode-time force). The added
+    # fixed path must resolve it to the real width.
+    from vllm_mlx.routes.chat import _engine_output_vocab_size
+
+    class _W:
+        shape = (248320, 320)  # qwen3.5-4b: (vocab, packed_hidden)
+
+    class _Embed:
+        weight = _W()
+
+    class _Inner:
+        embed_tokens = _Embed()
+
+    class _LM:
+        model = _Inner()
+
+    class _M:
+        language_model = _LM()
+
+    class _E:
+        _model = _M()
+        tokenizer = None
+
+    assert _engine_output_vocab_size(_E()) == 248320
+
+
+def test_actual_output_head_width_tree_walk_fallback():
+    # When the head sits at a path none of the fixed probes cover, the tree-walk
+    # fallback finds it by module-leaf name at any depth. An untied lm_head is the
+    # authoritative output projection and must win over a same-tree embed_tokens.
+    # DISTINCT widths (and embed listed FIRST) so a wrong "return the embedding"
+    # impl would fail with 151000 instead of the lm_head's 151936 (codex).
+    from vllm_mlx.routes.chat import _actual_output_head_width
+
+    class _W:
+        def __init__(self, n):
+            self.shape = (n, 64)
+
+    class _Head:
+        weight = _W(151936)  # the OUTPUT head — authoritative
+
+    class _Embed:
+        weight = _W(151000)  # input embedding — DIFFERENT width, must lose
+
+    class _Model:
+        # No fixed path matches (head is under an unusual attribute), but
+        # named_modules exposes it by leaf name — embed_tokens seen first.
+        def named_modules(self):
+            return [
+                ("", self),
+                ("deeply.nested.embed_tokens", _Embed()),
+                ("deeply.nested.lm_head", _Head()),
+            ]
+
+    assert _actual_output_head_width(_Model()) == 151936
+
+
+def test_actual_output_head_width_fixed_path_prefers_lm_head_over_embed():
+    # codex: the fixed-path scan must probe ALL lm_head paths before any
+    # embed_tokens path, so an untied nested output head is never shadowed by an
+    # input embedding of a differing width. Both live under `model.*` with
+    # DISTINCT widths; the lm_head (output projection) must win.
+    from vllm_mlx.routes.chat import _actual_output_head_width
+
+    class _WH:
+        shape = (151936, 64)  # lm_head — authoritative output width
+
+    class _WE:
+        shape = (151000, 64)  # embed_tokens — input embedding, different width
+
+    class _Head:
+        weight = _WH()
+
+    class _Embed:
+        weight = _WE()
+
+    class _Inner:
+        lm_head = _Head()
+        embed_tokens = _Embed()
+
+    class _Model:
+        model = _Inner()
+
+    assert _actual_output_head_width(_Model()) == 151936
+
+
+def test_actual_output_head_width_tree_walk_tied_embed_only():
+    # Tied model (no lm_head anywhere) — the tree walk falls back to the tied
+    # embed_tokens width.
+    from vllm_mlx.routes.chat import _actual_output_head_width
+
+    class _W:
+        shape = (200000, 64)
+
+    class _Embed:
+        weight = _W()
+
+    class _Model:
+        def named_modules(self):
+            return [("", self), ("odd.path.embed_tokens", _Embed())]
+
+    assert _actual_output_head_width(_Model()) == 200000
+
+
 # ─────────── add_generation_prompt plumbing (codex R11 #1) ──────────────────
 # The two-render seed probe needs build_prompt to HONOR add_generation_prompt so
 # the True/False renders differ. base.py's build_prompt is @abstractmethod (no
