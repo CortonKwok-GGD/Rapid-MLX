@@ -49,7 +49,8 @@ class ExpertCache:
                  expert_key_pattern: str, proj_map: dict,
                  num_layers: int, num_experts: int,
                  max_experts: int = 256, format: str = "per_expert",
-                 stacked_key_template: str | None = None):
+                 stacked_key_template: str | None = None,
+                 no_split: bool = False):
         self.model_path = Path(model_path)
         self.weight_map = weight_map
         self.expert_key_pattern = expert_key_pattern
@@ -59,13 +60,27 @@ class ExpertCache:
         self.max_experts = max_experts
         self.format = format
         self.stacked_key_template = stacked_key_template
+        self.no_split = no_split
         self.cache: OrderedDict[tuple, dict] = OrderedDict()
         self.hits = 0
         self.misses = 0
 
-        # Pre-split expert weights into per-expert files for fast loading
-        self.expert_dir = self.model_path / ".expert_cache"
-        self._ensure_expert_files()
+        if no_split:
+            # Build index: (layer, proj.component) -> (filename, stacked_key)
+            self._stacked_index = {}
+            for key in weight_map:
+                if ".switch_mlp." not in key:
+                    continue
+                m = re.search(r'\.(\d+)\.\w+\.switch_mlp\.(\w+)\.(\w+)$', key)
+                if m:
+                    layer = int(m.group(1))
+                    proj = m.group(2)
+                    comp = m.group(3)
+                    self._stacked_index[(layer, proj, comp)] = (weight_map[key], key)
+            print(f"  Direct-load mode (no pre-split), {len(self._stacked_index)} stacked tensors indexed")
+        else:
+            self.expert_dir = self.model_path / ".expert_cache"
+            self._ensure_expert_files()
 
     def _ensure_expert_files(self):
         """Split safetensors into per-expert files if not already done."""
@@ -186,6 +201,7 @@ class ExpertCache:
         return count
 
     def ensure_experts(self, layer: int, expert_ids: list[int]):
+        missing = []
         for eid in expert_ids:
             key = (layer, eid)
             if key in self.cache:
@@ -193,6 +209,16 @@ class ExpertCache:
                 self.cache.move_to_end(key)
             else:
                 self.misses += 1
+                missing.append(eid)
+
+        if not missing:
+            return
+
+        if self.no_split:
+            # Batch load: load file once, extract all missing experts
+            self._load_experts_direct_batch(layer, missing)
+        else:
+            for eid in missing:
                 self._load_expert(layer, eid)
 
     def get_proj(self, layer: int, expert_id: int, proj_name: str):
@@ -202,6 +228,12 @@ class ExpertCache:
         while len(self.cache) >= self.max_experts:
             self.cache.popitem(last=False)
 
+        if self.no_split:
+            self._load_expert_direct(layer, expert_id)
+        else:
+            self._load_expert_from_file(layer, expert_id)
+
+    def _load_expert_from_file(self, layer: int, expert_id: int):
         expert_file = self.expert_dir / f"L{layer}_E{expert_id}.safetensors"
         all_tensors = mx.load(str(expert_file))
 
@@ -217,6 +249,39 @@ class ExpertCache:
             )
 
         self.cache[(layer, expert_id)] = entry
+
+    def _load_experts_direct_batch(self, layer: int, expert_ids: list[int]):
+        """Batch load experts: load file once, extract all needed experts."""
+        # Evict to make room
+        while len(self.cache) + len(expert_ids) > self.max_experts:
+            self.cache.popitem(last=False)
+
+        # Group stacked tensors by file
+        files_needed: dict[str, list] = {}
+        for proj_name in self.proj_map:
+            for comp in ("weight", "scales", "biases"):
+                fname, key = self._stacked_index[(layer, proj_name, comp)]
+                files_needed.setdefault(fname, []).append((proj_name, comp, key))
+
+        # Load each file ONCE and extract ALL missing experts
+        loaded_files: dict[str, dict] = {}
+        for fname, items in files_needed.items():
+            if fname not in loaded_files:
+                loaded_files[fname] = mx.load(str(self.model_path / fname))
+
+        for eid in expert_ids:
+            entry: dict[str, dict] = {}
+            for fname, items in files_needed.items():
+                file_data = loaded_files[fname]
+                for proj_name, comp, key in items:
+                    entry.setdefault(proj_name, {})[comp] = file_data[key][eid]
+
+            self.cache[(layer, eid)] = {
+                proj: (d["weight"], d["scales"], d["biases"])
+                for proj, d in entry.items()
+            }
+
+        del loaded_files
 
     @property
     def hit_rate(self):
@@ -541,7 +606,10 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     # For stacked format, get num_experts from config
     if num_experts is None:
         text_cfg = config.get("text_config", config)
-        num_experts = text_cfg.get("num_experts", text_cfg.get("num_local_experts"))
+        for key in ("num_experts", "num_local_experts", "n_routed_experts"):
+            num_experts = text_cfg.get(key, config.get(key))
+            if num_experts is not None:
+                break
         if num_experts is None:
             raise ValueError("Cannot determine num_experts from config")
         print(f"  Experts per layer: {num_experts} (from config)")
@@ -607,13 +675,33 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     model_args = ModelArgsClass.from_dict(config)
     model = ModelClass(model_args)
 
-    # Quantize shared layers only (skip switch_mlp/expert layers)
-    def class_predicate(path, module):
-        if "switch_mlp" in path or "switch_glu" in path or "experts" in path:
-            return False
-        return f"{path}.scales" in shared_weights
+    # Quantize shared layers with per-layer config support (for Dynamic quantization)
+    # Build set of shared quantized paths and their configs
+    shared_quant_paths = {}
+    for sw_key in shared_weights:
+        if not sw_key.endswith(".scales"):
+            continue
+        path = sw_key.rsplit(".scales", 1)[0]
+        if "switch_mlp" in path or "switch_glu" in path:
+            continue
+        layer_cfg = quant_config.get(path, {})
+        b = layer_cfg.get("bits", bits)
+        g = layer_cfg.get("group_size", group_size)
+        shared_quant_paths[path] = (b, g)
 
-    nn.quantize(model, group_size=group_size, bits=bits, class_predicate=class_predicate)
+    # Group by (bits, group_size) for batch quantization
+    quant_groups: dict[tuple, set] = {}
+    for path, (b, g) in shared_quant_paths.items():
+        quant_groups.setdefault((b, g), set()).add(path)
+
+    for (b, g), path_set in quant_groups.items():
+        def predicate(p, m, _ps=path_set):
+            # Match if exact path or if any path starts with this module path
+            if p in _ps:
+                return True
+            # Handle cases where nn.quantize path format differs slightly
+            return any(sp.endswith(p) or p.endswith(sp) for sp in _ps)
+        nn.quantize(model, group_size=g, bits=b, class_predicate=predicate)
 
     # Auto-size cache
     if max_cached_experts is None:
@@ -621,11 +709,22 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     else:
         print(f"  Manual cache size: {max_cached_experts} experts")
 
+    # Check if we have enough disk space for pre-split (stacked format needs ~2x disk)
+    no_split = False
+    if fmt == "stacked":
+        import shutil
+        disk_free = shutil.disk_usage(str(model_path)).free
+        expert_data_est = total_expert_entries * expert_size_est
+        if disk_free < expert_data_est * 1.1:
+            no_split = True
+            print(f"  Disk free: {disk_free/1e9:.0f} GB < expert data {expert_data_est/1e9:.0f} GB")
+            print(f"  Using direct-load mode (no pre-split)")
+
     # Create cache
     cache = ExpertCache(
         str(model_path), weight_map, pattern, proj_map,
         num_layers=len(expert_layers), num_experts=num_experts,
-        max_experts=max_cached_experts, format=fmt,
+        max_experts=max_cached_experts, format=fmt, no_split=no_split,
     )
 
     # Find and replace all SwitchGLU instances
@@ -639,11 +738,22 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
             continue
         layer_idx = int(m.group(1))
 
+        # For Dynamic quantization: get per-layer bits for expert weights
+        expert_bits = bits
+        expert_gs = group_size
+        # Check config for this layer's switch_mlp quantization
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            cfg_key = f"model.layers.{layer_idx}.mlp.switch_mlp.{proj}"
+            if cfg_key in quant_config:
+                expert_bits = quant_config[cfg_key].get("bits", bits)
+                expert_gs = quant_config[cfg_key].get("group_size", group_size)
+                break
+
         offloaded = OffloadedSwitchGLU(
             input_dims=hidden_size,
             hidden_dims=moe_hidden,
             num_experts=num_experts,
-            group_size=group_size, bits=bits,
+            group_size=expert_gs, bits=expert_bits,
             cache=cache, layer_idx=layer_idx,
         )
 
