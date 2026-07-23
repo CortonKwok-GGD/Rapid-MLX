@@ -4,6 +4,10 @@
 Runs large MoE models on memory-constrained Macs by keeping shared layers
 in RAM and streaming expert weights from SSD via an LRU cache.
 
+Supports two expert weight formats:
+  - Per-expert: .experts.{N}.w1.weight (Mixtral, DBRX, etc.)
+  - Stacked: .switch_mlp.gate_proj.weight with shape (num_experts, ...) (Qwen3.6, etc.)
+
 v3 optimizations:
   1. Single eval per MoE block (not 3 per SwitchLinear)
   2. Pre-cached remap shared across projections
@@ -11,13 +15,14 @@ v3 optimizations:
   4. Auto-adaptive cache sizing based on available RAM
 
 Usage:
-    python scripts/expert_offload_mvp.py
     python scripts/expert_offload_mvp.py --model mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit
+    python scripts/expert_offload_mvp.py --model mlx-community/Qwen3.6-35B-A3B-8bit --serve
 """
 
 import argparse
 import json
 import os
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -32,14 +37,19 @@ import mlx.nn as nn
 class ExpertCache:
     """LRU cache keyed by (layer, expert_id). Each entry holds all projections.
 
-    On first init, splits the model's safetensors into per-layer expert files
+    On first init, splits the model's safetensors into per-expert files
     for fast mx.load() access (no numpy intermediate).
+
+    Supports two source formats:
+      - per_expert: weights named .experts.{N}.w1.weight (one expert per key)
+      - stacked: weights named .switch_mlp.gate_proj.weight with dim 0 = num_experts
     """
 
     def __init__(self, model_path: str, weight_map: dict,
                  expert_key_pattern: str, proj_map: dict,
                  num_layers: int, num_experts: int,
-                 max_experts: int = 256):
+                 max_experts: int = 256, format: str = "per_expert",
+                 stacked_key_template: str | None = None):
         self.model_path = Path(model_path)
         self.weight_map = weight_map
         self.expert_key_pattern = expert_key_pattern
@@ -47,40 +57,49 @@ class ExpertCache:
         self.num_layers = num_layers
         self.num_experts_per_layer = num_experts
         self.max_experts = max_experts
+        self.format = format
+        self.stacked_key_template = stacked_key_template
         self.cache: OrderedDict[tuple, dict] = OrderedDict()
         self.hits = 0
         self.misses = 0
 
-        # Pre-split expert weights into per-layer files for fast loading
+        # Pre-split expert weights into per-expert files for fast loading
         self.expert_dir = self.model_path / ".expert_cache"
         self._ensure_expert_files()
 
     def _ensure_expert_files(self):
-        """Split safetensors into per-layer-expert files if not already done."""
+        """Split safetensors into per-expert files if not already done."""
         marker = self.expert_dir / ".done"
         if marker.exists():
             return
 
         self.expert_dir.mkdir(exist_ok=True)
-        print(f"  Splitting expert weights (one-time)...", end="", flush=True)
+        print(f"  Splitting expert weights (one-time)...", flush=True)
         t0 = time.perf_counter()
 
+        if self.format == "stacked":
+            count = self._split_stacked()
+        else:
+            count = self._split_per_expert()
+
+        marker.touch()
+        print(f"  Split complete: {count} expert files in {time.perf_counter() - t0:.1f}s")
+
+    def _split_per_expert(self) -> int:
+        """Split per-expert format (Mixtral-style .experts.N. keys)."""
         from safetensors import safe_open
         from safetensors.numpy import save_file
 
-        # Group expert keys by (layer, expert)
         groups: dict[tuple, dict] = {}
         for key in self.weight_map:
             if ".experts." not in key:
                 continue
-            import re
             m = re.search(r'\.(\d+)\..*\.experts\.(\d+)\.(.*)', key)
             if not m:
                 continue
             layer, expert = int(m.group(1)), int(m.group(2))
             groups.setdefault((layer, expert), {})[key] = None
 
-        # Write per-expert safetensors files
         file_handles = {}
         for (layer, expert), keys in sorted(groups.items()):
             out_path = self.expert_dir / f"L{layer}_E{expert}.safetensors"
@@ -100,8 +119,71 @@ class ExpertCache:
         for fh in file_handles.values():
             del fh
 
-        marker.touch()
-        print(f" {time.perf_counter() - t0:.1f}s ({len(groups)} expert files)")
+        return len(groups)
+
+    def _split_stacked(self) -> int:
+        """Split stacked format (Qwen3.6-style switch_mlp.proj.weight with dim0=num_experts)."""
+        # Group stacked keys by (layer, proj, component)
+        # Template: "prefix.{layer}.mlp.switch_mlp.{proj}.{component}"
+        stacked_keys = {}
+        for key in self.weight_map:
+            if ".switch_mlp." not in key:
+                continue
+            m = re.search(r'\.(\d+)\.\w+\.switch_mlp\.(\w+)\.(\w+)$', key)
+            if not m:
+                continue
+            layer = int(m.group(1))
+            proj = m.group(2)  # gate_proj, up_proj, down_proj
+            component = m.group(3)  # weight, scales, biases
+            stacked_keys.setdefault(layer, {})[f"{proj}.{component}"] = key
+
+        count = 0
+        # Process one layer at a time to limit memory usage
+        for layer in sorted(stacked_keys.keys()):
+            print(f"    Layer {layer}/{max(stacked_keys.keys())}...", end="\r", flush=True)
+            keys_in_layer = stacked_keys[layer]
+
+            # Load all stacked tensors for this layer
+            files_needed = {}
+            for pc, key in keys_in_layer.items():
+                fname = self.weight_map[key]
+                files_needed.setdefault(fname, []).append((pc, key))
+
+            stacked_tensors = {}
+            for fname, items in files_needed.items():
+                fpath = str(self.model_path / fname)
+                loaded = mx.load(fpath)
+                for pc, key in items:
+                    stacked_tensors[pc] = loaded[key]
+                del loaded
+
+            # Materialize to avoid lazy-load memory issues
+            mx.eval(*stacked_tensors.values())
+
+            # Slice and save per-expert files
+            for expert_id in range(self.num_experts_per_layer):
+                out_path = self.expert_dir / f"L{layer}_E{expert_id}.safetensors"
+                if out_path.exists():
+                    count += 1
+                    continue
+
+                expert_tensors = {}
+                for pc, stacked in stacked_tensors.items():
+                    proj, component = pc.split(".")
+                    # Use synthetic per-expert key naming
+                    ekey = self.expert_key_pattern.format(
+                        layer=layer, expert=expert_id, wname=proj
+                    )
+                    expert_tensors[f"{ekey}.{component}"] = stacked[expert_id]
+
+                mx.save_safetensors(str(out_path), expert_tensors)
+                count += 1
+
+            # Free stacked tensors before next layer
+            del stacked_tensors
+
+        print()  # clear \r
+        return count
 
     def ensure_experts(self, layer: int, expert_ids: list[int]):
         for eid in expert_ids:
@@ -120,7 +202,6 @@ class ExpertCache:
         while len(self.cache) >= self.max_experts:
             self.cache.popitem(last=False)
 
-        # Fast path: load from pre-split per-expert file using mx.load
         expert_file = self.expert_dir / f"L{layer}_E{expert_id}.safetensors"
         all_tensors = mx.load(str(expert_file))
 
@@ -172,7 +253,6 @@ class OffloadedSwitchGLU(nn.Module):
         self.bits = bits
         self._cache = cache
         self._layer_idx = layer_idx
-        # Keep the activation function
         from mlx_lm.models.switch_layers import SwiGLU
         self.activation = SwiGLU()
 
@@ -180,30 +260,24 @@ class OffloadedSwitchGLU(nn.Module):
         x = mx.expand_dims(x, (-2, -3))
 
         # Check if ALL experts for THIS layer are already cached.
-        # If so, skip mx.eval (no need to know which experts — they're all here).
         layer_all_cached = all(
             (self._layer_idx, eid) in self._cache.cache
             for eid in range(self._num_experts)
         )
 
         if layer_all_cached:
-            # All experts resident — use original indices, no eval needed.
-            # This preserves MLX lazy evaluation across layers!
             unique_experts = list(range(self._num_experts))
             new_indices = indices
         else:
-            # Must eval to know which experts to load from disk
             mx.eval(indices)
             idx_list = indices.reshape(-1).tolist()
             unique_experts = sorted(set(idx_list))
             self._cache.ensure_experts(self._layer_idx, unique_experts)
 
-            # Remap indices to compact tensor positions
             remap = {old: new for new, old in enumerate(unique_experts)}
             new_idx_flat = [remap[i] for i in idx_list]
             new_indices = mx.array(new_idx_flat, dtype=mx.uint32).reshape(indices.shape)
 
-        # Sort for gather_qmm efficiency
         from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
         do_sort = indices.size >= 64
         idx = new_indices
@@ -221,8 +295,6 @@ class OffloadedSwitchGLU(nn.Module):
         return x.squeeze(-2)
 
     def _proj_call(self, proj_name, x, indices, unique_experts, sorted_indices):
-        """Run one projection with pre-loaded experts."""
-        # Check pre-built full tensor cache
         cache_key = (self._layer_idx, proj_name)
         if cache_key in _STACKED_CACHE:
             w, s, b = _STACKED_CACHE[cache_key]
@@ -236,7 +308,6 @@ class OffloadedSwitchGLU(nn.Module):
             w = mx.stack(w_list)
             s = mx.stack(s_list)
             b = mx.stack(b_list)
-            # Cache full tensor if ALL experts are present
             if len(unique_experts) == self._num_experts:
                 _STACKED_CACHE[cache_key] = (w, s, b)
 
@@ -258,39 +329,45 @@ _STACKED_CACHE: dict = {}
 # ---------------------------------------------------------------------------
 
 def _detect_expert_pattern(weight_map: dict):
-    """Auto-detect expert weight naming pattern from the safetensors index."""
-    # Find any expert weight key
-    sample = None
+    """Auto-detect expert weight naming pattern from the safetensors index.
+
+    Returns (pattern, proj_map, expert_layers, num_experts, format).
+    format is "per_expert" or "stacked".
+    """
+    # Try per-expert format first (.experts.N.)
     for k in weight_map:
         if ".experts." in k and k.endswith(".weight"):
-            sample = k
-            break
-    if sample is None:
-        raise ValueError("No expert weights found in model — not a MoE model?")
+            result = _detect_per_expert_pattern(weight_map)
+            return (*result, "per_expert")
 
-    # Parse the pattern: find layer index, expert index, projection name
-    # e.g. "model.layers.0.block_sparse_moe.experts.0.w1.weight"
-    import re
+    # Try stacked format (.switch_mlp.proj.weight with dim 0 = num_experts)
+    for k in weight_map:
+        if ".switch_mlp." in k and k.endswith(".weight"):
+            result = _detect_stacked_pattern(weight_map)
+            return (*result, "stacked")
+
+    raise ValueError("No expert weights found in model — not a MoE model?")
+
+
+def _detect_per_expert_pattern(weight_map: dict):
+    """Detect per-expert naming pattern (Mixtral-style)."""
+    sample = next(k for k in weight_map if ".experts." in k and k.endswith(".weight"))
+
     m = re.match(r"(.+?)\.(\d+)\.(.+?)\.experts\.(\d+)\.(\w+)\.weight", sample)
     if not m:
         raise ValueError(f"Cannot parse expert weight pattern from: {sample}")
 
-    prefix = m.group(1)     # "model.layers"
-    moe_block = m.group(3)  # "block_sparse_moe"
-    w_name = m.group(5)     # "w1"
+    prefix = m.group(1)
+    moe_block = m.group(3)
 
-    # Build pattern template
     pattern = f"{prefix}.{{layer}}.{moe_block}.experts.{{expert}}.{{wname}}"
 
-    # Detect all projection names (w1, w2, w3, etc.)
     proj_names = set()
     for k in weight_map:
         m2 = re.match(rf"{re.escape(prefix)}\.(\d+)\.{re.escape(moe_block)}\.experts\.(\d+)\.(\w+)\.", k)
         if m2:
             proj_names.add(m2.group(3))
 
-    # Map to SwitchGLU projection names
-    # Convention: w1=gate_proj, w2=down_proj, w3=up_proj (Mixtral/Qwen/etc.)
     proj_map = {}
     for pn in sorted(proj_names):
         if pn in ("w1", "gate_proj"):
@@ -300,9 +377,8 @@ def _detect_expert_pattern(weight_map: dict):
         elif pn in ("w3", "up_proj"):
             proj_map["up_proj"] = pn
         else:
-            proj_map[pn] = pn  # unknown, keep as-is
+            proj_map[pn] = pn
 
-    # Detect num_experts and num_layers
     layers = set()
     experts = set()
     for k in weight_map:
@@ -311,11 +387,53 @@ def _detect_expert_pattern(weight_map: dict):
             layers.add(int(m3.group(1)))
             experts.add(int(m3.group(2)))
 
-    print(f"  Detected MoE pattern: {pattern}")
+    print(f"  Detected per-expert MoE pattern: {pattern}")
     print(f"  Projections: {proj_map}")
-    print(f"  Layers with experts: {len(layers)}, Experts per layer: {len(experts)}")
+    print(f"  Layers: {len(layers)}, Experts/layer: {len(experts)}")
 
     return pattern, proj_map, sorted(layers), len(experts)
+
+
+def _detect_stacked_pattern(weight_map: dict):
+    """Detect stacked expert format (Qwen3.6-style switch_mlp.proj.weight)."""
+    # Find the prefix pattern: e.g. "language_model.model.layers.{N}.mlp.switch_mlp.{proj}.weight"
+    sample = next(k for k in weight_map if ".switch_mlp." in k and k.endswith(".weight"))
+    m = re.match(r"(.+?)\.(\d+)\.(\w+)\.switch_mlp\.(\w+)\.weight", sample)
+    if not m:
+        raise ValueError(f"Cannot parse stacked pattern from: {sample}")
+
+    prefix = m.group(1)  # e.g. "language_model.model.layers"
+    mlp_name = m.group(3)  # e.g. "mlp"
+
+    # Synthetic per-expert key pattern for cache files
+    pattern = f"{prefix}.{{layer}}.{mlp_name}.switch_mlp.e.{{expert}}.{{wname}}"
+
+    # Detect projections
+    proj_names = set()
+    for k in weight_map:
+        m2 = re.search(r'\.switch_mlp\.(\w+)\.weight$', k)
+        if m2:
+            proj_names.add(m2.group(1))
+
+    proj_map = {pn: pn for pn in sorted(proj_names)}
+
+    # Detect layers
+    layers = set()
+    for k in weight_map:
+        if ".switch_mlp." in k:
+            m3 = re.search(rf'{re.escape(prefix)}\.(\d+)\.', k)
+            if m3:
+                layers.add(int(m3.group(1)))
+
+    # Get num_experts from config (can't determine from weight_map alone for stacked)
+    # We'll detect it during loading from tensor shapes
+    num_experts = None
+
+    print(f"  Detected stacked MoE pattern: {prefix}.{{N}}.{mlp_name}.switch_mlp.{{proj}}")
+    print(f"  Projections: {proj_map}")
+    print(f"  Layers with experts: {len(layers)}")
+
+    return pattern, proj_map, sorted(layers), num_experts
 
 
 def _find_switch_glus(model):
@@ -339,6 +457,33 @@ def _find_switch_glus(model):
     return results
 
 
+def _make_cache(model):
+    """Create the right cache for the model (handles hybrid attention+SSM models)."""
+    if hasattr(model, 'make_cache'):
+        return model.make_cache()
+    # Fallback: plain KVCache for each layer
+    from mlx_lm.models.cache import KVCache
+    return [KVCache() for _ in _get_layers(model)]
+
+
+def _get_layers(model):
+    """Find the layers list in the model, handling wrappers like VL models."""
+    # Direct: model.layers
+    if hasattr(model, 'layers'):
+        return model.layers
+    # VL wrapper: model.language_model.model.layers
+    if hasattr(model, 'language_model'):
+        lm = model.language_model
+        if hasattr(lm, 'model') and hasattr(lm.model, 'layers'):
+            return lm.model.layers
+        if hasattr(lm, 'layers'):
+            return lm.layers
+    # model.model.layers
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        return model.model.layers
+    raise AttributeError("Cannot find layers in model")
+
+
 # ---------------------------------------------------------------------------
 # Auto-adaptive cache sizing
 # ---------------------------------------------------------------------------
@@ -356,7 +501,6 @@ def _auto_cache_size(shared_bytes: int, num_experts_total: int, expert_size_esti
     # Use 60% of available for expert cache
     cache_budget = int(available * 0.6)
     max_experts = max(64, cache_budget // max(expert_size_estimate, 1))
-    # Don't try to cache MORE than all experts (pointless)
     max_experts = min(max_experts, num_experts_total)
 
     print(f"  Total RAM: {total_ram / 1e9:.1f} GB")
@@ -373,8 +517,6 @@ def _auto_cache_size(shared_bytes: int, num_experts_total: int, expert_size_esti
 
 def load_model_offloaded(model_path: str, max_cached_experts: int | None = None):
     """Load any mlx-lm MoE model with expert weights offloaded to disk."""
-    from mlx_lm.utils import load_model as _load_model_info
-
     model_path = Path(model_path)
 
     with open(model_path / "config.json") as f:
@@ -390,27 +532,39 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
         with open(index_file) as f:
             weight_map = json.load(f)["weight_map"]
     else:
-        # Single safetensors file
-        weight_map = {k: "model.safetensors" for k in mx.load(str(model_path / "model.safetensors")).keys()}
+        weight_map = {k: "model.safetensors"
+                      for k in mx.load(str(model_path / "model.safetensors")).keys()}
 
     # Auto-detect MoE pattern
-    pattern, proj_map, expert_layers, num_experts = _detect_expert_pattern(weight_map)
+    pattern, proj_map, expert_layers, num_experts, fmt = _detect_expert_pattern(weight_map)
+
+    # For stacked format, get num_experts from config
+    if num_experts is None:
+        text_cfg = config.get("text_config", config)
+        num_experts = text_cfg.get("num_experts", text_cfg.get("num_local_experts"))
+        if num_experts is None:
+            raise ValueError("Cannot determine num_experts from config")
+        print(f"  Experts per layer: {num_experts} (from config)")
 
     # Separate expert vs shared weights
     expert_keys = set()
     shared_keys = set()
     for k in weight_map:
-        if ".experts." in k:
+        if fmt == "stacked":
+            is_expert = ".switch_mlp." in k
+        else:
+            is_expert = ".experts." in k
+        if is_expert:
             expert_keys.add(k)
         else:
             shared_keys.add(k)
 
-    print(f"  Weight split: {len(shared_keys)} shared, {len(expert_keys)} expert")
+    print(f"  Weight split: {len(shared_keys)} shared, {len(expert_keys)} expert ({fmt} format)")
 
-    # Load ONLY shared weights using selective tensor access (not full file load)
+    # Load ONLY shared weights using selective tensor access
     shared_weights = {}
     from safetensors import safe_open
-    files_needed = {}  # filename -> set of shared keys in that file
+    files_needed = {}
     for k in shared_keys:
         fname = weight_map[k]
         files_needed.setdefault(fname, []).append(k)
@@ -418,34 +572,44 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     for fname, keys in sorted(files_needed.items()):
         fpath = str(model_path / fname)
         print(f"  Loading {len(keys)} shared tensors from {fname}...")
-        with safe_open(fpath, framework="numpy") as f:
-            for k in keys:
-                shared_weights[k] = mx.array(f.get_tensor(k))
+        # Use mx.load for files that may contain bf16 tensors
+        loaded = mx.load(fpath)
+        for k in keys:
+            if k in loaded:
+                shared_weights[k] = loaded[k]
+        del loaded
+
     mx.eval(*shared_weights.values())
 
     shared_bytes = sum(v.nbytes for v in shared_weights.values())
     print(f"  Shared weights: {shared_bytes / 1e9:.2f} GB")
 
     # Estimate expert size for cache sizing
-    sample_expert_key = next(k for k in expert_keys if k.endswith(".weight"))
-    # rough estimate: 3 projs × 3 components × ~10MB each
-    expert_size_est = (len(expert_keys) // (len(expert_layers) * num_experts)) * 10 * 1024 * 1024
+    # Per expert: ~3 projections * weight+scales+biases
+    text_cfg = config.get("text_config", config)
+    hidden_size = text_cfg.get("hidden_size", config.get("hidden_size", 4096))
+    moe_hidden = text_cfg.get("moe_intermediate_size",
+                              text_cfg.get("intermediate_size",
+                                           config.get("intermediate_size", 14336)))
+    # Rough estimate based on quantized sizes
+    expert_size_est = (hidden_size * moe_hidden * 3 * bits) // (8 * 1024) * 1024  # bytes
+    expert_size_est = max(expert_size_est, 1024 * 1024)  # at least 1MB
     total_expert_entries = len(expert_layers) * num_experts
 
-    # Build model using mlx-lm's model class
-    from mlx_lm.utils import load_model
-    # We use load_model's model construction but NOT its weight loading
-    model_module = __import__(f"mlx_lm.models.{config['model_type']}", fromlist=["Model", "ModelArgs"])
+    print(f"  Expert size estimate: {expert_size_est / 1e6:.1f} MB/expert, {total_expert_entries} total")
+
+    # Build model
+    model_type = config.get("model_type", "")
+    model_module = __import__(f"mlx_lm.models.{model_type}", fromlist=["Model", "ModelArgs"])
     ModelClass = model_module.Model
     ModelArgsClass = model_module.ModelArgs
 
-    # Build args from config
     model_args = ModelArgsClass.from_dict(config)
     model = ModelClass(model_args)
 
-    # Quantize shared layers only
+    # Quantize shared layers only (skip switch_mlp/expert layers)
     def class_predicate(path, module):
-        if "switch_mlp" in path or "switch_glu" in path:
+        if "switch_mlp" in path or "switch_glu" in path or "experts" in path:
             return False
         return f"{path}.scales" in shared_weights
 
@@ -458,17 +622,17 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
         print(f"  Manual cache size: {max_cached_experts} experts")
 
     # Create cache
-    cache = ExpertCache(str(model_path), weight_map, pattern, proj_map,
-                        num_layers=len(expert_layers), num_experts=num_experts,
-                        max_experts=max_cached_experts)
+    cache = ExpertCache(
+        str(model_path), weight_map, pattern, proj_map,
+        num_layers=len(expert_layers), num_experts=num_experts,
+        max_experts=max_cached_experts, format=fmt,
+    )
 
     # Find and replace all SwitchGLU instances
     switch_glus = _find_switch_glus(model)
     print(f"  Found {len(switch_glus)} SwitchGLU layers to offload")
 
     for path, original_glu in switch_glus:
-        # Extract layer index from path (e.g. "model.layers.5.block_sparse_moe.switch_mlp")
-        import re
         m = re.search(r'\.(\d+)\.', path)
         if not m:
             print(f"    WARNING: Cannot determine layer index from {path}, skipping")
@@ -476,14 +640,13 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
         layer_idx = int(m.group(1))
 
         offloaded = OffloadedSwitchGLU(
-            input_dims=model_args.hidden_size,
-            hidden_dims=model_args.intermediate_size,
+            input_dims=hidden_size,
+            hidden_dims=moe_hidden,
             num_experts=num_experts,
             group_size=group_size, bits=bits,
             cache=cache, layer_idx=layer_idx,
         )
 
-        # Replace in model tree
         parts = path.split(".")
         parent = model
         for part in parts[:-1]:
@@ -497,23 +660,20 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     model.load_weights(list(shared_weights.items()), strict=False)
     mx.eval(model.parameters())
 
-    # Pre-warm: incrementally load all experts into cache.
-    # Load one layer at a time and eval to keep memory stable.
+    # Pre-warm: incrementally load all experts if cache can hold them all
     if max_cached_experts >= total_expert_entries:
         print(f"  Pre-warming {total_expert_entries} experts...", end="", flush=True)
         t_warm = time.perf_counter()
         for layer in expert_layers:
             for eid in range(num_experts):
                 cache.ensure_experts(layer, [eid])
-            # Eval after each layer to materialize lazy loads and free intermediates
             entries = [cache.cache[(layer, e)] for e in range(num_experts)]
             tensors = [t for entry in entries for proj in entry.values() for t in proj]
             mx.eval(*tensors)
         elapsed = time.perf_counter() - t_warm
         print(f" {elapsed:.0f}s")
 
-        # Pre-build stacked tensors for every (layer, proj)
-        # Then clear individual expert cache to avoid 2x memory usage
+        # Pre-build stacked tensors, then clear individual cache
         print(f"  Pre-building stacked tensors...", end="", flush=True)
         t_stack = time.perf_counter()
         for layer in expert_layers:
@@ -529,12 +689,10 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
                 sb = mx.stack(all_b)
                 _STACKED_CACHE[(layer, proj_name)] = (sw, ss, sb)
         mx.eval(*[t for v in _STACKED_CACHE.values() for t in v])
-        # Clear individual entries — stacked tensors have all data now
         cache.cache.clear()
-        # Re-mark all experts as "cached" so layer_all_cached still works
         for layer in expert_layers:
             for eid in range(num_experts):
-                cache.cache[(layer, eid)] = None  # sentinel, not used
+                cache.cache[(layer, eid)] = None  # sentinel
         print(f" {time.perf_counter() - t_stack:.0f}s")
 
     return model, cache
@@ -545,10 +703,8 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
 # ---------------------------------------------------------------------------
 
 def generate(model, tokenizer, prompt: str, max_tokens: int = 100, temp: float = 0.0):
-    from mlx_lm.models.cache import KVCache
-
     tokens = mx.array(tokenizer.encode(prompt))[None]
-    cache = [KVCache() for _ in model.layers]
+    cache = _make_cache(model)
 
     t0 = time.perf_counter()
     logits = model(tokens, cache=cache)
@@ -610,46 +766,48 @@ def _extract_text(content):
     return str(content)
 
 
-def _sanitize_messages(messages):
-    """Ensure messages alternate user/assistant for Mixtral-style templates."""
+def _build_prompt(tokenizer, messages):
+    """Build prompt using tokenizer's chat template, with fallbacks."""
     clean = []
     for m in messages:
         role = m.get("role", "user")
         content = _extract_text(m.get("content", ""))
         if role == "system":
-            # Prepend system message to next user message
             if clean and clean[-1]["role"] == "user":
                 clean[-1]["content"] = content + "\n\n" + clean[-1]["content"]
             else:
                 clean.append({"role": "user", "content": content})
             continue
-        # Skip consecutive same-role messages (merge them)
         if clean and clean[-1]["role"] == role:
             clean[-1]["content"] += "\n" + content
         else:
             clean.append({"role": role, "content": content})
-    # Must start with user
     if clean and clean[0]["role"] != "user":
         clean.insert(0, {"role": "user", "content": "Hi"})
-    return clean
+    if not clean:
+        clean = [{"role": "user", "content": "Hello"}]
 
+    # Try apply_chat_template first
+    try:
+        return tokenizer.apply_chat_template(clean, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        pass
 
-def stream_generate(model, tokenizer, messages, max_tokens=512, temp=0.7):
-    """Generate tokens as a stream, yielding incremental text chunks."""
-    from mlx_lm.models.cache import KVCache
-
-    messages = _sanitize_messages(messages)
-    # Build Mixtral instruct prompt manually (avoid Jinja template issues)
+    # Fallback: Mixtral/Llama instruct format
     prompt = ""
-    for m in messages:
+    for m in clean:
         if m["role"] == "user":
             prompt += f"<s>[INST] {m['content']} [/INST]"
         elif m["role"] == "assistant":
             prompt += f" {m['content']}</s>"
-    if not prompt:
-        prompt = "<s>[INST] Hello [/INST]"
+    return prompt or "<s>[INST] Hello [/INST]"
+
+
+def stream_generate(model, tokenizer, messages, max_tokens=512, temp=0.7):
+    """Generate tokens as a stream, yielding incremental text chunks."""
+    prompt = _build_prompt(tokenizer, messages)
     tokens = mx.array(tokenizer.encode(prompt))[None]
-    cache = [KVCache() for _ in model.layers]
+    cache = _make_cache(model)
 
     logits = model(tokens, cache=cache)
     mx.eval(logits)
@@ -659,7 +817,6 @@ def stream_generate(model, tokenizer, messages, max_tokens=512, temp=0.7):
     else:
         token = mx.argmax(logits[:, -1], axis=-1)
 
-    # Incremental decode: accumulate IDs, diff decoded text
     generated_ids = []
     prev_text = ""
 
@@ -687,26 +844,27 @@ def stream_generate(model, tokenizer, messages, max_tokens=512, temp=0.7):
 # Serve mode — minimal OpenAI-compatible API
 # ---------------------------------------------------------------------------
 
-_CHAT_HTML = """<!DOCTYPE html>
+def _make_chat_html(model_name: str, description: str):
+    return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MoE Expert Offloading Chat</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
-.header{padding:12px 20px;background:#16213e;border-bottom:1px solid #333;font-size:14px;color:#8888aa}
-.header b{color:#4fc3f7}
-#chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
-.msg{max-width:80%;padding:12px 16px;border-radius:12px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
-.user{align-self:flex-end;background:#1e3a5f;border-bottom-right-radius:4px}
-.assistant{align-self:flex-start;background:#2a2a3e;border-bottom-left-radius:4px}
-.input-area{padding:12px 20px;background:#16213e;border-top:1px solid #333;display:flex;gap:8px}
-#input{flex:1;padding:10px 14px;border:1px solid #444;border-radius:8px;background:#1a1a2e;color:#e0e0e0;font-size:15px;outline:none}
-#input:focus{border-color:#4fc3f7}
-button{padding:10px 20px;border:none;border-radius:8px;background:#4fc3f7;color:#000;font-weight:bold;cursor:pointer}
-button:disabled{opacity:0.5}
-.typing{color:#888;font-style:italic}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}}
+.header{{padding:12px 20px;background:#16213e;border-bottom:1px solid #333;font-size:14px;color:#8888aa}}
+.header b{{color:#4fc3f7}}
+#chat{{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}}
+.msg{{max-width:80%;padding:12px 16px;border-radius:12px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}}
+.user{{align-self:flex-end;background:#1e3a5f;border-bottom-right-radius:4px}}
+.assistant{{align-self:flex-start;background:#2a2a3e;border-bottom-left-radius:4px}}
+.input-area{{padding:12px 20px;background:#16213e;border-top:1px solid #333;display:flex;gap:8px}}
+#input{{flex:1;padding:10px 14px;border:1px solid #444;border-radius:8px;background:#1a1a2e;color:#e0e0e0;font-size:15px;outline:none}}
+#input:focus{{border-color:#4fc3f7}}
+button{{padding:10px 20px;border:none;border-radius:8px;background:#4fc3f7;color:#000;font-weight:bold;cursor:pointer}}
+button:disabled{{opacity:0.5}}
+.typing{{color:#888;font-style:italic}}
 </style></head><body>
-<div class="header"><b>Mixtral 8x7B</b> &mdash; 47B params, expert-offloaded to SSD, running on 32GB Mac</div>
+<div class="header"><b>{model_name}</b> &mdash; {description}</div>
 <div id="chat"></div>
 <div class="input-area">
 <input id="input" placeholder="Type a message..." autofocus>
@@ -715,43 +873,50 @@ button:disabled{opacity:0.5}
 <script>
 const chat=document.getElementById('chat'),input=document.getElementById('input'),btn=document.getElementById('send');
 let messages=[];
-input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
-async function send(){
+input.addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();send()}}}});
+async function send(){{
   const text=input.value.trim();if(!text)return;
   input.value='';btn.disabled=true;
-  messages.push({role:'user',content:text});
+  messages.push({{role:'user',content:text}});
   addMsg('user',text);
   const el=addMsg('assistant','');
   el.classList.add('typing');el.textContent='thinking...';
-  try{
-    const res=await fetch('/v1/chat/completions',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({messages,stream:true,max_tokens:512,temperature:0.7})});
+  try{{
+    const res=await fetch('/v1/chat/completions',{{method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{messages,stream:true,max_tokens:512,temperature:0.7}})}});
     const reader=res.body.getReader();const dec=new TextDecoder();
     let full='';el.classList.remove('typing');el.textContent='';
-    while(true){
-      const{done,value}=await reader.read();if(done)break;
+    while(true){{
+      const{{done,value}}=await reader.read();if(done)break;
       const lines=dec.decode(value).split('\\n');
-      for(const line of lines){
+      for(const line of lines){{
         if(!line.startsWith('data: ')||line==='data: [DONE]')continue;
-        try{const j=JSON.parse(line.slice(6));const d=j.choices?.[0]?.delta?.content;
-        if(d){full+=d;el.textContent=full;chat.scrollTop=chat.scrollHeight;}}catch{}}
-    }
-    messages.push({role:'assistant',content:full});
-  }catch(e){el.textContent='Error: '+e.message;el.classList.remove('typing');}
+        try{{const j=JSON.parse(line.slice(6));const d=j.choices?.[0]?.delta?.content;
+        if(d){{full+=d;el.textContent=full;chat.scrollTop=chat.scrollHeight;}}}}catch{{}}}}
+    }}
+    messages.push({{role:'assistant',content:full}});
+  }}catch(e){{el.textContent='Error: '+e.message;el.classList.remove('typing');}}
   btn.disabled=false;input.focus();
-}
-function addMsg(role,text){
+}}
+function addMsg(role,text){{
   const d=document.createElement('div');d.className='msg '+role;d.textContent=text;
   chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d;
-}
+}}
 </script></body></html>"""
 
 
-def serve_mode(model, tokenizer, expert_cache, port=8080):
+def serve_mode(model, tokenizer, expert_cache, port=8080, model_id="offloaded-moe"):
     """Start a minimal OpenAI-compatible server with web chat UI."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import uuid
+
+    # Build chat HTML with model info
+    total_experts = expert_cache.num_layers * expert_cache.num_experts_per_layer
+    cached = len(expert_cache.cache)
+    pct = cached * 100 // total_experts if total_experts else 0
+    desc = f"expert-offloaded, {cached}/{total_experts} experts cached ({pct}%)"
+    chat_html = _make_chat_html(model_id, desc)
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -784,21 +949,21 @@ def serve_mode(model, tokenizer, expert_cache, port=8080):
                     chunk = {
                         "id": req_id,
                         "object": "chat.completion.chunk",
-                        "model": "mixtral-8x7b-offloaded",
+                        "model": model_id,
                         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                     }
                     self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                     self.wfile.flush()
             except Exception as e:
                 err_chunk = {"id": req_id, "object": "chat.completion.chunk",
-                             "model": "mixtral-8x7b-offloaded",
+                             "model": model_id,
                              "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: {e}]"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(err_chunk)}\n\n".encode())
                 import traceback
                 traceback.print_exc()
 
             done = {"id": req_id, "object": "chat.completion.chunk",
-                    "model": "mixtral-8x7b-offloaded",
+                    "model": model_id,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             self.wfile.write(f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
             self.wfile.flush()
@@ -815,7 +980,7 @@ def serve_mode(model, tokenizer, expert_cache, port=8080):
             resp = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
                 "object": "chat.completion",
-                "model": "mixtral-8x7b-offloaded",
+                "model": model_id,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 0, "completion_tokens": len(tokens), "total_tokens": len(tokens)},
             }
@@ -829,7 +994,7 @@ def serve_mode(model, tokenizer, expert_cache, port=8080):
 
         def do_GET(self):
             if self.path == "/v1/models":
-                resp = {"data": [{"id": "mixtral-8x7b-offloaded", "object": "model"}]}
+                resp = {"data": [{"id": model_id, "object": "model"}]}
                 body = json.dumps(resp).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -843,7 +1008,7 @@ def serve_mode(model, tokenizer, expert_cache, port=8080):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.end_headers()
-                self.wfile.write(_CHAT_HTML.encode())
+                self.wfile.write(chat_html.encode())
             else:
                 self.send_error(404)
 
@@ -858,7 +1023,8 @@ def serve_mode(model, tokenizer, expert_cache, port=8080):
             pass  # quiet
 
     server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"\n🚀 Server ready at http://localhost:{port}/v1/chat/completions")
+    print(f"\nServer ready at http://localhost:{port}/v1/chat/completions")
+    print(f"   Model: {model_id}")
     print(f"   Expert cache: {expert_cache.stats()}")
     print(f"   Try: curl -X POST http://localhost:{port}/v1/chat/completions \\")
     print(f'     -H "Content-Type: application/json" \\')
@@ -894,6 +1060,21 @@ def main():
         model_path = snapshot_download(model_path)
     print(f"Model: {model_path}")
 
+    # Derive a short model ID for API responses
+    mp = Path(model_path)
+    # Handle HuggingFace cache paths: .../models--org--name/snapshots/hash/
+    if "snapshots" in mp.parts:
+        # Go up to find models--org--name
+        for parent in mp.parents:
+            if parent.name.startswith("models--"):
+                model_id = parent.name.replace("models--", "").replace("--", "/")
+                break
+        else:
+            model_id = mp.name
+    else:
+        model_id = mp.name
+    model_id = model_id.split("/")[-1].lower().replace(" ", "-") + "-offloaded"
+
     print(f"\n=== Loading with expert offloading ===")
     model, expert_cache = load_model_offloaded(model_path, args.max_cached_experts)
 
@@ -904,7 +1085,7 @@ def main():
     print(f"\n  RAM: {mem:.0f} MB ({32768 - mem:.0f} MB free)")
 
     if args.serve:
-        serve_mode(model, tokenizer, expert_cache, port=args.port)
+        serve_mode(model, tokenizer, expert_cache, port=args.port, model_id=model_id)
     else:
         print(f"\n=== Generating ({args.max_tokens} tokens max) ===")
         text, stats = generate(model, tokenizer, args.prompt, args.max_tokens, args.temp)
