@@ -2580,6 +2580,116 @@ def test_line1_token_id_gate_holds_then_opens_and_excludes_boundary():
         restore()
 
 
+def test_line1_think_exclusion_masks_tool_start_during_gate_closed():
+    # codex #3 / SGLang think_excluded_token_ids: while the reasoning gate is
+    # CLOSED, the tool-call opener id(s) are masked to -inf so the model cannot
+    # begin a <tool_call> inside <think> (which the forced </think> could then
+    # split). Every OTHER logit stays free. After </think> the grammar owns the
+    # mask and the exclusion is moot.
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    END = 99
+    EXCLUDED = 3  # stand-in <tool_call> opener id
+    restore, state = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(),
+            "g",
+            reasoning_end_id=END,
+            think_excluded_ids=(EXCLUDED,),
+            tokenizer=None,
+        )
+        proc(mx.array([1]), mx.zeros((1, 8)))  # prompt baseline
+
+        # Thinking: gate closed → only the excluded id is -inf, the rest untouched.
+        out_think = np.array(proc(mx.array([1, 5]), mx.zeros((1, 8))))
+        assert out_think[0, EXCLUDED] == -np.inf, "tool-start id must be masked in think"
+        free = np.delete(out_think[0], EXCLUDED)
+        assert np.array_equal(free, np.zeros(7)), "all non-opener logits stay free"
+        assert state["fills"] == 0, "grammar mask must NOT run while thinking"
+
+        # After </think> the grammar mask takes over (exclusion no longer applies).
+        proc(mx.array([1, 5, END]), mx.zeros((1, 8)))
+        out_post = np.array(proc(mx.array([1, 5, END, 7]), mx.zeros((1, 8))))
+        assert np.array_equal(out_post, np.full((1, 8), -1.0)), (
+            "post-boundary masking is the grammar's, not the think-exclusion"
+        )
+    finally:
+        restore()
+
+
+def test_line1_no_exclusion_when_gate_absent():
+    # Without a gate (PATH A / non-reasoning) there is nothing to protect, so the
+    # think-exclusion never runs even if ids were passed — grammar constrains from
+    # token 0 as before.
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", think_excluded_ids=(3,), tokenizer=None
+        )
+        assert proc._reasoning_ended is True, "no gate ⇒ constrain from token 0"
+        proc(mx.array([1]), mx.zeros((1, 8)))
+        out = np.array(proc(mx.array([1, 4]), mx.zeros((1, 8))))
+        # First real token is grammar-masked (-1 from the fake matcher), NOT the
+        # additive think-exclusion (which is inert once the gate is open).
+        assert np.array_equal(out, np.full((1, 8), -1.0))
+    finally:
+        restore()
+
+
+def test_line1_resolve_tool_start_exclusion_ids():
+    # The trigger resolver keeps ONLY a single-special-token opener (surgical mask)
+    # and declines multi-token / missing triggers (best-effort no-op).
+    from vllm_mlx.routes.chat import _resolve_tool_start_exclusion_ids
+
+    class _SI:
+        def __init__(self, trigger):
+            self.trigger = trigger
+
+    class _Tok:
+        # <tool_call> is a single special token (id 55); a multi-token trigger is
+        # not (returns >1 id) and must be declined.
+        def encode(self, s, add_special_tokens=False):
+            return {"<tool_call>": [55], "<mt>": [10, 11]}.get(s, [1, 2, 3])
+
+    class _Parser:
+        def __init__(self, trigger):
+            self._t = trigger
+
+        def structure_info(self):
+            return lambda name: _SI(self._t)
+
+    tools = [{"name": "f", "parameters": {}}]
+    # Single special token → kept.
+    assert _resolve_tool_start_exclusion_ids(
+        _Parser("<tool_call>"), _Tok(), tools
+    ) == (55,)
+    # Multi-token trigger → declined.
+    assert _resolve_tool_start_exclusion_ids(_Parser("<mt>"), _Tok(), tools) == ()
+    # No structure_info → declined.
+
+    class _NoSI:
+        structure_info = None
+
+    assert _resolve_tool_start_exclusion_ids(_NoSI(), _Tok(), tools) == ()
+    # No tools → declined.
+    assert _resolve_tool_start_exclusion_ids(_Parser("<tool_call>"), _Tok(), []) == ()
+
+
 def test_line1_string_gate_not_run_when_id_gate_active():
     # The decode-based string gate (``_maybe_open_after_reasoning``) is a known
     # footgun and must be BYPASSED whenever the deterministic token-id gate is
@@ -2611,13 +2721,22 @@ def test_line1_string_gate_not_run_when_id_gate_active():
 
 
 class _L1Req:
-    """Minimal request stub carrying the three fields the line① front-line
-    predicate reads (``_RequestStub`` above omits ``reasoning_max_tokens``)."""
+    """Minimal request stub carrying the fields the line① front-line predicate
+    reads (``_RequestStub`` above omits ``reasoning_max_tokens``)."""
 
-    def __init__(self, tools=("t",), tool_choice="required", reasoning_max_tokens=64):
+    def __init__(
+        self,
+        tools=("t",),
+        tool_choice="required",
+        reasoning_max_tokens=64,
+        max_tokens=None,
+        stop=None,
+    ):
         self.tools = list(tools) if tools else tools
         self.tool_choice = tool_choice
         self.reasoning_max_tokens = reasoning_max_tokens
+        self.max_tokens = max_tokens
+        self.stop = stop
 
 
 def test_line1_should_probe_seed_predicate():
@@ -2656,6 +2775,45 @@ def test_line1_should_probe_seed_predicate():
     assert _line1_should_probe_seed(_L1Req(tools=None), True) is False
     assert _line1_should_probe_seed(_L1Req(tools=[]), True) is False
 
+    # Declines: max_tokens too small for force-close + a minimal call (codex #4).
+    # budget=64, floor=+16 → max_tokens must exceed 80.
+    assert _line1_should_probe_seed(
+        _L1Req(reasoning_max_tokens=64, max_tokens=64), True
+    ) is False
+    assert _line1_should_probe_seed(
+        _L1Req(reasoning_max_tokens=64, max_tokens=80), True
+    ) is False
+    # Engages: max_tokens comfortably above the floor.
+    assert _line1_should_probe_seed(
+        _L1Req(reasoning_max_tokens=64, max_tokens=256), True
+    ) is True
+    # Unset max_tokens never blocks (unbounded generation).
+    assert _line1_should_probe_seed(
+        _L1Req(reasoning_max_tokens=64, max_tokens=None), True
+    ) is True
+
+
+def test_line1_completion_limit_ok_predicate():
+    # codex #4: the completion-limit guard in isolation. max_tokens must leave
+    # room for the force-close + a minimal constrained call past the budget.
+    from vllm_mlx.routes.chat import _LINE1_MIN_CALL_TOKENS, _line1_completion_limit_ok
+
+    # Unset either bound → no constraint.
+    assert _line1_completion_limit_ok(_L1Req(reasoning_max_tokens=64, max_tokens=None))
+    assert _line1_completion_limit_ok(_L1Req(reasoning_max_tokens=None, max_tokens=32))
+    # At / below the floor (budget + minimal call envelope) → decline.
+    floor = 64 + _LINE1_MIN_CALL_TOKENS
+    assert not _line1_completion_limit_ok(
+        _L1Req(reasoning_max_tokens=64, max_tokens=64)
+    )
+    assert not _line1_completion_limit_ok(
+        _L1Req(reasoning_max_tokens=64, max_tokens=floor)
+    )
+    # One token above the floor → OK.
+    assert _line1_completion_limit_ok(
+        _L1Req(reasoning_max_tokens=64, max_tokens=floor + 1)
+    )
+
 
 def test_line1_route_threads_predicate_into_offload_build():
     # Wiring guard (same pattern as ``test_route_offload_gated_on_eligibility_in_
@@ -2691,6 +2849,20 @@ def test_line1_route_threads_predicate_into_offload_build():
     )
     assert "seed_prefix=(_line1_prefix" in src, (
         "route must thread the already-rendered prefix into the budget builder"
+    )
+    # codex #1: the probe render is wrapped so an MLLM render failure falls back
+    # instead of 500ing.
+    assert "line①: generation-prefix render failed" in src, (
+        "route must wrap the seed-state probe render in try/except (codex #1)"
+    )
+    # codex #2 / #4: the gate block declines when the coupled budget would (stop
+    # conflict) or when max_tokens strands the call — so the gate is never orphaned.
+    gate_src = inspect.getsource(chat_mod._maybe_build_tool_grammar_processor)
+    assert "reasoning_stop_conflicts(" in gate_src, (
+        "gate must decline on stop-conflict so the budget's force-close is present"
+    )
+    assert "_line1_completion_limit_ok(request)" in gate_src, (
+        "gate must decline when max_tokens strands the forced call (codex #4)"
     )
 
 

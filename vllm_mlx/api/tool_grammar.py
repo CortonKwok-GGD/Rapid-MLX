@@ -2255,6 +2255,7 @@ class GrammarLogitsProcessor:
         *,
         reasoning_end_token: str | None = None,
         reasoning_end_id: int | None = None,
+        think_excluded_ids: Any = None,
         tokenizer: Any = None,
         stop_token_ids: Any = None,
     ):
@@ -2298,6 +2299,25 @@ class GrammarLogitsProcessor:
         self._reasoning_ended = (
             reasoning_end_token is None and reasoning_end_id is None
         )
+        # LINE① (#558): tokens the model must NOT emit WHILE the reasoning gate is
+        # closed — the tool-call start marker(s). Copies SGLang's
+        # ``think_excluded_token_ids`` (``reasoner_grammar_backend.py``): during the
+        # ``<think>`` span the inner tool grammar is inactive (free generation), so
+        # without this a model could open a ``<tool_call>`` INSIDE reasoning and the
+        # coupled budget's forced ``</think>`` could then land mid-envelope. Masking
+        # the single-special-token opener during the closed gate makes that
+        # structurally impossible (the model can only begin the call AFTER
+        # ``</think>``, where the grammar owns it). Only meaningful WITH the id gate
+        # (during free PATH-A/non-gated generation there is nothing to protect); the
+        # caller supplies these ONLY when ``reasoning_end_id`` is set. Filtered to
+        # in-vocab ids; the additive -inf mask is built lazily per logits width.
+        self._think_excluded_ids: tuple[int, ...] = tuple(
+            sorted(
+                {int(t) for t in (think_excluded_ids or ()) if 0 <= int(t) < self._vocab}
+            )
+        )
+        self._think_exclude_add: Any = None
+        self._think_exclude_width: int | None = None
         self._tokenizer = tokenizer
         # MODEL STOP/EOS tokens re-admitted at accepting states (0.10.16 dogfood
         # P1-①). llguidance's compiled grammar terminates on the tokenizer's
@@ -2371,6 +2391,33 @@ class GrammarLogitsProcessor:
         disjoint). ``None`` => no gate => the budget keeps its tool opt-out.
         """
         return self._reasoning_end_id
+
+    def _apply_think_exclusion(self, logits: Any) -> Any:
+        """Additively mask the tool-call opener id(s) to ``-inf`` while the
+        reasoning gate is closed, leaving every other logit untouched (free
+        thinking). Additive (not override): the model still generates freely; only
+        the tool-start marker is forbidden until ``</think>``. The mask row is
+        cached per logits width and broadcast, preserving the incoming shape (the
+        mlx-lm processor contract — same guarantee as ``_force_distribution``)."""
+        import mlx.core as mx
+
+        width = logits.shape[-1]
+        dtype = logits.dtype
+        if self._think_exclude_add is None or self._think_exclude_width != width:
+            # Additive row: 0 everywhere, -inf at each excluded id. Built with the
+            # same ``where``-over-arange pattern as ``_force_distribution`` (no
+            # scatter — the opener set is tiny, typically a single ``<tool_call>``).
+            vocab = mx.arange(width)
+            neg = mx.array(-float("inf"), dtype=mx.float32)
+            row = mx.zeros((width,), dtype=mx.float32)
+            for i in self._think_excluded_ids:
+                if 0 <= i < width:
+                    row = mx.where(vocab == i, neg, row)
+            self._think_exclude_add = row.astype(dtype)
+            self._think_exclude_width = width
+        elif self._think_exclude_add.dtype != dtype:
+            self._think_exclude_add = self._think_exclude_add.astype(dtype)
+        return logits + mx.broadcast_to(self._think_exclude_add, logits.shape)
 
     def _maybe_open_after_reasoning(self, token_ids: Any) -> None:
         if self._reasoning_ended or self._tokenizer is None:
@@ -2463,7 +2510,13 @@ class GrammarLogitsProcessor:
         if not self._reasoning_ended and self._reasoning_end_id is None:
             self._maybe_open_after_reasoning(token_ids)
         if not self._reasoning_ended:
-            return logits  # free generation during reasoning
+            # Free generation during reasoning — EXCEPT the tool-call opener(s),
+            # which are masked so the model cannot begin a tool call inside
+            # ``<think>`` (LINE① / SGLang ``think_excluded_token_ids``). Everything
+            # else is unconstrained. No excluded ids ⇒ fully free (unchanged).
+            if self._think_excluded_ids:
+                return self._apply_think_exclusion(logits)
+            return logits
 
         if self._matcher.is_stopped():
             return logits
