@@ -926,20 +926,27 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request, reasoning_seed_ope
         # to the forced-prefix lever, because a bounded forced grammar would
         # force the trigger at token 0 and leave the prompt ``<think>`` unclosed
         # (the qwen3 parser then buries the whole call in ``reasoning_content``).
-        # That opt-out is LIFTED only when the generation-time thinking budget
-        # (#1185) is GUARANTEED to force ``</think>``: build the PLAIN
-        # (non-reasoning) bounded forced grammar but hold its mask OFF behind a
-        # runtime TOKEN-ID gate until ``</think>`` is decoded.
+        # That opt-out is LIFTED here: build the PLAIN (non-reasoning) bounded
+        # forced grammar but hold its mask OFF behind a runtime TOKEN-ID gate
+        # until ``</think>`` is decoded, and COUPLE a generation-time thinking
+        # budget (Option B) that force-closes ``</think>`` inside the think span —
+        # the exact shape SGLang's ``ReasonerGrammarObject`` and vLLM's
+        # reasoning-gated structured output use. The route installs that coupled
+        # budget by passing ``allow_tools`` to ``_build_reasoning_budget_processor``
+        # EXACTLY when this gate is set (``GrammarLogitsProcessor.reasoning_gate_
+        # id``), so the budget is GUARANTEED to force ``</think>`` and the gate is
+        # provably guaranteed to open (no infinite-wait regression). Because the
+        # mask is OFF through the whole ``<think>`` span, the force-closed
+        # ``</think>`` lands before any tool-call token can exist — safe despite
+        # vLLM #44676 (that footgun is the UNGATED auto/parser path we never take).
         #
-        # The engage predicate MIRRORS #1185's seeded-budget install conditions
-        # EXACTLY, so the gate is provably guaranteed to open (no infinite-wait
-        # regression): the caller passes ``reasoning_seed_open`` = the template
-        # PREFILLS an unclosed ``<think>`` (seed state "open") AND a budget is
-        # set — precisely when #1185 installs a SEEDED budget that force-closes.
-        # We additionally re-verify ``</think>`` is a single in-vocab id (the same
+        # The engage predicate is the seed-state "open" classification (the
+        # template PREFILLS an unclosed ``<think>``) plus a set budget — precisely
+        # when the coupled budget installs a SEEDED force-close. We additionally
+        # re-verify ``</think>`` is a single in-vocab id (the same
         # ``resolve_think_token_ids`` + width check ``build_reasoning_budget_
-        # processor`` applies), so line① declines in the identical corner #1185
-        # declines. "emit"/"ambiguous"/no-budget requests never set
+        # processor`` applies), so line① declines in the identical corner the
+        # budget declines. "emit"/"ambiguous"/no-budget requests never set
         # ``reasoning_seed_open`` and keep the forced-prefix fallback — strictly
         # non-regressive; the "emit" (model-emitted-``<think>``) scope is a
         # tracked follow-up.
@@ -2415,8 +2422,18 @@ def _engine_output_vocab_size(engine) -> int | None:
     return _actual_output_head_width(model)
 
 
+_LINE1_SEED_UNSET = object()  # sentinel: no pre-rendered seed prefix supplied
+
+
 def _build_reasoning_budget_processor(
-    engine, request, cfg, messages, resolved_thinking
+    engine,
+    request,
+    cfg,
+    messages,
+    resolved_thinking,
+    *,
+    allow_tools: bool = False,
+    seed_prefix=_LINE1_SEED_UNSET,
 ) -> "ReasoningBudgetLogitsProcessor | None":  # noqa: F821 — forward ref
     """Build the generation-time thinking-budget processor for this request, or
     ``None`` (the caller then keeps the post-hoc reasoning cap).
@@ -2441,9 +2458,20 @@ def _build_reasoning_budget_processor(
         unknown-model default (``None``) is skipped, so we never install an
         unseeded processor that can't fire yet still suppresses the post-hoc cap
         (guards vLLM #39130: never force a reasoning-end that cannot occur).
-      * TOOL requests opt out — a mid-span force-close could inject ``</think>``
-        after a tool-call opener and corrupt the call (vLLM #44676); a tracked
-        follow-up adds SGLang's ``think_excluded_tokens`` so the two can coexist.
+      * TOOL requests opt out — UNLESS ``allow_tools`` (LINE① #558): a mid-span
+        force-close could inject ``</think>`` after a tool-call opener and corrupt
+        the call ONLY when the tool grammar/parser is active DURING the think span
+        (vLLM #44676 — the UNGATED ``tool_choice="auto"`` parser path). LINE①'s
+        forced grammar is REASONING-GATED (its mask is held OFF until ``</think>``
+        via the runtime token-id gate), so the constrained region begins strictly
+        AFTER the boundary and the force-closed ``</think>`` cannot land mid-call.
+        The route passes ``allow_tools=True`` EXACTLY when that gate is active
+        (``GrammarLogitsProcessor.reasoning_gate_id is not None``), COUPLING the
+        budget to the gate — the same structural coupling SGLang enforces (its
+        ``ReasonerGrammarObject`` never installs the budget without the gate) and
+        the same reason vLLM applies the budget to structured requests without a
+        tool opt-out (budget and grammar are temporally disjoint). Every other
+        tool request keeps the opt-out (protects the ungated auto/parser path).
       * A request that lists ``</think>`` (or an overlapping substring) in
         ``stop`` opts out — forcing ``</think>`` would trip that client stop AT
         the reasoning boundary; the post-hoc cap (which appends ``</think>`` to
@@ -2468,33 +2496,41 @@ def _build_reasoning_budget_processor(
         return None
     if getattr(request, "reasoning_max_tokens", None) is None:
         return None
-    if request.tools:
+    if request.tools and not allow_tools:
         return None
     if reasoning_stop_conflicts(
         getattr(request, "stop", None), getattr(cfg, "reasoning_parser_name", None)
     ):
         return None
-    try:
-        seed_suffix = _template_generation_prefix(
-            engine, messages, request.tools, resolved_thinking
-        )
-    except Exception as exc:
-        # Rendering can fail (e.g. MLLM engines reject build_prompt). Signal that
-        # with None so build_budget_from_render installs NO processor and the
-        # post-hoc cap is retained — never a non-seeded processor that would
-        # silently suppress the cap yet never fire (codex). The budget stays
-        # enforced via the post-hoc cap, so this is a legitimate fallback for some
-        # engines — but log it (debug, with model context) so a genuine rendering
-        # regression is diagnosable instead of silently degrading to post-hoc for
-        # every request (codex R16 nit).
-        logger.debug(
-            "reasoning budget: generation-prefix render failed for model=%s "
-            "(%s: %s) — falling back to the post-hoc reasoning cap",
-            getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
-            type(exc).__name__,
-            exc,
-        )
-        seed_suffix = None
+    # LINE① threads the ALREADY-rendered generation prefix (the route computed it
+    # to classify the seed state before building the gated grammar), so the budget
+    # reuses that single render instead of a second synchronous ``apply_chat_
+    # template`` on the event loop (codex #3). The sentinel distinguishes "not
+    # supplied" from a legitimate ``None`` (render failed → post-hoc cap).
+    if seed_prefix is not _LINE1_SEED_UNSET:
+        seed_suffix = seed_prefix
+    else:
+        try:
+            seed_suffix = _template_generation_prefix(
+                engine, messages, request.tools, resolved_thinking
+            )
+        except Exception as exc:
+            # Rendering can fail (e.g. MLLM engines reject build_prompt). Signal
+            # that with None so build_budget_from_render installs NO processor and
+            # the post-hoc cap is retained — never a non-seeded processor that
+            # would silently suppress the cap yet never fire (codex). The budget
+            # stays enforced via the post-hoc cap, so this is a legitimate fallback
+            # for some engines — but log it (debug, with model context) so a
+            # genuine rendering regression is diagnosable instead of silently
+            # degrading to post-hoc for every request (codex R16 nit).
+            logger.debug(
+                "reasoning budget: generation-prefix render failed for model=%s "
+                "(%s: %s) — falling back to the post-hoc reasoning cap",
+                getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
+                type(exc).__name__,
+                exc,
+            )
+            seed_suffix = None
     return build_budget_from_render(
         getattr(engine, "tokenizer", None),
         getattr(cfg, "reasoning_parser_name", None),
@@ -3225,12 +3261,19 @@ async def _create_chat_completion_impl(
     # forced-prefix fallback (strictly non-regressive; a render that fails, e.g.
     # an MLLM engine, stays False too).
     _line1_seed_open = False
+    # Captured for reuse by the generation-time budget below (Option B): the SAME
+    # render that classifies the seed state is threaded into
+    # ``_build_reasoning_budget_processor`` so the coupled budget never re-renders
+    # the template on the event loop (codex #3). ``_LINE1_SEED_UNSET`` = line①
+    # never probed (not a candidate) → the budget builder renders on its own path.
+    _line1_prefix = _LINE1_SEED_UNSET
     if _line1_should_probe_seed(request, resolved_thinking):
         from ..api.reasoning_budget import reasoning_seed_state
 
         _l1_prefix = _template_generation_prefix(
             engine, messages, request.tools, resolved_thinking
         )
+        _line1_prefix = _l1_prefix
         if _l1_prefix is not None:
             _line1_seed_open = (
                 reasoning_seed_state(
@@ -3239,6 +3282,16 @@ async def _create_chat_completion_impl(
                 == "open"
             )
     _glp = await _offload_tool_grammar_build(engine, cfg, request, _line1_seed_open)
+    # LINE① (#558) Option B — COUPLE the generation-time thinking budget to the
+    # gated grammar. ``reasoning_gate_id is not None`` means the grammar's mask is
+    # held OFF until ``</think>`` (runtime token-id gate), so a budget that
+    # force-closes ``</think>`` inside the think span cannot corrupt a tool call
+    # (the constrained region starts strictly AFTER the boundary). This is the
+    # structural coupling SGLang enforces and the reason vLLM applies the budget to
+    # structured requests without a tool opt-out. ``_build_reasoning_budget_
+    # processor`` is passed ``allow_tools`` EXACTLY here (every other tool request
+    # keeps the opt-out, protecting the ungated auto/parser path — vLLM #44676).
+    _line1_gate_engaged = _glp is not None and _glp.reasoning_gate_id is not None
     # DELIBERATE AVAILABILITY POLICY (codex #558-PR5 override, NOT fail-closed):
     # a ``None`` here degrades this request to the pre-#558 free-form
     # tool-parsing path. That degrade is reserved for exactly two families of
@@ -3429,8 +3482,20 @@ async def _create_chat_completion_impl(
     # is committed to LOCAL generation (past the cloud-offload decision), so a
     # cloud-routed request neither installs the processor nor has its post-hoc
     # cap suppressed (codex). See ``_build_reasoning_budget_processor``.
+    # LINE① Option B: when the gated grammar is active, pass ``allow_tools`` so the
+    # budget is installed for this tool request (coupled to the gate) and thread
+    # the already-rendered generation prefix so no second render runs. The gate
+    # holds the tool grammar OFF through the ``<think>`` span, so the budget's
+    # force-close of ``</think>`` lands before any tool-call token — safe despite
+    # vLLM #44676 (which is the UNGATED auto/parser path this never touches).
     _rblp = _build_reasoning_budget_processor(
-        engine, request, cfg, messages, resolved_thinking
+        engine,
+        request,
+        cfg,
+        messages,
+        resolved_thinking,
+        allow_tools=_line1_gate_engaged,
+        seed_prefix=(_line1_prefix if _line1_gate_engaged else _LINE1_SEED_UNSET),
     )
     if _rblp is not None:
         chat_kwargs["reasoning_budget_logits_processor"] = _rblp

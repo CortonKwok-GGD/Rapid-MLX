@@ -2285,8 +2285,15 @@ class GrammarLogitsProcessor:
         # supplied the mask starts OFF (reasoning not yet ended) and opens when
         # the boundary is observed; with NEITHER, the grammar constrains from
         # token 0 (PATH A). The id gate is only sound when a thinking budget
-        # (#1185) guarantees the boundary is emitted — the chat route wires it
-        # exactly there (forced + reasoning + a set ``reasoning_max_tokens``).
+        # guarantees the boundary is emitted — the chat route COUPLES one exactly
+        # there (Option B: it reads ``reasoning_gate_id`` and installs a budget
+        # for this tool request via ``_build_reasoning_budget_processor(allow_
+        # tools=True)``), mirroring SGLang's ``ReasonerGrammarObject`` (budget +
+        # gated grammar in one object) and vLLM's reasoning-gated structured
+        # output (budget applied to structured requests, temporally disjoint from
+        # the grammar). Because the mask is OFF through the ``<think>`` span, the
+        # forced ``</think>`` cannot land mid-tool-call (vLLM #44676 is the ungated
+        # path only).
         self._reasoning_end_id = reasoning_end_id
         self._reasoning_ended = (
             reasoning_end_token is None and reasoning_end_id is None
@@ -2348,6 +2355,22 @@ class GrammarLogitsProcessor:
     def is_broken(self) -> bool:
         """Whether the grammar failed to compile (masks nothing; use fallback)."""
         return self._broken
+
+    @property
+    def reasoning_gate_id(self) -> int | None:
+        """LINE① (#558): the ``</think>`` TOKEN ID this processor's mask is gated
+        behind, or ``None`` when the grammar constrains from token 0 (PATH A) or
+        uses the string gate. The route reads this to COUPLE the generation-time
+        thinking budget to the gate — a non-``None`` value means the mask is held
+        OFF through the ``<think>`` span, so installing a budget that force-closes
+        ``</think>`` inside that span cannot land mid-tool-call (the constrained
+        region begins strictly AFTER the boundary). Mirrors how SGLang's
+        ``ReasonerGrammarObject`` carries both the budget and the inner grammar in
+        one object, and vLLM applies the budget to structured requests precisely
+        because the grammar is reasoning-gated (budget and grammar temporally
+        disjoint). ``None`` => no gate => the budget keeps its tool opt-out.
+        """
+        return self._reasoning_end_id
 
     def _maybe_open_after_reasoning(self, token_ids: Any) -> None:
         if self._reasoning_ended or self._tokenizer is None:

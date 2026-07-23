@@ -2621,9 +2621,9 @@ class _L1Req:
 
 
 def test_line1_should_probe_seed_predicate():
-    # codex BLOCKING fix: behaviorally test the EXTRACTED eligibility predicate
-    # (the prior test only searched source text, so it passed even if the code
-    # were unreachable). Exercises forced/auto/none x budget/no-budget x
+    # Behavioral test for the EXTRACTED eligibility predicate (an earlier revision
+    # only searched source text, so it passed even if the code were unreachable).
+    # Exercises forced/auto/none x budget/no-budget x
     # thinking on/off x tools/no-tools — the predicate that decides whether the
     # (synchronous) seed-state render runs and, transitively, whether line①
     # engages.
@@ -2658,9 +2658,9 @@ def test_line1_should_probe_seed_predicate():
 
 
 def test_line1_route_threads_predicate_into_offload_build():
-    # Complements the behavioral predicate test: assert the route actually USES
-    # ``_line1_should_probe_seed`` and threads its (seed-open) result into the
-    # off-loop build — i.e. the tested predicate is on the live path, not dead.
+    # Wiring guard (same pattern as ``test_route_offload_gated_on_eligibility_in_
+    # source``): the behavioral predicate/coupling tests below prove the units;
+    # this asserts the route actually WIRES them on the live path, not dead code.
     import inspect
 
     from vllm_mlx.routes import chat as chat_mod
@@ -2677,3 +2677,96 @@ def test_line1_route_threads_predicate_into_offload_build():
     assert 'reasoning_seed_state(' in src and '== "open"' in src, (
         "route must classify the rendered prefix and engage only on 'open'"
     )
+    # Option B coupling: the route derives gate-engaged from the grammar's
+    # ``reasoning_gate_id`` and threads ``allow_tools`` + the reused prefix into
+    # the budget builder (so the budget is installed for this tool request and no
+    # second render runs).
+    gate_pos = src.find("_glp.reasoning_gate_id is not None")
+    budget_pos = src.find("allow_tools=_line1_gate_engaged")
+    assert gate_pos != -1 and offload_pos < gate_pos, (
+        "route must derive line① gate-engaged from the grammar's reasoning_gate_id"
+    )
+    assert budget_pos != -1 and gate_pos < budget_pos, (
+        "route must couple the budget to the gate via allow_tools"
+    )
+    assert "seed_prefix=(_line1_prefix" in src, (
+        "route must thread the already-rendered prefix into the budget builder"
+    )
+
+
+def test_line1_reasoning_gate_id_property_exposes_gate():
+    # Option B: the route reads ``reasoning_gate_id`` to decide whether to couple
+    # the budget. A gated processor exposes its ``</think>`` id; a plain one None.
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        gated = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=99, tokenizer=None
+        )
+        assert gated.reasoning_gate_id == 99
+        plain = GrammarLogitsProcessor(_FakeLLTok(), "g", tokenizer=None)
+        assert plain.reasoning_gate_id is None
+    finally:
+        restore()
+
+
+def test_line1_allow_tools_couples_budget_to_gate(monkeypatch):
+    # Option B, the load-bearing behavior: a tool request normally OPTS OUT of the
+    # generation-time thinking budget (allow_tools=False → None, protecting the
+    # ungated auto/parser path from vLLM #44676). With allow_tools=True — which the
+    # route passes EXACTLY when the reasoning-gated grammar is active — the opt-out
+    # is LIFTED, coupling the budget to the gate (SGLang / vLLM shape). We also
+    # assert the already-rendered prefix is THREADED through (codex #3: no second
+    # synchronous render).
+    import vllm_mlx.api.reasoning_budget as rb
+    from vllm_mlx.routes import chat as chat_mod
+
+    sentinel = object()
+    calls = []
+
+    def _fake_build(tok, parser, mtk, seed, *, vocab_size=None):
+        calls.append({"seed": seed, "vocab": vocab_size, "mtk": mtk})
+        return sentinel
+
+    monkeypatch.setattr(rb, "build_budget_from_render", _fake_build)
+    monkeypatch.setattr(chat_mod, "_engine_output_vocab_size", lambda _e: 4096)
+
+    class _Cfg:
+        model_path = "qwen3.5-4b"
+        model_name = "qwen3.5-4b"
+        reasoning_parser_name = "qwen3"
+
+    class _Req:
+        tools = ["t"]
+        reasoning_max_tokens = 64
+        stop = None
+
+    class _Eng:
+        tokenizer = object()
+
+    # allow_tools=False (default): tool opt-out fires — builder never reached.
+    out = chat_mod._build_reasoning_budget_processor(
+        _Eng(), _Req(), _Cfg(), [], True, seed_prefix="<think>"
+    )
+    assert out is None, "a tool request must opt out of the budget by default"
+    assert calls == [], "the tool opt-out must short-circuit before the builder"
+
+    # allow_tools=True: opt-out lifted — builder reached with the THREADED prefix.
+    out2 = chat_mod._build_reasoning_budget_processor(
+        _Eng(),
+        _Req(),
+        _Cfg(),
+        [],
+        True,
+        allow_tools=True,
+        seed_prefix="<think>",
+    )
+    assert out2 is sentinel, "allow_tools=True must couple the budget to the gate"
+    assert len(calls) == 1 and calls[0]["seed"] == "<think>", (
+        "the already-rendered prefix must be threaded (no second render)"
+    )
+    assert calls[0]["mtk"] == 64 and calls[0]["vocab"] == 4096
