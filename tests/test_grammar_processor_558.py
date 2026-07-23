@@ -2776,12 +2776,13 @@ def test_line1_should_probe_seed_predicate():
     assert _line1_should_probe_seed(_L1Req(tools=[]), True) is False
 
     # Declines: max_tokens too small for force-close + a minimal call (codex #4).
-    # budget=64, floor=+16 → max_tokens must exceed 80.
+    # tools=("t",) has no resolvable name → floor == envelope (24); budget=64 ⇒
+    # max_tokens must exceed 88.
     assert _line1_should_probe_seed(
         _L1Req(reasoning_max_tokens=64, max_tokens=64), True
     ) is False
     assert _line1_should_probe_seed(
-        _L1Req(reasoning_max_tokens=64, max_tokens=80), True
+        _L1Req(reasoning_max_tokens=64, max_tokens=88), True
     ) is False
     # Engages: max_tokens comfortably above the floor.
     assert _line1_should_probe_seed(
@@ -2794,24 +2795,53 @@ def test_line1_should_probe_seed_predicate():
 
 
 def test_line1_completion_limit_ok_predicate():
-    # codex #4: the completion-limit guard in isolation. max_tokens must leave
-    # room for the force-close + a minimal constrained call past the budget.
-    from vllm_mlx.routes.chat import _LINE1_MIN_CALL_TOKENS, _line1_completion_limit_ok
+    # codex #4 / r2 #2: the completion-limit guard in isolation. max_tokens must
+    # leave room for the force-close + a minimal constrained call past the budget,
+    # and the floor SCALES with the tool name + required schema (not a flat const).
+    from vllm_mlx.routes.chat import (
+        _LINE1_CALL_ENVELOPE_TOKENS,
+        _line1_completion_limit_ok,
+        _line1_min_call_tokens,
+    )
 
     # Unset either bound → no constraint.
     assert _line1_completion_limit_ok(_L1Req(reasoning_max_tokens=64, max_tokens=None))
     assert _line1_completion_limit_ok(_L1Req(reasoning_max_tokens=None, max_tokens=32))
-    # At / below the floor (budget + minimal call envelope) → decline.
-    floor = 64 + _LINE1_MIN_CALL_TOKENS
-    assert not _line1_completion_limit_ok(
-        _L1Req(reasoning_max_tokens=64, max_tokens=64)
-    )
+    # Bare tools stub (no resolvable name) → floor == the fixed envelope.
+    bare = _L1Req(reasoning_max_tokens=64)
+    assert _line1_min_call_tokens(bare) == _LINE1_CALL_ENVELOPE_TOKENS
+    floor = 64 + _LINE1_CALL_ENVELOPE_TOKENS
     assert not _line1_completion_limit_ok(
         _L1Req(reasoning_max_tokens=64, max_tokens=floor)
     )
-    # One token above the floor → OK.
     assert _line1_completion_limit_ok(
         _L1Req(reasoning_max_tokens=64, max_tokens=floor + 1)
+    )
+
+    # Floor SCALES with a long tool name + required fields (codex r2 #2): a value
+    # of max_tokens that clears the bare floor must NOT clear the fat-schema floor.
+    fat_tool = {
+        "function": {
+            "name": "an_extremely_long_and_descriptive_tool_name_for_testing",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alpha": {"type": "string"},
+                    "beta": {"type": "string"},
+                    "gamma": {"type": "string"},
+                },
+                "required": ["alpha", "beta", "gamma"],
+            },
+        }
+    }
+    fat = _L1Req(tools=(fat_tool,), reasoning_max_tokens=64)
+    assert _line1_min_call_tokens(fat) > _LINE1_CALL_ENVELOPE_TOKENS, (
+        "floor must grow with a long name + required schema"
+    )
+    # A budget that would pass the bare floor is rejected for the fat schema.
+    fat.max_tokens = floor + 1
+    assert not _line1_completion_limit_ok(fat), (
+        "a long-name/large-schema tool must not slip under the flat envelope"
     )
 
 
@@ -2824,16 +2854,25 @@ def test_line1_route_threads_predicate_into_offload_build():
     from vllm_mlx.routes import chat as chat_mod
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    probe_pos = src.find("_line1_should_probe_seed(request, resolved_thinking)")
+    probe_pos = src.find("_line1_probe_seed_offloaded(")
     offload_pos = src.find(
         "_offload_tool_grammar_build(engine, cfg, request, _line1_seed_open"
     )
-    assert probe_pos != -1, "route must call the extracted line① predicate"
+    assert probe_pos != -1, "route must run the OFFLOADED line① seed probe"
     assert offload_pos != -1 and probe_pos < offload_pos, (
         "the seed-open decision must be computed and threaded into the build"
     )
-    assert 'reasoning_seed_state(' in src and '== "open"' in src, (
-        "route must classify the rendered prefix and engage only on 'open'"
+    # codex r2 #3: the seed-state render runs off the event loop (in an executor)
+    # and classifies "open" there, not inline in the async handler.
+    probe_src = inspect.getsource(chat_mod._line1_probe_seed_offloaded)
+    assert "run_in_executor" in probe_src, (
+        "seed probe render must run in an executor, not on the event loop"
+    )
+    assert 'reasoning_seed_state(' in probe_src and '== "open"' in probe_src, (
+        "probe must classify the rendered prefix and engage only on 'open'"
+    )
+    assert "line①: generation-prefix render failed" in probe_src, (
+        "probe must degrade gracefully on render failure (codex #1)"
     )
     # Option B coupling: the route derives gate-engaged from the grammar's
     # ``reasoning_gate_id`` and threads ``allow_tools`` + the reused prefix into
@@ -2850,13 +2889,9 @@ def test_line1_route_threads_predicate_into_offload_build():
     assert "seed_prefix=(_line1_prefix" in src, (
         "route must thread the already-rendered prefix into the budget builder"
     )
-    # codex #1: the probe render is wrapped so an MLLM render failure falls back
-    # instead of 500ing.
-    assert "line①: generation-prefix render failed" in src, (
-        "route must wrap the seed-state probe render in try/except (codex #1)"
-    )
-    # codex #2 / #4: the gate block declines when the coupled budget would (stop
-    # conflict) or when max_tokens strands the call — so the gate is never orphaned.
+    # codex #2 / #4 / r2 #1: the gate declines when the coupled budget would (stop
+    # conflict), when max_tokens strands the call, OR when the tool-start opener
+    # exclusion is not guaranteed — so the gate is never orphaned or unprotected.
     gate_src = inspect.getsource(chat_mod._maybe_build_tool_grammar_processor)
     assert "reasoning_stop_conflicts(" in gate_src, (
         "gate must decline on stop-conflict so the budget's force-close is present"
@@ -2864,6 +2899,55 @@ def test_line1_route_threads_predicate_into_offload_build():
     assert "_line1_completion_limit_ok(request)" in gate_src, (
         "gate must decline when max_tokens strands the forced call (codex #4)"
     )
+    assert "and _line1_tool_start_ids" in gate_src, (
+        "gate must require a resolved opener exclusion (codex r2 #1)"
+    )
+
+
+def test_line1_probe_seed_offloaded_behavior(monkeypatch):
+    # codex r2 #3: the seed probe runs off the event loop and degrades gracefully.
+    import asyncio
+
+    from vllm_mlx.routes import chat as chat_mod
+    from vllm_mlx.routes.chat import _LINE1_SEED_UNSET, _line1_probe_seed_offloaded
+
+    class _Cfg:
+        model_path = "qwen3.5-4b"
+        model_name = "qwen3.5-4b"
+        reasoning_parser_name = "qwen3"
+
+    # Non-candidate (auto choice) → short-circuits to (UNSET, False), NO render.
+    called = {"n": 0}
+
+    def _boom(*a, **k):
+        called["n"] += 1
+        raise AssertionError("render must not run for a non-candidate")
+
+    monkeypatch.setattr(chat_mod, "_template_generation_prefix", _boom)
+    req_auto = _L1Req(tool_choice="auto")
+    prefix, seed = asyncio.run(
+        _line1_probe_seed_offloaded(object(), _Cfg(), req_auto, [], True)
+    )
+    assert prefix is _LINE1_SEED_UNSET and seed is False
+    assert called["n"] == 0
+
+    # Candidate but the render RAISES → declines to (UNSET, False), no 500.
+    def _raise(*a, **k):
+        raise RuntimeError("MLLM build_prompt rejected")
+
+    monkeypatch.setattr(chat_mod, "_template_generation_prefix", _raise)
+    req = _L1Req(tool_choice="required", max_tokens=512)
+    prefix, seed = asyncio.run(
+        _line1_probe_seed_offloaded(object(), _Cfg(), req, [], True)
+    )
+    assert prefix is _LINE1_SEED_UNSET and seed is False
+
+    # Candidate + render returns an OPEN <think> prefix → (prefix, True).
+    monkeypatch.setattr(chat_mod, "_template_generation_prefix", lambda *a, **k: "<think>")
+    prefix, seed = asyncio.run(
+        _line1_probe_seed_offloaded(object(), _Cfg(), req, [], True)
+    )
+    assert prefix == "<think>" and seed is True
 
 
 def test_line1_reasoning_gate_id_property_exposes_gate():
