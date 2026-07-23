@@ -2261,19 +2261,6 @@ def _valid_head_width(obj) -> int | None:
     return None
 
 
-def _iter_named_modules(model):
-    """Yield ``(name, module)`` pairs from ``model.named_modules()``.
-
-    Real MLX ``nn.Module.named_modules()`` returns a *list of ``(str, Module)``
-    tuples* (its docstring: "Return a list … A list of tuples (str, Module)"),
-    so ordinary tuple-unpacking iteration is correct. Normalize defensively so a
-    mapping return (``.items()``) — should a wrapper or a future MLX revision use
-    one — is handled too, instead of a shape mismatch falling into the caller's
-    broad ``except`` and silently disabling the tree-walk fallback (codex)."""
-    nm = model.named_modules()
-    return nm.items() if hasattr(nm, "items") else nm
-
-
 def _actual_output_head_width(model) -> int | None:
     """The model's TRUE logits width — the vocab dimension (rows) of the output
     projection weight — or ``None`` if it cannot be inspected.
@@ -2283,85 +2270,48 @@ def _actual_output_head_width(model) -> int | None:
     lm-head width; validate against the actual head so a processor is never
     installed — and the post-hoc cap never suppressed — for a ``</think>`` id the
     head cannot emit). Reads ``weight.shape[0]`` off the untied ``lm_head`` or the
-    tied embedding projected via ``as_linear`` (qwen3 and most MLX text models).
+    tied ``embed_tokens`` (qwen3 and most MLX text models).
 
-    Real checkpoints nest the LM to varying depths — a flat mlx-lm text model
-    exposes ``model.embed_tokens``; a multimodal-capable wrapper (qwen3_5,
-    gemma3n, …) nests it under ``language_model.model.embed_tokens``. Missing the
-    head means ``_engine_output_vocab_size`` returns ``None`` and the budget
-    silently declines to the post-hoc cap (no decode-time force) — the regression
-    that shipped in #1185, where qwen3.5's head at
-    ``language_model.model.embed_tokens.weight`` matched none of the fixed paths.
-    So after the fixed fast paths we FALL BACK to a tree walk that finds the head
-    by module name at any depth. The width stays WEIGHT-derived either way (==
-    the decode logits width), keeping the out-of-range guard provably dead.
+    Resolution is by STRUCTURED fixed paths only — the canonical head locations
+    across the model families we serve: a flat mlx-lm text model exposes
+    ``lm_head``/``model.lm_head`` (untied) or ``model.embed_tokens`` (tied); a
+    multimodal-capable wrapper (qwen3_5, gemma3n, …) nests these under
+    ``language_model[.model]``. The #1185 regression was exactly a MISSING fixed
+    path — qwen3.5's tied head at ``language_model.model.embed_tokens.weight`` —
+    now covered below.
+
+    We deliberately do NOT tree-walk for a head by module name: a module named
+    ``lm_head`` anywhere in the tree is not necessarily the TEXT output head (a
+    vision/draft/MTP head can share the name), and validating ``</think>``
+    against the wrong head's width is unsound (codex). An unrecognized nesting
+    therefore returns ``None`` → ``_engine_output_vocab_size`` declines → the
+    budget falls back to the safe post-hoc cap (correct, just no decode-time
+    force until that family's fixed path is added). All ``lm_head`` (untied,
+    authoritative) paths are probed before any ``embed_tokens`` (tied) path so an
+    untied head is never shadowed by a differing-width input embedding.
     """
     if model is None:
         return None
 
-    def _probe(paths) -> int | None:
-        for path in paths:
-            obj = model
-            for attr in path:
-                obj = getattr(obj, attr, None)
-                if obj is None:
-                    break
-            width = _valid_head_width(obj)
-            if width is not None:
-                return width
-        return None
-
-    # An untied ``lm_head`` is the authoritative output projection: it must win
-    # over any tied ``embed_tokens`` of a differing width, WHEREVER each lives
-    # (codex). So EXHAUST every ``lm_head`` candidate — fixed fast paths AND the
-    # module-tree walk — before considering any ``embed_tokens`` width. A single
-    # ordered loop is unsound: a shallow fixed ``embed_tokens`` would return
-    # before the tree walk could reach a deeply nested untied ``lm_head``.
-    #
-    # Phase 1 — ``lm_head`` anywhere (fixed shallow → deep, then tree walk).
-    width = _probe(
-        (
-            ("lm_head", "weight"),
-            ("model", "lm_head", "weight"),
-            ("language_model", "lm_head", "weight"),
-            ("language_model", "model", "lm_head", "weight"),
-        )
-    )
-    if width is not None:
-        return width
-    try:
-        for name, mod in _iter_named_modules(model):
-            if name.rsplit(".", 1)[-1] == "lm_head":
-                width = _valid_head_width(getattr(mod, "weight", None))
-                if width is not None:
-                    return width
-    except Exception:
-        pass
-
-    # Phase 2 — no ``lm_head`` anywhere → the model ties its output head to the
-    # input embedding; use the ``embed_tokens`` width (fixed paths, then tree
-    # walk). Real checkpoints nest it to varying depths — a flat mlx-lm text
-    # model exposes ``model.embed_tokens``; a multimodal-capable wrapper (qwen3_5,
-    # gemma3n, …) nests it under ``language_model.model.embed_tokens`` — the
-    # #1185 regression, where that fixed path was missing. Still weight-derived
-    # (== the decode logits width), keeping the out-of-range guard provably dead.
-    width = _probe(
-        (
-            ("model", "embed_tokens", "weight"),
-            ("embed_tokens", "weight"),
-            ("language_model", "model", "embed_tokens", "weight"),
-        )
-    )
-    if width is not None:
-        return width
-    try:
-        for name, mod in _iter_named_modules(model):
-            if name.rsplit(".", 1)[-1] == "embed_tokens":
-                width = _valid_head_width(getattr(mod, "weight", None))
-                if width is not None:
-                    return width
-    except Exception:
-        return None
+    for path in (
+        # untied output projection — authoritative — shallow → deep
+        ("lm_head", "weight"),
+        ("model", "lm_head", "weight"),
+        ("language_model", "lm_head", "weight"),
+        ("language_model", "model", "lm_head", "weight"),
+        # tied: output head == input embedding — shallow → deep
+        ("model", "embed_tokens", "weight"),
+        ("embed_tokens", "weight"),
+        ("language_model", "model", "embed_tokens", "weight"),
+    ):
+        obj = model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        width = _valid_head_width(obj)
+        if width is not None:
+            return width
     return None
 
 

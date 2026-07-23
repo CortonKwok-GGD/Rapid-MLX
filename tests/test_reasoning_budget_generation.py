@@ -936,37 +936,6 @@ def test_engine_output_vocab_size_resolves_language_model_nested_head():
     assert _engine_output_vocab_size(_E()) == 248320
 
 
-def test_actual_output_head_width_tree_walk_fallback():
-    # When the head sits at a path none of the fixed probes cover, the tree-walk
-    # fallback finds it by module-leaf name at any depth. An untied lm_head is the
-    # authoritative output projection and must win over a same-tree embed_tokens.
-    # DISTINCT widths (and embed listed FIRST) so a wrong "return the embedding"
-    # impl would fail with 151000 instead of the lm_head's 151936 (codex).
-    from vllm_mlx.routes.chat import _actual_output_head_width
-
-    class _W:
-        def __init__(self, n):
-            self.shape = (n, 64)
-
-    class _Head:
-        weight = _W(151936)  # the OUTPUT head — authoritative
-
-    class _Embed:
-        weight = _W(151000)  # input embedding — DIFFERENT width, must lose
-
-    class _Model:
-        # No fixed path matches (head is under an unusual attribute), but
-        # named_modules exposes it by leaf name — embed_tokens seen first.
-        def named_modules(self):
-            return [
-                ("", self),
-                ("deeply.nested.embed_tokens", _Embed()),
-                ("deeply.nested.lm_head", _Head()),
-            ]
-
-    assert _actual_output_head_width(_Model()) == 151936
-
-
 def test_actual_output_head_width_fixed_path_prefers_lm_head_over_embed():
     # codex: the fixed-path scan must probe ALL lm_head paths before any
     # embed_tokens path, so an untied nested output head is never shadowed by an
@@ -996,89 +965,81 @@ def test_actual_output_head_width_fixed_path_prefers_lm_head_over_embed():
     assert _actual_output_head_width(_Model()) == 151936
 
 
-def test_actual_output_head_width_tree_walk_mapping_return():
-    # Real MLX `nn.Module.named_modules()` returns a LIST of (str, Module) tuples
-    # (covered by the tests above). This asserts the tree walk ALSO survives a
-    # MAPPING return ({name: module}) via the `.items()` normalization, so a
-    # differently-shaped return can never fall into the broad `except` and
-    # silently disable the fallback (codex). The untied lm_head must still win.
+def test_actual_output_head_width_resolves_tied_nested_embed():
+    # The #1185 regression at the head-width level: a multimodal-capable wrapper
+    # nests its TIED text head at language_model.model.embed_tokens.weight. That
+    # fixed path must resolve it (else the budget silently declines to post-hoc).
     from vllm_mlx.routes.chat import _actual_output_head_width
 
     class _W:
-        def __init__(self, n):
-            self.shape = (n, 64)
-
-    class _Head:
-        weight = _W(151936)
-
-    class _Embed:
-        weight = _W(151000)
-
-    class _Model:
-        def named_modules(self):
-            # a dict, NOT a list of tuples — exercises the `.items()` path
-            return {
-                "": self,
-                "deep.embed_tokens": _Embed(),
-                "deep.lm_head": _Head(),
-            }
-
-    assert _actual_output_head_width(_Model()) == 151936
-
-
-def test_actual_output_head_width_tree_walk_tied_embed_only():
-    # Tied model (no lm_head anywhere) — the tree walk falls back to the tied
-    # embed_tokens width.
-    from vllm_mlx.routes.chat import _actual_output_head_width
-
-    class _W:
-        shape = (200000, 64)
+        shape = (248320, 64)
 
     class _Embed:
         weight = _W()
 
+    class _Inner:
+        embed_tokens = _Embed()
+
+    class _LMModel:
+        model = _Inner()
+
     class _Model:
-        def named_modules(self):
-            return [("", self), ("odd.path.embed_tokens", _Embed())]
+        language_model = _LMModel()
 
-    assert _actual_output_head_width(_Model()) == 200000
+    assert _actual_output_head_width(_Model()) == 248320
 
 
-def test_actual_output_head_width_deep_untied_head_beats_fixed_embed():
-    # codex: an untied lm_head must win over a tied embed_tokens WHEREVER each
-    # lives — even when the embed_tokens sits on a FIXED fast path but the lm_head
-    # is only reachable via the tree walk. A single ordered probe loop is unsound
-    # here: the shallow fixed `model.embed_tokens` (151000) would return before the
-    # tree walk could reach the deep untied output head (151936). The phased probe
-    # exhausts ALL lm_head candidates (fixed + tree-walk) before ANY embed width.
+def test_actual_output_head_width_declines_on_unknown_nesting():
+    # A head reachable only at an UNRECOGNIZED path (no fixed path matches) yields
+    # None — we deliberately do NOT tree-walk, so an unknown nesting declines to
+    # the safe post-hoc cap rather than risk validating against the wrong head.
     from vllm_mlx.routes.chat import _actual_output_head_width
 
     class _W:
-        def __init__(self, n):
-            self.shape = (n, 64)
+        shape = (151936, 64)
 
     class _Head:
-        weight = _W(151936)  # deep untied output head — must win
+        weight = _W()
 
-    class _Embed:
-        weight = _W(151000)  # input embedding on a fixed path — different width
-
-    class _Inner:
-        embed_tokens = _Embed()  # matches fixed path ("model","embed_tokens","weight")
+    class _Weird:
+        lm_head = _Head()  # buried under an attribute no fixed path probes
 
     class _Model:
-        model = _Inner()
+        transformer = _Weird()  # not `model` / `language_model`
 
-        def named_modules(self):
-            # lm_head is nested where no fixed lm_head path reaches it; only the
-            # tree walk finds it. embed_tokens is exposed here too (as it would be).
-            return [
-                ("", self),
-                ("model.embed_tokens", self.model.embed_tokens),
-                ("visual.blocks.7.output.lm_head", _Head()),
-            ]
+    assert _actual_output_head_width(_Model()) is None
 
-    assert _actual_output_head_width(_Model()) == 151936
+
+def test_actual_output_head_width_ignores_stray_nonfixed_lm_head():
+    # codex soundness guard: a stray lm_head at a NON-fixed path (a vision/draft
+    # head) must NEVER hijack the width of the TIED text head on a fixed path.
+    # Fixed-paths-only resolution uses model.embed_tokens (fixed) and never even
+    # inspects the off-path stray head.
+    from vllm_mlx.routes.chat import _actual_output_head_width
+
+    class _WE:
+        shape = (200000, 64)  # real tied text head, on a fixed path
+
+    class _WV:
+        shape = (99999, 64)  # stray vision/draft head, off the fixed paths
+
+    class _Embed:
+        weight = _WE()
+
+    class _Head:
+        weight = _WV()
+
+    class _Vision:
+        lm_head = _Head()
+
+    class _Inner:
+        embed_tokens = _Embed()
+
+    class _Model:
+        model = _Inner()  # model.embed_tokens.weight — fixed tied path
+        visual = _Vision()  # visual.lm_head — off every fixed path
+
+    assert _actual_output_head_width(_Model()) == 200000
 
 
 # ─────────── add_generation_prompt plumbing (codex R11 #1) ──────────────────
