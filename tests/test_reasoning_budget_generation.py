@@ -1014,6 +1014,43 @@ def test_actual_output_head_width_tree_walk_tied_embed_only():
     assert _actual_output_head_width(_Model()) == 200000
 
 
+def test_actual_output_head_width_deep_untied_head_beats_fixed_embed():
+    # codex: an untied lm_head must win over a tied embed_tokens WHEREVER each
+    # lives — even when the embed_tokens sits on a FIXED fast path but the lm_head
+    # is only reachable via the tree walk. A single ordered probe loop is unsound
+    # here: the shallow fixed `model.embed_tokens` (151000) would return before the
+    # tree walk could reach the deep untied output head (151936). The phased probe
+    # exhausts ALL lm_head candidates (fixed + tree-walk) before ANY embed width.
+    from vllm_mlx.routes.chat import _actual_output_head_width
+
+    class _W:
+        def __init__(self, n):
+            self.shape = (n, 64)
+
+    class _Head:
+        weight = _W(151936)  # deep untied output head — must win
+
+    class _Embed:
+        weight = _W(151000)  # input embedding on a fixed path — different width
+
+    class _Inner:
+        embed_tokens = _Embed()  # matches fixed path ("model","embed_tokens","weight")
+
+    class _Model:
+        model = _Inner()
+
+        def named_modules(self):
+            # lm_head is nested where no fixed lm_head path reaches it; only the
+            # tree walk finds it. embed_tokens is exposed here too (as it would be).
+            return [
+                ("", self),
+                ("model.embed_tokens", self.model.embed_tokens),
+                ("visual.blocks.7.output.lm_head", _Head()),
+            ]
+
+    assert _actual_output_head_width(_Model()) == 151936
+
+
 # ─────────── add_generation_prompt plumbing (codex R11 #1) ──────────────────
 # The two-render seed probe needs build_prompt to HONOR add_generation_prompt so
 # the True/False renders differ. base.py's build_prompt is @abstractmethod (no

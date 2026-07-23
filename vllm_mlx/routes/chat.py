@@ -2285,44 +2285,71 @@ def _actual_output_head_width(model) -> int | None:
     """
     if model is None:
         return None
-    # ALL ``lm_head`` (untied output projection — authoritative) paths are
-    # probed BEFORE any ``embed_tokens`` (tied/input embedding) path, so an untied
-    # nested head is never shadowed by an input embedding of a differing width
-    # (codex). Within each group, shallow → deep.
-    for path in (
-        ("lm_head", "weight"),
-        ("model", "lm_head", "weight"),
-        ("language_model", "lm_head", "weight"),
-        ("language_model", "model", "lm_head", "weight"),
-        ("model", "embed_tokens", "weight"),
-        ("embed_tokens", "weight"),
-        ("language_model", "model", "embed_tokens", "weight"),
-    ):
-        obj = model
-        for attr in path:
-            obj = getattr(obj, attr, None)
-            if obj is None:
-                break
-        width = _valid_head_width(obj)
-        if width is not None:
-            return width
-    # Fallback: locate the output head / tied embedding ANYWHERE in the module
-    # tree (handles nestings the fixed paths miss). An untied ``lm_head`` is the
-    # authoritative output projection, so it wins immediately; otherwise the tied
-    # ``embed_tokens`` carries the same vocab width. Still weight-derived.
+
+    def _probe(paths) -> int | None:
+        for path in paths:
+            obj = model
+            for attr in path:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            width = _valid_head_width(obj)
+            if width is not None:
+                return width
+        return None
+
+    # An untied ``lm_head`` is the authoritative output projection: it must win
+    # over any tied ``embed_tokens`` of a differing width, WHEREVER each lives
+    # (codex). So EXHAUST every ``lm_head`` candidate — fixed fast paths AND the
+    # module-tree walk — before considering any ``embed_tokens`` width. A single
+    # ordered loop is unsound: a shallow fixed ``embed_tokens`` would return
+    # before the tree walk could reach a deeply nested untied ``lm_head``.
+    #
+    # Phase 1 — ``lm_head`` anywhere (fixed shallow → deep, then tree walk).
+    width = _probe(
+        (
+            ("lm_head", "weight"),
+            ("model", "lm_head", "weight"),
+            ("language_model", "lm_head", "weight"),
+            ("language_model", "model", "lm_head", "weight"),
+        )
+    )
+    if width is not None:
+        return width
     try:
-        embed_width: int | None = None
         for name, mod in model.named_modules():
-            leaf = name.rsplit(".", 1)[-1]
-            if leaf == "lm_head":
+            if name.rsplit(".", 1)[-1] == "lm_head":
                 width = _valid_head_width(getattr(mod, "weight", None))
                 if width is not None:
                     return width
-            elif leaf == "embed_tokens" and embed_width is None:
-                embed_width = _valid_head_width(getattr(mod, "weight", None))
-        return embed_width
+    except Exception:
+        pass
+
+    # Phase 2 — no ``lm_head`` anywhere → the model ties its output head to the
+    # input embedding; use the ``embed_tokens`` width (fixed paths, then tree
+    # walk). Real checkpoints nest it to varying depths — a flat mlx-lm text
+    # model exposes ``model.embed_tokens``; a multimodal-capable wrapper (qwen3_5,
+    # gemma3n, …) nests it under ``language_model.model.embed_tokens`` — the
+    # #1185 regression, where that fixed path was missing. Still weight-derived
+    # (== the decode logits width), keeping the out-of-range guard provably dead.
+    width = _probe(
+        (
+            ("model", "embed_tokens", "weight"),
+            ("embed_tokens", "weight"),
+            ("language_model", "model", "embed_tokens", "weight"),
+        )
+    )
+    if width is not None:
+        return width
+    try:
+        for name, mod in model.named_modules():
+            if name.rsplit(".", 1)[-1] == "embed_tokens":
+                width = _valid_head_width(getattr(mod, "weight", None))
+                if width is not None:
+                    return width
     except Exception:
         return None
+    return None
 
 
 def _engine_output_vocab_size(engine) -> int | None:
