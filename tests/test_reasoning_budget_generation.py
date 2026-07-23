@@ -989,6 +989,27 @@ def test_actual_output_head_width_resolves_tied_nested_embed():
     assert _actual_output_head_width(_Model()) == 248320
 
 
+def test_actual_output_head_width_resolves_shallow_lm_wrapped_tied_embed():
+    # codex: the tied group must mirror the lm_head group and cover BOTH wrapper
+    # layouts. A tied head at the SHALLOW language_model.embed_tokens.weight (no
+    # inner .model) must resolve, not just the deeper language_model.model.* one.
+    from vllm_mlx.routes.chat import _actual_output_head_width
+
+    class _W:
+        shape = (262144, 64)
+
+    class _Embed:
+        weight = _W()
+
+    class _LMModel:
+        embed_tokens = _Embed()  # language_model.embed_tokens — shallow layout
+
+    class _Model:
+        language_model = _LMModel()
+
+    assert _actual_output_head_width(_Model()) == 262144
+
+
 def test_actual_output_head_width_declines_on_unknown_nesting():
     # A head reachable only at an UNRECOGNIZED path (no fixed path matches) yields
     # None — we deliberately do NOT tree-walk, so an unknown nesting declines to

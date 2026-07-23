@@ -2299,9 +2299,11 @@ def _actual_output_head_width(model) -> int | None:
         ("model", "lm_head", "weight"),
         ("language_model", "lm_head", "weight"),
         ("language_model", "model", "lm_head", "weight"),
-        # tied: output head == input embedding — shallow → deep
-        ("model", "embed_tokens", "weight"),
+        # tied: output head == input embedding — shallow → deep (mirrors the
+        # lm_head group, incl. BOTH language_model[.model] wrapper layouts)
         ("embed_tokens", "weight"),
+        ("model", "embed_tokens", "weight"),
+        ("language_model", "embed_tokens", "weight"),
         ("language_model", "model", "embed_tokens", "weight"),
     ):
         obj = model
