@@ -996,6 +996,36 @@ def test_actual_output_head_width_fixed_path_prefers_lm_head_over_embed():
     assert _actual_output_head_width(_Model()) == 151936
 
 
+def test_actual_output_head_width_tree_walk_mapping_return():
+    # Real MLX `nn.Module.named_modules()` returns a LIST of (str, Module) tuples
+    # (covered by the tests above). This asserts the tree walk ALSO survives a
+    # MAPPING return ({name: module}) via the `.items()` normalization, so a
+    # differently-shaped return can never fall into the broad `except` and
+    # silently disable the fallback (codex). The untied lm_head must still win.
+    from vllm_mlx.routes.chat import _actual_output_head_width
+
+    class _W:
+        def __init__(self, n):
+            self.shape = (n, 64)
+
+    class _Head:
+        weight = _W(151936)
+
+    class _Embed:
+        weight = _W(151000)
+
+    class _Model:
+        def named_modules(self):
+            # a dict, NOT a list of tuples — exercises the `.items()` path
+            return {
+                "": self,
+                "deep.embed_tokens": _Embed(),
+                "deep.lm_head": _Head(),
+            }
+
+    assert _actual_output_head_width(_Model()) == 151936
+
+
 def test_actual_output_head_width_tree_walk_tied_embed_only():
     # Tied model (no lm_head anywhere) — the tree walk falls back to the tied
     # embed_tokens width.

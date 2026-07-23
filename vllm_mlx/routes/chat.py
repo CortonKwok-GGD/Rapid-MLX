@@ -2261,6 +2261,19 @@ def _valid_head_width(obj) -> int | None:
     return None
 
 
+def _iter_named_modules(model):
+    """Yield ``(name, module)`` pairs from ``model.named_modules()``.
+
+    Real MLX ``nn.Module.named_modules()`` returns a *list of ``(str, Module)``
+    tuples* (its docstring: "Return a list … A list of tuples (str, Module)"),
+    so ordinary tuple-unpacking iteration is correct. Normalize defensively so a
+    mapping return (``.items()``) — should a wrapper or a future MLX revision use
+    one — is handled too, instead of a shape mismatch falling into the caller's
+    broad ``except`` and silently disabling the tree-walk fallback (codex)."""
+    nm = model.named_modules()
+    return nm.items() if hasattr(nm, "items") else nm
+
+
 def _actual_output_head_width(model) -> int | None:
     """The model's TRUE logits width — the vocab dimension (rows) of the output
     projection weight — or ``None`` if it cannot be inspected.
@@ -2317,7 +2330,7 @@ def _actual_output_head_width(model) -> int | None:
     if width is not None:
         return width
     try:
-        for name, mod in model.named_modules():
+        for name, mod in _iter_named_modules(model):
             if name.rsplit(".", 1)[-1] == "lm_head":
                 width = _valid_head_width(getattr(mod, "weight", None))
                 if width is not None:
@@ -2342,7 +2355,7 @@ def _actual_output_head_width(model) -> int | None:
     if width is not None:
         return width
     try:
-        for name, mod in model.named_modules():
+        for name, mod in _iter_named_modules(model):
             if name.rsplit(".", 1)[-1] == "embed_tokens":
                 width = _valid_head_width(getattr(mod, "weight", None))
                 if width is not None:
