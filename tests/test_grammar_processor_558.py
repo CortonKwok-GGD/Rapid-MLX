@@ -1086,7 +1086,7 @@ def test_route_offload_gated_on_eligibility_in_source():
 
     # The route calls the extracted helper (which owns the gate + admission).
     route_src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    assert "_offload_tool_grammar_build(engine, cfg, request)" in route_src, (
+    assert "_offload_tool_grammar_build(engine, cfg, request" in route_src, (
         "the route must delegate the off-loop build to _offload_tool_grammar_build"
     )
 
@@ -1289,7 +1289,7 @@ def test_admission_slot_not_released_until_compile_finishes_on_cancel():
     # Make the REAL helper's build block: it submits _maybe_build_tool_grammar_
     # processor to the pool, so patch that to a blocking function. The done-
     # callback (attached by the helper) releases the slot when this returns.
-    def _blocking_build(engine, cfg, request):
+    def _blocking_build(engine, cfg, request, reasoning_seed_open=False):
         started.set()
         release_gate.wait(timeout=5)
         finished.set()
@@ -1378,7 +1378,7 @@ def test_cancelled_caller_does_not_cancel_a_queued_compile():
     pool = ThreadPoolExecutor(max_workers=1)  # forces B to QUEUE behind A
     chat_mod._get_tool_grammar_build_executor = lambda: pool
 
-    def _build(engine, cfg, request):
+    def _build(engine, cfg, request, reasoning_seed_open=False):
         # Distinguish A (first) from B (second) by a per-request marker.
         if getattr(request, "_which", None) == "A":
             a_started.set()
@@ -2434,4 +2434,246 @@ def test_forced_prefix_block_is_gated_on_grammar_absence():
     )
     assert glp_pos < prefix_gate, (
         "the grammar processor must be built BEFORE the forced-prefix gate"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# LINE① (#558): reasoning-GATED forced grammar — token-id gate mechanics.
+# --------------------------------------------------------------------------- #
+
+
+def _line1_fake_env():
+    """Patch every llguidance primitive the processor touches with fakes so the
+    gate tests run UNCONDITIONALLY in base CI (no ``llguidance`` extra). Returns
+    ``(restore_fn, state)`` where ``state`` exposes the accepting matcher's
+    consume count and the fill spy count. Mirrors
+    ``test_rejected_committed_token_drops_constraint_and_stops_masking``.
+    """
+    import mlx.core as mx
+
+    import vllm_mlx.api.tool_grammar as tg
+
+    state = {"consumed": [], "fills": 0}
+
+    class _AcceptingMatcher:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_error(self):
+            return None
+
+        def deep_copy(self):
+            return _AcceptingMatcher()
+
+        def consume_token(self, tok_id):
+            state["consumed"].append(tok_id)
+            return True
+
+        def is_stopped(self):
+            return False
+
+        def reset(self):
+            pass
+
+    orig = (
+        tg.LLMatcher,
+        tg.allocate_token_bitmask,
+        tg.fill_next_token_bitmask,
+        tg.apply_token_bitmask,
+    )
+
+    def _spy_fill(matcher, bitmask, row):
+        state["fills"] += 1
+
+    tg.LLMatcher = _AcceptingMatcher
+    tg.allocate_token_bitmask = lambda n, v: None
+    tg.fill_next_token_bitmask = _spy_fill
+    # A sentinel mask clearly distinct from unchanged logits, so a test can prove
+    # whether masking ran on a given step.
+    tg.apply_token_bitmask = lambda logits, bitmask: mx.full(
+        logits.shape, -1.0, dtype=logits.dtype
+    )
+
+    def _restore():
+        (
+            tg.LLMatcher,
+            tg.allocate_token_bitmask,
+            tg.fill_next_token_bitmask,
+            tg.apply_token_bitmask,
+        ) = orig
+
+    return _restore, state
+
+
+def test_line1_reasoning_end_id_sets_initial_gate_closed():
+    # With a token-id gate supplied, the mask starts OFF (reasoning not ended);
+    # with NEITHER a token nor an id, the grammar constrains from token 0 (PATH
+    # A, the non-reasoning default is unchanged).
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        gated = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=99, tokenizer=None
+        )
+        assert gated._reasoning_ended is False
+        plain = GrammarLogitsProcessor(_FakeLLTok(), "g", tokenizer=None)
+        assert plain._reasoning_ended is True
+    finally:
+        restore()
+
+
+def test_line1_token_id_gate_holds_then_opens_and_excludes_boundary():
+    # The decisive LINE① mechanic. With ``reasoning_end_id`` set the processor:
+    #   1. leaves generation FREE while thinking — reasoning tokens are neither
+    #      consumed by the matcher nor masked (logits returned unchanged);
+    #   2. opens the gate the instant the reasoning-end id is decoded, WITHOUT
+    #      consuming that boundary token (the grammar begins at the first
+    #      POST-reasoning token);
+    #   3. masks + consumes every token after the boundary.
+    import mlx.core as mx
+    import numpy as np
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    END = 99  # stand-in </think> id
+    restore, state = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=END, tokenizer=None
+        )
+
+        # Prompt baseline (1 token) — no generation yet.
+        proc(mx.array([1]), mx.zeros((1, 8)))
+
+        # A reasoning token (id 5, != END): free generation, no mask, not consumed.
+        out_think = proc(mx.array([1, 5]), mx.zeros((1, 8)))
+        assert np.array_equal(np.array(out_think), np.zeros((1, 8))), (
+            "logits must be unchanged while thinking (gate closed)"
+        )
+        assert state["fills"] == 0, "no mask fill while thinking"
+        assert state["consumed"] == [], "reasoning tokens must NOT feed the matcher"
+
+        # The </think> boundary (id == END): opens the gate. The boundary itself
+        # is the delimiter — it is NOT consumed by the matcher, and the SAME step
+        # begins masking the NEXT token.
+        out_boundary = proc(mx.array([1, 5, END]), mx.zeros((1, 8)))
+        assert proc._reasoning_ended is True, "boundary id must open the gate"
+        assert state["consumed"] == [], "the </think> boundary must not be consumed"
+        assert state["fills"] == 1, "mask must engage on/after the boundary step"
+        assert np.array_equal(np.array(out_boundary), np.full((1, 8), -1.0)), (
+            "post-boundary logits must be masked (constraint active)"
+        )
+
+        # First post-reasoning token (id 7): consumed by the matcher, masked.
+        out_post = proc(mx.array([1, 5, END, 7]), mx.zeros((1, 8)))
+        assert state["consumed"] == [7], "post-reasoning tokens must feed the matcher"
+        assert state["fills"] == 2
+        assert np.array_equal(np.array(out_post), np.full((1, 8), -1.0))
+    finally:
+        restore()
+
+
+def test_line1_string_gate_not_run_when_id_gate_active():
+    # The decode-based string gate (``_maybe_open_after_reasoning``) is a known
+    # footgun and must be BYPASSED whenever the deterministic token-id gate is
+    # in use. Spy on the string gate and assert it is never called across a full
+    # think→boundary→answer sequence driven purely by the id gate.
+    import mlx.core as mx
+
+    from vllm_mlx.api.tool_grammar import GrammarLogitsProcessor
+
+    class _FakeLLTok:
+        vocab_size = 8
+
+    restore, _ = _line1_fake_env()
+    try:
+        proc = GrammarLogitsProcessor(
+            _FakeLLTok(), "g", reasoning_end_id=99, tokenizer=None
+        )
+        calls = {"n": 0}
+        proc._maybe_open_after_reasoning = lambda *_a, **_k: calls.__setitem__(
+            "n", calls["n"] + 1
+        )
+        proc(mx.array([1]), mx.zeros((1, 8)))
+        proc(mx.array([1, 5]), mx.zeros((1, 8)))  # thinking
+        proc(mx.array([1, 5, 99]), mx.zeros((1, 8)))  # boundary
+        proc(mx.array([1, 5, 99, 7]), mx.zeros((1, 8)))  # answer
+        assert calls["n"] == 0, "string gate must not run while the id gate is active"
+    finally:
+        restore()
+
+
+class _L1Req:
+    """Minimal request stub carrying the three fields the line① front-line
+    predicate reads (``_RequestStub`` above omits ``reasoning_max_tokens``)."""
+
+    def __init__(self, tools=("t",), tool_choice="required", reasoning_max_tokens=64):
+        self.tools = list(tools) if tools else tools
+        self.tool_choice = tool_choice
+        self.reasoning_max_tokens = reasoning_max_tokens
+
+
+def test_line1_should_probe_seed_predicate():
+    # codex BLOCKING fix: behaviorally test the EXTRACTED eligibility predicate
+    # (the prior test only searched source text, so it passed even if the code
+    # were unreachable). Exercises forced/auto/none x budget/no-budget x
+    # thinking on/off x tools/no-tools — the predicate that decides whether the
+    # (synchronous) seed-state render runs and, transitively, whether line①
+    # engages.
+    from vllm_mlx.routes.chat import _line1_should_probe_seed
+
+    # Engages: forced (required OR named) + thinking + a set budget + tools.
+    assert _line1_should_probe_seed(_L1Req(tool_choice="required"), True) is True
+    assert (
+        _line1_should_probe_seed(
+            _L1Req(tool_choice={"type": "function", "function": {"name": "f"}}), True
+        )
+        is True
+    )
+    assert _line1_should_probe_seed(_L1Req(reasoning_max_tokens=0), True) is True
+
+    # Declines: non-forced choice (auto / none / unset all keep the fallback).
+    assert _line1_should_probe_seed(_L1Req(tool_choice="auto"), True) is False
+    assert _line1_should_probe_seed(_L1Req(tool_choice="none"), True) is False
+    assert _line1_should_probe_seed(_L1Req(tool_choice=None), True) is False
+
+    # Declines: no / negative budget (no #1185 force-close ⇒ gate could hang).
+    assert _line1_should_probe_seed(_L1Req(reasoning_max_tokens=None), True) is False
+    assert _line1_should_probe_seed(_L1Req(reasoning_max_tokens=-1), True) is False
+
+    # Declines: thinking off or unresolved.
+    assert _line1_should_probe_seed(_L1Req(), False) is False
+    assert _line1_should_probe_seed(_L1Req(), None) is False
+
+    # Declines: no tools.
+    assert _line1_should_probe_seed(_L1Req(tools=None), True) is False
+    assert _line1_should_probe_seed(_L1Req(tools=[]), True) is False
+
+
+def test_line1_route_threads_predicate_into_offload_build():
+    # Complements the behavioral predicate test: assert the route actually USES
+    # ``_line1_should_probe_seed`` and threads its (seed-open) result into the
+    # off-loop build — i.e. the tested predicate is on the live path, not dead.
+    import inspect
+
+    from vllm_mlx.routes import chat as chat_mod
+
+    src = inspect.getsource(chat_mod._create_chat_completion_impl)
+    probe_pos = src.find("_line1_should_probe_seed(request, resolved_thinking)")
+    offload_pos = src.find(
+        "_offload_tool_grammar_build(engine, cfg, request, _line1_seed_open"
+    )
+    assert probe_pos != -1, "route must call the extracted line① predicate"
+    assert offload_pos != -1 and probe_pos < offload_pos, (
+        "the seed-open decision must be computed and threaded into the build"
+    )
+    assert 'reasoning_seed_state(' in src and '== "open"' in src, (
+        "route must classify the rendered prefix and engage only on 'open'"
     )

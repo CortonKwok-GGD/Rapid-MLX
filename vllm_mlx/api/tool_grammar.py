@@ -2254,6 +2254,7 @@ class GrammarLogitsProcessor:
         grammar: str,
         *,
         reasoning_end_token: str | None = None,
+        reasoning_end_id: int | None = None,
         tokenizer: Any = None,
         stop_token_ids: Any = None,
     ):
@@ -2278,7 +2279,18 @@ class GrammarLogitsProcessor:
         self._vocab = lltokenizer.vocab_size
         self._bitmask = allocate_token_bitmask(1, self._vocab)
         self._reasoning_end_token = reasoning_end_token
-        self._reasoning_ended = reasoning_end_token is None
+        # LINE① (#558): a TOKEN-ID reasoning gate — preferred over the string
+        # gate (no per-step decode, no multi-token ``</think>`` boundary
+        # ambiguity, and it opens deterministically). When EITHER gate token is
+        # supplied the mask starts OFF (reasoning not yet ended) and opens when
+        # the boundary is observed; with NEITHER, the grammar constrains from
+        # token 0 (PATH A). The id gate is only sound when a thinking budget
+        # (#1185) guarantees the boundary is emitted — the chat route wires it
+        # exactly there (forced + reasoning + a set ``reasoning_max_tokens``).
+        self._reasoning_end_id = reasoning_end_id
+        self._reasoning_ended = (
+            reasoning_end_token is None and reasoning_end_id is None
+        )
         self._tokenizer = tokenizer
         # MODEL STOP/EOS tokens re-admitted at accepting states (0.10.16 dogfood
         # P1-①). llguidance's compiled grammar terminates on the tokenizer's
@@ -2376,6 +2388,16 @@ class GrammarLogitsProcessor:
             for t in tail:
                 self._committed += 1
                 if not self._reasoning_ended:
+                    # LINE① token-id gate: open the instant the reasoning-end
+                    # id is observed. The boundary token is the delimiter — it
+                    # is NOT consumed by the matcher (the grammar starts at the
+                    # first POST-reasoning token), and neither are the reasoning
+                    # tokens before it.
+                    if (
+                        self._reasoning_end_id is not None
+                        and int(t) == self._reasoning_end_id
+                    ):
+                        self._reasoning_ended = True
                     continue
                 tok = int(t)
                 if not self._matcher.consume_token(tok):
@@ -2413,7 +2435,9 @@ class GrammarLogitsProcessor:
         # from construction, so the ``continue`` above never fires and every
         # token is consumed). Only a defense-in-depth path-B caller that sets
         # ``reasoning_end_token`` hits the deferral.
-        if not self._reasoning_ended:
+        # The string gate (decode-based) only runs when no token-id gate is
+        # active — the id gate above already opened it inline (LINE①).
+        if not self._reasoning_ended and self._reasoning_end_id is None:
             self._maybe_open_after_reasoning(token_ids)
         if not self._reasoning_ended:
             return logits  # free generation during reasoning

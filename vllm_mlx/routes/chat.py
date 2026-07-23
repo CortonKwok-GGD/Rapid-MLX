@@ -768,7 +768,29 @@ def _enforce_tool_grammar_bounds_or_400(cfg, request) -> None:
         )
 
 
-def _maybe_build_tool_grammar_processor(engine, cfg, request):
+def _line1_should_probe_seed(request, resolved_thinking) -> bool:
+    """LINE① (#558): true iff this request is a CANDIDATE for the reasoning-
+    gated forced grammar, so the synchronous seed-state render is worth doing.
+
+    Requires ALL of: a FORCED (``required`` / named) tool choice — never
+    ``auto`` / ``none`` (codex: don't run the two-render prefix probe for
+    choices the builder never gates on); a thinking model
+    (``resolved_thinking is True``); a set thinking budget
+    (``reasoning_max_tokens >= 0`` — #1185's guaranteed force-close is what makes
+    the runtime token-id gate provably open); and tools present. The seed-state
+    ``"open"`` classification and the ``</think>``-id resolution happen AFTER this
+    cheap, pure, front-line gate.
+    """
+    if not request.tools or resolved_thinking is not True:
+        return False
+    rmt = getattr(request, "reasoning_max_tokens", None)
+    if rmt is None or rmt < 0:
+        return False
+    choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
+    return choice is not None and choice["mode"] != "auto"
+
+
+def _maybe_build_tool_grammar_processor(engine, cfg, request, reasoning_seed_open=False):
     """Build a per-request ``GrammarLogitsProcessor`` for #558, or ``None``.
 
     Non-breaking: returns ``None`` (today's free-form-then-parse fallback)
@@ -898,6 +920,45 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         reasoning_sentinels = resolve_reasoning_sentinels(
             getattr(cfg, "reasoning_parser_name", None), tokenizer
         )
+
+        # LINE① (#558): reasoning-GATED forced grammar. A forced/named tool call
+        # on a reasoning model normally opts OUT (``build_tool_grammar`` :2068)
+        # to the forced-prefix lever, because a bounded forced grammar would
+        # force the trigger at token 0 and leave the prompt ``<think>`` unclosed
+        # (the qwen3 parser then buries the whole call in ``reasoning_content``).
+        # That opt-out is LIFTED only when the generation-time thinking budget
+        # (#1185) is GUARANTEED to force ``</think>``: build the PLAIN
+        # (non-reasoning) bounded forced grammar but hold its mask OFF behind a
+        # runtime TOKEN-ID gate until ``</think>`` is decoded.
+        #
+        # The engage predicate MIRRORS #1185's seeded-budget install conditions
+        # EXACTLY, so the gate is provably guaranteed to open (no infinite-wait
+        # regression): the caller passes ``reasoning_seed_open`` = the template
+        # PREFILLS an unclosed ``<think>`` (seed state "open") AND a budget is
+        # set — precisely when #1185 installs a SEEDED budget that force-closes.
+        # We additionally re-verify ``</think>`` is a single in-vocab id (the same
+        # ``resolve_think_token_ids`` + width check ``build_reasoning_budget_
+        # processor`` applies), so line① declines in the identical corner #1185
+        # declines. "emit"/"ambiguous"/no-budget requests never set
+        # ``reasoning_seed_open`` and keep the forced-prefix fallback — strictly
+        # non-regressive; the "emit" (model-emitted-``<think>``) scope is a
+        # tracked follow-up.
+        _line1_gate_id = None
+        if choice["mode"] != "auto" and reasoning_seed_open:
+            from ..api.reasoning_budget import resolve_think_token_ids
+
+            _t_start, _t_end = resolve_think_token_ids(
+                tokenizer, getattr(cfg, "reasoning_parser_name", None)
+            )
+            _vocab = _engine_output_vocab_size(engine)
+            if _t_end is not None and _vocab is not None and 0 <= _t_end < _vocab:
+                _line1_gate_id = _t_end
+                # Empty the reasoning refs so ``build_tool_grammar`` takes the
+                # NON-reasoning constrained path (bypasses the :2068 opt-out and
+                # the free-prefix path-A grammar); the runtime id gate is the
+                # reasoning lever instead.
+                reasoning_sentinels = ()
+
         grammar = build_tool_grammar(
             flat_tools,
             builder_choice,
@@ -930,6 +991,7 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
             lltok,
             grammar,
             reasoning_end_token=None,
+            reasoning_end_id=_line1_gate_id,
             tokenizer=tokenizer,
             stop_token_ids=stop_ids,
         )
@@ -947,7 +1009,7 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request):
         return None
 
 
-async def _offload_tool_grammar_build(engine, cfg, request):
+async def _offload_tool_grammar_build(engine, cfg, request, reasoning_seed_open=False):
     """Off-loop, admission-gated build of a ``GrammarLogitsProcessor`` (or None).
 
     Extracted from the chat route so the admission gate is directly testable
@@ -1002,7 +1064,7 @@ async def _offload_tool_grammar_build(engine, cfg, request):
         return None
     try:
         fut = _get_tool_grammar_build_executor().submit(
-            _maybe_build_tool_grammar_processor, engine, cfg, request
+            _maybe_build_tool_grammar_processor, engine, cfg, request, reasoning_seed_open
         )
     except Exception:
         # Submission itself failed (e.g. pool shut down): the compile never ran,
@@ -3149,7 +3211,34 @@ async def _create_chat_completion_impl(
     # schema as ineligible and returns ``None`` (silent free-form), which under
     # default-on would drop the structural guarantee the operator asked for.
     _enforce_tool_grammar_bounds_or_400(cfg, request)
-    _glp = await _offload_tool_grammar_build(engine, cfg, request)
+    # LINE① (#558): decide reasoning-gated forced-grammar eligibility HERE (the
+    # rendered generation prefix is available), then thread a single bool into
+    # the off-loop build. Engage only when a thinking budget (#1185) is set AND
+    # the template PREFILLS an unclosed ``<think>`` (seed state "open") — the
+    # exact condition under which #1185 installs a SEEDED budget that is
+    # guaranteed to force ``</think>``, so the runtime token-id gate is
+    # guaranteed to open. ``_line1_should_probe_seed`` is the pure front-line
+    # gate (forced choice + thinking + set budget + tools) — it excludes
+    # ``auto``/``none`` so the two-render probe never runs for them. Reuses
+    # #1185's own ``_template_generation_prefix`` probe + ``reasoning_seed_state``
+    # classifier (do not reinvent). "emit"/"ambiguous"/no-budget keep the
+    # forced-prefix fallback (strictly non-regressive; a render that fails, e.g.
+    # an MLLM engine, stays False too).
+    _line1_seed_open = False
+    if _line1_should_probe_seed(request, resolved_thinking):
+        from ..api.reasoning_budget import reasoning_seed_state
+
+        _l1_prefix = _template_generation_prefix(
+            engine, messages, request.tools, resolved_thinking
+        )
+        if _l1_prefix is not None:
+            _line1_seed_open = (
+                reasoning_seed_state(
+                    _l1_prefix, getattr(cfg, "reasoning_parser_name", None)
+                )
+                == "open"
+            )
+    _glp = await _offload_tool_grammar_build(engine, cfg, request, _line1_seed_open)
     # DELIBERATE AVAILABILITY POLICY (codex #558-PR5 override, NOT fail-closed):
     # a ``None`` here degrades this request to the pre-#558 free-form
     # tool-parsing path. That degrade is reserved for exactly two families of
