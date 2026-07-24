@@ -805,16 +805,20 @@ def _enforce_tool_grammar_bounds_or_400(cfg, request) -> None:
 # plus its REQUIRED fields (``_line1_min_call_tokens``), so a long name or a
 # many-required-field schema cannot slip under a flat constant (codex r2 #2).
 #
-# This is a fixed, tokenizer-INDEPENDENT constant (codex r8 #4): the exact minimal
-# envelope depends on the active parser's wire format and the model's tokenizer, and
-# computing it precisely would need to serialize + tokenize a per-parser skeleton
-# here (out of scope for this front-line guard). ``64`` is a deliberately generous
-# allowance — several times the ~10-20 tokens any supported wire wrapper's EMPTY
-# envelope actually costs — so it over-reserves rather than under-reserves. This
-# whole guard is defensive: when the true minimal call does not fit it declines to
-# the (non-regressive) forced-prefix path, and if a pathologically tokenized envelope
-# ever exceeded even this margin the runtime desync fallback finishes the request
-# under the free-form parser rather than emitting a truncated call.
+# This is a fixed, tokenizer-INDEPENDENT constant (codex r8 #4 / r9 #3): the exact
+# minimal envelope depends on the active parser's wire format and the model's
+# tokenizer, and computing it precisely would need to serialize + tokenize a
+# per-parser skeleton here (out of scope for this front-line guard). ``64`` is a
+# deliberately generous allowance — several times the ~10-20 tokens any supported
+# wire wrapper's EMPTY envelope actually costs — so it over-reserves rather than
+# under-reserves. This whole ``max_tokens``-room precheck is a BEYOND-UPSTREAM
+# defensive addition: vLLM / SGLang install the reasoning-gated grammar without any
+# such room guard and simply let generation truncate, so a fixed conservative
+# allowance here is strictly ahead of the upstream contract this mirrors. When the
+# true minimal call does not fit it declines to the (non-regressive) forced-prefix
+# path, and if a pathologically tokenized envelope ever exceeded even this margin the
+# runtime desync fallback finishes the request under the free-form parser rather than
+# emitting a truncated call.
 _LINE1_CALL_ENVELOPE_TOKENS = 64
 
 
@@ -862,14 +866,24 @@ def _line1_min_value_bytes(schema) -> int:
     ]
     if numeric_bounds:
         return 1 + max(len(repr(b).encode("utf-8")) for b in numeric_bounds)
+
+    def _base_type_min_bytes(tp) -> int:
+        if tp in ("integer", "number"):
+            return 1  # "0"
+        if tp == "boolean":
+            return 5  # "false" (upper bound of true/false)
+        if tp == "null":
+            return 4  # "null"
+        return 2  # string ('""'), empty object/array ('{}' / '[]'), or unknown scalar
+
     t = schema.get("type")
-    if t in ("integer", "number"):
-        return 1  # "0"
-    if t == "boolean":
-        return 5  # "false" (upper bound of true/false)
-    if t == "null":
-        return 4  # "null"
-    return 2  # string ('""'), empty object/array ('{}' / '[]'), or unknown scalar
+    if isinstance(t, list):
+        # JSON Schema allows a UNION type, e.g. the very common nullable
+        # ``["string", "null"]`` or ``["boolean"]`` (codex r9 #2). The shortest valid
+        # value is the smallest across the allowed members — NOT the 2-byte unknown
+        # default that an array-valued ``type`` used to silently hit and under-reserve.
+        return min((_base_type_min_bytes(mt) for mt in t), default=2)
+    return _base_type_min_bytes(t)
 
 
 def _line1_min_call_tokens(request) -> int:

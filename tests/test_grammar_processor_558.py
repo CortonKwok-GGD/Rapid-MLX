@@ -2811,6 +2811,24 @@ def test_line1_completion_limit_declines_uncoverable_schema():
         _Req(bare_int)
     )
 
+    # codex r9 #2: an ARRAY-valued (union) ``type`` must be priced by the smallest
+    # allowed member, not the 2-byte unknown default. ``["boolean"]`` needs >=4 bytes
+    # ("true"); the common nullable ``["string","null"]`` stays a 2-byte string.
+    from vllm_mlx.routes.chat import _line1_min_value_bytes
+
+    assert _line1_min_value_bytes({"type": ["boolean"]}) >= 4
+    assert _line1_min_value_bytes({"type": ["string", "null"]}) == 2
+    assert _line1_min_value_bytes({"type": ["integer", "null"]}) == 1
+    union_bool = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": ["boolean"]}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(union_bool) is False
+    assert _line1_min_call_tokens(_Req(union_bool)) > _line1_min_call_tokens(
+        _Req({"type": "object", "required": ["a"], "properties": {"a": {}}})
+    )
+
     # codex r8 #3: a key needing JSON escaping (``a"b`` -> ``a\"b``) must be priced by
     # its full json.dumps serialization, not raw UTF-8 bytes.
     esc_key = {"type": "object", "required": ['a"b\\c'], "properties": {}}
