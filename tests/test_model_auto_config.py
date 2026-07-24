@@ -2897,3 +2897,111 @@ class TestMtpDeclaredAbsentReconciliation:
         monkeypatch.setattr(auto_config_mod, "_local_weight_tensor_names", _boom)
         table = format_profile_table(self._NATIVE, self._cfg(spec_off=True))
         assert "MTP path         : disabled" in table
+
+
+class TestLocalWeightTensorNames:
+    """``_local_weight_tensor_names`` reads tensor names from a LOCAL
+    safetensors index / header defensively — a malformed or hostile file
+    must degrade to ``None`` ("couldn't check"), never to an empty list that
+    would falsely "confirm" the MTP head is absent (codex #1202 round 2).
+    """
+
+    @staticmethod
+    def _cfg(directory):
+        return ModelConfig(hf_path=str(directory))
+
+    def _write(self, directory, name, data: bytes):
+        import os
+
+        path = os.path.join(str(directory), name)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def test_sharded_index_returns_weight_map_keys(self, tmp_path):
+        import json
+
+        keys = ["model.embed_tokens.weight", "model.mtp.layers.0.q_proj.weight"]
+        self._write(
+            tmp_path,
+            "model.safetensors.index.json",
+            json.dumps({"weight_map": {k: "shard.safetensors" for k in keys}}).encode(),
+        )
+        names = auto_config_mod._local_weight_tensor_names(
+            str(tmp_path), self._cfg(tmp_path)
+        )
+        assert set(names) == set(keys)
+
+    def test_malformed_index_missing_weight_map_returns_none(self, tmp_path):
+        import json
+
+        # Valid JSON but no ``weight_map`` — must NOT read as "zero tensors".
+        self._write(
+            tmp_path,
+            "model.safetensors.index.json",
+            json.dumps({"metadata": {"total_size": 1}}).encode(),
+        )
+        assert (
+            auto_config_mod._local_weight_tensor_names(
+                str(tmp_path), self._cfg(tmp_path)
+            )
+            is None
+        )
+
+    def test_empty_weight_map_returns_none(self, tmp_path):
+        import json
+
+        self._write(
+            tmp_path,
+            "model.safetensors.index.json",
+            json.dumps({"weight_map": {}}).encode(),
+        )
+        assert (
+            auto_config_mod._local_weight_tensor_names(
+                str(tmp_path), self._cfg(tmp_path)
+            )
+            is None
+        )
+
+    def test_single_file_header_returns_keys(self, tmp_path):
+        import json
+        import struct
+
+        header = {
+            "model.embed_tokens.weight": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            },
+            "__metadata__": {"format": "pt"},
+        }
+        blob = json.dumps(header).encode()
+        self._write(tmp_path, "model.safetensors", struct.pack("<Q", len(blob)) + blob)
+        names = auto_config_mod._local_weight_tensor_names(
+            str(tmp_path), self._cfg(tmp_path)
+        )
+        # ``__metadata__`` is filtered out; the real tensor name remains.
+        assert names == ["model.embed_tokens.weight"]
+
+    def test_single_file_oversized_header_returns_none(self, tmp_path):
+        import struct
+
+        # Header length far exceeds both the safetensors cap and the file
+        # size — must be rejected BEFORE allocating the read.
+        self._write(
+            tmp_path, "model.safetensors", struct.pack("<Q", 2_000_000_000) + b"{}"
+        )
+        assert (
+            auto_config_mod._local_weight_tensor_names(
+                str(tmp_path), self._cfg(tmp_path)
+            )
+            is None
+        )
+
+    def test_directory_without_safetensors_returns_none(self, tmp_path):
+        assert (
+            auto_config_mod._local_weight_tensor_names(
+                str(tmp_path), self._cfg(tmp_path)
+            )
+            is None
+        )

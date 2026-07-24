@@ -2114,6 +2114,12 @@ def _load_hf_config_cached(model_path: str, cfg: "ModelConfig") -> "dict | None"
 _MTP_MTP_SEGMENT_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_5_moe"})
 
 
+# safetensors caps its JSON header at 100 MB; refuse to read anything the
+# spec would reject so a malformed/hostile file can't make us allocate a
+# multi-gigabyte read (codex #1202 round 2).
+_SAFETENSORS_MAX_HEADER_BYTES = 100_000_000
+
+
 def _local_weight_tensor_names(
     model_path: str, cfg: "ModelConfig"
 ) -> "list[str] | None":
@@ -2123,8 +2129,9 @@ def _local_weight_tensor_names(
     present, else the single-file ``model.safetensors`` header (an 8-byte
     little-endian length prefix followed by a JSON blob of tensor metadata).
     LOCAL cache only — no network. Returns ``None`` when the checkpoint isn't
-    cached / has no recognizable safetensors, so callers can distinguish
-    "confirmed empty" from "couldn't check".
+    cached, has no recognizable safetensors, or the metadata is malformed —
+    so callers can distinguish "confirmed empty" from "couldn't check" and a
+    broken index never masquerades as "no MTP tensors".
     """
     import json as _json
     import os as _os
@@ -2132,34 +2139,68 @@ def _local_weight_tensor_names(
 
     hf_path = getattr(cfg, "hf_path", None) or model_path
 
-    def _from_index(path: str) -> list[str]:
+    def _from_index(path: str) -> "list[str] | None":
         with open(path) as fh:
-            weight_map = _json.load(fh).get("weight_map", {})
-        return list(weight_map.keys())
+            data = _json.load(fh)
+        weight_map = data.get("weight_map") if isinstance(data, dict) else None
+        # A syntactically valid but structurally broken index (missing /
+        # empty ``weight_map``) must NOT be read as "zero tensors" — that
+        # would falsely confirm the MTP head is absent (codex #1202 round 2).
+        if not isinstance(weight_map, dict) or not weight_map:
+            return None
+        keys = [k for k in weight_map if isinstance(k, str)]
+        return keys or None
 
-    def _from_single(path: str) -> list[str]:
+    def _from_single(path: str) -> "list[str] | None":
+        size = _os.path.getsize(path)
+        if size < 8:
+            return None
         with open(path, "rb") as fh:
             (header_len,) = _struct.unpack("<Q", fh.read(8))
+            # Reject an oversized / impossible header before allocating the
+            # read (untrusted length field — codex #1202 round 2).
+            if (
+                header_len <= 0
+                or header_len > _SAFETENSORS_MAX_HEADER_BYTES
+                or 8 + header_len > size
+            ):
+                return None
             header = _json.loads(fh.read(header_len))
-        return [k for k in header if k != "__metadata__"]
+        if not isinstance(header, dict):
+            return None
+        keys = [k for k in header if isinstance(k, str) and k != "__metadata__"]
+        return keys or None
+
+    def _resolve(directory: str, filename: str) -> "str | None":
+        """Local path for ``filename`` in a checkpoint dir or HF cache repo.
+
+        ``try_to_load_from_cache`` returns a truthy ``_CACHED_NO_EXIST``
+        sentinel (NOT a path) when it knows the file is absent; accept only
+        real ``str`` paths so the sentinel is treated as a miss and the
+        caller can fall through to the next candidate (codex #1202 round 2).
+        """
+        local = _os.path.join(directory, filename)
+        if _os.path.isfile(local):
+            return local
+        if _os.path.isdir(directory):
+            return None  # explicit local dir — don't consult the HF cache
+        from huggingface_hub import try_to_load_from_cache as _cache_lookup
+
+        cached = _cache_lookup(repo_id=directory, filename=filename)
+        if isinstance(cached, str) and _os.path.isfile(cached):
+            return cached
+        return None
 
     try:
         directory = str(hf_path)
-        if _os.path.isdir(directory):
-            idx = _os.path.join(directory, "model.safetensors.index.json")
-            if _os.path.isfile(idx):
-                return _from_index(idx)
-            single = _os.path.join(directory, "model.safetensors")
-            if _os.path.isfile(single):
-                return _from_single(single)
-            return None
-        from huggingface_hub import try_to_load_from_cache as _cache_lookup
-
-        idx = _cache_lookup(repo_id=directory, filename="model.safetensors.index.json")
-        if idx and _os.path.exists(idx):
+        idx = _resolve(directory, "model.safetensors.index.json")
+        if idx is not None:
+            # A sharded checkpoint: the index is authoritative (return its
+            # keys, or None if it's malformed — do not fall back to a
+            # single-file that won't exist alongside a real index).
             return _from_index(idx)
-        single = _cache_lookup(repo_id=directory, filename="model.safetensors")
-        if single and _os.path.exists(single):
+        single = _resolve(directory, "model.safetensors")
+        if single is not None:
             return _from_single(single)
     except Exception:
         return None

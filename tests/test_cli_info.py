@@ -99,9 +99,12 @@ def test_info_prints_mtp_sidecar_note_when_head_declared_but_absent(
     out = _run_info("qwen3.6-27b-8bit")
     assert "mtp_num_hidden_layers=1" in out, f"declared-layer count missing:\n{out}"
     assert "head weights are absent" in out, f"absent-head diagnosis missing:\n{out}"
-    # Actionable: mirrors the serve-time sidecar remedy.
-    assert "--speculative-config" in out and '"method":"mtp"' in out, (
-        f"sidecar serve command missing from note:\n{out}"
+    # Actionable: must emit the COMPLETE sidecar remedy — the ``model`` field
+    # is load-bearing. Asserting the full fragment (not just ``method``)
+    # guards against regressing to a bare ``{"method":"mtp"}`` that would just
+    # reproduce the original inject-time hard failure (codex #1202 round 2).
+    assert """--speculative-config '{"method":"mtp","model":"<head-repo>"}'""" in out, (
+        f"complete sidecar serve command missing from note:\n{out}"
     )
     # The serve command must carry the user-typed alias, not the HF path.
     assert "rapid-mlx serve qwen3.6-27b-8bit" in out, (
