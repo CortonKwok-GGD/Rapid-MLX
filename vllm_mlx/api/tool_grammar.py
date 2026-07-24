@@ -2296,9 +2296,7 @@ class GrammarLogitsProcessor:
         # forced ``</think>`` cannot land mid-tool-call (vLLM #44676 is the ungated
         # path only).
         self._reasoning_end_id = reasoning_end_id
-        self._reasoning_ended = (
-            reasoning_end_token is None and reasoning_end_id is None
-        )
+        self._reasoning_ended = reasoning_end_token is None and reasoning_end_id is None
         # LINE① (#558): tokens the model must NOT emit WHILE the reasoning gate is
         # closed — the tool-call start marker(s). Copies SGLang's
         # ``think_excluded_token_ids`` (``reasoner_grammar_backend.py``): during the
@@ -2313,7 +2311,11 @@ class GrammarLogitsProcessor:
         # in-vocab ids; the additive -inf mask is built lazily per logits width.
         self._think_excluded_ids: tuple[int, ...] = tuple(
             sorted(
-                {int(t) for t in (think_excluded_ids or ()) if 0 <= int(t) < self._vocab}
+                {
+                    int(t)
+                    for t in (think_excluded_ids or ())
+                    if 0 <= int(t) < self._vocab
+                }
             )
         )
         self._think_exclude_add: Any = None
@@ -2510,10 +2512,14 @@ class GrammarLogitsProcessor:
         if not self._reasoning_ended and self._reasoning_end_id is None:
             self._maybe_open_after_reasoning(token_ids)
         if not self._reasoning_ended:
-            # Free generation during reasoning — EXCEPT the tool-call opener(s),
-            # which are masked so the model cannot begin a tool call inside
-            # ``<think>`` (LINE① / SGLang ``think_excluded_token_ids``). Everything
-            # else is unconstrained. No excluded ids ⇒ fully free (unchanged).
+            # Free generation during reasoning — EXCEPT the tool-call opener
+            # SPECIAL TOKEN(s), which are masked so the model cannot begin a tool
+            # call inside ``<think>`` via its natural opener (LINE① / SGLang
+            # ``think_excluded_token_ids``). This blocks the atomic opener a trained
+            # model actually emits; it is NOT a proof the trigger TEXT can't be
+            # spelled as ordinary subtokens (codex r3 #4 — best-effort, see the
+            # route's think_excluded comment). Everything else is unconstrained. No
+            # excluded ids ⇒ fully free (unchanged).
             if self._think_excluded_ids:
                 return self._apply_think_exclusion(logits)
             return logits

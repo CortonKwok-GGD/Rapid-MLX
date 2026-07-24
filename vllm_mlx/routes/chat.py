@@ -794,12 +794,15 @@ def _line1_min_call_tokens(request) -> int:
     tools = getattr(request, "tools", None) or []
     worst = 0
     for t in tools:
-        fn = t.function if hasattr(t, "function") else (
-            t.get("function", t) if isinstance(t, dict) else t
+        fn = (
+            t.function
+            if hasattr(t, "function")
+            else (t.get("function", t) if isinstance(t, dict) else t)
         )
         name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
         params = (
-            fn.get("parameters") if isinstance(fn, dict)
+            fn.get("parameters")
+            if isinstance(fn, dict)
             else getattr(fn, "parameters", None)
         )
         cost = len(name) if isinstance(name, str) else 0
@@ -813,9 +816,98 @@ def _line1_min_call_tokens(request) -> int:
     return _LINE1_CALL_ENVELOPE_TOKENS + worst
 
 
+# JSON-Schema keywords that can push a VALID instance's minimum size ARBITRARILY
+# above the flat name+required-skeleton floor ``_line1_min_call_tokens`` models
+# (codex r3 #2): a 1,000-char ``minLength`` / ``const`` / long ``enum`` value, a
+# ``minItems`` array of objects, a ``pattern`` forcing a long literal, a
+# ``minProperties`` map, or a required NESTED object whose own required fields the
+# flat estimator never descends into. We do NOT try to price these exactly (that
+# needs compiling+measuring the grammar); instead their mere PRESENCE anywhere in
+# a forced tool's schema makes the floor unprovable, so a BOUNDED request declines
+# the gate to the forced-prefix fallback (non-regressive) rather than admit a gate
+# whose call might not fit.
+_LINE1_UNBOUNDED_MIN_KEYWORDS = frozenset(
+    {"minLength", "minItems", "minProperties", "const", "pattern", "enum"}
+)
+
+
+def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
+    """True iff ``schema`` (a JSON-Schema dict) contains a value/shape constraint
+    the flat ``_line1_min_call_tokens`` floor cannot bound (codex r3 #2).
+
+    Walks ``properties`` / ``items`` / ``$defs`` / ``allOf`` / ``anyOf`` /
+    ``oneOf`` and the required-nested-object case. Bounded depth (a hostile schema
+    can nest arbitrarily) — treat an over-deep schema as uncoverable too. Purely
+    structural: any hit means "the estimator can't prove a minimal call fits", so
+    the caller conservatively declines the gate for bounded requests.
+    """
+    if _depth > 6:
+        return True  # too deep to price -> conservatively uncoverable
+    if not isinstance(schema, dict):
+        return False
+    if _LINE1_UNBOUNDED_MIN_KEYWORDS & schema.keys():
+        return True
+    # A required NESTED object contributes its own (unpriced) required skeleton.
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for sub in props.values():
+            if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
+                return True
+    items = schema.get("items")
+    if isinstance(items, dict):
+        if _line1_schema_has_uncoverable_constraint(items, _depth + 1):
+            return True
+    elif isinstance(items, list):
+        for sub in items:
+            if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
+                return True
+    for combinator in ("allOf", "anyOf", "oneOf"):
+        branch = schema.get(combinator)
+        if isinstance(branch, list):
+            for sub in branch:
+                if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
+                    return True
+    defs = schema.get("$defs") or schema.get("definitions")
+    if isinstance(defs, dict):
+        for sub in defs.values():
+            if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
+                return True
+    # A ``$ref`` we cannot resolve locally is unpriced -> uncoverable.
+    if "$ref" in schema:
+        return True
+    return False
+
+
+def _line1_request_has_uncoverable_constraint(request) -> bool:
+    """True iff ANY of THIS request's forced tools carries a schema constraint the
+    flat floor can't bound (codex r3 #2). Best-effort: any error -> assume
+    uncoverable (conservative decline)."""
+    try:
+        tools = getattr(request, "tools", None) or []
+        for t in tools:
+            fn = (
+                t.function
+                if hasattr(t, "function")
+                else (t.get("function", t) if isinstance(t, dict) else t)
+            )
+            params = (
+                fn.get("parameters")
+                if isinstance(fn, dict)
+                else getattr(fn, "parameters", None)
+            )
+            if isinstance(params, dict) and _line1_schema_has_uncoverable_constraint(
+                params
+            ):
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def _line1_completion_limit_ok(request) -> bool:
-    """LINE① (#558, codex #4 / r2 #2): true unless ``max_tokens`` is too small for
-    the force-close + a minimal constrained call for THIS request's tools.
+    """LINE① (#558, codex #4 / r2 #2 / r3 #2): true unless the request's completion
+    allowance is too small — or too unprovable — for the force-close + a minimal
+    constrained call for THIS request's tools.
 
     The coupled budget force-closes ``</think>`` after ``reasoning_max_tokens``
     thinking tokens; the gated grammar then constrains the call AFTER that
@@ -825,11 +917,37 @@ def _line1_completion_limit_ok(request) -> bool:
     strands / truncates the forced choice. The floor scales with the tool name and
     required schema, so a long-name / large-schema tool cannot pass under a flat
     constant.
+
+    Two conservative declines harden the floor (codex r3):
+      * **#2 — unprovable schema minimum.** ``_line1_min_call_tokens`` only prices
+        the required-key skeleton; a ``minLength`` / ``const`` / nested-required /
+        ``$ref`` schema can make a VALID call arbitrarily larger. When ``max_tokens``
+        is set AND the schema carries such a constraint the floor cannot bound, the
+        room check is unprovable, so we DECLINE.
+      * **#1 — unknown effective allowance.** ``max_tokens=None`` is NOT unbounded:
+        the model context window (and any server default) still cap generation, and
+        a near-full prompt can leave no room for ``</think>`` + the call. The chat
+        route does not carry the resolved context window, so with ``max_tokens=None``
+        we cannot PROVE room — but declining every no-``max_tokens`` request (the
+        common case) would gut the feature. We keep engaging there BUT rely on the
+        coupled budget being SMALL (``reasoning_max_tokens`` closes ``</think>``
+        early, leaving the bulk of any remaining window for the short call); a
+        prompt so close to the ceiling that even that does not fit is a degenerate
+        request that truncates WITH OR WITHOUT line① (non-regressive either way).
+        Documented residual — a future context-window plumbing pass can make this a
+        hard check.
     """
     rmt = getattr(request, "reasoning_max_tokens", None)
     mx = getattr(request, "max_tokens", None)
-    if mx is None or rmt is None:
+    if rmt is None:
         return True
+    if mx is None:
+        # #1: allowance unknown (context-window not in reach). Engage on the
+        # small-budget argument above; documented residual.
+        return True
+    # #2: a bounded request whose schema minimum we cannot price -> decline.
+    if _line1_request_has_uncoverable_constraint(request):
+        return False
     return mx > rmt + _line1_min_call_tokens(request)
 
 
@@ -859,51 +977,52 @@ def _line1_should_probe_seed(request, resolved_thinking) -> bool:
     return choice is not None and choice["mode"] != "auto"
 
 
-async def _line1_probe_seed_offloaded(engine, cfg, request, messages, resolved_thinking):
-    """LINE① seed-state probe, run OFF the event loop (codex r2 #3).
+def _line1_probe_seed(engine, cfg, request, messages, resolved_thinking):
+    """LINE① seed-state probe — SYNCHRONOUS, run INSIDE the admission-gated build
+    slot (codex r2 #3 + r3 #5).
 
     The seed-state classification needs the template's isolated generation-prefix
     delta (``_template_generation_prefix`` — a full ``apply_chat_template`` render +
-    tokenization). Running that inline in the async handler adds rendering work to
-    the event loop for every eligible forced-tool request. Offload it to the
-    executor (the same pattern the grammar build uses) and return
-    ``(prefix, seed_open)`` so the route reuses the SINGLE render for both the gate
-    decision and the coupled budget (no second render). Returns
-    ``(_LINE1_SEED_UNSET, False)`` when line① is not a candidate or the render
-    fails (an MLLM engine may reject ``build_prompt``) — line① then declines to the
-    forced-prefix fallback (non-regressive).
+    tokenization). r3 #5 (DoS): the earlier revision submitted this render to the
+    SHARED default executor from the route BEFORE the grammar-build admission gate,
+    so a flood of concurrent / abandoned forced-tool requests could queue unbounded
+    render work and starve unrelated ``run_in_executor`` users. It now runs
+    SYNCHRONOUSLY from within ``_maybe_build_tool_grammar_processor``, which itself
+    executes only inside a SLOT of the bounded, admission-gated tool-grammar
+    executor (``_offload_tool_grammar_build`` → ``_try_admit_tool_grammar_build``).
+    So the render is bounded by the SAME compile-admission cap as the build it feeds
+    — no separate unbounded queue, and the single render is reused for both the gate
+    decision and the coupled budget (no second render).
+
+    Returns ``(prefix, seed_open)`` — or ``(_LINE1_SEED_UNSET, False)`` when line①
+    is not a candidate or the render fails (an MLLM engine may reject
+    ``build_prompt``); line① then declines to the forced-prefix fallback
+    (non-regressive).
     """
     if not _line1_should_probe_seed(request, resolved_thinking):
         return _LINE1_SEED_UNSET, False
 
-    def _probe():
-        from ..api.reasoning_budget import reasoning_seed_state
+    from ..api.reasoning_budget import reasoning_seed_state
 
-        try:
-            prefix = _template_generation_prefix(
-                engine, messages, request.tools, resolved_thinking
-            )
-        except Exception as exc:
-            logger.debug(
-                "line①: generation-prefix render failed for model=%s (%s: %s) — "
-                "declining the gated grammar (forced-prefix fallback)",
-                getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
-                type(exc).__name__,
-                exc,
-            )
-            return None, False
-        if prefix is None:
-            return None, False
-        seed_open = (
-            reasoning_seed_state(prefix, getattr(cfg, "reasoning_parser_name", None))
-            == "open"
+    try:
+        prefix = _template_generation_prefix(
+            engine, messages, request.tools, resolved_thinking
         )
-        return prefix, seed_open
-
-    loop = asyncio.get_event_loop()
-    prefix, seed_open = await loop.run_in_executor(None, _probe)
+    except Exception as exc:
+        logger.debug(
+            "line①: generation-prefix render failed for model=%s (%s: %s) — "
+            "declining the gated grammar (forced-prefix fallback)",
+            getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None),
+            type(exc).__name__,
+            exc,
+        )
+        return _LINE1_SEED_UNSET, False
     if prefix is None:
         return _LINE1_SEED_UNSET, False
+    seed_open = (
+        reasoning_seed_state(prefix, getattr(cfg, "reasoning_parser_name", None))
+        == "open"
+    )
     return prefix, seed_open
 
 
@@ -917,9 +1036,18 @@ def _resolve_tool_start_exclusion_ids(parser, tokenizer, flat_tools) -> tuple[in
     token on this tokenizer. That single-token requirement is what makes masking
     surgical: it forbids exactly the opener marker during ``<think>`` without
     touching ordinary reasoning bytes (a multi-token trigger would require masking
-    its first piece, e.g. ``<``, which would corrupt legitimate reasoning — so we
-    decline it and leave that family best-effort). Returns ``()`` on any failure
-    (no ``structure_info``, no tools, unresolvable / multi-token trigger).
+    its first piece, e.g. ``<``, which would corrupt legitimate reasoning).
+
+    ALL-OR-NOTHING across the forced set (codex r3 #3): a ``required`` choice may
+    span SEVERAL tools, and the model is free to open ANY of them during
+    reasoning. If even one eligible tool's opener does not resolve to a single
+    special token, masking the resolved subset leaves the unresolved tool's opener
+    emittable inside ``<think>`` — a hole the caller's ``non-empty`` admission gate
+    would not catch. So we return ``()`` the moment ANY tool's trigger is
+    missing / non-string / multi-token / unresolvable, declining the whole gate to
+    the forced-prefix fallback rather than protecting only part of the set. Returns
+    ``()`` on any failure (no ``structure_info``, no tools, or any unresolvable /
+    multi-token trigger).
     """
     try:
         info_fn = getattr(parser, "structure_info", None)
@@ -935,17 +1063,20 @@ def _resolve_tool_start_exclusion_ids(parser, tokenizer, flat_tools) -> tuple[in
             si = get_info(tool.get("name"))
             trigger = getattr(si, "trigger", None) if si is not None else None
             if not isinstance(trigger, str) or not trigger:
-                continue
+                return ()  # unresolved opener -> decline the WHOLE gate (codex r3 #3)
             tid = _encode_single_special(tokenizer, trigger)
-            if tid is not None:
-                seen.add(tid)
+            if tid is None:
+                return ()  # multi-token / non-special opener -> decline the WHOLE gate
+            seen.add(tid)
         return tuple(sorted(seen))
     except Exception:
         # Best-effort hardening only — never fail the request over it.
         return ()
 
 
-def _maybe_build_tool_grammar_processor(engine, cfg, request, reasoning_seed_open=False):
+def _maybe_build_tool_grammar_processor(
+    engine, cfg, request, messages=None, resolved_thinking=None
+):
     """Build a per-request ``GrammarLogitsProcessor`` for #558, or ``None``.
 
     Non-breaking: returns ``None`` (today's free-form-then-parse fallback)
@@ -957,6 +1088,15 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request, reasoning_seed_ope
     Re-runs the cheap eligibility checks (so it stays correct when called
     directly, e.g. from tests) before the heavy path; the route gates on
     ``_tool_grammar_eligible`` first to keep the offload off the hot path.
+
+    LINE① (#558, r3 #5): the reasoning-gate seed-state probe (``_line1_probe_seed``)
+    runs HERE, inside this admission-gated executor slot, rather than on the shared
+    default executor before admission — so its template render is bounded by the
+    compile-admission cap. ``messages`` / ``resolved_thinking`` are the render
+    inputs; when absent (a direct unit-test call) the probe short-circuits to
+    non-candidate and line① stays disengaged. When the gate DOES engage, the
+    rendered prefix is stashed on the returned processor as ``_line1_seed_prefix``
+    so the route can reuse it for the coupled budget (no second render).
     """
     if not _tool_grammar_eligible(cfg, request):
         return None
@@ -964,6 +1104,14 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request, reasoning_seed_ope
     choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
     if choice is None:  # pragma: no cover - _tool_grammar_eligible already gated
         return None  # "none" / malformed object form -> no grammar (free-form)
+
+    # LINE① (#558, r3 #5): seed-state probe runs HERE (bounded by this slot's
+    # admission), not on the shared default executor before the gate. Returns
+    # ``(_LINE1_SEED_UNSET, False)`` for a non-candidate / render failure / a
+    # direct unit-test call with no ``messages``.
+    _line1_seed_prefix, reasoning_seed_open = _line1_probe_seed(
+        engine, cfg, request, messages, resolved_thinking
+    )
 
     try:
         from ..api.tool_grammar import (
@@ -1116,17 +1264,30 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request, reasoning_seed_ope
             _parser_name = getattr(cfg, "reasoning_parser_name", None)
             _t_start, _t_end = resolve_think_token_ids(tokenizer, _parser_name)
             _vocab = _engine_output_vocab_size(engine)
-            # SGLang ``think_excluded_token_ids``: the tool-call opener the model
-            # must not emit WHILE the gate is closed, so the coupled budget's forced
-            # ``</think>`` can never land inside a tool-call envelope started during
-            # reasoning. Resolved from the parser's ``structure_info`` trigger (the
-            # SAME source the grammar builder uses) and kept ONLY when it is a single
-            # special token on this tokenizer. A RESOLVED exclusion is a PRECONDITION
-            # for gating (codex r2 #1): without it a free-form reasoning span could
-            # emit a complete opener before the force-close, corrupting the envelope
-            # — so a family whose opener is multi-token / unresolvable does NOT get
-            # the gate (it keeps the forced-prefix fallback), rather than getting an
-            # unprotected gate.
+            # SGLang ``think_excluded_token_ids``: mask the tool-call opener token
+            # WHILE the gate is closed, so the model cannot begin a tool call inside
+            # ``<think>`` via its NATURAL opener and the coupled budget's forced
+            # ``</think>`` does not land inside a tool-call envelope. Resolved from
+            # the parser's ``structure_info`` trigger (the SAME source the grammar
+            # builder uses) and kept ONLY when it is a single special token on this
+            # tokenizer, and only when EVERY forced tool's opener so resolves (codex
+            # r3 #3 — all-or-nothing). A RESOLVED exclusion is a PRECONDITION for
+            # gating (codex r2 #1): a family whose opener is multi-token /
+            # unresolvable does NOT get the gate (it keeps the forced-prefix
+            # fallback), rather than getting an unprotected gate.
+            #
+            # HONEST SCOPE (codex r3 #4): this masks the opener's SPECIAL TOKEN id
+            # — the way a trained reasoning model actually emits a tool call. It is
+            # NOT a structural proof that the trigger TEXT (e.g. ``<tool_call>``)
+            # can never appear: a model could in principle spell it out as ordinary
+            # subtokens inside ``<think>``, which a string-matching parser could
+            # observe. We do not defend against that adversarial spelling here (it
+            # would need stateful multi-token sequence suppression, or the parser
+            # quarantining in-``<think>`` markers entirely — a follow-up). In
+            # practice it was never observed across adversarial probes (trained
+            # models emit the atomic opener token), so this is best-effort
+            # hardening that removes the natural path, not an unconditional
+            # guarantee. See the design note / PR body.
             _line1_tool_start_ids = _resolve_tool_start_exclusion_ids(
                 parser, tokenizer, flat_tools
             )
@@ -1211,13 +1372,21 @@ def _maybe_build_tool_grammar_processor(engine, cfg, request, reasoning_seed_ope
         if processor.is_broken():
             logger.error("tool-grammar: grammar failed to compile; free-form fallback")
             return None
+        # LINE① (#558, r3 #5): stash the seed render on the (gated) processor so the
+        # route reuses it for the coupled budget instead of rendering a second time.
+        # Only meaningful when the gate engaged (``_line1_gate_id`` set); harmless
+        # otherwise (the route reads it only when ``reasoning_gate_id is not None``).
+        if _line1_gate_id is not None and _line1_seed_prefix is not _LINE1_SEED_UNSET:
+            processor._line1_seed_prefix = _line1_seed_prefix
         return processor
     except Exception:
         logger.exception("tool-grammar: failed to build processor; free-form fallback")
         return None
 
 
-async def _offload_tool_grammar_build(engine, cfg, request, reasoning_seed_open=False):
+async def _offload_tool_grammar_build(
+    engine, cfg, request, messages=None, resolved_thinking=None
+):
     """Off-loop, admission-gated build of a ``GrammarLogitsProcessor`` (or None).
 
     Extracted from the chat route so the admission gate is directly testable
@@ -1272,7 +1441,12 @@ async def _offload_tool_grammar_build(engine, cfg, request, reasoning_seed_open=
         return None
     try:
         fut = _get_tool_grammar_build_executor().submit(
-            _maybe_build_tool_grammar_processor, engine, cfg, request, reasoning_seed_open
+            _maybe_build_tool_grammar_processor,
+            engine,
+            cfg,
+            request,
+            messages,
+            resolved_thinking,
         )
     except Exception:
         # Submission itself failed (e.g. pool shut down): the compile never ran,
@@ -3454,17 +3628,16 @@ async def _create_chat_completion_impl(
     # budget installs a SEEDED force-close, so the runtime token-id gate is
     # guaranteed to open. ``_line1_should_probe_seed`` is the pure front-line gate
     # (forced choice + thinking + set budget + max_tokens room + tools); it excludes
-    # ``auto``/``none`` so the probe never runs for them. The seed-state render runs
-    # OFF the event loop (``_line1_probe_seed_offloaded`` — codex r2 #3) and returns
-    # the SAME rendered prefix the coupled budget reuses below (no second render).
-    # ``_LINE1_SEED_UNSET`` = not a candidate / render failed → the budget builder
-    # renders on its own path. "emit"/"ambiguous"/no-budget keep the forced-prefix
-    # fallback (strictly non-regressive; a render that fails, e.g. an MLLM engine,
-    # stays False too).
-    _line1_prefix, _line1_seed_open = await _line1_probe_seed_offloaded(
+    # ``auto``/``none`` so the probe never runs for them. r3 #5 (DoS): the seed-state
+    # render now runs INSIDE the admission-gated build slot (``_line1_probe_seed`` is
+    # called from ``_maybe_build_tool_grammar_processor``), bounded by the same
+    # compile-admission cap — NOT on the shared default executor before admission,
+    # where a request flood could queue unbounded render work. When the gate engages
+    # the build stashes the rendered prefix on the processor (``_line1_seed_prefix``)
+    # and the coupled budget reuses it below (no second render).
+    _glp = await _offload_tool_grammar_build(
         engine, cfg, request, messages, resolved_thinking
     )
-    _glp = await _offload_tool_grammar_build(engine, cfg, request, _line1_seed_open)
     # LINE① (#558) Option B — COUPLE the generation-time thinking budget to the
     # gated grammar. ``reasoning_gate_id is not None`` means the grammar's mask is
     # held OFF until ``</think>`` (runtime token-id gate), so a budget that
@@ -3475,6 +3648,12 @@ async def _create_chat_completion_impl(
     # processor`` is passed ``allow_tools`` EXACTLY here (every other tool request
     # keeps the opt-out, protecting the ungated auto/parser path — vLLM #44676).
     _line1_gate_engaged = _glp is not None and _glp.reasoning_gate_id is not None
+    # Reuse the render the (gated) build already did for the coupled budget below.
+    _line1_prefix = (
+        getattr(_glp, "_line1_seed_prefix", _LINE1_SEED_UNSET)
+        if _line1_gate_engaged
+        else _LINE1_SEED_UNSET
+    )
     # DELIBERATE AVAILABILITY POLICY (codex #558-PR5 override, NOT fail-closed):
     # a ``None`` here degrades this request to the pre-#558 free-form
     # tool-parsing path. That degrade is reserved for exactly two families of

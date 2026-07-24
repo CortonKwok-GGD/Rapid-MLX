@@ -1085,8 +1085,11 @@ def test_route_offload_gated_on_eligibility_in_source():
     from vllm_mlx.routes import chat as chat_mod
 
     # The route calls the extracted helper (which owns the gate + admission).
+    # r3 #5: the call now spans lines (messages/resolved_thinking threaded in for
+    # the in-slot seed render), so match the normalized form.
     route_src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    assert "_offload_tool_grammar_build(engine, cfg, request" in route_src, (
+    _norm = " ".join(route_src.split())
+    assert "_offload_tool_grammar_build( engine, cfg, request" in _norm, (
         "the route must delegate the off-loop build to _offload_tool_grammar_build"
     )
 
@@ -1289,7 +1292,7 @@ def test_admission_slot_not_released_until_compile_finishes_on_cancel():
     # Make the REAL helper's build block: it submits _maybe_build_tool_grammar_
     # processor to the pool, so patch that to a blocking function. The done-
     # callback (attached by the helper) releases the slot when this returns.
-    def _blocking_build(engine, cfg, request, reasoning_seed_open=False):
+    def _blocking_build(engine, cfg, request, *args, **kwargs):
         started.set()
         release_gate.wait(timeout=5)
         finished.set()
@@ -1378,7 +1381,7 @@ def test_cancelled_caller_does_not_cancel_a_queued_compile():
     pool = ThreadPoolExecutor(max_workers=1)  # forces B to QUEUE behind A
     chat_mod._get_tool_grammar_build_executor = lambda: pool
 
-    def _build(engine, cfg, request, reasoning_seed_open=False):
+    def _build(engine, cfg, request, *args, **kwargs):
         # Distinguish A (first) from B (second) by a per-request marker.
         if getattr(request, "_which", None) == "A":
             a_started.set()
@@ -2609,7 +2612,9 @@ def test_line1_think_exclusion_masks_tool_start_during_gate_closed():
 
         # Thinking: gate closed → only the excluded id is -inf, the rest untouched.
         out_think = np.array(proc(mx.array([1, 5]), mx.zeros((1, 8))))
-        assert out_think[0, EXCLUDED] == -np.inf, "tool-start id must be masked in think"
+        assert out_think[0, EXCLUDED] == -np.inf, (
+            "tool-start id must be masked in think"
+        )
         free = np.delete(out_think[0], EXCLUDED)
         assert np.array_equal(free, np.zeros(7)), "all non-opener logits stay free"
         assert state["fills"] == 0, "grammar mask must NOT run while thinking"
@@ -2675,9 +2680,9 @@ def test_line1_resolve_tool_start_exclusion_ids():
 
     tools = [{"name": "f", "parameters": {}}]
     # Single special token → kept.
-    assert _resolve_tool_start_exclusion_ids(
-        _Parser("<tool_call>"), _Tok(), tools
-    ) == (55,)
+    assert _resolve_tool_start_exclusion_ids(_Parser("<tool_call>"), _Tok(), tools) == (
+        55,
+    )
     # Multi-token trigger → declined.
     assert _resolve_tool_start_exclusion_ids(_Parser("<mt>"), _Tok(), tools) == ()
     # No structure_info → declined.
@@ -2688,6 +2693,85 @@ def test_line1_resolve_tool_start_exclusion_ids():
     assert _resolve_tool_start_exclusion_ids(_NoSI(), _Tok(), tools) == ()
     # No tools → declined.
     assert _resolve_tool_start_exclusion_ids(_Parser("<tool_call>"), _Tok(), []) == ()
+
+    # codex r3 #3 — ALL-OR-NOTHING across a mixed forced set: if even ONE tool's
+    # opener does not resolve to a single special token, the WHOLE set is declined
+    # (returning the resolved subset would leave the unresolved tool's opener
+    # emittable inside <think>).
+    class _PerNameParser:
+        def __init__(self, mapping):
+            self._m = mapping
+
+        def structure_info(self):
+            return lambda name: _SI(self._m.get(name))
+
+    mixed = [{"name": "ok", "parameters": {}}, {"name": "bad", "parameters": {}}]
+    # ``ok`` → single special token, ``bad`` → multi-token: decline the whole set.
+    assert (
+        _resolve_tool_start_exclusion_ids(
+            _PerNameParser({"ok": "<tool_call>", "bad": "<mt>"}), _Tok(), mixed
+        )
+        == ()
+    )
+    # ``bad`` has NO trigger (None) → decline the whole set.
+    assert (
+        _resolve_tool_start_exclusion_ids(
+            _PerNameParser({"ok": "<tool_call>", "bad": None}), _Tok(), mixed
+        )
+        == ()
+    )
+    # BOTH resolve to (the same) single special token → kept.
+    assert _resolve_tool_start_exclusion_ids(
+        _PerNameParser({"ok": "<tool_call>", "bad": "<tool_call>"}), _Tok(), mixed
+    ) == (55,)
+
+
+def test_line1_completion_limit_declines_uncoverable_schema():
+    # codex r3 #2 — a BOUNDED request whose schema carries a value/shape constraint
+    # the flat floor cannot price (minLength / const / nested-required / $ref) must
+    # DECLINE the gate rather than admit a call that might not fit.
+    from vllm_mlx.routes.chat import (
+        _line1_completion_limit_ok,
+        _line1_schema_has_uncoverable_constraint,
+    )
+
+    class _Req:
+        def __init__(self, params, max_tokens=4096, reasoning_max_tokens=64):
+            self.tools = [{"function": {"name": "f", "parameters": params}}]
+            self.max_tokens = max_tokens
+            self.reasoning_max_tokens = reasoning_max_tokens
+
+    # Plain schema → coverable → gate stays eligible on the numeric floor.
+    plain = {"type": "object", "properties": {"a": {"type": "string"}}}
+    assert _line1_schema_has_uncoverable_constraint(plain) is False
+    assert _line1_completion_limit_ok(_Req(plain)) is True
+
+    # Each uncoverable keyword forces a decline for a BOUNDED request.
+    for params in (
+        {"type": "object", "properties": {"a": {"type": "string", "minLength": 1000}}},
+        {"type": "object", "properties": {"a": {"const": "x" * 500}}},
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string", "pattern": "^.{99}$"}},
+        },
+        {"type": "object", "properties": {"a": {"enum": ["red", "green"]}}},
+        {"type": "object", "properties": {"a": {"type": "array", "minItems": 3}}},
+        # nested required object whose inner constraint the flat floor never descends
+        {
+            "type": "object",
+            "properties": {"a": {"type": "object", "properties": {"b": {"const": 1}}}},
+        },
+        {"$ref": "#/$defs/Foo"},
+    ):
+        assert _line1_schema_has_uncoverable_constraint(params) is True, params
+        assert _line1_completion_limit_ok(_Req(params)) is False, params
+
+    # An UNBOUNDED request (max_tokens=None) is NOT declined on this axis — the
+    # unknown-allowance residual (#1) is handled separately; a constrained schema
+    # only forces a decline when there is a concrete max_tokens to blow.
+    assert (
+        _line1_completion_limit_ok(_Req({"const": "x" * 500}, max_tokens=None)) is True
+    )
 
 
 def test_line1_string_gate_not_run_when_id_gate_active():
@@ -2778,20 +2862,24 @@ def test_line1_should_probe_seed_predicate():
     # Declines: max_tokens too small for force-close + a minimal call (codex #4).
     # tools=("t",) has no resolvable name → floor == envelope (24); budget=64 ⇒
     # max_tokens must exceed 88.
-    assert _line1_should_probe_seed(
-        _L1Req(reasoning_max_tokens=64, max_tokens=64), True
-    ) is False
-    assert _line1_should_probe_seed(
-        _L1Req(reasoning_max_tokens=64, max_tokens=88), True
-    ) is False
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=64), True)
+        is False
+    )
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=88), True)
+        is False
+    )
     # Engages: max_tokens comfortably above the floor.
-    assert _line1_should_probe_seed(
-        _L1Req(reasoning_max_tokens=64, max_tokens=256), True
-    ) is True
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=256), True)
+        is True
+    )
     # Unset max_tokens never blocks (unbounded generation).
-    assert _line1_should_probe_seed(
-        _L1Req(reasoning_max_tokens=64, max_tokens=None), True
-    ) is True
+    assert (
+        _line1_should_probe_seed(_L1Req(reasoning_max_tokens=64, max_tokens=None), True)
+        is True
+    )
 
 
 def test_line1_completion_limit_ok_predicate():
@@ -2854,25 +2942,33 @@ def test_line1_route_threads_predicate_into_offload_build():
     from vllm_mlx.routes import chat as chat_mod
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
-    probe_pos = src.find("_line1_probe_seed_offloaded(")
+    # r3 #5 (DoS): the seed-state render runs INSIDE the admission-gated build
+    # (``_line1_probe_seed`` called from ``_maybe_build_tool_grammar_processor``),
+    # NOT on the shared default executor before admission. The route no longer runs
+    # a separate pre-admission probe — it passes ``messages`` / ``resolved_thinking``
+    # into the offload so the in-slot probe can render.
     offload_pos = src.find(
-        "_offload_tool_grammar_build(engine, cfg, request, _line1_seed_open"
+        "_offload_tool_grammar_build(\n        engine, cfg, request, messages, resolved_thinking"
     )
-    assert probe_pos != -1, "route must run the OFFLOADED line① seed probe"
-    assert offload_pos != -1 and probe_pos < offload_pos, (
-        "the seed-open decision must be computed and threaded into the build"
+    assert offload_pos != -1, (
+        "route must thread messages/resolved_thinking into the admission-gated build "
+        "so the seed render runs in-slot (r3 #5)"
     )
-    # codex r2 #3: the seed-state render runs off the event loop (in an executor)
-    # and classifies "open" there, not inline in the async handler.
-    probe_src = inspect.getsource(chat_mod._line1_probe_seed_offloaded)
-    assert "run_in_executor" in probe_src, (
-        "seed probe render must run in an executor, not on the event loop"
+    assert "_line1_probe_seed_offloaded(" not in src, (
+        "the pre-admission offloaded probe must be gone (r3 #5 DoS)"
     )
-    assert 'reasoning_seed_state(' in probe_src and '== "open"' in probe_src, (
+    # The in-slot probe classifies "open" and degrades gracefully on render failure.
+    probe_src = inspect.getsource(chat_mod._line1_probe_seed)
+    assert "reasoning_seed_state(" in probe_src and '== "open"' in probe_src, (
         "probe must classify the rendered prefix and engage only on 'open'"
     )
     assert "line①: generation-prefix render failed" in probe_src, (
         "probe must degrade gracefully on render failure (codex #1)"
+    )
+    # The probe is invoked from within the admission-gated builder, not the route.
+    build_src = inspect.getsource(chat_mod._maybe_build_tool_grammar_processor)
+    assert "_line1_probe_seed(" in build_src, (
+        "seed probe must run inside the admission-gated build slot (r3 #5)"
     )
     # Option B coupling: the route derives gate-engaged from the grammar's
     # ``reasoning_gate_id`` and threads ``allow_tools`` + the reused prefix into
@@ -2889,6 +2985,10 @@ def test_line1_route_threads_predicate_into_offload_build():
     assert "seed_prefix=(_line1_prefix" in src, (
         "route must thread the already-rendered prefix into the budget builder"
     )
+    # The reused prefix is read off the (gated) processor, not a separate probe.
+    assert "_line1_seed_prefix" in src, (
+        "route must reuse the build's stashed seed prefix for the budget (r3 #5)"
+    )
     # codex #2 / #4 / r2 #1: the gate declines when the coupled budget would (stop
     # conflict), when max_tokens strands the call, OR when the tool-start opener
     # exclusion is not guaranteed — so the gate is never orphaned or unprotected.
@@ -2904,12 +3004,11 @@ def test_line1_route_threads_predicate_into_offload_build():
     )
 
 
-def test_line1_probe_seed_offloaded_behavior(monkeypatch):
-    # codex r2 #3: the seed probe runs off the event loop and degrades gracefully.
-    import asyncio
-
+def test_line1_probe_seed_behavior(monkeypatch):
+    # r3 #5: the seed probe is SYNCHRONOUS (runs inside the admission-gated build
+    # slot, not on the shared default executor) and degrades gracefully.
     from vllm_mlx.routes import chat as chat_mod
-    from vllm_mlx.routes.chat import _LINE1_SEED_UNSET, _line1_probe_seed_offloaded
+    from vllm_mlx.routes.chat import _LINE1_SEED_UNSET, _line1_probe_seed
 
     class _Cfg:
         model_path = "qwen3.5-4b"
@@ -2925,9 +3024,7 @@ def test_line1_probe_seed_offloaded_behavior(monkeypatch):
 
     monkeypatch.setattr(chat_mod, "_template_generation_prefix", _boom)
     req_auto = _L1Req(tool_choice="auto")
-    prefix, seed = asyncio.run(
-        _line1_probe_seed_offloaded(object(), _Cfg(), req_auto, [], True)
-    )
+    prefix, seed = _line1_probe_seed(object(), _Cfg(), req_auto, [], True)
     assert prefix is _LINE1_SEED_UNSET and seed is False
     assert called["n"] == 0
 
@@ -2937,16 +3034,14 @@ def test_line1_probe_seed_offloaded_behavior(monkeypatch):
 
     monkeypatch.setattr(chat_mod, "_template_generation_prefix", _raise)
     req = _L1Req(tool_choice="required", max_tokens=512)
-    prefix, seed = asyncio.run(
-        _line1_probe_seed_offloaded(object(), _Cfg(), req, [], True)
-    )
+    prefix, seed = _line1_probe_seed(object(), _Cfg(), req, [], True)
     assert prefix is _LINE1_SEED_UNSET and seed is False
 
     # Candidate + render returns an OPEN <think> prefix → (prefix, True).
-    monkeypatch.setattr(chat_mod, "_template_generation_prefix", lambda *a, **k: "<think>")
-    prefix, seed = asyncio.run(
-        _line1_probe_seed_offloaded(object(), _Cfg(), req, [], True)
+    monkeypatch.setattr(
+        chat_mod, "_template_generation_prefix", lambda *a, **k: "<think>"
     )
+    prefix, seed = _line1_probe_seed(object(), _Cfg(), req, [], True)
     assert prefix == "<think>" and seed is True
 
 
