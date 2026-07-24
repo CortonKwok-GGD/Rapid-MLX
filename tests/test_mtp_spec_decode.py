@@ -2048,18 +2048,30 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     )
 
     # The MoE path (SwitchGLU / QuantizedSwitchLinear -> gather_qmm) —
-    # exercised when a Qwen3.6 MoE MTP head layer is present.
+    # exercised when a Qwen3.6 MoE MTP head layer is present. Cover BOTH
+    # directions here too (matching the quantized_matmul cases above and
+    # the "in both directions" claim in the qwen3_5_inject.py comment):
+    # (a) fp32 module/input with mismatched bf16/fp16 sidecar scales, and
+    # (b) the reverse — a bf16 module/input with mismatched fp32 scales,
+    # which is exactly the "fp32 scales for a bf16 MoE module" config the
+    # by-role check accepts.
     from mlx_lm.models.switch_layers import SwitchGLU
 
     num_experts, top_k = 4, 2
-    switch = SwitchGLU(in_dims, in_dims, num_experts)
-    _nn.quantize(switch, group_size=group_size, bits=bits)
-    _mx.eval(switch.parameters())
-    x_moe = _mx.random.uniform(shape=(1, 3, in_dims)).astype(_mx.float32)
     inds = _mx.array([[0, 1], [1, 2], [2, 3]]).reshape(1, 3, top_k)
-    gate = switch.gate_proj
 
-    def gather_qmm_ok(scales, biases):
+    def make_switch(param_dtype):
+        switch = SwitchGLU(in_dims, in_dims, num_experts)
+        # Cast each SwitchLinear's FP weight before quantizing so the
+        # derived scales/biases land in ``param_dtype``.
+        for _name in ("gate_proj", "up_proj", "down_proj"):
+            _lin = getattr(switch, _name)
+            _lin.weight = _lin.weight.astype(param_dtype)
+        _nn.quantize(switch, group_size=group_size, bits=bits)
+        _mx.eval(switch.parameters())
+        return switch
+
+    def gather_qmm_ok(gate, x_moe, scales, biases):
         out = _mx.gather_qmm(
             x_moe,
             gate.weight,
@@ -2073,8 +2085,34 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         _mx.eval(out)
         assert bool(_mx.all(_mx.isfinite(out)).item())
 
-    gather_qmm_ok(gate.scales.astype(_mx.bfloat16), gate.biases)
-    gather_qmm_ok(gate.scales, gate.biases.astype(_mx.float16))
+    # (a) fp32 MoE module + fp32 input, scales/biases forced to bf16 / fp16.
+    fp32_switch = make_switch(_mx.float32)
+    fp32_gate = fp32_switch.gate_proj
+    assert fp32_gate.scales.dtype == _mx.float32
+    x_moe_fp32 = _mx.random.uniform(shape=(1, 3, in_dims)).astype(_mx.float32)
+    gather_qmm_ok(
+        fp32_gate, x_moe_fp32, fp32_gate.scales.astype(_mx.bfloat16), fp32_gate.biases
+    )
+    gather_qmm_ok(
+        fp32_gate, x_moe_fp32, fp32_gate.scales, fp32_gate.biases.astype(_mx.float16)
+    )
+
+    # (b) the reverse: bf16 MoE module + bf16 input, scales/biases forced
+    # to fp32 — the "fp32 scales for a bf16 MoE module" config the by-role
+    # check accepts and the comment claims tolerance for.
+    bf16_switch = make_switch(_mx.bfloat16)
+    bf16_gate = bf16_switch.gate_proj
+    assert bf16_gate.scales.dtype == _mx.bfloat16
+    x_moe_bf16 = _mx.random.uniform(shape=(1, 3, in_dims)).astype(_mx.bfloat16)
+    gather_qmm_ok(
+        bf16_gate, x_moe_bf16, bf16_gate.scales.astype(_mx.float32), bf16_gate.biases
+    )
+    gather_qmm_ok(
+        bf16_gate,
+        x_moe_bf16,
+        bf16_gate.scales.astype(_mx.float32),
+        bf16_gate.biases.astype(_mx.float32),
+    )
 
 
 def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts_correctly(
