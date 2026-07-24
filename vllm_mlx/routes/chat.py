@@ -960,21 +960,44 @@ def _line1_min_call_tokens(request) -> int:
         # wire spelling INCLUDING the surrounding quotes and any escapes.
         cost = len(json.dumps(name).encode("utf-8")) if isinstance(name, str) else 0
         if isinstance(params, dict):
-            required = params.get("required")
-            props = params.get("properties")
-            if isinstance(required, list):
-                # Each required key is emitted as ``<json-key>:<value>,`` — the
-                # json.dumps-serialized key (quotes + escapes) + 2 punctuation bytes
-                # (colon, comma) + the shortest legal value's bytes for its schema.
-                for k in required:
-                    sub = props.get(k) if isinstance(props, dict) else None
-                    cost += (
-                        len(json.dumps(str(k)).encode("utf-8"))
-                        + 2
-                        + _line1_min_value_bytes(sub)
-                    )
+            if "enum" in params or "const" in params:
+                # ROOT-level enum/const (codex r12 #2): the WHOLE arguments object is a
+                # single fixed value the grammar must emit in full, NOT a required-key
+                # skeleton — price it as a value (the shortest enum member / the const).
+                cost += _line1_min_value_bytes(params)
+            else:
+                required = params.get("required")
+                props = params.get("properties")
+                if isinstance(required, list):
+                    # Each required key is emitted as ``<json-key>:<value>,`` — the
+                    # json.dumps-serialized key (quotes + escapes) + 2 punctuation
+                    # bytes (colon, comma) + the shortest legal value's bytes.
+                    for k in required:
+                        sub = props.get(k) if isinstance(props, dict) else None
+                        cost += (
+                            len(json.dumps(str(k)).encode("utf-8"))
+                            + 2
+                            + _line1_min_value_bytes(sub)
+                        )
         worst = max(worst, cost)
     return _LINE1_CALL_ENVELOPE_TOKENS + worst
+
+
+def _line1_stop_conflicts_with_forced_output(stop, forced_prefix) -> bool:
+    """True iff a client ``stop`` sequence would fire on the FORCED wire output the
+    GATED path GENERATES (codex r12 #3).
+
+    The forced-prefix fallback places the tool opener in the PROMPT — stops never
+    scan the prompt — but line①'s gated path EMITS that opener as output. So
+    ``stop=["<tool_call>"]`` (a substring of the forced prefix) would terminate
+    generation the instant the constrained opener appears, truncating the call. When
+    such an overlap exists the gate declines to the forced-prefix path (where the
+    opener is prompt-injected, immune) rather than admit a self-truncating gate — the
+    same shape as the ``</think>``-in-``stop`` decline (codex #2)."""
+    if not isinstance(forced_prefix, str) or not forced_prefix:
+        return False
+    stops = stop if isinstance(stop, (list, tuple)) else ([stop] if stop else [])
+    return any(isinstance(s, str) and s and s in forced_prefix for s in stops)
 
 
 # FAIL-SAFE ALLOWLIST of JSON-Schema keywords whose effect on a minimal instance's
@@ -1630,6 +1653,10 @@ def _maybe_build_tool_grammar_processor(
             #   * NOT ``reasoning_stop_conflicts`` — the budget declines (keeps the
             #     post-hoc cap) when the client lists ``</think>`` in ``stop``, so the
             #     gate must decline too (codex #2);
+            #   * NOT ``_line1_stop_conflicts_with_forced_output`` — a client ``stop``
+            #     overlapping the forced wire opener would truncate the GENERATED call
+            #     (the forced-prefix path prompt-injects that opener, immune) (codex
+            #     r12 #3);
             #   * ``_line1_tool_start_ids`` non-empty — opener exclusion guaranteed
             #     (codex r2 #1).
             # On decline we leave ``reasoning_sentinels`` INTACT so
@@ -1643,6 +1670,10 @@ def _maybe_build_tool_grammar_processor(
                 and _line1_tool_start_ids
                 and not reasoning_stop_conflicts(
                     getattr(request, "stop", None), _parser_name
+                )
+                and not _line1_stop_conflicts_with_forced_output(
+                    getattr(request, "stop", None),
+                    _compute_forced_tool_prefix(cfg, request),
                 )
             ):
                 _line1_gate_id = _t_end

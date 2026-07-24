@@ -2806,6 +2806,14 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert _line1_schema_has_uncoverable_constraint(float_min) is True
     assert _line1_completion_limit_ok(_Req(float_min)) is False
 
+    # codex r12 #2: a ROOT-level enum/const on the params OBJECT (not a property) must
+    # be priced as the whole value — the flat required-key skeleton never sees it, so
+    # a large member has to inflate the floor and decline a tight completion.
+    root_enum = {"type": "object", "enum": [{"a": "x" * 300}]}
+    assert _line1_schema_has_uncoverable_constraint(root_enum) is False
+    assert _line1_min_call_tokens(_Req(root_enum)) > 300
+    assert _line1_completion_limit_ok(_Req(root_enum, max_tokens=128)) is False
+
     # codex r8 #2: an UPPER / negative bound forbids the 1-byte default value —
     # ``maximum:-999`` needs at least ``"-999"`` (4 bytes), which must be priced.
     neg_max = {
@@ -3238,6 +3246,23 @@ def test_line1_context_room_ok_predicate(monkeypatch):
         )
         is True
     )
+
+
+def test_line1_stop_conflicts_with_forced_output():
+    # codex r12 #3: a client stop overlapping the FORCED wire opener would truncate the
+    # gated path's GENERATED call (forced-prefix prompt-injects that opener, immune), so
+    # the gate must decline when such an overlap exists.
+    from vllm_mlx.routes.chat import _line1_stop_conflicts_with_forced_output as _conf
+
+    forced = '<tool_call>\n{"name": "get_weather", "arguments": '
+    assert _conf(["<tool_call>"], forced) is True  # opener substring -> conflict
+    assert _conf("<tool_call>", forced) is True  # bare-string stop form
+    assert _conf(['{"name"'], forced) is True  # any forced-output substring
+    assert _conf(["\n\n"], forced) is False  # unrelated stop -> no conflict
+    # missing signals never conflict (no false decline)
+    assert _conf(["<tool_call>"], None) is False
+    assert _conf(None, forced) is False
+    assert _conf([], forced) is False
 
 
 def test_line1_split_reasoning_for_tool_parse():
