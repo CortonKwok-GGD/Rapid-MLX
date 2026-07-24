@@ -1034,30 +1034,52 @@ def _line1_stop_conflicts_with_forced_output(stop, forced_openers) -> bool:
 
 def _line1_forced_wire_openers(parser, flat_tools, cfg, request) -> tuple[str, ...]:
     """The FIXED wire prefix strings the line① gated path GENERATES for a forced call
-    (codex r13 #1).
+    (codex r13 #1, extended r15 #2).
 
-    Each forced tool's ``structure_info`` trigger marker (the opener the model emits
-    when the gate opens — the SAME source ``_resolve_tool_start_exclusion_ids`` masks),
-    resolved INDEPENDENTLY of any fixed function name so a ``required`` choice spanning
-    MULTIPLE tools is covered (``_compute_forced_tool_prefix`` returns ``None`` there).
-    Plus the fuller named/``required``-single forced-prefix envelope when available.
+    Two families of mandatory generated fragment a client ``stop`` could truncate:
+
+    (a) Each forced tool's ``structure_info`` trigger marker (the opener the model
+        emits when the gate opens — the SAME source ``_resolve_tool_start_exclusion_ids``
+        masks), resolved INDEPENDENTLY of any fixed function name.
+
+    (b) The PER-CANDIDATE forced envelope ``{"name":"<tool>","arguments": `` for every
+        tool the gated path could emit — the NAMED tool for a named choice, or ALL
+        tools for ``required`` (single OR multi). This is what closes the multi-tool
+        gap (codex r15 #2): with ``required`` over several tools the model picks one and
+        generates its name + the mandatory ``", "arguments": `` boundary, so a stop
+        matching any candidate name or that boundary text would truncate the call. The
+        old code only guarded the shared trigger marker.
+
     Fed to ``_line1_stop_conflicts_with_forced_output`` so a client ``stop`` that would
-    truncate this generated opener declines the gate to the forced-prefix path."""
+    truncate any mandatory generated fragment declines the gate to the (non-regressive)
+    forced-prefix / free path."""
     openers: list[str] = []
+    tools = flat_tools or []
+    # (a) trigger markers — name-independent.
     try:
         info_fn = getattr(parser, "structure_info", None)
         get_info = info_fn() if info_fn is not None else None
-        if get_info is not None and flat_tools:
-            for tool in flat_tools:
+        if get_info is not None and tools:
+            for tool in tools:
                 si = get_info(tool.get("name"))
                 trigger = getattr(si, "trigger", None) if si is not None else None
                 if isinstance(trigger, str) and trigger:
                     openers.append(trigger)
     except Exception:
         pass  # best-effort — a missing trigger just means fewer openers to guard
-    envelope = _compute_forced_tool_prefix(cfg, request)
-    if isinstance(envelope, str) and envelope:
-        openers.append(envelope)
+    # (b) per-candidate mandatory envelope, scoped to the tools the choice could emit.
+    choice = _normalize_tool_choice_for_grammar(getattr(request, "tool_choice", None))
+    if choice and choice.get("mode") == "named":
+        cand_names = [choice.get("name")]
+    else:  # required (single or multi) — any tool is eligible
+        cand_names = [t.get("name") for t in tools]
+    parser_name = getattr(cfg, "tool_call_parser", None)
+    for nm in cand_names:
+        if not (isinstance(nm, str) and nm):
+            continue
+        env = _forced_tool_call_prefix(parser_name, nm)
+        if isinstance(env, str) and env:
+            openers.append(env)
     return tuple(openers)
 
 

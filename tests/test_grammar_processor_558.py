@@ -3310,19 +3310,41 @@ def test_line1_forced_wire_openers():
         tool_call_parser = "hermes"
 
     class _Req:
-        tools = [{"name": "a"}, {"name": "b"}]
+        tools = [{"name": "alpha"}, {"name": "beta"}]
         tool_choice = "required"  # multi-tool required -> no fixed-name envelope
 
     openers = _line1_forced_wire_openers(
-        _Parser(), [{"name": "a"}, {"name": "b"}], _Cfg(), _Req()
+        _Parser(), [{"name": "alpha"}, {"name": "beta"}], _Cfg(), _Req()
     )
-    assert "<tool_call>" in openers  # trigger marker present, name-independent
+    assert "<tool_call>" in openers  # (a) trigger marker present, name-independent
+    # (b) codex r15 #2: per-candidate envelopes for BOTH multi-tool candidates, so a
+    # stop matching either NAME or the mandatory boundary declines the gate.
+    assert any('"name": "alpha"' in o for o in openers)
+    assert any('"name": "beta"' in o for o in openers)
+    # a stop matching a non-selected candidate name still conflicts (conservative).
+    from vllm_mlx.routes.chat import _line1_stop_conflicts_with_forced_output as _conf
 
-    # A parser with no structure_info yields no triggers (best-effort, no raise).
+    assert _conf(["alpha"], openers) is True
+    assert _conf(['", "arguments": '], openers) is True  # mandatory boundary text
+
+    # A named choice scopes candidates to just the named tool.
+    class _ReqNamed:
+        tools = [{"name": "alpha"}, {"name": "beta"}]
+        tool_choice = {"type": "function", "function": {"name": "alpha"}}
+
+    named_openers = _line1_forced_wire_openers(
+        _Parser(), [{"name": "alpha"}, {"name": "beta"}], _Cfg(), _ReqNamed()
+    )
+    assert any('"name": "alpha"' in o for o in named_openers)
+    assert not any('"name": "beta"' in o for o in named_openers)  # not emittable
+
+    # A parser with no structure_info yields no triggers, but still per-candidate
+    # envelopes (best-effort, no raise).
     class _NoInfo:
         pass
 
-    assert _line1_forced_wire_openers(_NoInfo(), [{"name": "a"}], _Cfg(), _Req()) == ()
+    no_info = _line1_forced_wire_openers(_NoInfo(), [{"name": "alpha"}], _Cfg(), _Req())
+    assert any('"name": "alpha"' in o for o in no_info)  # envelope still built
 
 
 def test_line1_gated_tool_call_preserves_reasoning_content():
