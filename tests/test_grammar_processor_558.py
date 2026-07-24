@@ -2795,6 +2795,17 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert _line1_min_call_tokens(_Req(big_min)) > 40  # 41-digit boundary priced
     assert _line1_completion_limit_ok(_Req(big_min, max_tokens=80)) is False
 
+    # codex r11 #3: a FLOAT bound reprs in exponent form (repr(1e100)=="1e+100", 6
+    # chars) while an integer grammar may need 101 digits, so the repr under-reserves.
+    # Plain ints repr as full decimal (safe, priced above); floats DECLINE.
+    float_min = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer", "minimum": 1e100}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(float_min) is True
+    assert _line1_completion_limit_ok(_Req(float_min)) is False
+
     # codex r8 #2: an UPPER / negative bound forbids the 1-byte default value —
     # ``maximum:-999`` needs at least ``"-999"`` (4 bytes), which must be priced.
     neg_max = {

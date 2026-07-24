@@ -1040,6 +1040,15 @@ def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
     # Any keyword we do not KNOW to be length-safe -> decline (fail closed).
     if set(schema.keys()) - _LINE1_SAFE_SCHEMA_KEYWORDS:
         return True
+    # A FLOAT numeric bound is unpriceable (codex r11 #3): ``repr`` renders a large
+    # float in EXPONENT form (``repr(1e100) == "1e+100"``, 6 chars) while an integer
+    # grammar may require the full 101-digit decimal expansion — so pricing the repr
+    # under-reserves. A plain ``int`` bound always ``repr``s as full decimal (never
+    # exponent), so only floats are the hazard; decline them (non-regressive).
+    for _kw in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+        _b = schema.get(_kw)
+        if isinstance(_b, float):
+            return True
     # A NESTED ``required`` skeleton (codex r4 #2): the flat floor prices ONLY the
     # ROOT required list, so any required list below the root is unpriced bytes.
     if _depth > 0 and schema.get("required"):
