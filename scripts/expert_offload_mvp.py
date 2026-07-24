@@ -50,7 +50,8 @@ class ExpertCache:
                  num_layers: int, num_experts: int,
                  max_experts: int = 256, format: str = "per_expert",
                  stacked_key_template: str | None = None,
-                 no_split: bool = False):
+                 no_split: bool = False,
+                 expert_cache_dir: str | None = None):
         self.model_path = Path(model_path)
         self.weight_map = weight_map
         self.expert_key_pattern = expert_key_pattern
@@ -77,9 +78,24 @@ class ExpertCache:
                     proj = m.group(2)
                     comp = m.group(3)
                     self._stacked_index[(layer, proj, comp)] = (weight_map[key], key)
-            print(f"  Direct-load mode (no pre-split), {len(self._stacked_index)} stacked tensors indexed")
+
+            # Pre-parse safetensors headers for fast selective loading
+            self._file_headers: dict[str, tuple] = {}  # fname -> (header, data_start)
+            files_with_experts = set(v[0] for v in self._stacked_index.values())
+            import struct
+            for fname in files_with_experts:
+                fpath = str(self.model_path / fname)
+                with open(fpath, "rb") as fh:
+                    hs = struct.unpack("<Q", fh.read(8))[0]
+                    hdr = json.loads(fh.read(hs))
+                    self._file_headers[fname] = (hdr, 8 + hs)
+
+            print(f"  Selective-load mode, {len(self._stacked_index)} tensors, {len(files_with_experts)} files indexed")
         else:
-            self.expert_dir = self.model_path / ".expert_cache"
+            if expert_cache_dir:
+                self.expert_dir = Path(expert_cache_dir)
+            else:
+                self.expert_dir = self.model_path / ".expert_cache"
             self._ensure_expert_files()
 
     def _ensure_expert_files(self):
@@ -250,38 +266,59 @@ class ExpertCache:
 
         self.cache[(layer, expert_id)] = entry
 
+    @staticmethod
+    def _read_expert_slice(filepath, tensor_name, expert_id, header, data_start):
+        """Read a single expert slice directly from safetensors via seek+read."""
+        import numpy as np
+        meta = header[tensor_name]
+        dtype_str = meta["dtype"]
+        shape = meta["shape"]
+        off0, off1 = meta["data_offsets"]
+
+        expert_size = (off1 - off0) // shape[0]
+        expert_offset = off0 + expert_id * expert_size
+        expert_shape = shape[1:]
+
+        with open(filepath, "rb") as fh:
+            fh.seek(data_start + expert_offset)
+            raw = fh.read(expert_size)
+
+        if dtype_str == "U32":
+            return mx.array(np.frombuffer(raw, dtype=np.uint32).reshape(expert_shape))
+        elif dtype_str == "BF16":
+            return mx.array(
+                np.frombuffer(raw, dtype=np.uint16).reshape(expert_shape)
+            ).view(mx.bfloat16)
+        elif dtype_str == "F16":
+            return mx.array(np.frombuffer(raw, dtype=np.float16).reshape(expert_shape))
+        else:
+            return mx.array(np.frombuffer(raw, dtype=np.float32).reshape(expert_shape))
+
     def _load_experts_direct_batch(self, layer: int, expert_ids: list[int]):
-        """Batch load experts: load file once, extract all needed experts."""
-        # Evict to make room
+        """Selective load: read only the exact bytes needed per expert."""
         while len(self.cache) + len(expert_ids) > self.max_experts:
             self.cache.popitem(last=False)
 
-        # Group stacked tensors by file
+        # Group tensors by file
         files_needed: dict[str, list] = {}
         for proj_name in self.proj_map:
             for comp in ("weight", "scales", "biases"):
                 fname, key = self._stacked_index[(layer, proj_name, comp)]
                 files_needed.setdefault(fname, []).append((proj_name, comp, key))
 
-        # Load each file ONCE and extract ALL missing experts
-        loaded_files: dict[str, dict] = {}
-        for fname, items in files_needed.items():
-            if fname not in loaded_files:
-                loaded_files[fname] = mx.load(str(self.model_path / fname))
-
         for eid in expert_ids:
             entry: dict[str, dict] = {}
             for fname, items in files_needed.items():
-                file_data = loaded_files[fname]
+                hdr, ds = self._file_headers[fname]
+                fpath = str(self.model_path / fname)
                 for proj_name, comp, key in items:
-                    entry.setdefault(proj_name, {})[comp] = file_data[key][eid]
+                    t = self._read_expert_slice(fpath, key, eid, hdr, ds)
+                    entry.setdefault(proj_name, {})[comp] = t
 
             self.cache[(layer, eid)] = {
                 proj: (d["weight"], d["scales"], d["biases"])
                 for proj, d in entry.items()
             }
-
-        del loaded_files
 
     @property
     def hit_rate(self):
@@ -580,7 +617,8 @@ def _auto_cache_size(shared_bytes: int, num_experts_total: int, expert_size_esti
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model_offloaded(model_path: str, max_cached_experts: int | None = None):
+def load_model_offloaded(model_path: str, max_cached_experts: int | None = None,
+                         expert_cache_dir: str | None = None):
     """Load any mlx-lm MoE model with expert weights offloaded to disk."""
     model_path = Path(model_path)
 
@@ -659,9 +697,23 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     moe_hidden = text_cfg.get("moe_intermediate_size",
                               text_cfg.get("intermediate_size",
                                            config.get("intermediate_size", 14336)))
-    # Rough estimate based on quantized sizes
-    expert_size_est = (hidden_size * moe_hidden * 3 * bits) // (8 * 1024) * 1024  # bytes
-    expert_size_est = max(expert_size_est, 1024 * 1024)  # at least 1MB
+    # Estimate from actual weight file if possible, else rough formula
+    expert_size_est = None
+    if fmt == "stacked" and expert_layers:
+        sample_layer = expert_layers[0]
+        sample_keys = [k for k in weight_map if f".{sample_layer}." in k and ".switch_mlp." in k]
+        if sample_keys:
+            sample_file = weight_map[sample_keys[0]]
+            try:
+                t = mx.load(str(model_path / sample_file))
+                est = sum(t[k][0].nbytes for k in sample_keys if k in t)
+                expert_size_est = est
+                del t
+            except Exception:
+                pass
+    if expert_size_est is None:
+        expert_size_est = (hidden_size * moe_hidden * 3 * bits) // (8 * 1024) * 1024
+        expert_size_est = max(expert_size_est, 1024 * 1024)
     total_expert_entries = len(expert_layers) * num_experts
 
     print(f"  Expert size estimate: {expert_size_est / 1e6:.1f} MB/expert, {total_expert_entries} total")
@@ -709,15 +761,16 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     else:
         print(f"  Manual cache size: {max_cached_experts} experts")
 
-    # Check if we have enough disk space for pre-split (stacked format needs ~2x disk)
+    # Check if we have enough disk space for pre-split
     no_split = False
     if fmt == "stacked":
         import shutil
-        disk_free = shutil.disk_usage(str(model_path)).free
+        split_target = Path(expert_cache_dir) if expert_cache_dir else model_path
+        disk_free = shutil.disk_usage(str(split_target)).free
         expert_data_est = total_expert_entries * expert_size_est
         if disk_free < expert_data_est * 1.1:
             no_split = True
-            print(f"  Disk free: {disk_free/1e9:.0f} GB < expert data {expert_data_est/1e9:.0f} GB")
+            print(f"  Disk free ({split_target}): {disk_free/1e9:.0f} GB < expert data {expert_data_est/1e9:.0f} GB")
             print(f"  Using direct-load mode (no pre-split)")
 
     # Create cache
@@ -725,6 +778,7 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
         str(model_path), weight_map, pattern, proj_map,
         num_layers=len(expert_layers), num_experts=num_experts,
         max_experts=max_cached_experts, format=fmt, no_split=no_split,
+        expert_cache_dir=expert_cache_dir,
     )
 
     # Find and replace all SwitchGLU instances
@@ -771,22 +825,55 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
     mx.eval(model.parameters())
 
     # Pre-warm: incrementally load all experts if cache can hold them all
-    if max_cached_experts >= total_expert_entries:
-        print(f"  Pre-warming {total_expert_entries} experts...", end="", flush=True)
-        t_warm = time.perf_counter()
-        for layer in expert_layers:
-            for eid in range(num_experts):
-                cache.ensure_experts(layer, [eid])
-            entries = [cache.cache[(layer, e)] for e in range(num_experts)]
-            tensors = [t for entry in entries for proj in entry.values() for t in proj]
-            mx.eval(*tensors)
-        elapsed = time.perf_counter() - t_warm
-        print(f" {elapsed:.0f}s")
+    # Allow partial pre-warming: warm as many layers as fit safely
+    prewarm_layers = min(len(expert_layers), max_cached_experts // num_experts)
+    # On memory-tight systems, limit to ~60% of layers to leave headroom
+    import subprocess
+    total_ram = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                   capture_output=True, text=True).stdout.strip())
+    stacked_per_layer = num_experts * expert_size_est
+    max_stacked_gb = (total_ram * 0.55) / 1e9  # use at most 55% of RAM for stacked
+    max_layers_by_mem = int(max_stacked_gb * 1e9 / stacked_per_layer)
+    prewarm_layers = min(prewarm_layers, max_layers_by_mem)
 
-        # Pre-build stacked tensors, then clear individual cache
-        print(f"  Pre-building stacked tensors...", end="", flush=True)
-        t_stack = time.perf_counter()
-        for layer in expert_layers:
+    if prewarm_layers > 0 and max_cached_experts >= total_expert_entries:
+        warm_list = expert_layers[:prewarm_layers]
+        print(f"  Pre-warming {len(warm_list)}/{len(expert_layers)} layers "
+              f"({len(warm_list)*num_experts} experts)...", flush=True)
+        t_warm = time.perf_counter()
+        import gc
+        for li, layer in enumerate(warm_list):
+            # For direct-load: load file, extract experts, eval, stack, clear — all per-layer
+            if cache.no_split:
+                # Selective load: read only exact bytes per expert
+                files_needed: dict[str, list] = {}
+                for proj_name in cache.proj_map:
+                    for comp in ("weight", "scales", "biases"):
+                        fname, key = cache._stacked_index[(layer, proj_name, comp)]
+                        files_needed.setdefault(fname, []).append((proj_name, comp, key))
+
+                for eid in range(num_experts):
+                    entry = {}
+                    for fn, items in files_needed.items():
+                        hdr, ds = cache._file_headers[fn]
+                        fpath = str(cache.model_path / fn)
+                        for pn, comp, key in items:
+                            entry.setdefault(pn, {})[comp] = cache._read_expert_slice(
+                                fpath, key, eid, hdr, ds)
+                    cache.cache[(layer, eid)] = {
+                        p: (d["weight"], d["scales"], d["biases"]) for p, d in entry.items()
+                    }
+
+                all_t = [t for e in range(num_experts) for p in cache.cache[(layer, e)].values() for t in p]
+                mx.eval(*all_t)
+                del all_t
+            else:
+                cache.ensure_experts(layer, list(range(num_experts)))
+                entries = [cache.cache[(layer, e)] for e in range(num_experts)]
+                tensors = [t for entry in entries for proj in entry.values() for t in proj]
+                mx.eval(*tensors)
+
+            # Stack this layer immediately and clear individual entries
             for proj_name in proj_map:
                 all_w, all_s, all_b = [], [], []
                 for eid in range(num_experts):
@@ -794,16 +881,21 @@ def load_model_offloaded(model_path: str, max_cached_experts: int | None = None)
                     all_w.append(w)
                     all_s.append(s)
                     all_b.append(b)
-                sw = mx.stack(all_w)
-                ss = mx.stack(all_s)
-                sb = mx.stack(all_b)
-                _STACKED_CACHE[(layer, proj_name)] = (sw, ss, sb)
-        mx.eval(*[t for v in _STACKED_CACHE.values() for t in v])
-        cache.cache.clear()
-        for layer in expert_layers:
+                _STACKED_CACHE[(layer, proj_name)] = (
+                    mx.stack(all_w), mx.stack(all_s), mx.stack(all_b))
+            mx.eval(*[t for pn in proj_map for t in _STACKED_CACHE[(layer, pn)]])
             for eid in range(num_experts):
-                cache.cache[(layer, eid)] = None  # sentinel
-        print(f" {time.perf_counter() - t_stack:.0f}s")
+                cache.cache[(layer, eid)] = None
+            gc.collect()
+
+            if (li + 1) % 5 == 0 or li == len(expert_layers) - 1:
+                import resource
+                rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024*1024)
+                print(f"    Layer {li+1}/{len(expert_layers)} ({rss:.0f} MB)", flush=True)
+        elapsed = time.perf_counter() - t_warm
+        print(f"  Pre-warm + stack done in {elapsed:.0f}s", flush=True)
+
+        # Stacking already done in pre-warming loop above
 
     return model, cache
 
@@ -1158,6 +1250,8 @@ def main():
                         help="Expert cache size (default: auto based on RAM)")
     parser.add_argument("--serve", action="store_true", help="Start OpenAI-compatible server")
     parser.add_argument("--port", type=int, default=8080, help="Server port (default: 8080)")
+    parser.add_argument("--expert-cache-dir", type=str, default=None,
+                        help="Directory for per-expert cache files (default: alongside model)")
     parser.add_argument("--prompt", default="Explain quantum computing in simple terms.")
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--temp", type=float, default=0.0)
@@ -1186,7 +1280,8 @@ def main():
     model_id = model_id.split("/")[-1].lower().replace(" ", "-") + "-offloaded"
 
     print(f"\n=== Loading with expert offloading ===")
-    model, expert_cache = load_model_offloaded(model_path, args.max_cached_experts)
+    model, expert_cache = load_model_offloaded(model_path, args.max_cached_experts,
+                                               expert_cache_dir=args.expert_cache_dir)
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path)
