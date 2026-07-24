@@ -2760,11 +2760,13 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert _line1_schema_has_uncoverable_constraint(plain) is False
     assert _line1_completion_limit_ok(_Req(plain)) is True
 
-    # A small enum is COVERABLE (codex r5 NIT): its shortest member fits the flat
-    # envelope, so the canonical enum-constrained tool arg keeps the grammar engaged.
+    # ``enum`` is UNCOVERABLE (codex r6 B1 revert): an enum member's own bytes are
+    # never priced into the flat floor, and whether a minimal instance instantiates a
+    # given enum depends on the schema branch taken — undecidable for the estimator.
+    # Even a short enum therefore declines to the (non-regressive) forced-prefix path.
     small_enum = {"type": "object", "properties": {"a": {"enum": ["celsius", "f"]}}}
-    assert _line1_schema_has_uncoverable_constraint(small_enum) is False
-    assert _line1_completion_limit_ok(_Req(small_enum)) is True
+    assert _line1_schema_has_uncoverable_constraint(small_enum) is True
+    assert _line1_completion_limit_ok(_Req(small_enum)) is False
 
     # Each uncoverable keyword forces a decline for a BOUNDED request.
     for params in (
@@ -2774,7 +2776,7 @@ def test_line1_completion_limit_declines_uncoverable_schema():
             "type": "object",
             "properties": {"a": {"type": "string", "pattern": "^.{99}$"}},
         },
-        # a LONG-only enum is a de-facto minLength -> still uncoverable
+        # any enum (short or long) is unbounded for the flat floor
         {"type": "object", "properties": {"a": {"enum": ["y" * 200]}}},
         {"type": "object", "properties": {"a": {"type": "array", "minItems": 3}}},
         # nested required object whose inner constraint the flat floor never descends
@@ -3109,10 +3111,20 @@ def test_line1_split_reasoning_for_tool_parse():
             return self._result
 
     # No parser → deterministic literal </think> split (NOT the raw text): the suffix
-    # after the last close tag, so the <think> span never reaches the tool parser.
+    # after the FIRST close tag, so the <think> span never reaches the tool parser.
     assert _line1_split_reasoning_for_tool_parse(None, "<think>x</think>call") == "call"
     # No parser AND no </think> (still thinking) → "" (no legitimate post-think call).
     assert _line1_split_reasoning_for_tool_parse(None, "<think>only <tool_call>") == ""
+
+    # codex r6 B3: a schema-valid tool ARGUMENT may itself contain the literal
+    # "</think>". Splitting on the LAST occurrence (the old rfind) would truncate the
+    # call; the FIRST close tag is the real reasoning boundary, so the whole call —
+    # embedded "</think>" and all — must survive.
+    arg_with_marker = '<think>reason</think>{"a":"the </think> tag means stop"}'
+    assert (
+        _line1_split_reasoning_for_tool_parse(None, arg_with_marker)
+        == '{"a":"the </think> tag means stop"}'
+    )
 
     # (reasoning, content) → the post-</think> content only; the <think> marker is
     # never returned, so a sub-token-spelled opener inside it cannot reach the parser.
@@ -3127,6 +3139,14 @@ def test_line1_split_reasoning_for_tool_parse():
     # text), so the tool parser sees nothing and cannot extract an in-think marker.
     assert _line1_split_reasoning_for_tool_parse(_RP(("all think", None)), "x") == ""
 
+    # codex r6 B2: a parser that reports "no reasoning found" as (None, full_text)
+    # returns the ENTIRE raw output as content. Trusting it would re-open the leak, so
+    # reasoning is None must be IGNORED and the helper must fall through to the literal
+    # split — the in-<think> marker must NOT survive into the returned string.
+    leaky = "<think>plot <tool_call>evil</tool_call></think>call"
+    assert (
+        _line1_split_reasoning_for_tool_parse(_RP((None, leaky)), leaky) == "call"
+    )
     # (None, None) — parser found no reasoning markers → "" (empty, safe).
     assert _line1_split_reasoning_for_tool_parse(_RP((None, None)), "x") == ""
 

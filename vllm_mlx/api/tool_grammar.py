@@ -2400,7 +2400,14 @@ class GrammarLogitsProcessor:
         thinking). Additive (not override): the model still generates freely; only
         the tool-start marker is forbidden until ``</think>``. The mask row is
         cached per logits width and broadcast, preserving the incoming shape (the
-        mlx-lm processor contract — same guarantee as ``_force_distribution``)."""
+        mlx-lm processor contract — same guarantee as ``_force_distribution``).
+
+        The full-width additive broadcast (vs an in-place indexed write at the tiny
+        opener set) is DELIBERATE (codex r6 NIT): it is out-of-place and shape-
+        preserving like ``_force_distribution``, so it cannot desync a caller that
+        retains ``logits``; the O(vocab) add is the same order as the sampler's own
+        softmax/argmax on the very next line and only runs during the reasoning span
+        of a line①-engaged request, so the allocation is negligible in practice."""
         import mlx.core as mx
 
         width = logits.shape[-1]

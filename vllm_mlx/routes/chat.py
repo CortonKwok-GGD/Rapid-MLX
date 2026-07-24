@@ -848,7 +848,7 @@ def _line1_min_call_tokens(request) -> int:
 
 # JSON-Schema keywords that can push a VALID instance's minimum size ARBITRARILY
 # above the flat name+required-skeleton floor ``_line1_min_call_tokens`` models
-# (codex r3 #2): a 1,000-char ``minLength`` / ``const`` / long ``enum`` value, a
+# (codex r3 #2): a 1,000-char ``minLength`` / ``const``, an ``enum`` value, a
 # ``minItems`` array of objects, a ``pattern`` forcing a long literal, a
 # ``minProperties`` map, or a required NESTED object whose own required fields the
 # flat estimator never descends into. We do NOT try to price these exactly (that
@@ -856,15 +856,18 @@ def _line1_min_call_tokens(request) -> int:
 # a forced tool's schema makes the floor unprovable, so a BOUNDED request declines
 # the gate to the forced-prefix fallback (non-regressive) rather than admit a gate
 # whose call might not fit.
+#
+# ``enum`` (codex r6 B1): reverted to blanket-unbounded. An enum member's own bytes
+# are never added to ``_line1_min_call_tokens`` (which prices only the required-key
+# SKELETON), and whether a minimal instance even instantiates a given enum depends
+# on which schema branch (``oneOf`` / ``anyOf`` / ``items`` / optional-vs-required)
+# the grammar takes — undecidable for the flat estimator. So an ``enum`` makes the
+# exact floor unprovable exactly like the other keywords here; a bounded request
+# declines to the (non-regressive) forced-prefix fallback rather than admit a gate
+# whose shortest valid call might not fit a tight ``max_tokens``.
 _LINE1_UNBOUNDED_MIN_KEYWORDS = frozenset(
-    {"minLength", "minItems", "minProperties", "const", "pattern"}
+    {"minLength", "minItems", "minProperties", "const", "pattern", "enum"}
 )
-# ``enum`` is NOT blanket-unpriceable (codex r5 NIT): an enum is a FINITE set, so its
-# minimum valid instance is its SHORTEST member — computable, unlike a ``minLength``.
-# A common enum (``["celsius","fahrenheit"]``) must keep the grammar engaged; only a
-# pathologically long shortest member (a de-facto ``minLength``) is unbounded. Members
-# up to this many JSON chars fit the flat call envelope the floor already reserves.
-_LINE1_ENUM_COVERABLE_CHARS = 64
 
 
 def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
@@ -883,18 +886,6 @@ def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
         return False
     if _LINE1_UNBOUNDED_MIN_KEYWORDS & schema.keys():
         return True
-    # ``enum`` (codex r5 NIT): coverable when its SHORTEST member is short enough to
-    # fit the flat call envelope; only a pathologically long shortest member (a
-    # de-facto ``minLength``) is unbounded. An empty enum is a degenerate,
-    # unsatisfiable schema handled by the shared grammar guard, not priced here.
-    enum = schema.get("enum")
-    if isinstance(enum, list) and enum:
-        try:
-            shortest = min(len(json.dumps(m)) for m in enum)
-        except Exception:  # noqa: BLE001 - unpriceable member -> conservatively decline
-            return True
-        if shortest > _LINE1_ENUM_COVERABLE_CHARS:
-            return True
     # NESTED ``required`` (codex r4 #2): ``_line1_min_call_tokens`` prices ONLY the
     # ROOT ``required`` skeleton, so a nested required object — even with no value
     # keyword — adds unpriced ``"key":v,`` bytes the floor never counted. Any
@@ -1076,12 +1067,20 @@ def _line1_split_reasoning_for_tool_parse(reasoning_parser, text):
     prove the trigger TEXT is unspellable inside the think span, but reasoning-first
     extraction makes the span invisible to the tool parser regardless of spelling.
 
-    FAIL CLOSED (codex r5 #3): the configured ``cfg.reasoning_parser`` (consistent
-    with ``_finalize_content_and_reasoning``) is tried first; when it is absent OR
-    raises we do NOT fall back to the full text — we deterministically locate the
-    span after the LAST ``</think>`` literal, and if there is none the model never
-    closed thinking, so there is no legitimate post-think call and we return ``""``
-    (the tool parser sees nothing). Either way the think span never reaches the parser.
+    FAIL CLOSED (codex r5 #3, r6 B2/B3): the configured ``cfg.reasoning_parser``
+    (consistent with ``_finalize_content_and_reasoning``) is tried first, but its
+    ``content`` is trusted ONLY when the parser POSITIVELY identified a reasoning
+    span (``reasoning is not None``). A parser that reports "no reasoning found" as
+    ``(None, text)`` returns the FULL raw output as ``content``; trusting that would
+    re-open the leak (codex r6 B2), so on ``reasoning is None`` we ignore ``content``
+    and fall through to the literal split. When the parser is absent, raises, or
+    found no reasoning we deterministically locate the span after the FIRST
+    ``</think>`` literal (codex r6 B3: the FIRST close tag is the real reasoning
+    boundary — a schema-valid tool argument may itself contain the literal
+    ``</think>``, and splitting on the LAST occurrence would truncate the call). If
+    there is no close tag the model never closed thinking, so there is no legitimate
+    post-think call and we return ``""`` (the tool parser sees nothing). Either way
+    the think span never reaches the parser.
 
     Applied ONLY when line① is engaged (the caller gates on
     ``_line1_gate_engaged``): line①'s gate + coupled thinking budget GUARANTEE the
@@ -1093,16 +1092,23 @@ def _line1_split_reasoning_for_tool_parse(reasoning_parser, text):
     """
     if reasoning_parser is not None:
         try:
-            _reasoning, content = reasoning_parser.extract_reasoning(text)
-            # ``content is None`` means the parser routed everything to reasoning
-            # (no ``</think>`` split / Case-4 all-reasoning) — no legitimate
-            # post-think call, so the tool parser sees an empty string.
-            return content or ""
+            reasoning, content = reasoning_parser.extract_reasoning(text)
+            # Trust ``content`` ONLY when a reasoning span was positively identified
+            # (codex r6 B2). ``reasoning is None`` means the parser found no
+            # reasoning and routed EVERYTHING to ``content`` (i.e. ``content`` is the
+            # full raw output incl. any ``<think>`` span) — trusting it re-opens the
+            # leak, so fall through to the deterministic literal split instead.
+            # ``reasoning is not None`` + ``content is None`` = all-reasoning /
+            # Case-4 (no legitimate post-think call), so the tool parser sees "".
+            if reasoning is not None:
+                return content or ""
         except Exception:  # noqa: BLE001 - parser bug must not re-open the leak
             pass  # fall through to the deterministic literal split (fail closed)
-    # No parser (or it raised): fail closed on the ``</think>`` literal. Take the
-    # suffix after the LAST close tag; no close tag => still thinking => "" (no call).
-    idx = text.rfind(_LINE1_THINK_END)
+    # No parser, it raised, or it found no reasoning: fail closed on the ``</think>``
+    # literal. Take the suffix after the FIRST close tag (the real reasoning
+    # boundary; a later ``</think>`` inside a tool argument must NOT truncate the
+    # call — codex r6 B3); no close tag => still thinking => "" (no call).
+    idx = text.find(_LINE1_THINK_END)
     if idx == -1:
         return ""
     return text[idx + len(_LINE1_THINK_END) :]
