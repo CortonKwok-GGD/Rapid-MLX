@@ -2429,7 +2429,11 @@ def test_forced_prefix_block_is_gated_on_grammar_absence():
 
     src = inspect.getsource(chat_mod._create_chat_completion_impl)
     glp_pos = src.find("_glp = await _offload_tool_grammar_build(")
-    prefix_gate = src.find("if _glp is None and request.tools")
+    # The forced-prefix computation is now factored into ``_compute_forced_tool_
+    # prefix`` and gated on ``_glp is None`` (grammar and prefix mutually
+    # exclusive). r4 #3 also RESTORES it via the same helper when a gate engaged
+    # but its coupled budget did not build.
+    prefix_gate = src.find("if _glp is None:\n        _forced_prefix = ")
     assert glp_pos != -1, "grammar processor build call not found in route"
     assert prefix_gate != -1, (
         "forced-prefix block must be gated on '_glp is None' — the two are "
@@ -2437,6 +2441,16 @@ def test_forced_prefix_block_is_gated_on_grammar_absence():
     )
     assert glp_pos < prefix_gate, (
         "the grammar processor must be built BEFORE the forced-prefix gate"
+    )
+    # r4 #3: gate engaged + budget None must discard the gate and restore the
+    # forced-prefix fallback (never leave an orphaned gate with no force-close).
+    reconcile_pos = src.find("elif _line1_gate_engaged:")
+    assert reconcile_pos != -1 and reconcile_pos > glp_pos, (
+        "route must reconcile an engaged gate whose coupled budget did not build "
+        "(codex r4 #3) — discard the gate, restore forced-prefix"
+    )
+    assert "_restored_prefix = _compute_forced_tool_prefix(cfg, request)" in src, (
+        "reconcile must RESTORE the forced-prefix via the shared helper (r4 #3)"
     )
 
 
@@ -2772,6 +2786,70 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert (
         _line1_completion_limit_ok(_Req({"const": "x" * 500}, max_tokens=None)) is True
     )
+
+    # codex r4 #2 — a NESTED ``required`` (no value keyword at all) is uncoverable
+    # because ``_line1_min_call_tokens`` prices only the ROOT required list.
+    nested_required = {
+        "type": "object",
+        "required": ["outer"],
+        "properties": {
+            "outer": {
+                "type": "object",
+                "required": ["a", "b", "c"],
+                "properties": {
+                    "a": {"type": "string"},
+                    "b": {"type": "string"},
+                    "c": {"type": "string"},
+                },
+            }
+        },
+    }
+    assert _line1_schema_has_uncoverable_constraint(nested_required) is True
+    assert _line1_completion_limit_ok(_Req(nested_required)) is False
+    # A ROOT-only required list (what the flat floor DOES price) stays coverable.
+    root_only = {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(root_only) is False
+
+
+def test_compute_forced_tool_prefix_helper():
+    # r4 #3 — the shared forced-prefix helper the reconcile path reuses.
+    from vllm_mlx.routes.chat import _compute_forced_tool_prefix
+
+    class _Cfg:
+        tool_call_parser = "hermes"
+
+    class _Fn:
+        def __init__(self, name):
+            self._n = name
+
+        def get(self, k, default=None):
+            return {"name": self._n}.get(k, default)
+
+    class _Tool:
+        def __init__(self, name):
+            self.function = _Fn(name)
+
+    class _Req:
+        def __init__(self, tools, tool_choice):
+            self.tools = tools
+            self.tool_choice = tool_choice
+
+    # named function → hermes JSON envelope opener with the name baked in.
+    named = _Req(
+        [_Tool("set_color")], {"type": "function", "function": {"name": "set_color"}}
+    )
+    pfx = _compute_forced_tool_prefix(_Cfg(), named)
+    assert pfx is not None and '"name": "set_color"' in pfx
+    # required + single tool → same forcing semantics.
+    req_single = _Req([_Tool("only")], "required")
+    assert _compute_forced_tool_prefix(_Cfg(), req_single) is not None
+    # no tools / no choice → None.
+    assert _compute_forced_tool_prefix(_Cfg(), _Req([], "required")) is None
+    assert _compute_forced_tool_prefix(_Cfg(), _Req([_Tool("x")], None)) is None
 
 
 def test_line1_string_gate_not_run_when_id_gate_active():

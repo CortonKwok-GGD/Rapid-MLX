@@ -285,6 +285,35 @@ def _forced_tool_call_prefix(parser_name: str | None, function_name: str) -> str
     return None
 
 
+def _compute_forced_tool_prefix(cfg, request) -> str | None:
+    """The forced-function assistant-turn prefix for a forced/named ``tool_choice``,
+    or ``None`` when the request is not a forced single/named choice or the parser
+    has no audited wire opener.
+
+    Shared by (a) the primary forced-prefix path (used when NO grammar processor is
+    active) and (b) the line① reconcile path (codex r4 #3): when a reasoning gate
+    engaged but its coupled generation-time budget did NOT build, the installed
+    gated grammar would suppress this fallback while having no force-close to open
+    the gate — the exact call-dropping regression. The reconcile discards the gate
+    and RESTORES this fallback, so the computation must be callable from both sites.
+    """
+    if not (request.tools and getattr(request, "tool_choice", None) is not None):
+        return None
+    _forced_name: str | None = None
+    if (
+        isinstance(request.tool_choice, dict)
+        and request.tool_choice.get("type") == "function"
+    ):
+        _forced_name = (request.tool_choice.get("function") or {}).get("name")
+    elif request.tool_choice == "required" and len(request.tools) == 1:
+        # OpenAI spec: ``required`` with a single tool is unambiguous — same
+        # forcing semantics as a named choice.
+        _forced_name = request.tools[0].function.get("name")
+    if not _forced_name:
+        return None
+    return _forced_tool_call_prefix(cfg.tool_call_parser, _forced_name)
+
+
 def _normalize_tool_choice_for_grammar(tool_choice) -> dict | None:
     """Normalize an OpenAI ``tool_choice`` into a collision-safe tagged form.
 
@@ -846,6 +875,12 @@ def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
     if not isinstance(schema, dict):
         return False
     if _LINE1_UNBOUNDED_MIN_KEYWORDS & schema.keys():
+        return True
+    # NESTED ``required`` (codex r4 #2): ``_line1_min_call_tokens`` prices ONLY the
+    # ROOT ``required`` skeleton, so a nested required object — even with no value
+    # keyword — adds unpriced ``"key":v,`` bytes the floor never counted. Any
+    # ``required`` list below the root therefore makes the minimum unprovable.
+    if _depth > 0 and schema.get("required"):
         return True
     # A required NESTED object contributes its own (unpriced) required skeleton.
     props = schema.get("properties")
@@ -3685,21 +3720,8 @@ async def _create_chat_completion_impl(
     # taxonomy. SKIPPED when a grammar processor is active (see above) —
     # the grammar is the stronger, self-sufficient lever.
     _forced_prefix = None
-    if _glp is None and request.tools and request.tool_choice is not None:
-        _forced_name: str | None = None
-        if (
-            isinstance(request.tool_choice, dict)
-            and request.tool_choice.get("type") == "function"
-        ):
-            _forced_name = (request.tool_choice.get("function") or {}).get("name")
-        elif request.tool_choice == "required" and len(request.tools) == 1:
-            # OpenAI spec: ``required`` with a single tool is unambiguous
-            # — same forcing semantics as a named choice.
-            _forced_name = request.tools[0].function.get("name")
-        if _forced_name:
-            _forced_prefix = _forced_tool_call_prefix(
-                cfg.tool_call_parser, _forced_name
-            )
+    if _glp is None:
+        _forced_prefix = _compute_forced_tool_prefix(cfg, request)
     if _forced_prefix:
         chat_kwargs["forced_assistant_prefix"] = _forced_prefix
 
@@ -3861,6 +3883,27 @@ async def _create_chat_completion_impl(
     )
     if _rblp is not None:
         chat_kwargs["reasoning_budget_logits_processor"] = _rblp
+    elif _line1_gate_engaged:
+        # LINE① ATOMICITY (codex r4 #3): the reasoning gate engaged but its coupled
+        # generation-time budget did NOT build. Left as-is that is a REGRESSION: the
+        # gated grammar (installed above) holds its mask OFF until ``</think>`` and
+        # relies on the budget to force that close — with no budget the gate can
+        # never open, AND the forced-prefix fallback was suppressed because ``_glp``
+        # is non-``None``, so a forced call that never naturally closes ``<think>``
+        # is dropped entirely. The gate's engage predicate mirrors the budget's
+        # install conditions so this divergence should not happen in practice, but
+        # it is not STRUCTURALLY guaranteed — so reconcile safely: discard the gated
+        # grammar and RESTORE the forced-prefix path (strictly non-regressive).
+        logger.warning(
+            "line①: reasoning gate engaged but coupled budget unavailable; "
+            "discarding the gated grammar and restoring the forced-prefix fallback"
+        )
+        chat_kwargs.pop("grammar_logits_processor", None)
+        _glp = None
+        _line1_gate_engaged = False
+        _restored_prefix = _compute_forced_tool_prefix(cfg, request)
+        if _restored_prefix:
+            chat_kwargs["forced_assistant_prefix"] = _restored_prefix
 
     # ``tool_choice="required"`` + ``stream=true`` is enforceable IF the
     # engine has SOME path to produce a streaming tool_call:
