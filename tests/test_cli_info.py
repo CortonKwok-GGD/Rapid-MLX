@@ -78,7 +78,9 @@ def test_info_does_not_require_model_weights() -> None:
     assert True
 
 
-def test_info_prints_mtp_sidecar_note_when_head_declared_but_absent(monkeypatch) -> None:
+def test_info_prints_mtp_sidecar_note_when_head_declared_but_absent(
+    monkeypatch,
+) -> None:
     """When ``config.json`` declares an MTP head but the head weights were
     stripped from this checkpoint, ``info`` must print the actionable ``MTP:``
     note that mirrors the serve-time hard-fail and points to the sidecar path.
@@ -98,7 +100,7 @@ def test_info_prints_mtp_sidecar_note_when_head_declared_but_absent(monkeypatch)
     assert "mtp_num_hidden_layers=1" in out, f"declared-layer count missing:\n{out}"
     assert "head weights are absent" in out, f"absent-head diagnosis missing:\n{out}"
     # Actionable: mirrors the serve-time sidecar remedy.
-    assert '--speculative-config' in out and '"method":"mtp"' in out, (
+    assert "--speculative-config" in out and '"method":"mtp"' in out, (
         f"sidecar serve command missing from note:\n{out}"
     )
     # The serve command must carry the user-typed alias, not the HF path.

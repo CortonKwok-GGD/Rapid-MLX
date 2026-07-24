@@ -2104,14 +2104,102 @@ def _load_hf_config_cached(model_path: str, cfg: "ModelConfig") -> "dict | None"
     return None
 
 
+# ``model_type`` values whose native MTP head tensors are named with an
+# ``mtp`` path segment (``model.mtp.*`` in the checkpoint, ``mtp.*`` in a
+# sidecar — see ``spec_decode.mtp.qwen3_5_inject``). Only for these can the
+# weight-index probe positively confirm the head is present or absent. Other
+# native-MTP families (e.g. HY3, whose extra predict layer is an ordinary
+# ``model.layers.<n>`` block) are NOT probed here — the caller degrades to
+# ``None`` rather than risk a false "absent" claim.
+_MTP_MTP_SEGMENT_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_5_moe"})
+
+
+def _local_weight_tensor_names(
+    model_path: str, cfg: "ModelConfig"
+) -> "list[str] | None":
+    """Tensor names from the LOCAL safetensors index / header, or ``None``.
+
+    Reads the sharded ``model.safetensors.index.json`` weight map when
+    present, else the single-file ``model.safetensors`` header (an 8-byte
+    little-endian length prefix followed by a JSON blob of tensor metadata).
+    LOCAL cache only — no network. Returns ``None`` when the checkpoint isn't
+    cached / has no recognizable safetensors, so callers can distinguish
+    "confirmed empty" from "couldn't check".
+    """
+    import json as _json
+    import os as _os
+    import struct as _struct
+
+    hf_path = getattr(cfg, "hf_path", None) or model_path
+
+    def _from_index(path: str) -> list[str]:
+        with open(path) as fh:
+            weight_map = _json.load(fh).get("weight_map", {})
+        return list(weight_map.keys())
+
+    def _from_single(path: str) -> list[str]:
+        with open(path, "rb") as fh:
+            (header_len,) = _struct.unpack("<Q", fh.read(8))
+            header = _json.loads(fh.read(header_len))
+        return [k for k in header if k != "__metadata__"]
+
+    try:
+        directory = str(hf_path)
+        if _os.path.isdir(directory):
+            idx = _os.path.join(directory, "model.safetensors.index.json")
+            if _os.path.isfile(idx):
+                return _from_index(idx)
+            single = _os.path.join(directory, "model.safetensors")
+            if _os.path.isfile(single):
+                return _from_single(single)
+            return None
+        from huggingface_hub import try_to_load_from_cache as _cache_lookup
+
+        idx = _cache_lookup(repo_id=directory, filename="model.safetensors.index.json")
+        if idx and _os.path.exists(idx):
+            return _from_index(idx)
+        single = _cache_lookup(repo_id=directory, filename="model.safetensors")
+        if single and _os.path.exists(single):
+            return _from_single(single)
+    except Exception:
+        return None
+    return None
+
+
+def _weight_names_have_mtp_head(tensor_names: "list[str]") -> bool:
+    """True when any tensor name carries an ``mtp`` path segment.
+
+    The native Qwen3.5 / Qwen3.6 MTP head lives at ``model.mtp.*``; a
+    published sidecar carries ``mtp.*``. Matching a dot-delimited segment
+    that starts with ``mtp`` (``mtp``, ``mtp.layers``…) identifies the head
+    without false-matching unrelated tensors.
+    """
+    return any(
+        seg.startswith("mtp") for name in tensor_names for seg in name.split(".")
+    )
+
+
 def _mtp_declared_absent_layers(model_path: str, cfg: "ModelConfig") -> int | None:
     """Reconcile ``rapid-mlx info`` with the serve-time MTP eligibility gate.
 
     Returns the ``mtp_num_hidden_layers`` value the checkpoint's
-    ``config.json`` DECLARES when the config advertises a native MTP head
-    (supported ``model_type`` + ``mtp_num_hidden_layers >= 1``) but this
-    profile has spec decode wired OFF (``supports_spec_decode=False`` — the
-    head weights were stripped at convert time). Returns ``None`` otherwise.
+    ``config.json`` DECLARES when ALL of the following hold, and ``None``
+    otherwise:
+
+    * the config advertises a native MTP head (supported ``model_type`` +
+      ``mtp_num_hidden_layers >= 1``), AND
+    * the local weight index is READABLE and positively confirms the head
+      tensors are ABSENT (0 ``mtp`` tensors) — i.e. the head was stripped at
+      convert time.
+
+    The absence is verified against the checkpoint's own safetensors index,
+    NOT inferred from ``supports_spec_decode`` — a stale or conservative
+    profile could wire spec decode off while the head weights are actually
+    present, and claiming "weights absent" there would be false (codex
+    #1202). Verification is scoped to Qwen3.5 / Qwen3.6 (``qwen3_5`` /
+    ``qwen3_5_moe``), the families whose head tensors carry an ``mtp`` path
+    segment; when the index can't be read (uncached) the note is suppressed
+    rather than guessed.
 
     Why this exists: the serve-time gate is CONFIG-based — it runs
     ``detect_mtp_eligibility(config.json)`` and, for a checkpoint whose
@@ -2159,6 +2247,21 @@ def _mtp_declared_absent_layers(model_path: str, cfg: "ModelConfig") -> int | No
         # Config also says NONE (unsupported model_type, or the layer count
         # was stripped from config too) — the plain "disabled" label is
         # already honest; nothing to reconcile.
+        return None
+
+    # Positively verify the head tensors are absent from the local
+    # checkpoint (do NOT infer absence from ``supports_spec_decode``). Scoped
+    # to families whose head tensors carry an ``mtp`` segment; for others, or
+    # when the weight index can't be read, suppress the note rather than risk
+    # a false "weights absent" claim.
+    if result.model_type not in _MTP_MTP_SEGMENT_MODEL_TYPES:
+        return None
+    tensor_names = _local_weight_tensor_names(model_path, cfg)
+    if tensor_names is None:
+        return None
+    if _weight_names_have_mtp_head(tensor_names):
+        # Head weights ARE present — the profile is just conservatively off;
+        # this is not the declared-but-absent whiplash. No note.
         return None
     return result.num_mtp_layers
 

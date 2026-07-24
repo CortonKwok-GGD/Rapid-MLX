@@ -6438,16 +6438,24 @@ def info_command(args):
     if cfg is not None:
         _declared_absent = _mtp_declared_absent_layers(name, cfg)
         if _declared_absent is not None:
+            import shlex
+
+            # ``original_alias`` is user-supplied (may be a raw HF path with
+            # spaces / shell metacharacters); quote it so the printed command
+            # is safe to copy-paste.
+            _serve_target = shlex.quote(original_alias)
             print(
                 f"  MTP: config declares mtp_num_hidden_layers={_declared_absent} "
                 "but the MTP head weights are absent in this checkpoint."
             )
             print(
                 "  Attach a separately-published MTP head, e.g.:\n"
-                f"    rapid-mlx serve {original_alias} "
+                f"    rapid-mlx serve {_serve_target} "
                 """--speculative-config '{"method":"mtp","model":"<head-repo>"}'"""
             )
-            print("  (or re-convert the base checkpoint with an MTP-preserving convert).")
+            print(
+                "  (or re-convert the base checkpoint with an MTP-preserving convert)."
+            )
             print()
 
     # DFlash eligibility — render the report so users can see which

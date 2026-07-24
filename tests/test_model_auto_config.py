@@ -2701,29 +2701,123 @@ class TestMtpDeclaredAbsentReconciliation:
     weights were stripped, announces ``MTP: enabled`` then hard-fails at
     inject. ``info`` is weight-free and reports a bare ``disabled``. This
     helper detects the exact whiplash case so ``info`` can print the same
-    actionable sidecar note. The config read is monkeypatched here so the
-    test is deterministic and does NOT depend on the local HF cache.
+    actionable sidecar note. The absence of the head is POSITIVELY verified
+    against the checkpoint's local safetensors index (not inferred from the
+    profile). Both the config read and the weight-index read are
+    monkeypatched here so the tests are deterministic and do NOT depend on
+    the local HF cache.
     """
 
     _NATIVE = "mlx-community/Qwen3.6-9B-4bit"  # name segment ⇒ native_mtp
+    # A weight index that declares NO MTP head tensor (stripped convert).
+    _NO_MTP_TENSORS = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "lm_head.weight",
+    ]
+    # A weight index that DOES carry the native head (``model.mtp.*``).
+    _WITH_MTP_TENSORS = _NO_MTP_TENSORS + ["model.mtp.layers.0.self_attn.q_proj.weight"]
 
     def _cfg(self, *, spec_off: bool):
         return ModelConfig(hf_path=self._NATIVE, supports_spec_decode=not spec_off)
 
-    def test_returns_declared_layers_when_config_declares_but_spec_off(
-        self, monkeypatch
-    ):
-        # Config declares an MTP head (model_type qwen3_5, layers=1) but the
-        # profile has spec decode wired OFF ⇒ weights stripped ⇒ return N.
+    def _patch(self, monkeypatch, *, config, tensor_names):
+        monkeypatch.setattr(
+            auto_config_mod, "_load_hf_config_cached", lambda path, cfg: config
+        )
         monkeypatch.setattr(
             auto_config_mod,
-            "_load_hf_config_cached",
-            lambda path, cfg: {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+            "_local_weight_tensor_names",
+            lambda path, cfg: tensor_names,
+        )
+
+    def test_returns_declared_layers_when_config_declares_and_head_absent(
+        self, monkeypatch
+    ):
+        # Config declares an MTP head (model_type qwen3_5, layers=1), spec
+        # decode is off, AND the weight index positively confirms 0 mtp
+        # tensors ⇒ stripped convert ⇒ return N.
+        self._patch(
+            monkeypatch,
+            config={"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+            tensor_names=self._NO_MTP_TENSORS,
         )
         n = auto_config_mod._mtp_declared_absent_layers(
             self._NATIVE, self._cfg(spec_off=True)
         )
         assert n == 1
+
+    def test_none_when_head_weights_present(self, monkeypatch):
+        # Config declares MTP and spec decode is off, BUT the weight index
+        # shows the head IS present ⇒ the profile is merely conservatively
+        # off; claiming "weights absent" would be false ⇒ return None
+        # (codex #1202 BLOCKING #1: verify, don't infer from the profile).
+        self._patch(
+            monkeypatch,
+            config={"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+            tensor_names=self._WITH_MTP_TENSORS,
+        )
+        assert (
+            auto_config_mod._mtp_declared_absent_layers(
+                self._NATIVE, self._cfg(spec_off=True)
+            )
+            is None
+        )
+
+    def test_none_when_weight_index_unreadable(self, monkeypatch):
+        # Config declares MTP + spec off, but the weight index can't be read
+        # (uncached / no safetensors) ⇒ we cannot confirm absence ⇒ suppress
+        # the note rather than guess.
+        self._patch(
+            monkeypatch,
+            config={"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+            tensor_names=None,
+        )
+        assert (
+            auto_config_mod._mtp_declared_absent_layers(
+                self._NATIVE, self._cfg(spec_off=True)
+            )
+            is None
+        )
+
+    def test_none_for_declared_family_without_mtp_segment_naming(self, monkeypatch):
+        # HY3 declares MTP via ``num_nextn_predict_layers`` but its extra
+        # layer is an ordinary ``model.layers.<n>`` block (no ``mtp`` segment),
+        # so the weight-index probe can't reliably confirm absence ⇒ the note
+        # is scoped out (return None) rather than risk a false claim. The
+        # weight reader must NOT even be consulted for such a model_type.
+        def _boom(path, cfg):  # pragma: no cover - must never be called
+            raise AssertionError("weight index must not be read for hy_v3")
+
+        monkeypatch.setattr(
+            auto_config_mod,
+            "_load_hf_config_cached",
+            lambda path, cfg: {
+                "model_type": "hy_v3",
+                "num_nextn_predict_layers": 1,
+            },
+        )
+        monkeypatch.setattr(auto_config_mod, "_local_weight_tensor_names", _boom)
+        # An HY3-named checkpoint so the family pre-filter passes.
+        cfg = ModelConfig(
+            hf_path="mlx-community/Hy3-preview-4bit", supports_spec_decode=False
+        )
+        assert (
+            auto_config_mod._mtp_declared_absent_layers(
+                "mlx-community/Hy3-preview-4bit", cfg
+            )
+            is None
+        )
+
+    def test_weight_names_have_mtp_head_detector(self):
+        # Direct unit for the segment matcher used to confirm head presence.
+        assert auto_config_mod._weight_names_have_mtp_head(self._WITH_MTP_TENSORS)
+        assert not auto_config_mod._weight_names_have_mtp_head(self._NO_MTP_TENSORS)
+        # ``mtp`` must match only as a path segment, not a substring of an
+        # unrelated token.
+        assert not auto_config_mod._weight_names_have_mtp_head(
+            ["model.layers.0.attempts.weight"]
+        )
 
     def test_none_when_spec_decode_on(self, monkeypatch):
         # supports_spec_decode=True ⇒ native head IS wired; no whiplash, and
@@ -2785,13 +2879,21 @@ class TestMtpDeclaredAbsentReconciliation:
             is None
         )
 
-    def test_profile_table_stays_deterministic_and_config_free(self, monkeypatch):
-        # Guard the design invariant: format_profile_table must NOT consult
-        # config.json — a config read there would make the fixed-width table
-        # cache-dependent and could break the MTP-path vocabulary contract.
-        def _boom(path, cfg):  # pragma: no cover - must never be called
-            raise AssertionError("format_profile_table must stay config-free")
+    def test_profile_table_does_not_invoke_any_config_or_weight_read(self, monkeypatch):
+        # Guard the design invariant precisely: ``format_profile_table``
+        # renders from the profile alone and must NOT invoke ANY of the
+        # disk-reading reconciliation helpers — a config.json / weight-index
+        # read there would make the fixed-width table cache-dependent and
+        # could break the MTP-path vocabulary contract. Every disk-touching
+        # entry point the reconciliation adds is patched to raise, so the
+        # test fails if the table reaches config OR the weight index through
+        # any of them (codex #1202 — the earlier version only patched the
+        # config reader and would have missed a weight-index read).
+        def _boom(*args, **kwargs):  # pragma: no cover - must never be called
+            raise AssertionError("format_profile_table must not read config/weights")
 
+        monkeypatch.setattr(auto_config_mod, "_mtp_declared_absent_layers", _boom)
         monkeypatch.setattr(auto_config_mod, "_load_hf_config_cached", _boom)
+        monkeypatch.setattr(auto_config_mod, "_local_weight_tensor_names", _boom)
         table = format_profile_table(self._NATIVE, self._cfg(spec_off=True))
         assert "MTP path         : disabled" in table
