@@ -1377,10 +1377,10 @@ def test_inject_mtp_support_loads_synthetic_sidecar():
 
     # Build the MTP head separately so we can capture its random-init
     # weights, write them to disk, and verify the inject loads them
-    # byte-equally. (Note: this tiny model is FP, so the sidecar ships a
-    # config.json declaring no quantization block — the inject detects a
-    # full-precision sidecar and keeps the MTP module FP, matching the
-    # sidecar layout.)
+    # byte-equally. (Note: this tiny model is FP, so the sidecar ships as
+    # a metadata-less full-precision safetensors file, with no config.json
+    # and no fc.scales — the inject detects a full-precision sidecar from
+    # its tensors and keeps the MTP module FP, matching the sidecar layout.)
     args = model_a.args
     mtp_template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
     _mx.eval(mtp_template.parameters())
@@ -1793,6 +1793,60 @@ def test_inject_refuses_corrupt_sidecar_file_without_raising(tmp_path):
         "inject_mtp_support should refuse (return False) a corrupt sidecar "
         "file, not raise mx.load's exception mid-request."
     )
+    assert not hasattr(base, "mtp"), (
+        "inject refused but still attached an MTP module — the refusal must "
+        "leave the base model untouched (plain path)."
+    )
+
+
+def test_inject_refuses_when_materialization_raises_without_propagating(
+    tmp_path, monkeypatch
+):
+    """``mx.load`` (Step 3) is LAZY — it only reads the safetensors header,
+    not tensor DATA. A truncated/lazily-unreadable sidecar with a VALID
+    header sails through every earlier shape/dtype check and only raises at
+    Step 4's ``mtp.load_weights(...)`` + ``mx.eval(mtp.parameters())``
+    materialization — a SECOND escape point from the same fail-safe that
+    ``test_inject_refuses_corrupt_sidecar_file_without_raising`` covers for
+    the eager ``mx.load`` header-read path (codex round-2 review on #1201).
+    Pin the materialization guard independent of a real truncated file:
+    monkeypatch ``mx.eval`` (as ``inject_mtp_support`` resolves it — it does
+    a local ``import mlx.core as mx``, the same shared module object) to
+    raise a sentinel, using an OTHERWISE-VALID sidecar so, absent the
+    try/except, this call would raise straight out of ``inject_mtp_support``.
+    """
+    import mlx.core as _mx
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    # A valid full-precision sidecar that exactly matches the MTP module's
+    # parameter tree — built + saved BEFORE the patch, so this setup's own
+    # eval uses the real ``mx.eval``.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    class _MaterializeBoomError(RuntimeError):
+        pass
+
+    def _boom(*_a, **_k):
+        raise _MaterializeBoomError("sentinel: truncated tensor data")
+
+    # Set AFTER the setup eval above so only the in-inject materialization
+    # call hits the boom.
+    monkeypatch.setattr(_mx, "eval", _boom)
+
+    # Handler must convert the raise into a clean False, not propagate.
+    assert inject_mtp_support(base, mtp_sidecar=str(tmp_path)) is False
     assert not hasattr(base, "mtp"), (
         "inject refused but still attached an MTP module — the refusal must "
         "leave the base model untouched (plain path)."

@@ -712,8 +712,28 @@ def inject_mtp_support(
         # keys (metadata blobs some converters bundle), but the
         # coverage + shape + dtype checks above prove every required
         # tensor is present and fits its target parameter exactly.
-        mtp.load_weights(list(mtp_weights.items()), strict=False)
-        mx.eval(mtp.parameters())
+        #
+        # ``mx.load`` above (Step 3) is LAZY — it only reads the
+        # safetensors header, not tensor DATA. A truncated/unreadable
+        # sidecar with a valid header sails through every check above
+        # and only RAISES here, at ``mx.eval(mtp.parameters())``
+        # materialization. That must hit the same return-False
+        # fail-safe as every other bad-sidecar path in this function,
+        # not escape as an uncaught exception and abort the request
+        # mid-generation.
+        try:
+            mtp.load_weights(list(mtp_weights.items()), strict=False)
+            mx.eval(mtp.parameters())
+        except Exception as exc:
+            logger.error(
+                "[mtp.inject] sidecar %r raised while materializing MTP "
+                "weights (%s); refusing MTP injection rather than abort "
+                "the request mid-generation. Omit --speculative-config "
+                "to run the plain base path.",
+                mtp_sidecar,
+                exc,
+            )
+            return False
         extra = loaded_keys - expected_keys
         logger.info(
             "[mtp.inject] Loaded %d/%d expected MTP weight tensors from %s%s",
