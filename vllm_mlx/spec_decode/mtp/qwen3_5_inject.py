@@ -671,18 +671,35 @@ def inject_mtp_support(
             return False
         # Dtype verification (by ROLE, not exact match): a shape-correct
         # sidecar can still smuggle in a wrong-*dtype* tensor that
-        # ``load_weights(strict=False)`` installs without casting, then
-        # ``mx.quantized_matmul`` / ``mx.gather_qmm`` rejects. MLX packs
-        # quantized ``weight`` as unsigned 32-bit; an ``int32``/``float32``
-        # packed weight (or an integer ``scales``/``biases``) has the right
-        # shape but blows up at the first draft step — the same empty-response
-        # class this fix closes. Enforce by role: an integer-typed expected
-        # parameter (the packed ``weight``) must match its dtype EXACTLY,
-        # while a floating-typed expected parameter (``scales`` / ``biases`` /
-        # any FP weight) need only be *some* floating dtype — a real sidecar
-        # legitimately ships bf16 scales against the freshly-quantized fp32
-        # module and ``load_weights`` casts them, so an exact float check
-        # would false-reject valid checkpoints.
+        # ``load_weights(strict=False)`` installs VERBATIM — it does NOT
+        # cast (confirmed by reading ``nn.Module.load_weights`` /
+        # ``nn.Module.update``: the assignment is a bare ``dst[k] =
+        # new_value``, no ``.astype`` anywhere). MLX packs quantized
+        # ``weight`` as unsigned 32-bit, so an ``int32``/``float32`` packed
+        # weight (or an integer ``scales``/``biases``) has the right shape
+        # but IS a corrupt/incompatible sidecar — reject it. Enforce by
+        # role: an integer-typed expected parameter (the packed ``weight``)
+        # must match its dtype EXACTLY.
+        #
+        # A floating-typed expected parameter (``scales`` / ``biases`` /
+        # any FP weight), by contrast, only needs to be *some* floating
+        # dtype. This is intentionally loose — a real sidecar legitimately
+        # ships bf16 scales against the freshly-quantized fp32 module — but
+        # NOT because ``load_weights`` casts them (it doesn't, see above).
+        # It is safe because ``mx.quantized_matmul`` / ``mx.gather_qmm``
+        # (the ops every quantized MTP leaf routes through — plain
+        # ``QuantizedLinear`` for ``fc``/attention, ``QuantizedSwitchLinear``
+        # via ``gather_qmm`` for any MoE layer) TOLERATE a floating-dtype
+        # mismatch between weight/scales/biases/x: they silently
+        # promote/compute rather than raise. Verified empirically across
+        # fp32/bf16/fp16 combinations in both directions, on this repo's
+        # pinned MLX (``mlx>=0.31.2``), on the default GPU device — see
+        # ``test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype``
+        # and ``test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts_correctly``
+        # in ``tests/test_mtp_spec_decode.py``. If a future MLX version
+        # starts rejecting a floating-dtype mismatch, those tests fail
+        # first and this check needs tightening to an exact-match — same
+        # as the integer branch above.
         dtype_mismatches = {}
         for k, v in expected.items():
             got_dt = mtp_weights[k].dtype

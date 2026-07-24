@@ -1942,6 +1942,216 @@ def test_inject_refuses_sidecar_with_dtype_mismatched_packed_weight(tmp_path):
     assert not hasattr(base, "mtp")
 
 
+def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
+    """Canary for the MLX behavior the by-role dtype check (Step 4 above)
+    relies on but does not itself exercise.
+
+    Follow-up to an independent codex review of PR #1201 ("[BLOCKING]
+    the dtype check accepts each floating tensor independently ...
+    a sidecar with shape-correct but MISMATCHED scales/biases float
+    dtype passes validation and can still fail later in
+    mx.quantized_matmul at the first draft step"). The finding also
+    noted the code comment defending the loose check ("load_weights
+    casts them") is factually wrong — confirmed by reading
+    ``nn.Module.load_weights`` / ``nn.Module.update``: they assign
+    ``dst[k] = new_value`` verbatim, with NO ``.astype`` anywhere.
+
+    That does NOT automatically make the finding's failure mode real —
+    it depends on whether ``mx.quantized_matmul`` / ``mx.gather_qmm``
+    (the two ops the MTP head's quantized leaves route through: plain
+    ``QuantizedLinear`` for ``fc`` / attention projections, and
+    ``QuantizedSwitchLinear`` via ``gather_qmm`` for any MoE MTP
+    layer) actually reject a float-dtype mismatch between
+    weight/scales/biases/x. Empirically — on this repo's pinned MLX
+    (``mlx>=0.31.2``), on the default GPU (Metal) device — they do
+    NOT: every fp32/bf16/fp16 combination below (module built fp32
+    with mismatched scales/biases, and the reverse: module built
+    bf16 with mismatched scales) runs to completion and returns a
+    finite tensor, never raises. MLX silently promotes/computes
+    across floating dtypes here, it does not enforce an exact match.
+
+    This test is the tripwire: if a future MLX bump starts raising on
+    ANY of these combinations, this test fails FIRST — before an
+    operator sees an intermittent empty response — and the by-role
+    dtype check in ``qwen3_5_inject.py`` (which currently accepts any
+    floating dtype for scales/biases) needs to be tightened to an
+    exact-match check for the affected op.
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+
+    group_size, bits = 64, 4
+    in_dims = out_dims = 128
+
+    def quantized_linear(param_dtype):
+        lin = _nn.Linear(in_dims, out_dims, bias=False)
+        lin.weight = lin.weight.astype(param_dtype)
+        qlin = lin.to_quantized(group_size=group_size, bits=bits, mode="affine")
+        _mx.eval(qlin.parameters())
+        return qlin
+
+    fp32_layer = quantized_linear(_mx.float32)
+    bf16_layer = quantized_linear(_mx.bfloat16)
+    x_fp32 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.float32)
+    x_bf16 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.bfloat16)
+
+    def matmul_ok(x, weight, scales, biases):
+        out = _mx.quantized_matmul(
+            x,
+            weight,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+        )
+        _mx.eval(out)
+        assert bool(_mx.all(_mx.isfinite(out)).item()), (
+            "mismatched-dtype matmul produced non-finite output"
+        )
+        return out
+
+    # fp32 module, scales/biases forced to bf16 / fp16 (both directions
+    # the codex finding names: "module built for fp32 activations but
+    # scales forced to bf16 or fp16").
+    matmul_ok(
+        x_fp32,
+        fp32_layer.weight,
+        fp32_layer.scales.astype(_mx.bfloat16),
+        fp32_layer.biases,
+    )
+    matmul_ok(
+        x_fp32,
+        fp32_layer.weight,
+        fp32_layer.scales,
+        fp32_layer.biases.astype(_mx.bfloat16),
+    )
+    matmul_ok(
+        x_fp32,
+        fp32_layer.weight,
+        fp32_layer.scales.astype(_mx.float16),
+        fp32_layer.biases,
+    )
+    matmul_ok(
+        x_fp32,
+        fp32_layer.weight,
+        fp32_layer.scales.astype(_mx.bfloat16),
+        fp32_layer.biases.astype(_mx.bfloat16),
+    )
+    # ... "and the reverse": bf16 module, scales forced to fp32.
+    matmul_ok(
+        x_bf16,
+        bf16_layer.weight,
+        bf16_layer.scales.astype(_mx.float32),
+        bf16_layer.biases,
+    )
+
+    # The MoE path (SwitchGLU / QuantizedSwitchLinear -> gather_qmm) —
+    # exercised when a Qwen3.6 MoE MTP head layer is present.
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    num_experts, top_k = 4, 2
+    switch = SwitchGLU(in_dims, in_dims, num_experts)
+    _nn.quantize(switch, group_size=group_size, bits=bits)
+    _mx.eval(switch.parameters())
+    x_moe = _mx.random.uniform(shape=(1, 3, in_dims)).astype(_mx.float32)
+    inds = _mx.array([[0, 1], [1, 2], [2, 3]]).reshape(1, 3, top_k)
+    gate = switch.gate_proj
+
+    def gather_qmm_ok(scales, biases):
+        out = _mx.gather_qmm(
+            x_moe,
+            gate.weight,
+            scales,
+            biases,
+            rhs_indices=inds,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+        )
+        _mx.eval(out)
+        assert bool(_mx.all(_mx.isfinite(out)).item())
+
+    gather_qmm_ok(gate.scales.astype(_mx.bfloat16), gate.biases)
+    gather_qmm_ok(gate.scales, gate.biases.astype(_mx.float16))
+
+
+def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts_correctly(
+    tmp_path,
+):
+    """Companion to ``test_inject_refuses_sidecar_with_dtype_mismatched_packed_weight``:
+    that test proves an INTEGER-role mismatch (packed ``weight``) is
+    correctly refused. This test proves the intentionally looser
+    FLOATING-role check (``scales`` / ``biases`` need only be *some*
+    floating dtype, not an exact match) is safe to accept — per the
+    codex-finding follow-up on PR #1201, verified empirically by
+    ``test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype``
+    above: a shape-correct sidecar with mismatched-but-floating
+    ``scales`` dtype passes the check AND the MTP draft forward runs
+    to completion without raising — it does not "fail later in
+    mx.quantized_matmul at the first draft step" as the codex finding
+    hypothesized. (The finding's factual premise about the defending
+    comment — "load_weights casts them" — IS wrong, confirmed by
+    reading ``nn.Module.load_weights``/``update``; but the conclusion
+    the comment reached, that the loose check is safe, holds anyway —
+    for the real reason documented above, not the stated one.)
+    """
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import (
+        inject_mtp_support,
+        validate_mtp_support,
+    )
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    _nn.quantize(base.model, group_size=32, bits=4)
+
+    # A valid, uniformly 4-bit-packed sidecar.
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(template, group_size=32, bits=4)
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+
+    # Corrupt ONE floating tensor's DTYPE (fp32 -> bf16) while keeping its
+    # shape and values (up to bf16 precision) intact — exactly the
+    # "shape-correct but mismatched float dtype" shape the codex finding
+    # describes. Target a non-fc ``.scales`` tensor so the fc-inference
+    # step (which reads fc's own tensors) is unaffected.
+    victim = next(
+        k for k in sorted(flat) if k.endswith(".scales") and not k.startswith("fc.")
+    )
+    assert flat[victim].dtype == _mx.float32
+    flat[victim] = flat[victim].astype(_mx.bfloat16)
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+
+    injected = inject_mtp_support(base, mtp_sidecar=str(tmp_path))
+    assert injected is True, (
+        "inject_mtp_support refused a shape-correct sidecar whose only "
+        "defect is a mismatched-but-floating scales dtype; the by-role "
+        "check is supposed to accept this (floating-role tensors need only "
+        "be *some* floating dtype)."
+    )
+    assert validate_mtp_support(base) is True
+
+    # The draft forward must run without raising — this is the exact call
+    # path (QuantizedLinear.__call__ -> mx.quantized_matmul) the codex
+    # finding predicted would crash mid-generation.
+    hidden = _mx.zeros((1, 1, int(args.hidden_size)), dtype=_mx.float32)
+    next_ids = _mx.array([[0]], dtype=_mx.uint32)
+    logits = base.mtp_forward(hidden, next_ids, base.make_mtp_cache())
+    _mx.eval(logits)
+    assert logits.shape[-1] == int(args.vocab_size)
+    assert bool(_mx.all(_mx.isfinite(logits)).item())
+
+
 def test_inject_refuses_mixed_bit_sidecar_fail_safe(tmp_path):
     """The fc-derived quantization is applied UNIFORMLY (intentional scope).
     A hypothetical mixed-bit sidecar — FP ``fc`` but a quantized decoder —
