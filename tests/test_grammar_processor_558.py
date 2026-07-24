@@ -3011,6 +3011,75 @@ def test_line1_completion_limit_ok_predicate():
     )
 
 
+def test_line1_context_room_ok_predicate(monkeypatch):
+    # codex r4 #1: the HARD context-window allowance check that runs at the route
+    # AFTER the prompt is counted. Proves room for the coupled budget + a minimal
+    # call ONLY on the ``max_tokens=None`` path (where the request-time context
+    # guard reserves zero completion room); conservative on every missing signal.
+    import vllm_mlx.routes.chat as chat_mod
+    from vllm_mlx.routes.chat import (
+        _LINE1_CALL_ENVELOPE_TOKENS,
+        _line1_context_room_ok,
+    )
+
+    engine = object()  # get_model_max_context is monkeypatched, so any object works
+    threshold = 64 + _LINE1_CALL_ENVELOPE_TOKENS  # rmt(64) + bare-tool floor
+
+    def _window(_n):
+        def _fn(_engine):
+            return _n
+
+        return _fn
+
+    # No constraint: rmt unset → always ok regardless of window.
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(1))
+    assert (
+        _line1_context_room_ok(engine, 10_000, _L1Req(reasoning_max_tokens=None))
+        is True
+    )
+
+    # max_tokens set → covered by enforce_context_length + completion-limit; this
+    # check stays permissive even with an absurdly small window.
+    assert (
+        _line1_context_room_ok(
+            engine, 10_000, _L1Req(reasoning_max_tokens=64, max_tokens=32)
+        )
+        is True
+    )
+
+    # Unknown prompt count (MLLM / skipped render) → engage on small-budget arg.
+    assert _line1_context_room_ok(engine, None, _L1Req(reasoning_max_tokens=64)) is True
+
+    # Unreadable window (probe raises) → conservative True.
+    def _boom(_engine):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _boom)
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is True
+
+    # Non-int / non-positive window → conservative True.
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(0))
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is True
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(None))
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is True
+
+    # PROVABLE no-room: room == threshold is NOT > threshold → decline.
+    monkeypatch.setattr(chat_mod, "get_model_max_context", _window(1000))
+    no_room_prompt = 1000 - threshold
+    assert (
+        _line1_context_room_ok(engine, no_room_prompt, _L1Req(reasoning_max_tokens=64))
+        is False
+    )
+
+    # PROVABLE room: one token of slack past the floor → engage.
+    assert (
+        _line1_context_room_ok(
+            engine, no_room_prompt - 1, _L1Req(reasoning_max_tokens=64)
+        )
+        is True
+    )
+
+
 def test_line1_route_threads_predicate_into_offload_build():
     # Wiring guard (same pattern as ``test_route_offload_gated_on_eligibility_in_
     # source``): the behavioral predicate/coupling tests below prove the units;
@@ -3079,6 +3148,19 @@ def test_line1_route_threads_predicate_into_offload_build():
     )
     assert "and _line1_tool_start_ids" in gate_src, (
         "gate must require a resolved opener exclusion (codex r2 #1)"
+    )
+    # codex r4 #1: the route captures the prompt-token count the context guard
+    # already paid for and runs the HARD window check, disengaging the gate to the
+    # forced-prefix fallback when the window cannot fit the budget + a minimal call.
+    assert "_line1_prompt_tokens = enforce_context_length_for_messages(" in src, (
+        "route must capture the prompt-token count for the hard window check"
+    )
+    room_pos = src.find("not _line1_context_room_ok(")
+    assert room_pos != -1, (
+        "route must DISENGAGE on a provable no-room verdict (codex r4 #1)"
+    )
+    assert room_pos < budget_pos, (
+        "hard window check must run BEFORE the budget build so allow_tools reflects it"
     )
 
 

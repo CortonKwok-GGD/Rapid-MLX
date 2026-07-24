@@ -106,6 +106,7 @@ from ..service.helpers import (
     enable_thinking_warning_header,
     enforce_context_length_for_messages,
     get_engine,
+    get_model_max_context,
     maybe_apply_reasoning_effort,
     maybe_auto_disable_thinking_for_casual_chat,
     maybe_auto_disable_thinking_for_tools,
@@ -960,30 +961,70 @@ def _line1_completion_limit_ok(request) -> bool:
         is set AND the schema carries such a constraint the floor cannot bound, the
         room check is unprovable, so we DECLINE.
       * **#1 — unknown effective allowance.** ``max_tokens=None`` is NOT unbounded:
-        the model context window (and any server default) still cap generation, and
-        a near-full prompt can leave no room for ``</think>`` + the call. The chat
-        route does not carry the resolved context window, so with ``max_tokens=None``
-        we cannot PROVE room — but declining every no-``max_tokens`` request (the
-        common case) would gut the feature. We keep engaging there BUT rely on the
-        coupled budget being SMALL (``reasoning_max_tokens`` closes ``</think>``
-        early, leaving the bulk of any remaining window for the short call); a
-        prompt so close to the ceiling that even that does not fit is a degenerate
-        request that truncates WITH OR WITHOUT line① (non-regressive either way).
-        Documented residual — a future context-window plumbing pass can make this a
-        hard check.
+        the model context window still caps generation, and a near-full prompt can
+        leave no room for ``</think>`` + the call. This request-time predicate runs
+        BEFORE the prompt is rendered, so it cannot see the prompt-token count and
+        keeps engaging on ``max_tokens=None`` (declining every no-``max_tokens``
+        request — the common case — would gut the feature). The HARD context-window
+        check now lives at the route in :func:`_line1_context_room_ok`, which runs
+        AFTER ``enforce_context_length_for_messages`` has rendered + counted the
+        prompt (reusing that already-paid count) and disengages the gate when the
+        window cannot fit the budget + a minimal call. Here we stay permissive.
     """
     rmt = getattr(request, "reasoning_max_tokens", None)
     mx = getattr(request, "max_tokens", None)
     if rmt is None:
         return True
     if mx is None:
-        # #1: allowance unknown (context-window not in reach). Engage on the
-        # small-budget argument above; documented residual.
+        # #1: allowance unknown at this pre-render gate. Stay permissive; the
+        # route's ``_line1_context_room_ok`` makes the hard window check once the
+        # prompt has been counted.
         return True
     # #2: a bounded request whose schema minimum we cannot price -> decline.
     if _line1_request_has_uncoverable_constraint(request):
         return False
     return mx > rmt + _line1_min_call_tokens(request)
+
+
+def _line1_context_room_ok(engine, prompt_tokens, request) -> bool:
+    """LINE① (#558, codex r4 #1): the HARD context-window allowance check.
+
+    Runs at the route AFTER ``enforce_context_length_for_messages`` has rendered
+    and counted the prompt, so it can PROVE — not just assume — that the model
+    context window still fits the coupled thinking budget plus a minimal
+    constrained call. Returns ``False`` only when it can prove there is NO room,
+    in which case the route disengages the gate to the forced-prefix fallback
+    (strictly non-regressive).
+
+    Only ``max_tokens=None`` requests need this. When ``max_tokens`` is set the
+    request-time guard already proved ``prompt_tokens + max_tokens <= window``
+    AND ``_line1_completion_limit_ok`` proved ``max_tokens > rmt + floor``, so the
+    room is transitively guaranteed. But with ``max_tokens=None`` that guard uses
+    ``completion=0`` (it reserves ZERO generation room) — so a prompt sitting just
+    under the ceiling passes the guard yet leaves nothing for ``</think>`` + the
+    call. This check closes exactly that window.
+
+    Conservative on missing signal (non-regressive): an unknown prompt count
+    (``None`` — MLLM engine / render skipped) or an unreadable / sentinel window
+    keeps the gate ENGAGED on the documented small-budget argument (a prompt so
+    close to the ceiling that even a small budget cannot fit truncates WITH OR
+    WITHOUT line①). It declines ONLY on a provable no-room verdict.
+    """
+    rmt = getattr(request, "reasoning_max_tokens", None)
+    if rmt is None:
+        return True
+    if getattr(request, "max_tokens", None) is not None:
+        return True  # covered by enforce_context_length + _line1_completion_limit_ok
+    if prompt_tokens is None:
+        return True  # no estimate -> engage on the small-budget argument (documented)
+    try:
+        window = get_model_max_context(engine)
+    except Exception:  # noqa: BLE001 - never fail the request over a probe error
+        return True
+    if not isinstance(window, int) or window <= 0:
+        return True
+    room = window - int(prompt_tokens)
+    return room > rmt + _line1_min_call_tokens(request)
 
 
 def _line1_should_probe_seed(request, resolved_thinking) -> bool:
@@ -3758,13 +3799,43 @@ async def _create_chat_completion_impl(
     # DeepSeek-R1), over-estimates the prompt by the
     # ``<|im_start|>think...`` scaffolding, and can reject requests
     # that actually fit.
-    enforce_context_length_for_messages(
+    # Capture the prompt-token count the context guard already paid for
+    # (build_prompt + tokenize) so LINE①'s hard window check below reuses it
+    # rather than re-rendering (#558 codex r4 #1).
+    _line1_prompt_tokens = enforce_context_length_for_messages(
         engine,
         messages,
         tools=request.tools,
         max_tokens=chat_kwargs.get("max_tokens"),
         enable_thinking=resolved_thinking,
     )
+
+    # LINE① (#558, codex r4 #1) — HARD context-window allowance check. With
+    # ``max_tokens=None`` the guard above only proved ``prompt_tokens <= window``
+    # (it reserves ZERO completion room), so a near-ceiling prompt could leave no
+    # room for the coupled budget's ``</think>`` close + a minimal call. Now that
+    # the prompt is counted, PROVE the room; if the window cannot fit it, disengage
+    # the gate to the forced-prefix fallback (strictly non-regressive) — the same
+    # reconcile the coupled-budget-unavailable branch performs below. Done BEFORE
+    # the budget build so it sees the updated ``allow_tools`` and never installs a
+    # budget it would immediately discard.
+    if _line1_gate_engaged and not _line1_context_room_ok(
+        engine, _line1_prompt_tokens, request
+    ):
+        logger.warning(
+            "line①: context window (%s tokens) leaves no room for the thinking "
+            "budget + a minimal constrained call after a %s-token prompt; "
+            "discarding the gated grammar and restoring the forced-prefix fallback",
+            _line1_prompt_tokens,
+            getattr(request, "reasoning_max_tokens", None),
+        )
+        chat_kwargs.pop("grammar_logits_processor", None)
+        _glp = None
+        _line1_gate_engaged = False
+        _line1_prefix = _LINE1_SEED_UNSET
+        _restored_prefix = _compute_forced_tool_prefix(cfg, request)
+        if _restored_prefix:
+            chat_kwargs["forced_assistant_prefix"] = _restored_prefix
 
     # Cloud routing: offload large-context requests to cloud LLM.
     #
