@@ -1462,6 +1462,136 @@ def test_inject_mtp_support_refuses_synthetic_sidecar_missing_tensor():
         )
 
 
+def test_detect_sidecar_quantization_reads_config_json(tmp_path):
+    """The sidecar's own ``config.json`` quantization block is the source
+    of truth for how to quantize the MTP module.
+
+    Regression anchor for the 8-bit-base + 4-bit-sidecar empty-response
+    bug: the module must be quantized to match the sidecar it loads,
+    which is read here — not the base model.
+    """
+    import json
+
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import _detect_sidecar_quantization
+
+    weights_file = tmp_path / "model.safetensors"
+    weights_file.write_bytes(b"")  # content irrelevant; only sibling config is read
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization": {"group_size": 64, "bits": 4, "mode": "affine"}})
+    )
+    assert _detect_sidecar_quantization(weights_file) == {"bits": 4, "group_size": 64}
+
+
+def test_detect_sidecar_quantization_missing_or_malformed_returns_none(tmp_path):
+    """No config.json / no quantization block / non-int fields → ``None``
+    so the caller falls back to base-model detection (pre-fix behavior,
+    still correct for same-bit pairings)."""
+    import json
+
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import _detect_sidecar_quantization
+
+    wf = tmp_path / "model.safetensors"
+    wf.write_bytes(b"")
+    # (a) no config.json at all (bare hand-assembled sidecar).
+    assert _detect_sidecar_quantization(wf) is None
+    # (b) config.json without a quantization block (an FP sidecar).
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    assert _detect_sidecar_quantization(wf) is None
+    # (c) quantization present but ``bits`` is a bool (int subclass) —
+    # must NOT be mistaken for a 1-bit quantization.
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization": {"group_size": 64, "bits": True}})
+    )
+    assert _detect_sidecar_quantization(wf) is None
+
+
+def test_inject_quantizes_mtp_to_sidecar_bits_not_base_bits(tmp_path):
+    """Regression: an 8-bit base paired with a 4-bit MTP sidecar must
+    quantize the MTP module to the SIDECAR's 4 bits, not the base's 8.
+
+    Before the fix, the MTP module was quantized to the *base* model's
+    bit-width; loading the differently-packed sidecar tensors left the
+    ``fc`` layer's packed ``weight`` inconsistent with its ``bits``
+    attribute, so ``mx.quantized_matmul`` raised at the first MTP draft
+    step — surfacing to the client as an intermittent EMPTY response
+    (``prompt_tokens=0``) once the depth controller began speculating.
+    Mirrors the shipped pairing ``Qwen3.6-27B-MLX-8bit`` +
+    ``Qwen3.6-27B-MTP-4bit``.
+    """
+    import json
+
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten
+
+    from vllm_mlx.spec_decode.mtp.head import build_mtp_module
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import (
+        _detect_base_quantization,
+        inject_mtp_support,
+        validate_mtp_support,
+    )
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    _GROUP = 32
+    _BASE_BITS = 8
+    _SIDECAR_BITS = 4
+
+    # Quantize the BASE at 8-bit so ``_detect_base_quantization`` (the
+    # pre-fix source) returns 8-bit — the WRONG width for a 4-bit sidecar.
+    _nn.quantize(base.model, group_size=_GROUP, bits=_BASE_BITS)
+    assert _detect_base_quantization(base) == {
+        "bits": _BASE_BITS,
+        "group_size": _GROUP,
+    }
+
+    # Build a 4-bit MTP sidecar (weights + a config.json declaring 4-bit).
+    args = base.args
+    template = build_mtp_module(args, int(args.mtp_num_hidden_layers))
+    _nn.quantize(template, group_size=_GROUP, bits=_SIDECAR_BITS)
+    _mx.eval(template.parameters())
+    flat = dict(tree_flatten(template.parameters()))
+    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization": {
+                    "group_size": _GROUP,
+                    "bits": _SIDECAR_BITS,
+                    "mode": "affine",
+                }
+            }
+        )
+    )
+
+    injected = inject_mtp_support(base, mtp_sidecar=str(tmp_path))
+    assert injected is True, (
+        "inject_mtp_support returned False on an 8-bit base + 4-bit sidecar; "
+        "the module was likely quantized to the base's 8-bit and load_weights "
+        "or coverage-check rejected the 4-bit tensors."
+    )
+    assert validate_mtp_support(base) is True
+
+    # The MTP fc layer must carry the SIDECAR's 4 bits, not the base's 8.
+    assert isinstance(base.mtp.fc, _nn.QuantizedLinear)
+    assert int(base.mtp.fc.bits) == _SIDECAR_BITS, (
+        f"MTP fc quantized to {base.mtp.fc.bits}-bit; expected the sidecar's "
+        f"{_SIDECAR_BITS}-bit. Quantizing to the base model's bits reintroduces "
+        "the quantized_matmul weight/scales mismatch (empty-response bug)."
+    )
+
+    # And the draft forward must run without the quantized_matmul crash —
+    # this is the exact call that raised in the field repro.
+    hidden = _mx.zeros((1, 1, int(args.hidden_size)), dtype=_mx.float32)
+    next_ids = _mx.array([[0]], dtype=_mx.uint32)
+    logits = base.mtp_forward(hidden, next_ids, base.make_mtp_cache())
+    _mx.eval(logits)
+    assert logits.shape[-1] == int(args.vocab_size)
+
+
 # ---------------------------------------------------------------------------
 # 8. Generator loop — chain MTP verify/accept logic with mocked model
 # ---------------------------------------------------------------------------

@@ -141,6 +141,65 @@ def _detect_base_quantization(inner: Any) -> dict | None:
     return None
 
 
+def _detect_sidecar_quantization(weights_file: Path) -> dict | None:
+    """Read the MTP *sidecar* checkpoint's own quantization params.
+
+    The MTP module must be quantized to match the SIDECAR it loads its
+    weights from — NOT the base model. These usually agree (the
+    mlx-community pairing ships a 4-bit base with a 4-bit MTP head), so
+    detecting the base model's quantization happened to work. But a
+    mixed pairing makes them differ: e.g. an 8-bit base
+    (``Qwen3.6-27B-MLX-8bit``) with the only-published 4-bit MTP head
+    (``Qwen3.6-27B-MTP-4bit``). The packed ``weight`` / ``scales``
+    shapes of a ``QuantizedLinear`` are a function of ``(bits,
+    group_size)``; quantizing the module to the base's 8-bit and then
+    loading the sidecar's 4-bit tensors leaves a weight packed for
+    4-bit under a layer that still reports ``bits=8``, so
+    ``mx.quantized_matmul`` raises a "weight and scales incompatible"
+    ``ValueError`` at the first MTP draft step. Reading the sidecar's
+    own ``config.json`` quantization block fixes the shapes at their
+    true source.
+
+    Reads the ``quantization`` block from the ``config.json`` sitting
+    next to ``weights_file`` (the mlx-community MTP repos ship one).
+    Returns ``{"bits", "group_size"}`` or ``None`` when the sidecar
+    has no ``config.json`` / no top-level ``quantization`` block (e.g.
+    a hand-assembled bare ``*.safetensors``) — the caller then falls
+    back to :func:`_detect_base_quantization` (the pre-fix behavior),
+    which remains correct for the same-bit pairings.
+    """
+    import json
+
+    config_path = weights_file.parent / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        with config_path.open() as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError) as exc:  # pragma: no cover — malformed file
+        logger.warning(
+            "[mtp.inject] could not read sidecar config.json at %s: %s",
+            config_path,
+            exc,
+        )
+        return None
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict):
+        return None
+    bits = quant.get("bits")
+    group_size = quant.get("group_size")
+    # ``bool`` is a subclass of ``int`` — guard so a malformed
+    # ``"bits": true`` is not silently treated as a 1-bit quantization.
+    if (
+        not isinstance(bits, int)
+        or isinstance(bits, bool)
+        or not isinstance(group_size, int)
+        or isinstance(group_size, bool)
+    ):
+        return None
+    return {"bits": int(bits), "group_size": int(group_size)}
+
+
 def _resolve_sidecar_file(mtp_sidecar: str | Path) -> Path | None:
     """Resolve a sidecar reference to a concrete safetensors file path.
 
@@ -269,7 +328,7 @@ def inject_mtp_support(
     # NOTE: the global ``ArraysCache`` rollback_state class-default and
     # the ``GatedDeltaNet.__call__`` chunk-split patches are deferred
     # until AFTER every can-fail validation completes (see ``# --- Step
-    # 4`` below). Codex flagged on PR #954 that installing these
+    # 5`` below). Codex flagged on PR #954 that installing these
     # monkey-patches up-front meant a failed sidecar load left
     # process-global behavior mutated even though inject_mtp_support
     # returned False. The patches are now strictly post-validation.
@@ -321,21 +380,13 @@ def inject_mtp_support(
         getattr(args, "hidden_size", -1),
     )
 
-    # --- Step 2: Quantize MTP to match the base model's quantization ---
-    quant_info = _detect_base_quantization(inner)
-    if quant_info is not None:
-        nn.quantize(
-            mtp,
-            group_size=quant_info["group_size"],
-            bits=quant_info["bits"],
-        )
-        logger.info(
-            "[mtp.inject] Quantized MTP: %d-bit, group_size=%d",
-            quant_info["bits"],
-            quant_info["group_size"],
-        )
-
-    # --- Step 3: Load MTP weights from sidecar safetensors ---
+    # --- Step 2: Resolve the sidecar file up-front ---
+    # Resolved before quantization because the MTP module must be
+    # quantized to match the SIDECAR checkpoint it loads (see Step 3),
+    # which is read off the file's sibling ``config.json``. Resolving
+    # here lets Step 4 reuse the same path without a second
+    # ``snapshot_download``.
+    weights_file: Path | None = None
     if mtp_sidecar is not None:
         weights_file = _resolve_sidecar_file(mtp_sidecar)
         if weights_file is None:
@@ -348,6 +399,40 @@ def inject_mtp_support(
                 mtp_sidecar,
             )
             return False
+
+    # --- Step 3: Quantize MTP to match the SIDECAR's quantization ---
+    # The packed weight/scales shapes of a ``QuantizedLinear`` are a
+    # function of ``(bits, group_size)``. Loading a sidecar quantized
+    # at a DIFFERENT bit-width than the module was quantized to leaves
+    # a weight whose packing disagrees with the layer's ``bits`` attr,
+    # so ``mx.quantized_matmul`` raises "weight and scales incompatible"
+    # at the first MTP draft step. Historically we matched the BASE
+    # model's quantization, which is only safe when base bits == sidecar
+    # bits (the mlx-community 4bit+4bit pairing). A mixed pairing — an
+    # 8-bit base with the only-published 4-bit MTP head
+    # (Qwen3.6-27B-MLX-8bit + Qwen3.6-27B-MTP-4bit) — broke it. Prefer
+    # the sidecar's own quantization; fall back to base-model detection
+    # only when the sidecar ships no config.json (bare assembled file).
+    quant_info = None
+    if weights_file is not None:
+        quant_info = _detect_sidecar_quantization(weights_file)
+    if quant_info is None:
+        quant_info = _detect_base_quantization(inner)
+    if quant_info is not None:
+        nn.quantize(
+            mtp,
+            group_size=quant_info["group_size"],
+            bits=quant_info["bits"],
+        )
+        logger.info(
+            "[mtp.inject] Quantized MTP: %d-bit, group_size=%d",
+            quant_info["bits"],
+            quant_info["group_size"],
+        )
+
+    # --- Step 4: Load MTP weights from sidecar safetensors ---
+    if mtp_sidecar is not None:
+        # ``weights_file`` was resolved in Step 2 above.
         raw = mx.load(str(weights_file))
         # Some sidecars (Qwen3-Next ``add_mtp_weights.py`` output) prefix
         # every key with ``mtp.``; others (mlx-community/Qwen3.5-9B-MTP-4bit)
@@ -424,7 +509,7 @@ def inject_mtp_support(
             "do not use in production."
         )
 
-    # --- Step 4: Install global ArraysCache + GatedDeltaNet patches ---
+    # --- Step 5: Install global ArraysCache + GatedDeltaNet patches ---
     # Deferred from the top of this function so a failed validation /
     # sidecar load (above) leaves the process global state untouched.
     # Both patches are idempotent + transparent at n_confirmed=0, so
@@ -438,7 +523,7 @@ def inject_mtp_support(
     patch_arrays_cache_rollback_state()
     patch_gated_delta_net_for_mtp()
 
-    # --- Step 5: Attach + monkey-patch ``TextModel`` class ---
+    # --- Step 6: Attach + monkey-patch ``TextModel`` class ---
     inner.mtp = mtp
     original_class = type(inner)
 
