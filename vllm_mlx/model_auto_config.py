@@ -2074,6 +2074,95 @@ def _mtp_path_label(model_path: str, cfg: "ModelConfig") -> str:
     return "disabled"
 
 
+def _load_hf_config_cached(model_path: str, cfg: "ModelConfig") -> "dict | None":
+    """Read ``config.json`` for ``model_path`` from the LOCAL HF cache only.
+
+    No network fetch — mirrors ``cli._gather_kv_cache_dtype_inputs``. Handles
+    both a local checkpoint directory (``config.json`` on disk) and an HF
+    repo id resolved through ``huggingface_hub.try_to_load_from_cache``.
+    Returns ``None`` on any miss / parse failure so callers degrade to the
+    weight-free label rather than crash.
+    """
+    import json as _json
+    import os as _os
+
+    hf_path = getattr(cfg, "hf_path", None) or model_path
+    try:
+        # Local checkpoint directory passed straight through.
+        local = _os.path.join(str(hf_path), "config.json")
+        if _os.path.isfile(local):
+            with open(local) as fh:
+                return _json.load(fh)
+        from huggingface_hub import try_to_load_from_cache as _cache_lookup
+
+        cached = _cache_lookup(repo_id=str(hf_path), filename="config.json")
+        if cached and _os.path.exists(cached):
+            with open(cached) as fh:
+                return _json.load(fh)
+    except Exception:
+        return None
+    return None
+
+
+def _mtp_declared_absent_layers(model_path: str, cfg: "ModelConfig") -> int | None:
+    """Reconcile ``rapid-mlx info`` with the serve-time MTP eligibility gate.
+
+    Returns the ``mtp_num_hidden_layers`` value the checkpoint's
+    ``config.json`` DECLARES when the config advertises a native MTP head
+    (supported ``model_type`` + ``mtp_num_hidden_layers >= 1``) but this
+    profile has spec decode wired OFF (``supports_spec_decode=False`` — the
+    head weights were stripped at convert time). Returns ``None`` otherwise.
+
+    Why this exists: the serve-time gate is CONFIG-based — it runs
+    ``detect_mtp_eligibility(config.json)`` and, for a checkpoint whose
+    config still declares ``mtp_num_hidden_layers=1`` after the head weights
+    were stripped, it announces ``MTP: enabled via --speculative-config``
+    and only hard-fails later at inject time when the weights turn out to be
+    missing. The weight-free ``info`` label, by contrast, reports a bare
+    ``disabled`` off the profile. A user who runs ``info`` then ``serve``
+    gets whiplash. Surfacing the declared layer count here lets ``info``
+    print the same actionable ``MTP:`` note the serve-time hard-fail already
+    emits: the head is declared but absent, so attach a sidecar head (or
+    re-convert preserving MTP).
+
+    Consumed by ``cli.info_command`` to render that note AFTER the profile
+    table — the fixed-width table itself stays weight-free / config-free and
+    deterministic (its cells are unchanged). This helper reads
+    ``config.json`` (LOCAL cache only, no network) and is pre-filtered on
+    the resolved profile so it only touches disk for the exact
+    whiplash-prone case: a native-MTP-family checkpoint with spec decode
+    disabled. Returns ``None`` (note suppressed) when the config isn't
+    cached, so the output degrades gracefully. Behaviour of the serve-time
+    gate is unchanged — this only reconciles the ``info`` reporting.
+    """
+    # Cheap profile pre-filter (no IO): only a native-MTP family whose
+    # profile has spec decode wired off can hit the config-declares-but-
+    # weights-absent whiplash. Everything else keeps the weight-free path.
+    if cfg.supports_spec_decode:
+        return None
+    if _resolve_family(model_path, cfg) != "native_mtp":
+        return None
+
+    config = _load_hf_config_cached(model_path, cfg)
+    if config is None:
+        return None
+
+    # Reuse the serve-time detector so info and serve read the config the
+    # same way (do NOT reinvent the layer-count logic).
+    from vllm_mlx.spec_decode.mtp.detect import (
+        MTPEligibility,
+        _detect_mtp_eligibility_verbose,
+    )
+
+    result = _detect_mtp_eligibility_verbose(config)
+    if result.eligibility is MTPEligibility.NONE:
+        # Config also says NONE (unsupported model_type, or the layer count
+        # was stripped from config too) — the plain "disabled" label is
+        # already honest; nothing to reconcile.
+        return None
+    return result.num_mtp_layers
+
+
 def _kv_share_label(model_path: str, cfg: "ModelConfig") -> str:
     """Truth-in-labeling for cross-layer KV-sharing.
 

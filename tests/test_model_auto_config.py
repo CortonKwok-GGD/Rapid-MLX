@@ -2690,3 +2690,108 @@ class TestCheckpointMetadataFallback:
         monkeypatch.setattr(auto_config_mod, "read_model_metadata", lambda name: None)
 
         assert detect_model_config("publisher/unknown-model") is None
+
+
+class TestMtpDeclaredAbsentReconciliation:
+    """``_mtp_declared_absent_layers`` reconciles ``info`` with the config-
+    based serve-time MTP eligibility gate.
+
+    The serve gate reads ``config.json`` and, for a native-MTP checkpoint
+    whose config still declares ``mtp_num_hidden_layers >= 1`` after the head
+    weights were stripped, announces ``MTP: enabled`` then hard-fails at
+    inject. ``info`` is weight-free and reports a bare ``disabled``. This
+    helper detects the exact whiplash case so ``info`` can print the same
+    actionable sidecar note. The config read is monkeypatched here so the
+    test is deterministic and does NOT depend on the local HF cache.
+    """
+
+    _NATIVE = "mlx-community/Qwen3.6-9B-4bit"  # name segment ⇒ native_mtp
+
+    def _cfg(self, *, spec_off: bool):
+        return ModelConfig(hf_path=self._NATIVE, supports_spec_decode=not spec_off)
+
+    def test_returns_declared_layers_when_config_declares_but_spec_off(
+        self, monkeypatch
+    ):
+        # Config declares an MTP head (model_type qwen3_5, layers=1) but the
+        # profile has spec decode wired OFF ⇒ weights stripped ⇒ return N.
+        monkeypatch.setattr(
+            auto_config_mod,
+            "_load_hf_config_cached",
+            lambda path, cfg: {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+        )
+        n = auto_config_mod._mtp_declared_absent_layers(
+            self._NATIVE, self._cfg(spec_off=True)
+        )
+        assert n == 1
+
+    def test_none_when_spec_decode_on(self, monkeypatch):
+        # supports_spec_decode=True ⇒ native head IS wired; no whiplash, and
+        # the profile pre-filter must short-circuit BEFORE any config read.
+        def _boom(path, cfg):  # pragma: no cover - must never be called
+            raise AssertionError("config read must be skipped when spec is on")
+
+        monkeypatch.setattr(auto_config_mod, "_load_hf_config_cached", _boom)
+        assert (
+            auto_config_mod._mtp_declared_absent_layers(
+                self._NATIVE, self._cfg(spec_off=False)
+            )
+            is None
+        )
+
+    def test_none_for_non_native_family(self, monkeypatch):
+        # A non-native-MTP family (Llama) must short-circuit on the family
+        # pre-filter without reading config, even with spec decode off.
+        def _boom(path, cfg):  # pragma: no cover - must never be called
+            raise AssertionError("config read must be skipped for non-native family")
+
+        monkeypatch.setattr(auto_config_mod, "_load_hf_config_cached", _boom)
+        cfg = ModelConfig(
+            hf_path="mlx-community/Llama-3-8B-4bit", supports_spec_decode=False
+        )
+        assert (
+            auto_config_mod._mtp_declared_absent_layers(
+                "mlx-community/Llama-3-8B-4bit", cfg
+            )
+            is None
+        )
+
+    def test_none_when_config_uncached(self, monkeypatch):
+        # Config not in the local cache ⇒ helper degrades to None so the
+        # note is suppressed (info still renders, just without the note).
+        monkeypatch.setattr(
+            auto_config_mod, "_load_hf_config_cached", lambda path, cfg: None
+        )
+        assert (
+            auto_config_mod._mtp_declared_absent_layers(
+                self._NATIVE, self._cfg(spec_off=True)
+            )
+            is None
+        )
+
+    def test_none_when_config_declares_no_mtp(self, monkeypatch):
+        # Native-MTP family + spec off, but the config ALSO strips the layer
+        # count (declares nothing) ⇒ the plain ``disabled`` label is already
+        # honest; nothing to reconcile.
+        monkeypatch.setattr(
+            auto_config_mod,
+            "_load_hf_config_cached",
+            lambda path, cfg: {"model_type": "qwen3_5", "mtp_num_hidden_layers": 0},
+        )
+        assert (
+            auto_config_mod._mtp_declared_absent_layers(
+                self._NATIVE, self._cfg(spec_off=True)
+            )
+            is None
+        )
+
+    def test_profile_table_stays_deterministic_and_config_free(self, monkeypatch):
+        # Guard the design invariant: format_profile_table must NOT consult
+        # config.json — a config read there would make the fixed-width table
+        # cache-dependent and could break the MTP-path vocabulary contract.
+        def _boom(path, cfg):  # pragma: no cover - must never be called
+            raise AssertionError("format_profile_table must stay config-free")
+
+        monkeypatch.setattr(auto_config_mod, "_load_hf_config_cached", _boom)
+        table = format_profile_table(self._NATIVE, self._cfg(spec_off=True))
+        assert "MTP path         : disabled" in table

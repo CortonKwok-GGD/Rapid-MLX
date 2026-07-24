@@ -6405,6 +6405,7 @@ def info_command(args):
     """
     from vllm_mlx.model_aliases import resolve_model, resolve_profile
     from vllm_mlx.model_auto_config import (
+        _mtp_declared_absent_layers,
         detect_model_config,
         format_profile_table,
     )
@@ -6427,6 +6428,27 @@ def info_command(args):
     print()
     print(format_profile_table(name, cfg))
     print()
+
+    # Reconcile with the serve-time MTP eligibility gate: when config.json
+    # declares an MTP head but the head weights were stripped from this
+    # checkpoint, ``serve --speculative-config '{"method":"mtp"}'`` announces
+    # "MTP: enabled" and only hard-fails at inject time. Emit the same
+    # actionable sidecar guidance here so ``info`` and ``serve`` agree
+    # instead of the user getting whiplash.
+    if cfg is not None:
+        _declared_absent = _mtp_declared_absent_layers(name, cfg)
+        if _declared_absent is not None:
+            print(
+                f"  MTP: config declares mtp_num_hidden_layers={_declared_absent} "
+                "but the MTP head weights are absent in this checkpoint."
+            )
+            print(
+                "  Attach a separately-published MTP head, e.g.:\n"
+                f"    rapid-mlx serve {original_alias} "
+                """--speculative-config '{"method":"mtp","model":"<head-repo>"}'"""
+            )
+            print("  (or re-convert the base checkpoint with an MTP-preserving convert).")
+            print()
 
     # DFlash eligibility — render the report so users can see which
     # gates pass/fail without consulting the docs. Skipped for unknown

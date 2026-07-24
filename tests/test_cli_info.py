@@ -76,3 +76,47 @@ def test_info_does_not_require_model_weights() -> None:
     # Reaching this point in the test session is the success condition.
     # The other tests in this module already exercise multiple aliases.
     assert True
+
+
+def test_info_prints_mtp_sidecar_note_when_head_declared_but_absent(monkeypatch) -> None:
+    """When ``config.json`` declares an MTP head but the head weights were
+    stripped from this checkpoint, ``info`` must print the actionable ``MTP:``
+    note that mirrors the serve-time hard-fail and points to the sidecar path.
+
+    This reconciles ``info`` (which otherwise reports a bare ``disabled``)
+    with ``serve --speculative-config '{"method":"mtp"}'`` (which announces
+    ``MTP: enabled`` then hard-fails at inject). The config read is
+    monkeypatched via the eligibility helper so the test is deterministic and
+    cache-independent.
+    """
+    from vllm_mlx import model_auto_config as auto_config_mod
+
+    monkeypatch.setattr(
+        auto_config_mod, "_mtp_declared_absent_layers", lambda name, cfg: 1
+    )
+    out = _run_info("qwen3.6-27b-8bit")
+    assert "mtp_num_hidden_layers=1" in out, f"declared-layer count missing:\n{out}"
+    assert "head weights are absent" in out, f"absent-head diagnosis missing:\n{out}"
+    # Actionable: mirrors the serve-time sidecar remedy.
+    assert '--speculative-config' in out and '"method":"mtp"' in out, (
+        f"sidecar serve command missing from note:\n{out}"
+    )
+    # The serve command must carry the user-typed alias, not the HF path.
+    assert "rapid-mlx serve qwen3.6-27b-8bit" in out, (
+        f"note should reference the alias the user typed:\n{out}"
+    )
+
+
+def test_info_omits_mtp_note_when_not_declared_absent(monkeypatch) -> None:
+    """The reconciliation note must stay scoped: when the helper reports the
+    model is NOT in the declared-but-absent state (returns ``None``), ``info``
+    must not print the ``MTP:`` sidecar note."""
+    from vllm_mlx import model_auto_config as auto_config_mod
+
+    monkeypatch.setattr(
+        auto_config_mod, "_mtp_declared_absent_layers", lambda name, cfg: None
+    )
+    out = _run_info("qwen3.6-27b-8bit")
+    assert "head weights are absent" not in out, (
+        f"note leaked for a model that is not declared-but-absent:\n{out}"
+    )
