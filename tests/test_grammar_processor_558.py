@@ -2760,6 +2760,12 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert _line1_schema_has_uncoverable_constraint(plain) is False
     assert _line1_completion_limit_ok(_Req(plain)) is True
 
+    # A small enum is COVERABLE (codex r5 NIT): its shortest member fits the flat
+    # envelope, so the canonical enum-constrained tool arg keeps the grammar engaged.
+    small_enum = {"type": "object", "properties": {"a": {"enum": ["celsius", "f"]}}}
+    assert _line1_schema_has_uncoverable_constraint(small_enum) is False
+    assert _line1_completion_limit_ok(_Req(small_enum)) is True
+
     # Each uncoverable keyword forces a decline for a BOUNDED request.
     for params in (
         {"type": "object", "properties": {"a": {"type": "string", "minLength": 1000}}},
@@ -2768,7 +2774,8 @@ def test_line1_completion_limit_declines_uncoverable_schema():
             "type": "object",
             "properties": {"a": {"type": "string", "pattern": "^.{99}$"}},
         },
-        {"type": "object", "properties": {"a": {"enum": ["red", "green"]}}},
+        # a LONG-only enum is a de-facto minLength -> still uncoverable
+        {"type": "object", "properties": {"a": {"enum": ["y" * 200]}}},
         {"type": "object", "properties": {"a": {"type": "array", "minItems": 3}}},
         # nested required object whose inner constraint the flat floor never descends
         {
@@ -2780,11 +2787,11 @@ def test_line1_completion_limit_declines_uncoverable_schema():
         assert _line1_schema_has_uncoverable_constraint(params) is True, params
         assert _line1_completion_limit_ok(_Req(params)) is False, params
 
-    # An UNBOUNDED request (max_tokens=None) is NOT declined on this axis — the
-    # unknown-allowance residual (#1) is handled separately; a constrained schema
-    # only forces a decline when there is a concrete max_tokens to blow.
+    # codex r5 #1: an uncoverable schema is unbounded under ANY max_tokens — a
+    # max_tokens=None request with such a schema must ALSO decline (the flat context
+    # floor cannot price the schema minimum, so the gate would strand the call).
     assert (
-        _line1_completion_limit_ok(_Req({"const": "x" * 500}, max_tokens=None)) is True
+        _line1_completion_limit_ok(_Req({"const": "x" * 500}, max_tokens=None)) is False
     )
 
     # codex r4 #2 — a NESTED ``required`` (no value keyword at all) is uncoverable
@@ -3047,21 +3054,24 @@ def test_line1_context_room_ok_predicate(monkeypatch):
         is True
     )
 
-    # Unknown prompt count (MLLM / skipped render) → engage on small-budget arg.
-    assert _line1_context_room_ok(engine, None, _L1Req(reasoning_max_tokens=64)) is True
+    # FAIL CLOSED (codex r5 #2): unknown prompt count (MLLM / skipped render) →
+    # cannot prove room → False (disengage to forced-prefix, the safer choice).
+    assert (
+        _line1_context_room_ok(engine, None, _L1Req(reasoning_max_tokens=64)) is False
+    )
 
-    # Unreadable window (probe raises) → conservative True.
+    # Unreadable window (probe raises) → cannot prove room → False.
     def _boom(_engine):
         raise RuntimeError("probe failed")
 
     monkeypatch.setattr(chat_mod, "get_model_max_context", _boom)
-    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is True
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is False
 
-    # Non-int / non-positive window → conservative True.
+    # Non-int / non-positive window (incl. DoS sentinel) → cannot prove room → False.
     monkeypatch.setattr(chat_mod, "get_model_max_context", _window(0))
-    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is True
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is False
     monkeypatch.setattr(chat_mod, "get_model_max_context", _window(None))
-    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is True
+    assert _line1_context_room_ok(engine, 100, _L1Req(reasoning_max_tokens=64)) is False
 
     # PROVABLE no-room: room == threshold is NOT > threshold → decline.
     monkeypatch.setattr(chat_mod, "get_model_max_context", _window(1000))
@@ -3081,10 +3091,10 @@ def test_line1_context_room_ok_predicate(monkeypatch):
 
 
 def test_line1_split_reasoning_for_tool_parse():
-    # codex r4 #4: upstream-faithful reasoning-first split. Returns the post-
-    # </think> content the tool parser should see, or None (→ caller full-text
-    # fallback) when no split is available. A tool marker inside <think> must be
-    # discarded so it can never be mis-extracted (spelling-agnostic).
+    # codex r4 #4 / r5 #3: upstream-faithful reasoning-first split. Returns the
+    # post-</think> content the tool parser should see. FAILS CLOSED — NEVER returns
+    # the raw full text (that would re-expose an in-<think> marker on an engaged
+    # gate); on no-parser / parser-error it falls back to a literal </think> split.
     from vllm_mlx.routes.chat import _line1_split_reasoning_for_tool_parse
 
     class _RP:
@@ -3098,8 +3108,11 @@ def test_line1_split_reasoning_for_tool_parse():
                 raise self._result
             return self._result
 
-    # No parser → None (caller falls back to full-text parse, non-regressive).
-    assert _line1_split_reasoning_for_tool_parse(None, "<think>x</think>call") is None
+    # No parser → deterministic literal </think> split (NOT the raw text): the suffix
+    # after the last close tag, so the <think> span never reaches the tool parser.
+    assert _line1_split_reasoning_for_tool_parse(None, "<think>x</think>call") == "call"
+    # No parser AND no </think> (still thinking) → "" (no legitimate post-think call).
+    assert _line1_split_reasoning_for_tool_parse(None, "<think>only <tool_call>") == ""
 
     # (reasoning, content) → the post-</think> content only; the <think> marker is
     # never returned, so a sub-token-spelled opener inside it cannot reach the parser.
@@ -3117,8 +3130,13 @@ def test_line1_split_reasoning_for_tool_parse():
     # (None, None) — parser found no reasoning markers → "" (empty, safe).
     assert _line1_split_reasoning_for_tool_parse(_RP((None, None)), "x") == ""
 
-    # Parser raises → None (caller full-text fallback; a parser bug must not 500).
-    assert _line1_split_reasoning_for_tool_parse(_RP(RuntimeError("boom")), "x") is None
+    # Parser raises → FAIL CLOSED via the literal </think> split, NEVER the raw text
+    # (codex r5 #3). With a </think> present, the post-think suffix; without, "".
+    assert (
+        _line1_split_reasoning_for_tool_parse(_RP(RuntimeError("boom")), "a</think>b")
+        == "b"
+    )
+    assert _line1_split_reasoning_for_tool_parse(_RP(RuntimeError("boom")), "x") == ""
 
 
 def test_line1_streaming_redirect_gated_on_gate():
@@ -3262,9 +3280,9 @@ def test_line1_route_threads_predicate_into_offload_build():
     assert "_line1_split_reasoning_for_tool_parse(" in src, (
         "route must reasoning-first split before tool-parse for line① (codex r4 #4)"
     )
-    reorder_pos = src.find("_line1_post_think = _line1_split_reasoning_for_tool_parse")
     gate_guard_pos = src.find("if _line1_gate_engaged and engine_tool_calls is None:")
-    assert gate_guard_pos != -1 and reorder_pos != -1, (
+    split_pos = src.find("_line1_split_reasoning_for_tool_parse(cfg.reasoning_parser")
+    assert gate_guard_pos != -1 and split_pos != -1 and gate_guard_pos < split_pos, (
         "reorder must be gated on line①-engaged AND no engine structured calls "
         "(preserve the harmony/gemma4 structured-tool bypass)"
     )

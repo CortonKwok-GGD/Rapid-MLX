@@ -857,8 +857,14 @@ def _line1_min_call_tokens(request) -> int:
 # the gate to the forced-prefix fallback (non-regressive) rather than admit a gate
 # whose call might not fit.
 _LINE1_UNBOUNDED_MIN_KEYWORDS = frozenset(
-    {"minLength", "minItems", "minProperties", "const", "pattern", "enum"}
+    {"minLength", "minItems", "minProperties", "const", "pattern"}
 )
+# ``enum`` is NOT blanket-unpriceable (codex r5 NIT): an enum is a FINITE set, so its
+# minimum valid instance is its SHORTEST member — computable, unlike a ``minLength``.
+# A common enum (``["celsius","fahrenheit"]``) must keep the grammar engaged; only a
+# pathologically long shortest member (a de-facto ``minLength``) is unbounded. Members
+# up to this many JSON chars fit the flat call envelope the floor already reserves.
+_LINE1_ENUM_COVERABLE_CHARS = 64
 
 
 def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
@@ -877,6 +883,18 @@ def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
         return False
     if _LINE1_UNBOUNDED_MIN_KEYWORDS & schema.keys():
         return True
+    # ``enum`` (codex r5 NIT): coverable when its SHORTEST member is short enough to
+    # fit the flat call envelope; only a pathologically long shortest member (a
+    # de-facto ``minLength``) is unbounded. An empty enum is a degenerate,
+    # unsatisfiable schema handled by the shared grammar guard, not priced here.
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        try:
+            shortest = min(len(json.dumps(m)) for m in enum)
+        except Exception:  # noqa: BLE001 - unpriceable member -> conservatively decline
+            return True
+        if shortest > _LINE1_ENUM_COVERABLE_CHARS:
+            return True
     # NESTED ``required`` (codex r4 #2): ``_line1_min_call_tokens`` prices ONLY the
     # ROOT ``required`` skeleton, so a nested required object — even with no value
     # keyword — adds unpriced ``"key":v,`` bytes the floor never counted. Any
@@ -957,9 +975,14 @@ def _line1_completion_limit_ok(request) -> bool:
     Two conservative declines harden the floor (codex r3):
       * **#2 — unprovable schema minimum.** ``_line1_min_call_tokens`` only prices
         the required-key skeleton; a ``minLength`` / ``const`` / nested-required /
-        ``$ref`` schema can make a VALID call arbitrarily larger. When ``max_tokens``
-        is set AND the schema carries such a constraint the floor cannot bound, the
-        room check is unprovable, so we DECLINE.
+        ``$ref`` schema can make a VALID call arbitrarily larger. When the schema
+        carries such a constraint the floor cannot bound, the room check is
+        unprovable, so we DECLINE — REGARDLESS of ``max_tokens`` (codex r5 #1). A
+        ``max_tokens=None`` request whose schema has a 1,000-char ``minLength`` is
+        just as unbounded as a bounded one; letting it engage because
+        ``_line1_context_room_ok`` only reserves the flat floor would strand the call
+        when the schema minimum exceeds that floor. The uncoverable-schema decline is
+        therefore checked BEFORE the ``max_tokens`` split.
       * **#1 — unknown effective allowance.** ``max_tokens=None`` is NOT unbounded:
         the model context window still caps generation, and a near-full prompt can
         leave no room for ``</think>`` + the call. This request-time predicate runs
@@ -968,21 +991,23 @@ def _line1_completion_limit_ok(request) -> bool:
         request — the common case — would gut the feature). The HARD context-window
         check now lives at the route in :func:`_line1_context_room_ok`, which runs
         AFTER ``enforce_context_length_for_messages`` has rendered + counted the
-        prompt (reusing that already-paid count) and disengages the gate when the
-        window cannot fit the budget + a minimal call. Here we stay permissive.
+        prompt (reusing that already-paid count) and fails CLOSED (disengages to the
+        forced-prefix fallback) when it cannot PROVE the window fits the budget + a
+        minimal call. Here we stay permissive on the allowance only.
     """
     rmt = getattr(request, "reasoning_max_tokens", None)
     mx = getattr(request, "max_tokens", None)
     if rmt is None:
         return True
-    if mx is None:
-        # #1: allowance unknown at this pre-render gate. Stay permissive; the
-        # route's ``_line1_context_room_ok`` makes the hard window check once the
-        # prompt has been counted.
-        return True
-    # #2: a bounded request whose schema minimum we cannot price -> decline.
+    # #2 (codex r5 #1): an uncoverable schema minimum is unbounded under ANY
+    # ``max_tokens`` — including ``None`` — so decline BEFORE the allowance split.
     if _line1_request_has_uncoverable_constraint(request):
         return False
+    if mx is None:
+        # #1: allowance unknown at this pre-render gate. Stay permissive on the
+        # allowance; the route's ``_line1_context_room_ok`` makes the hard window
+        # check (fail-closed) once the prompt has been counted.
+        return True
     return mx > rmt + _line1_min_call_tokens(request)
 
 
@@ -992,9 +1017,8 @@ def _line1_context_room_ok(engine, prompt_tokens, request) -> bool:
     Runs at the route AFTER ``enforce_context_length_for_messages`` has rendered
     and counted the prompt, so it can PROVE — not just assume — that the model
     context window still fits the coupled thinking budget plus a minimal
-    constrained call. Returns ``False`` only when it can prove there is NO room,
-    in which case the route disengages the gate to the forced-prefix fallback
-    (strictly non-regressive).
+    constrained call. Returns ``True`` ONLY when room is provable; the route
+    disengages the gate to the forced-prefix fallback on ``False``.
 
     Only ``max_tokens=None`` requests need this. When ``max_tokens`` is set the
     request-time guard already proved ``prompt_tokens + max_tokens <= window``
@@ -1004,11 +1028,13 @@ def _line1_context_room_ok(engine, prompt_tokens, request) -> bool:
     under the ceiling passes the guard yet leaves nothing for ``</think>`` + the
     call. This check closes exactly that window.
 
-    Conservative on missing signal (non-regressive): an unknown prompt count
-    (``None`` — MLLM engine / render skipped) or an unreadable / sentinel window
-    keeps the gate ENGAGED on the documented small-budget argument (a prompt so
-    close to the ceiling that even a small budget cannot fit truncates WITH OR
-    WITHOUT line①). It declines ONLY on a provable no-room verdict.
+    FAIL CLOSED on missing signal (codex r5 #2): an unknown prompt count (``None`` —
+    MLLM engine / render skipped) or an unreadable / non-positive window means we
+    CANNOT prove room, so we DISENGAGE to the forced-prefix fallback rather than
+    install a gate that might exhaust the window during reasoning and never emit the
+    forced call. Forced-prefix emits the call immediately (no reasoning budget to
+    burn through the window), so it is the strictly safer choice when room is
+    unprovable — and it is non-regressive (identical to the pre-line① path).
     """
     rmt = getattr(request, "reasoning_max_tokens", None)
     if rmt is None:
@@ -1016,23 +1042,27 @@ def _line1_context_room_ok(engine, prompt_tokens, request) -> bool:
     if getattr(request, "max_tokens", None) is not None:
         return True  # covered by enforce_context_length + _line1_completion_limit_ok
     if prompt_tokens is None:
-        return True  # no estimate -> engage on the small-budget argument (documented)
+        return False  # no prompt count -> cannot prove room -> fail closed
     try:
         window = get_model_max_context(engine)
     except Exception:  # noqa: BLE001 - never fail the request over a probe error
-        return True
+        return False  # unreadable window -> cannot prove room -> fail closed
     if not isinstance(window, int) or window <= 0:
-        return True
+        return False  # no usable window (incl. DoS sentinel) -> fail closed
     room = window - int(prompt_tokens)
     return room > rmt + _line1_min_call_tokens(request)
+
+
+_LINE1_THINK_END = "</think>"
 
 
 def _line1_split_reasoning_for_tool_parse(reasoning_parser, text):
     """LINE① (#558, codex r4 #4) — upstream-faithful reasoning-first split.
 
-    Return the post-``</think>`` content the tool parser should see, or ``None``
-    when no split is available (no reasoning parser / parser raised) so the caller
-    falls back to today's full-text parse (strictly non-regressive).
+    Return the post-``</think>`` content the tool parser should see. NEVER returns
+    the raw full text: the caller invokes this ONLY for an ENGAGED gate, where the
+    real call is guaranteed AFTER ``</think>``, so exposing the ``<think>`` span to
+    the tool parser (even on a parser error) would re-open the very leak this closes.
 
     This mirrors what vLLM (``Parser.parse``: ``reasoning, content =
     extract_reasoning(model_output)`` then ``_extract_tool_calls(content)``) and
@@ -1046,26 +1076,36 @@ def _line1_split_reasoning_for_tool_parse(reasoning_parser, text):
     prove the trigger TEXT is unspellable inside the think span, but reasoning-first
     extraction makes the span invisible to the tool parser regardless of spelling.
 
+    FAIL CLOSED (codex r5 #3): the configured ``cfg.reasoning_parser`` (consistent
+    with ``_finalize_content_and_reasoning``) is tried first; when it is absent OR
+    raises we do NOT fall back to the full text — we deterministically locate the
+    span after the LAST ``</think>`` literal, and if there is none the model never
+    closed thinking, so there is no legitimate post-think call and we return ``""``
+    (the tool parser sees nothing). Either way the think span never reaches the parser.
+
     Applied ONLY when line① is engaged (the caller gates on
     ``_line1_gate_engaged``): line①'s gate + coupled thinking budget GUARANTEE the
     real forced call lands strictly AFTER ``</think>``, so parsing only post-think
     content loses nothing legitimate. Families that legitimately emit a tool call
     INSIDE ``<think>`` (minimax bare ``<invoke>``, forced-prefix hermes/qwen3) never
     engage line① — their multi-token openers fail the single-special-token gate —
-    so a blanket reorder is unsafe but this gated one is not. Uses the SAME
-    ``cfg.reasoning_parser`` that ``_finalize_content_and_reasoning`` uses, so the
-    split is consistent with the reasoning the response ultimately reports.
+    so a blanket reorder is unsafe but this gated one is not.
     """
-    if reasoning_parser is None:
-        return None
-    try:
-        _reasoning, content = reasoning_parser.extract_reasoning(text)
-    except Exception:  # noqa: BLE001 - parser bug must not fail the request
-        return None
-    # ``content is None`` means the parser routed everything to reasoning (no
-    # ``</think>`` split / Case-4 all-reasoning) — there is no legitimate post-think
-    # call, so the tool parser should see an empty string, not the raw think text.
-    return content or ""
+    if reasoning_parser is not None:
+        try:
+            _reasoning, content = reasoning_parser.extract_reasoning(text)
+            # ``content is None`` means the parser routed everything to reasoning
+            # (no ``</think>`` split / Case-4 all-reasoning) — no legitimate
+            # post-think call, so the tool parser sees an empty string.
+            return content or ""
+        except Exception:  # noqa: BLE001 - parser bug must not re-open the leak
+            pass  # fall through to the deterministic literal split (fail closed)
+    # No parser (or it raised): fail closed on the ``</think>`` literal. Take the
+    # suffix after the LAST close tag; no close tag => still thinking => "" (no call).
+    idx = text.rfind(_LINE1_THINK_END)
+    if idx == -1:
+        return ""
+    return text[idx + len(_LINE1_THINK_END) :]
 
 
 def _line1_should_probe_seed(request, resolved_thinking) -> bool:
@@ -3869,9 +3909,9 @@ async def _create_chat_completion_impl(
         engine, _line1_prompt_tokens, request
     ):
         logger.warning(
-            "line①: context window (%s tokens) leaves no room for the thinking "
-            "budget + a minimal constrained call after a %s-token prompt; "
-            "discarding the gated grammar and restoring the forced-prefix fallback",
+            "line①: a %s-token prompt + %s-token thinking budget leaves no provable "
+            "room in the context window for a minimal constrained call; discarding "
+            "the gated grammar and restoring the forced-prefix fallback",
             _line1_prompt_tokens,
             getattr(request, "reasoning_max_tokens", None),
         )
@@ -5041,16 +5081,14 @@ async def _create_chat_completion_impl(
     # tool parsing) that masking the opener token id alone could not. Gated on line①
     # because the gate GUARANTEES the real call lands after ``</think>`` — families
     # that legitimately parse a call inside ``<think>`` (minimax / forced-prefix
-    # hermes) never engage line①. Falls back to the full-text parse (today's
-    # behavior) whenever no split is available (non-regressive).
-    _line1_post_think = None
+    # hermes) never engage line①. ``_line1_split_reasoning_for_tool_parse`` FAILS
+    # CLOSED (never returns the raw text), so an engaged gate never re-exposes the
+    # think span even on a reasoning-parser error (codex r5 #3).
     if _line1_gate_engaged and engine_tool_calls is None:
-        _line1_post_think = _line1_split_reasoning_for_tool_parse(
-            cfg.reasoning_parser, output.text
-        )
-    if _line1_post_think is not None:
         cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            _line1_post_think, request, structured_tool_calls=engine_tool_calls
+            _line1_split_reasoning_for_tool_parse(cfg.reasoning_parser, output.text),
+            request,
+            structured_tool_calls=engine_tool_calls,
         )
         if not tool_calls:
             # No forced call recovered from the post-``</think>`` remainder. Blank
