@@ -479,15 +479,29 @@ def inject_mtp_support(
     if weights_file is not None:
         # Load the sidecar tensors up-front so their real layout drives
         # quantization; Step 4 reuses this dict for the coverage check.
-        raw = mx.load(str(weights_file))
-        # Some sidecars (Qwen3-Next ``add_mtp_weights.py`` output) prefix
-        # every key with ``mtp.``; others (mlx-community/Qwen3.5-9B-MTP-4bit)
-        # store at top-level. Strip the prefix if present so both shapes
-        # land on the MTP module's parameter tree.
-        mtp_weights = {
-            (k.removeprefix("mtp.") if k.startswith("mtp.") else k): v
-            for k, v in raw.items()
-        }
+        # A truncated/unreadable/corrupt safetensors file makes ``mx.load``
+        # raise — that must hit the same return-False fail-safe as every
+        # other bad-sidecar path below, not escape as an uncaught exception
+        # and abort the request mid-generation.
+        try:
+            raw = mx.load(str(weights_file))
+            # Some sidecars (Qwen3-Next ``add_mtp_weights.py`` output) prefix
+            # every key with ``mtp.``; others (mlx-community/Qwen3.5-9B-MTP-4bit)
+            # store at top-level. Strip the prefix if present so both shapes
+            # land on the MTP module's parameter tree.
+            mtp_weights = {
+                (k.removeprefix("mtp.") if k.startswith("mtp.") else k): v
+                for k, v in raw.items()
+            }
+        except Exception as exc:
+            logger.error(
+                "[mtp.inject] sidecar %r could not be read/parsed (%s); "
+                "refusing MTP injection rather than raise mid-request. Omit "
+                "--speculative-config to run the plain base path.",
+                mtp_sidecar,
+                exc,
+            )
+            return False
         # Read the fc's full-precision (out, in) dims off the freshly-built
         # module, then invert the sidecar's packed fc shapes to recover its
         # quantization.

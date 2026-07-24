@@ -1769,6 +1769,36 @@ def test_inject_refuses_explicit_sidecar_with_malformed_packing(tmp_path):
     )
 
 
+def test_inject_refuses_corrupt_sidecar_file_without_raising(tmp_path):
+    """A truncated/unreadable safetensors sidecar makes ``mx.load`` raise —
+    codex flagged (PR #1201) that this exception was UNGUARDED and would
+    escape ``inject_mtp_support`` instead of hitting the same return-False
+    fail-safe as every other bad-sidecar path (malformed packing, shape
+    mismatch, dtype mismatch, ...). A corrupt file on disk (partial
+    download, disk error) must degrade the same way: refuse injection,
+    never abort the request mid-generation.
+    """
+    from vllm_mlx.spec_decode.mtp.qwen3_5_inject import inject_mtp_support
+
+    try:
+        base = _build_tiny_qwen3_5_text_model()
+    except (TypeError, AttributeError) as exc:
+        pytest.skip(f"Qwen3.5 TextModelArgs schema mismatch: {exc}")
+
+    sidecar_path = tmp_path / "corrupt-sidecar.safetensors"
+    sidecar_path.write_bytes(b"not a real safetensors file" * 4)
+
+    result = inject_mtp_support(base, mtp_sidecar=str(sidecar_path))
+    assert result is False, (
+        "inject_mtp_support should refuse (return False) a corrupt sidecar "
+        "file, not raise mx.load's exception mid-request."
+    )
+    assert not hasattr(base, "mtp"), (
+        "inject refused but still attached an MTP module — the refusal must "
+        "leave the base model untouched (plain path)."
+    )
+
+
 def test_inject_refuses_sidecar_with_shape_mismatched_non_fc_tensor(tmp_path):
     """The fc-derived quantization is applied UNIFORMLY across the module.
     A sidecar whose fc is well-formed but another tensor's shape disagrees
