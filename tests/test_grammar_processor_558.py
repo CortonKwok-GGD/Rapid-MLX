@@ -2829,6 +2829,13 @@ def test_line1_completion_limit_declines_uncoverable_schema():
         _Req({"type": "object", "required": ["a"], "properties": {"a": {}}})
     )
 
+    # codex r10 #3: a sibling ``type`` invalidates enum members of another type, so
+    # the shortest PRICED member must be the shortest TYPE-VALID one — not the 1-byte
+    # ``0`` that ``{"type":"string","enum":[0,"verylongstring"]}`` forbids.
+    typed_enum = {"type": "string", "enum": [0, "verylongstring"]}
+    assert _line1_min_value_bytes(typed_enum) == len('"verylongstring"')  # 16, not 1
+    assert _line1_min_value_bytes({"enum": [0, "verylongstring"]}) == len("0")  # 1
+
     # codex r8 #3: a key needing JSON escaping (``a"b`` -> ``a\"b``) must be priced by
     # its full json.dumps serialization, not raw UTF-8 bytes.
     esc_key = {"type": "object", "required": ['a"b\\c'], "properties": {}}
@@ -2890,6 +2897,22 @@ def test_line1_completion_limit_declines_uncoverable_schema():
             },
         },
         {"$ref": "#/$defs/Foo"},
+        # codex r10 #2 — the fail-safe allowlist declines ANY unlisted keyword, so a
+        # blacklist gap can no longer under-price. A required key GOVERNED by
+        # additionalProperties (absent from ``properties``) is unpriced → decline.
+        {
+            "type": "object",
+            "required": ["a"],
+            "properties": {},
+            "additionalProperties": {"minLength": 1000},
+        },
+        {"type": "object", "properties": {"a": {"type": "integer", "multipleOf": 7}}},
+        {"type": "object", "dependentRequired": {"a": ["b"]}},
+        {
+            "type": "object",
+            "properties": {"a": {"type": "array", "minContains": 5}},
+        },
+        {"type": "object", "properties": {"a": {"type": "string", "format": "email"}}},
     ):
         assert _line1_schema_has_uncoverable_constraint(params) is True, params
         assert _line1_completion_limit_ok(_Req(params)) is False, params

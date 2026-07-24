@@ -822,6 +822,31 @@ def _enforce_tool_grammar_bounds_or_400(cfg, request) -> None:
 _LINE1_CALL_ENVELOPE_TOKENS = 64
 
 
+def _line1_value_matches_type(m, t) -> bool:
+    """True iff the concrete value ``m`` satisfies a JSON-Schema ``type`` ``t``
+    (scalar name, list of names, or ``None`` = unconstrained). Used to drop enum
+    members a sibling ``type`` forbids before pricing the shortest (codex r10 #3)."""
+    if t is None:
+        return True
+    if isinstance(t, list):
+        return any(_line1_value_matches_type(m, x) for x in t)
+    if t == "string":
+        return isinstance(m, str)
+    if t == "integer":
+        return isinstance(m, int) and not isinstance(m, bool)
+    if t == "number":
+        return isinstance(m, (int, float)) and not isinstance(m, bool)
+    if t == "boolean":
+        return isinstance(m, bool)
+    if t == "null":
+        return m is None
+    if t == "array":
+        return isinstance(m, list)
+    if t == "object":
+        return isinstance(m, dict)
+    return True  # unrecognized type -> do not filter
+
+
 def _line1_min_value_bytes(schema) -> int:
     """UTF-8 byte length of the SHORTEST JSON value a required field of ``schema``
     can legally take (codex r7 #2/#3). Prices the discrete value keywords the
@@ -845,8 +870,15 @@ def _line1_min_value_bytes(schema) -> int:
             return 2
     enum = schema.get("enum")
     if isinstance(enum, list) and enum:
+        # codex r10 #3: a sibling ``type`` narrows the enum — ``{"type":"string",
+        # "enum":[0,"long"]}`` admits only ``"long"``, so the ``0`` (shorter) is
+        # NOT a valid value. Price the shortest member that ALSO satisfies the type;
+        # if the intersection is empty the schema is unsatisfiable (no valid call to
+        # truncate) so the unfiltered set is a harmless fallback.
+        t = schema.get("type")
+        members = [m for m in enum if _line1_value_matches_type(m, t)] or enum
         try:
-            return min(len(json.dumps(m).encode("utf-8")) for m in enum)
+            return min(len(json.dumps(m).encode("utf-8")) for m in members)
         except Exception:  # noqa: BLE001
             return 2
     # Numeric bounds (codex r7 #3, r8 #2): a LOWER *or* UPPER bound can force the
@@ -945,79 +977,86 @@ def _line1_min_call_tokens(request) -> int:
     return _LINE1_CALL_ENVELOPE_TOKENS + worst
 
 
-# JSON-Schema keywords whose minimal VALID instance the byte-priced floor
-# ``_line1_min_call_tokens`` cannot bound, because their length is not a discrete
-# per-field value we can serialize and measure (codex r3 #2 / r7):
-#   * ``minLength`` — a string forced to N chars (N unbounded, char->byte fuzzy),
-#   * ``minItems`` — an array forced to N (possibly nested) elements,
-#   * ``minProperties`` — a map forced to N members,
-#   * ``pattern`` — a regex that can force an arbitrarily long literal.
-# Their mere PRESENCE anywhere in a forced tool's schema makes the floor unprovable,
-# so a BOUNDED request declines the gate to the forced-prefix fallback
-# (non-regressive) rather than admit a gate whose call might not fit.
-#
-# ``enum`` / ``const`` / numeric bounds (``minimum`` etc.) are DELIBERATELY NOT here
-# (codex r7 #2/#3): each is a discrete value whose shortest legal serialization
-# ``_line1_min_value_bytes`` prices exactly into the floor, so the gate stays
-# engaged for the canonical enum-/range-constrained tool arg instead of always
-# falling back to the unconstrained forced prefix — while a pathologically long
-# member / bound still inflates the priced floor and declines on its own.
-_LINE1_UNBOUNDED_MIN_KEYWORDS = frozenset(
-    {"minLength", "minItems", "minProperties", "pattern"}
+# FAIL-SAFE ALLOWLIST of JSON-Schema keywords whose effect on a minimal instance's
+# byte length ``_line1_min_call_tokens`` either prices EXACTLY or provably ignores.
+# A BLACKLIST of "unbounded" keywords is unbounded WORK — JSON Schema is large and
+# each codex round surfaced another gap (minLength, then minItems, then combinators,
+# then additionalProperties / dependentRequired / minContains / multipleOf ...).
+# So we invert it (codex r10): a required tool schema is priceable ONLY if every
+# node uses solely these keywords; ANY other keyword — present or future — makes the
+# floor unprovable and DECLINES the gate to the (non-regressive) forced-prefix path.
+# New keywords fail CLOSED, not open. Excluded on purpose (they force / hide length):
+# minLength/maxLength, minItems/maxItems, minProperties/maxProperties, minContains,
+# pattern, multipleOf, dependentRequired, patternProperties, propertyNames,
+# if/then/else, not, allOf/anyOf/oneOf, $ref/$defs, format. ``additionalProperties``
+# is allowed (a required key it would govern is caught by the required-in-properties
+# check below), and the DISCRETE value keywords enum/const/numeric-bounds are priced.
+_LINE1_SAFE_SCHEMA_KEYWORDS = frozenset(
+    {
+        # container structure we descend into / price explicitly
+        "type",
+        "properties",
+        "required",
+        "items",
+        "additionalProperties",
+        # discrete value keywords the byte pricer serializes exactly
+        "enum",
+        "const",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        # pure annotations — no effect on a valid instance's bytes
+        "description",
+        "title",
+        "default",
+        "examples",
+        "$comment",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "$schema",
+        "$id",
+    }
 )
 
 
 def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
-    """True iff ``schema`` (a JSON-Schema dict) contains a value/shape constraint
-    the flat ``_line1_min_call_tokens`` floor cannot bound (codex r3 #2).
+    """True iff ``schema`` (a JSON-Schema dict) carries a shape the byte floor
+    ``_line1_min_call_tokens`` cannot price (codex r3 #2 / r7 / r10).
 
-    Walks ``properties`` / ``items`` / ``$defs`` / ``allOf`` / ``anyOf`` /
-    ``oneOf`` and the required-nested-object case. Bounded depth (a hostile schema
-    can nest arbitrarily) — treat an over-deep schema as uncoverable too. Purely
-    structural: any hit means "the estimator can't prove a minimal call fits", so
-    the caller conservatively declines the gate for bounded requests.
+    FAIL-SAFE ALLOWLIST: decline on ANY keyword outside
+    ``_LINE1_SAFE_SCHEMA_KEYWORDS`` (so minLength / pattern / minItems / multipleOf /
+    additionalProperties-governed / dependentRequired / combinators / $ref / any
+    future keyword all fall back), on a NESTED ``required`` skeleton the flat floor
+    never descends into, on a required key absent from ``properties`` (unpriced), or
+    on an over-deep schema. What survives is a flat object of scalar fields the pricer
+    bounds exactly — a discrete-value or plain-scalar shape.
     """
     if _depth > 6:
         return True  # too deep to price -> conservatively uncoverable
     if not isinstance(schema, dict):
         return False
-    if _LINE1_UNBOUNDED_MIN_KEYWORDS & schema.keys():
+    # Any keyword we do not KNOW to be length-safe -> decline (fail closed).
+    if set(schema.keys()) - _LINE1_SAFE_SCHEMA_KEYWORDS:
         return True
-    # NESTED ``required`` (codex r4 #2): ``_line1_min_call_tokens`` prices ONLY the
-    # ROOT ``required`` skeleton, so a nested required object — even with no value
-    # keyword — adds unpriced ``"key":v,`` bytes the floor never counted. Any
-    # ``required`` list below the root therefore makes the minimum unprovable.
+    # A NESTED ``required`` skeleton (codex r4 #2): the flat floor prices ONLY the
+    # ROOT required list, so any required list below the root is unpriced bytes.
     if _depth > 0 and schema.get("required"):
         return True
-    # A required NESTED object contributes its own (unpriced) required skeleton.
     props = schema.get("properties")
+    required = schema.get("required")
+    # Every required key must be defined in ``properties`` — the only place the flat
+    # floor reads a per-key schema. A required key governed by ``additionalProperties``
+    # or otherwise absent is unpriced, so decline (codex r10 #2).
+    if isinstance(required, list):
+        prop_keys = set(props) if isinstance(props, dict) else set()
+        if any(k not in prop_keys for k in required):
+            return True
     if isinstance(props, dict):
         for sub in props.values():
             if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
                 return True
-    items = schema.get("items")
-    if isinstance(items, dict):
-        if _line1_schema_has_uncoverable_constraint(items, _depth + 1):
-            return True
-    elif isinstance(items, list):
-        for sub in items:
-            if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
-                return True
-    # A combinator's PRESENCE is uncoverable (codex r7): ``_line1_min_value_bytes``
-    # prices only a flat scalar's own keywords, so it cannot see a ``const`` / long
-    # value hidden inside a branch, nor decide which ``anyOf`` / ``oneOf`` branch a
-    # minimal instance takes. Decline rather than risk under-pricing the minimum.
-    for combinator in ("allOf", "anyOf", "oneOf"):
-        if combinator in schema:
-            return True
-    defs = schema.get("$defs") or schema.get("definitions")
-    if isinstance(defs, dict):
-        for sub in defs.values():
-            if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
-                return True
-    # A ``$ref`` we cannot resolve locally is unpriced -> uncoverable.
-    if "$ref" in schema:
-        return True
     return False
 
 
