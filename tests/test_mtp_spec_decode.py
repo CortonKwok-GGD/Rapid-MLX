@@ -1962,8 +1962,9 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     ``QuantizedLinear`` for ``fc`` / attention projections, and
     ``QuantizedSwitchLinear`` via ``gather_qmm`` for any MoE MTP
     layer) actually reject a float-dtype mismatch between
-    weight/scales/biases/x. Empirically — on this repo's pinned MLX
-    (``mlx>=0.31.2``), on the default GPU (Metal) device — they do
+    weight/scales/biases/x. Empirically — on the default GPU (Metal)
+    device, on both MLX versions this was checked against (0.31.2, the
+    ``mlx>=0.31.2`` floor pyproject declares, and 0.32.0) — they do
     NOT: every fp32/bf16/fp16 combination below (module built fp32
     with mismatched scales/biases, and the reverse: module built
     bf16 with mismatched scales) runs to completion and returns a

@@ -692,10 +692,14 @@ def inject_mtp_support(
         # via ``gather_qmm`` for any MoE layer) TOLERATE a floating-dtype
         # mismatch between weight/scales/biases/x: they silently
         # promote/compute rather than raise. Verified empirically across
-        # fp32/bf16/fp16 combinations in both directions, on this repo's
-        # pinned MLX (``mlx>=0.31.2``), on the default GPU device — see
+        # fp32/bf16/fp16 combinations in both directions, on the default
+        # GPU device, on the two MLX versions tested — 0.31.2 (the
+        # ``mlx>=0.31.2`` floor pyproject declares) and 0.32.0. Because
+        # that floor is an unbounded minimum, tolerance is NOT guaranteed
+        # for an arbitrary future MLX; it is asserted by the canary test
         # ``test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype``
-        # and ``test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts_correctly``
+        # (plus the injector-level
+        # ``test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts_correctly``)
         # in ``tests/test_mtp_spec_decode.py``. If a future MLX version
         # starts rejecting a floating-dtype mismatch, those tests fail
         # first and this check needs tightening to an exact-match — same
