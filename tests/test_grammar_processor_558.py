@@ -2855,6 +2855,22 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert _line1_min_value_bytes(typed_enum) == len('"verylongstring"')  # 16, not 1
     assert _line1_min_value_bytes({"enum": [0, "verylongstring"]}) == len("0")  # 1
 
+    # codex r14 #2: an ``enum`` COMBINED with a numeric bound is UNCOVERABLE — the
+    # shortest member (``0``) can be excluded by a sibling ``minimum``, leaving only a
+    # much longer legal value. Declining fails closed to the non-regressive path.
+    enum_with_bound = {"type": "integer", "enum": [0, 10**100], "minimum": 10**100}
+    assert _line1_schema_has_uncoverable_constraint(enum_with_bound) is True
+    # A required prop whose sub-schema is enum+bound also declines the whole request.
+    enum_bound_prop = {
+        "type": "object",
+        "required": ["n"],
+        "properties": {"n": enum_with_bound},
+    }
+    assert _line1_completion_limit_ok(_Req(enum_bound_prop, max_tokens=4096)) is False
+    # const+bound stays priceable (const value byte length is fixed regardless of bound).
+    const_with_bound = {"type": "integer", "const": 5, "minimum": 1}
+    assert _line1_schema_has_uncoverable_constraint(const_with_bound) is False
+
     # codex r8 #3: a key needing JSON escaping (``a"b`` -> ``a\"b``) must be priced by
     # its full json.dumps serialization, not raw UTF-8 bytes.
     esc_key = {"type": "object", "required": ['a"b\\c'], "properties": {}}
