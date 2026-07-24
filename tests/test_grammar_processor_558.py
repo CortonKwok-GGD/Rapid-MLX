@@ -3080,6 +3080,99 @@ def test_line1_context_room_ok_predicate(monkeypatch):
     )
 
 
+def test_line1_split_reasoning_for_tool_parse():
+    # codex r4 #4: upstream-faithful reasoning-first split. Returns the post-
+    # </think> content the tool parser should see, or None (→ caller full-text
+    # fallback) when no split is available. A tool marker inside <think> must be
+    # discarded so it can never be mis-extracted (spelling-agnostic).
+    from vllm_mlx.routes.chat import _line1_split_reasoning_for_tool_parse
+
+    class _RP:
+        def __init__(self, result):
+            self._result = result
+            self.seen = None
+
+        def extract_reasoning(self, text):
+            self.seen = text
+            if isinstance(self._result, Exception):
+                raise self._result
+            return self._result
+
+    # No parser → None (caller falls back to full-text parse, non-regressive).
+    assert _line1_split_reasoning_for_tool_parse(None, "<think>x</think>call") is None
+
+    # (reasoning, content) → the post-</think> content only; the <think> marker is
+    # never returned, so a sub-token-spelled opener inside it cannot reach the parser.
+    rp = _RP(("some reasoning <tool_call>fake</tool_call>", '{"name":"f"}'))
+    assert (
+        _line1_split_reasoning_for_tool_parse(rp, '<think>...</think>{"name":"f"}')
+        == '{"name":"f"}'
+    )
+    assert rp.seen == '<think>...</think>{"name":"f"}'  # split ran on the full text
+
+    # (reasoning, None) — all-reasoning / no </think> split → "" (NOT the raw think
+    # text), so the tool parser sees nothing and cannot extract an in-think marker.
+    assert _line1_split_reasoning_for_tool_parse(_RP(("all think", None)), "x") == ""
+
+    # (None, None) — parser found no reasoning markers → "" (empty, safe).
+    assert _line1_split_reasoning_for_tool_parse(_RP((None, None)), "x") == ""
+
+    # Parser raises → None (caller full-text fallback; a parser bug must not 500).
+    assert _line1_split_reasoning_for_tool_parse(_RP(RuntimeError("boom")), "x") is None
+
+
+def test_line1_streaming_redirect_gated_on_gate():
+    # codex r4 #4 (streaming half): the MiniMax tool-markup redirect
+    # (StreamingPostProcessor._process_with_reasoning) that promotes in-<think>
+    # reasoning bytes into content must be SKIPPED for line① requests, so a
+    # sub-token-spelled opener inside <think> stays in reasoning. And the route must
+    # DERIVE that flag from the actually-installed grammar's reasoning_gate_id (so
+    # the #1 / r4 #3 disengage paths, which pop the grammar, read False and keep the
+    # load-bearing redirect).
+    import inspect
+    from unittest.mock import MagicMock
+
+    from vllm_mlx.routes import chat as chat_mod
+    from vllm_mlx.service.postprocessor import StreamingPostProcessor
+
+    def _cfg():
+        cfg = MagicMock()
+        cfg.engine = None
+        cfg.reasoning_parser = None
+        cfg.reasoning_parser_name = None
+        cfg.enable_auto_tool_choice = False
+        cfg.tool_call_parser = None
+        cfg.tool_parser_instance = None
+        return cfg
+
+    # Constructor accepts the flag, defaults False (every existing call site / test
+    # keeps the redirect).
+    sig = inspect.signature(StreamingPostProcessor.__init__)
+    assert "line1_gate_engaged" in sig.parameters, (
+        "StreamingPostProcessor must accept line1_gate_engaged"
+    )
+    assert sig.parameters["line1_gate_engaged"].default is False, (
+        "line1_gate_engaged must default False so non-line① requests keep the redirect"
+    )
+    assert StreamingPostProcessor(_cfg())._line1_gate_engaged is False
+    assert StreamingPostProcessor(_cfg(), line1_gate_engaged=True)._line1_gate_engaged
+
+    # The redirect is gated on the flag (not silently removed / always-on).
+    pp_src = inspect.getsource(StreamingPostProcessor._process_with_reasoning)
+    assert "not self._line1_gate_engaged" in pp_src, (
+        "MiniMax redirect must be gated OFF when the reasoning gate is engaged"
+    )
+
+    # The route derives the flag from the installed grammar's reasoning_gate_id.
+    stream_src = inspect.getsource(chat_mod.stream_chat_completion)
+    assert "line1_gate_engaged=" in stream_src, (
+        "streaming route must pass line1_gate_engaged into StreamingPostProcessor"
+    )
+    assert "reasoning_gate_id" in stream_src, (
+        "streaming flag must derive from the installed grammar's reasoning_gate_id"
+    )
+
+
 def test_line1_route_threads_predicate_into_offload_build():
     # Wiring guard (same pattern as ``test_route_offload_gated_on_eligibility_in_
     # source``): the behavioral predicate/coupling tests below prove the units;
@@ -3161,6 +3254,22 @@ def test_line1_route_threads_predicate_into_offload_build():
     )
     assert room_pos < budget_pos, (
         "hard window check must run BEFORE the budget build so allow_tools reflects it"
+    )
+    # codex r4 #4: reasoning-first tool extraction — the route splits reasoning off
+    # FIRST for line① requests (gated on gate-engaged AND no engine structured
+    # calls) and feeds the tool parser only the post-</think> content, so an
+    # in-<think> marker (even sub-token-spelled) can never be mis-extracted.
+    assert "_line1_split_reasoning_for_tool_parse(" in src, (
+        "route must reasoning-first split before tool-parse for line① (codex r4 #4)"
+    )
+    reorder_pos = src.find("_line1_post_think = _line1_split_reasoning_for_tool_parse")
+    gate_guard_pos = src.find("if _line1_gate_engaged and engine_tool_calls is None:")
+    assert gate_guard_pos != -1 and reorder_pos != -1, (
+        "reorder must be gated on line①-engaged AND no engine structured calls "
+        "(preserve the harmony/gemma4 structured-tool bypass)"
+    )
+    assert "# No forced call recovered from the post-" in src, (
+        "reorder must blank cleaned_text on no-call so _finalize re-derives from raw"
     )
 
 

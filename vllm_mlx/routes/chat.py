@@ -1027,6 +1027,47 @@ def _line1_context_room_ok(engine, prompt_tokens, request) -> bool:
     return room > rmt + _line1_min_call_tokens(request)
 
 
+def _line1_split_reasoning_for_tool_parse(reasoning_parser, text):
+    """LINE① (#558, codex r4 #4) — upstream-faithful reasoning-first split.
+
+    Return the post-``</think>`` content the tool parser should see, or ``None``
+    when no split is available (no reasoning parser / parser raised) so the caller
+    falls back to today's full-text parse (strictly non-regressive).
+
+    This mirrors what vLLM (``Parser.parse``: ``reasoning, content =
+    extract_reasoning(model_output)`` then ``_extract_tool_calls(content)``) and
+    SGLang (``_build_chat_response``: ``parse_non_stream`` then ``_process_tool_
+    calls`` on the cleaned text) do for EVERY reasoning model — split reasoning off
+    FIRST, then parse tool calls only on the remainder. Because the split runs on
+    the DECODED string, a tool-call opener that appears inside ``<think>`` — whether
+    a single special token OR reassembled from ordinary sub-tokens — is discarded
+    before the tool parser ever sees it. That is the structural (not best-effort)
+    close for codex r4 #4: masking the opener token id at generation time cannot
+    prove the trigger TEXT is unspellable inside the think span, but reasoning-first
+    extraction makes the span invisible to the tool parser regardless of spelling.
+
+    Applied ONLY when line① is engaged (the caller gates on
+    ``_line1_gate_engaged``): line①'s gate + coupled thinking budget GUARANTEE the
+    real forced call lands strictly AFTER ``</think>``, so parsing only post-think
+    content loses nothing legitimate. Families that legitimately emit a tool call
+    INSIDE ``<think>`` (minimax bare ``<invoke>``, forced-prefix hermes/qwen3) never
+    engage line① — their multi-token openers fail the single-special-token gate —
+    so a blanket reorder is unsafe but this gated one is not. Uses the SAME
+    ``cfg.reasoning_parser`` that ``_finalize_content_and_reasoning`` uses, so the
+    split is consistent with the reasoning the response ultimately reports.
+    """
+    if reasoning_parser is None:
+        return None
+    try:
+        _reasoning, content = reasoning_parser.extract_reasoning(text)
+    except Exception:  # noqa: BLE001 - parser bug must not fail the request
+        return None
+    # ``content is None`` means the parser routed everything to reasoning (no
+    # ``</think>`` split / Case-4 all-reasoning) — there is no legitimate post-think
+    # call, so the tool parser should see an empty string, not the raw think text.
+    return content or ""
+
+
 def _line1_should_probe_seed(request, resolved_thinking) -> bool:
     """LINE① (#558): true iff this request is a CANDIDATE for the reasoning-
     gated forced grammar, so the synchronous seed-state render is worth doing.
@@ -1352,18 +1393,23 @@ def _maybe_build_tool_grammar_processor(
             # unresolvable does NOT get the gate (it keeps the forced-prefix
             # fallback), rather than getting an unprotected gate.
             #
-            # HONEST SCOPE (codex r3 #4): this masks the opener's SPECIAL TOKEN id
-            # — the way a trained reasoning model actually emits a tool call. It is
-            # NOT a structural proof that the trigger TEXT (e.g. ``<tool_call>``)
-            # can never appear: a model could in principle spell it out as ordinary
-            # subtokens inside ``<think>``, which a string-matching parser could
-            # observe. We do not defend against that adversarial spelling here (it
-            # would need stateful multi-token sequence suppression, or the parser
-            # quarantining in-``<think>`` markers entirely — a follow-up). In
-            # practice it was never observed across adversarial probes (trained
-            # models emit the atomic opener token), so this is best-effort
-            # hardening that removes the natural path, not an unconditional
-            # guarantee. See the design note / PR body.
+            # SCOPE (codex r3 #4 / r4 #4): this masks the opener's SPECIAL TOKEN id
+            # at GENERATION time — the way a trained reasoning model actually emits a
+            # tool call. On its own it is NOT a structural proof that the trigger
+            # TEXT (e.g. ``<tool_call>``) can never appear: a model could in principle
+            # spell it out as ordinary subtokens inside ``<think>``. That residual is
+            # now closed at the EXTRACTION layer, which is what actually determines
+            # whether a marker becomes a tool call: the non-streaming path splits
+            # reasoning off FIRST and parses tool calls only on the post-``</think>``
+            # remainder (``_line1_split_reasoning_for_tool_parse``, mirroring
+            # vLLM/SGLang), and the streaming path gates the MiniMax tool-markup
+            # redirect OFF for line① (``StreamingPostProcessor._line1_gate_engaged``)
+            # so an in-``<think>`` marker stays in reasoning. Because both operate on
+            # the DECODED text, they are spelling-agnostic — a subtoken-spelled opener
+            # inside ``<think>`` is discarded before any tool parser sees it. So the
+            # opener mask removes the natural generation path (best-effort) AND the
+            # reasoning-first extraction makes the think span structurally invisible
+            # to tool parsing (guaranteed). See the design note / PR body.
             _line1_tool_start_ids = _resolve_tool_start_exclusion_ids(
                 parser, tokenizer, flat_tools
             )
@@ -4986,9 +5032,36 @@ async def _create_chat_completion_impl(
     # contained literal harmony sentinel substrings (PR #515 codex
     # round-12 / round-14 BLOCKING).
     engine_tool_calls = getattr(output, "tool_calls", None)
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        output.text, request, structured_tool_calls=engine_tool_calls
-    )
+    # LINE① (#558, codex r4 #4) — reasoning-first extraction. When the reasoning
+    # gate is engaged (and the engine did NOT already produce structured calls via
+    # the OutputRouter's channel), split reasoning off FIRST and feed the tool parser
+    # ONLY the post-``</think>`` content — matching vLLM/SGLang, which never let the
+    # tool parser see the ``<think>`` span. This structurally closes the sub-token-
+    # spelling residual (a spelled-out opener inside ``<think>`` is discarded before
+    # tool parsing) that masking the opener token id alone could not. Gated on line①
+    # because the gate GUARANTEES the real call lands after ``</think>`` — families
+    # that legitimately parse a call inside ``<think>`` (minimax / forced-prefix
+    # hermes) never engage line①. Falls back to the full-text parse (today's
+    # behavior) whenever no split is available (non-regressive).
+    _line1_post_think = None
+    if _line1_gate_engaged and engine_tool_calls is None:
+        _line1_post_think = _line1_split_reasoning_for_tool_parse(
+            cfg.reasoning_parser, output.text
+        )
+    if _line1_post_think is not None:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            _line1_post_think, request, structured_tool_calls=engine_tool_calls
+        )
+        if not tool_calls:
+            # No forced call recovered from the post-``</think>`` remainder. Blank
+            # the tool-parser content so ``_finalize_content_and_reasoning`` re-derives
+            # BOTH content and reasoning from the raw text (its ``cleaned_text or
+            # raw_text`` fallback) — identical to today's no-tool-call outcome.
+            cleaned_text = ""
+    else:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            output.text, request, structured_tool_calls=engine_tool_calls
+        )
 
     # r7-A R7-H1: UI-TARS chat-lane coordinate-key parity. The parser
     # emits canonical ``point`` / ``start_point`` / ``end_point``; the
@@ -5610,6 +5683,18 @@ async def stream_chat_completion(
             # route into chat_kwargs and unpacked here) owns this request —
             # #558 single mechanism, decision shared with the non-stream path.
             reasoning_max_tokens=_effective_posthoc_reasoning_cap(kwargs, request),
+            # LINE① (#558, codex r4 #4): derive gate-engaged from the ACTUALLY
+            # installed grammar processor (``reasoning_gate_id is not None``) rather
+            # than a threaded flag — this stays self-consistent with the route's
+            # disengage paths (the #1 context-window check and the r4 #3 reconcile
+            # both ``pop`` the grammar, so a disengaged request reads False here and
+            # keeps the load-bearing MiniMax redirect).
+            line1_gate_engaged=(
+                getattr(
+                    kwargs.get("grammar_logits_processor"), "reasoning_gate_id", None
+                )
+                is not None
+            ),
         )
         processor.set_thinking_model(request.model)
         processor.reset()

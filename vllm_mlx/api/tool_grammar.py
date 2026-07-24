@@ -2517,8 +2517,12 @@ class GrammarLogitsProcessor:
             # call inside ``<think>`` via its natural opener (LINE① / SGLang
             # ``think_excluded_token_ids``). This blocks the atomic opener a trained
             # model actually emits; it is NOT a proof the trigger TEXT can't be
-            # spelled as ordinary subtokens (codex r3 #4 — best-effort, see the
-            # route's think_excluded comment). Everything else is unconstrained. No
+            # spelled as ordinary subtokens (codex r3 #4). That residual is closed at
+            # the EXTRACTION layer, not here: the route's reasoning-first tool parse
+            # (non-streaming) + the line①-gated redirect (streaming) discard any
+            # in-``<think>`` marker before a tool parser sees it, spelling-agnostic
+            # (codex r4 #4 — see the route's ``_line1_split_reasoning_for_tool_parse``
+            # and the think_excluded comment). Everything else is unconstrained. No
             # excluded ids ⇒ fully free (unchanged).
             if self._think_excluded_ids:
                 return self._apply_think_exclusion(logits)
