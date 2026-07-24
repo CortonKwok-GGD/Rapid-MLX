@@ -798,20 +798,32 @@ def _enforce_tool_grammar_bounds_or_400(cfg, request) -> None:
         )
 
 
-# Fixed token cost of the wire envelope a forced call always needs AFTER the
-# budget force-closes </think>: ``<tool_call>{"name":"","arguments":{}}</tool_call>``
-# and a small safety margin. The full floor ADDS the request-specific cost of the
-# tool NAME plus its REQUIRED fields (``_line1_min_call_tokens``), so a long name
-# or a many-required-field schema cannot slip under a flat constant (codex r2 #2).
-_LINE1_CALL_ENVELOPE_TOKENS = 24
+# Conservative token allowance for the wire envelope a forced call always needs
+# AFTER the budget force-closes </think> — the structural wrapper around the payload,
+# e.g. ``<tool_call>{"name":"","arguments":{}}</tool_call>`` or the Harmony/DeepSeek
+# section markers. The full floor ADDS the request-specific cost of the tool NAME
+# plus its REQUIRED fields (``_line1_min_call_tokens``), so a long name or a
+# many-required-field schema cannot slip under a flat constant (codex r2 #2).
+#
+# This is a fixed, tokenizer-INDEPENDENT constant (codex r8 #4): the exact minimal
+# envelope depends on the active parser's wire format and the model's tokenizer, and
+# computing it precisely would need to serialize + tokenize a per-parser skeleton
+# here (out of scope for this front-line guard). ``64`` is a deliberately generous
+# allowance — several times the ~10-20 tokens any supported wire wrapper's EMPTY
+# envelope actually costs — so it over-reserves rather than under-reserves. This
+# whole guard is defensive: when the true minimal call does not fit it declines to
+# the (non-regressive) forced-prefix path, and if a pathologically tokenized envelope
+# ever exceeded even this margin the runtime desync fallback finishes the request
+# under the free-form parser rather than emitting a truncated call.
+_LINE1_CALL_ENVELOPE_TOKENS = 64
 
 
 def _line1_min_value_bytes(schema) -> int:
     """UTF-8 byte length of the SHORTEST JSON value a required field of ``schema``
     can legally take (codex r7 #2/#3). Prices the discrete value keywords the
     uncoverable check no longer declines — ``enum`` (shortest member), ``const``
-    (its exact serialization), and numeric lower bounds (the boundary magnitude
-    forces that many digits). Length-forcing container/string/regex keywords
+    (its exact serialization), and numeric bounds (a lower OR upper bound can force
+    the value's magnitude/sign). Length-forcing container/string/regex keywords
     (``minLength`` / ``minItems`` / ``minProperties`` / ``pattern``) are declined
     upstream by ``_line1_schema_has_uncoverable_constraint`` and never reach here.
 
@@ -833,12 +845,23 @@ def _line1_min_value_bytes(schema) -> int:
             return min(len(json.dumps(m).encode("utf-8")) for m in enum)
         except Exception:  # noqa: BLE001
             return 2
-    for kw in ("minimum", "exclusiveMinimum"):
-        bound = schema.get(kw)
-        if isinstance(bound, (int, float)) and not isinstance(bound, bool):
-            # The value must be >= (or >) this bound, so its shortest JSON spelling
-            # is at least the boundary magnitude's own digit count.
-            return max(1, len(repr(bound).encode("utf-8")))
+    # Numeric bounds (codex r7 #3, r8 #2): a LOWER *or* UPPER bound can force the
+    # shortest valid value to a specific magnitude / sign — e.g. ``{"maximum": -999}``
+    # forbids ``0`` and needs ``"-999"`` (4 bytes), not the 1-byte default. Price the
+    # WORST (longest) present bound's serialization + 1 slack byte: the slack absorbs
+    # a minus sign a positive-bound repr omits and the +1 magnitude rollover of an
+    # exclusive bound (``exclusiveMinimum: 999`` -> shortest is ``1000``).
+    numeric_bounds = [
+        schema.get(kw)
+        for kw in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+    ]
+    numeric_bounds = [
+        b
+        for b in numeric_bounds
+        if isinstance(b, (int, float)) and not isinstance(b, bool)
+    ]
+    if numeric_bounds:
+        return 1 + max(len(repr(b).encode("utf-8")) for b in numeric_bounds)
     t = schema.get("type")
     if t in ("integer", "number"):
         return 1  # "0"
@@ -885,18 +908,24 @@ def _line1_min_call_tokens(request) -> int:
             if isinstance(fn, dict)
             else getattr(fn, "parameters", None)
         )
-        cost = len(name.encode("utf-8")) if isinstance(name, str) else 0
+        # ``json.dumps`` the name/keys (codex r8 #3): a key/name with a quote,
+        # backslash, or control char is ESCAPED on the wire (``a"b`` -> ``a\"b``),
+        # so a raw ``len(...encode())`` under-reserves. ``json.dumps`` emits the exact
+        # wire spelling INCLUDING the surrounding quotes and any escapes.
+        cost = len(json.dumps(name).encode("utf-8")) if isinstance(name, str) else 0
         if isinstance(params, dict):
             required = params.get("required")
             props = params.get("properties")
             if isinstance(required, list):
-                # Each required key is emitted as ``"key":<value>,`` — 4 punctuation
-                # bytes (two quotes, colon, comma) + the key's own UTF-8 bytes + the
-                # shortest legal value's UTF-8 bytes for that property's schema.
+                # Each required key is emitted as ``<json-key>:<value>,`` — the
+                # json.dumps-serialized key (quotes + escapes) + 2 punctuation bytes
+                # (colon, comma) + the shortest legal value's bytes for its schema.
                 for k in required:
                     sub = props.get(k) if isinstance(props, dict) else None
                     cost += (
-                        len(str(k).encode("utf-8")) + 4 + _line1_min_value_bytes(sub)
+                        len(json.dumps(str(k)).encode("utf-8"))
+                        + 2
+                        + _line1_min_value_bytes(sub)
                     )
         worst = max(worst, cost)
     return _LINE1_CALL_ENVELOPE_TOKENS + worst

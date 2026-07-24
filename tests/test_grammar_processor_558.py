@@ -2795,6 +2795,30 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert _line1_min_call_tokens(_Req(big_min)) > 40  # 41-digit boundary priced
     assert _line1_completion_limit_ok(_Req(big_min, max_tokens=80)) is False
 
+    # codex r8 #2: an UPPER / negative bound forbids the 1-byte default value —
+    # ``maximum:-999`` needs at least ``"-999"`` (4 bytes), which must be priced.
+    neg_max = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer", "maximum": -999}},
+    }
+    bare_int = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer"}},
+    }
+    assert _line1_min_call_tokens(_Req(neg_max)) > _line1_min_call_tokens(
+        _Req(bare_int)
+    )
+
+    # codex r8 #3: a key needing JSON escaping (``a"b`` -> ``a\"b``) must be priced by
+    # its full json.dumps serialization, not raw UTF-8 bytes.
+    esc_key = {"type": "object", "required": ['a"b\\c'], "properties": {}}
+    plain_key = {"type": "object", "required": ["a_b_c"], "properties": {}}
+    assert _line1_min_call_tokens(_Req(esc_key)) > _line1_min_call_tokens(
+        _Req(plain_key)
+    )
+
     # A small const / small numeric bound is priced cheaply → stays engaged.
     assert (
         _line1_completion_limit_ok(
