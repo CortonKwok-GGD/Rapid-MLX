@@ -806,20 +806,70 @@ def _enforce_tool_grammar_bounds_or_400(cfg, request) -> None:
 _LINE1_CALL_ENVELOPE_TOKENS = 24
 
 
+def _line1_min_value_bytes(schema) -> int:
+    """UTF-8 byte length of the SHORTEST JSON value a required field of ``schema``
+    can legally take (codex r7 #2/#3). Prices the discrete value keywords the
+    uncoverable check no longer declines — ``enum`` (shortest member), ``const``
+    (its exact serialization), and numeric lower bounds (the boundary magnitude
+    forces that many digits). Length-forcing container/string/regex keywords
+    (``minLength`` / ``minItems`` / ``minProperties`` / ``pattern``) are declined
+    upstream by ``_line1_schema_has_uncoverable_constraint`` and never reach here.
+
+    Bytes, not Python chars: a decoded token spans >=1 byte, so a byte count is a
+    PROVABLE upper bound on the value's token count (codex r7 #4) — a multi-byte
+    identifier that a ``len(str(...))`` char count would UNDER-reserve is bounded
+    correctly here.
+    """
+    if not isinstance(schema, dict):
+        return 2  # unknown scalar -> '""' / '0'
+    if "const" in schema:
+        try:
+            return len(json.dumps(schema["const"]).encode("utf-8"))
+        except Exception:  # noqa: BLE001 - unserializable -> small conservative default
+            return 2
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        try:
+            return min(len(json.dumps(m).encode("utf-8")) for m in enum)
+        except Exception:  # noqa: BLE001
+            return 2
+    for kw in ("minimum", "exclusiveMinimum"):
+        bound = schema.get(kw)
+        if isinstance(bound, (int, float)) and not isinstance(bound, bool):
+            # The value must be >= (or >) this bound, so its shortest JSON spelling
+            # is at least the boundary magnitude's own digit count.
+            return max(1, len(repr(bound).encode("utf-8")))
+    t = schema.get("type")
+    if t in ("integer", "number"):
+        return 1  # "0"
+    if t == "boolean":
+        return 5  # "false" (upper bound of true/false)
+    if t == "null":
+        return 4  # "null"
+    return 2  # string ('""'), empty object/array ('{}' / '[]'), or unknown scalar
+
+
 def _line1_min_call_tokens(request) -> int:
-    """A CONSERVATIVE lower bound on the tokens a minimal forced call needs after
-    ``</think>`` for THIS request's tools (codex r2 #2).
+    """A CONSERVATIVE upper bound on the tokens a minimal forced call needs after
+    ``</think>`` for THIS request's tools (codex r2 #2 / r7 #2-#4).
 
     A flat constant (the previous ``16``) let a long tool name / large required
     schema pass the guard yet still truncate under a tight ``max_tokens``. Derive
     the floor from the wire envelope PLUS the request's own worst-case tool: the
-    longest candidate NAME and its REQUIRED-field skeleton (``"field":v,`` per
-    required key). Character length is a deliberately conservative token
-    over-estimate (a special-token name is one token, plain text a few chars per
-    token), so the guard OVER-reserves — it never claims room it can't back. It is
-    a heuristic, not a proof of the compiled grammar's exact minimum; the exact
-    minimum is unknowable without compiling+measuring, so we intentionally lean
-    conservative and decline to the forced-prefix fallback when unsure.
+    longest candidate NAME and its REQUIRED-field skeleton (``"key":<value>,`` per
+    required key), where ``<value>`` is priced by ``_line1_min_value_bytes`` (an
+    empty string, a bool, an enum's shortest member, a const's serialization, or a
+    numeric bound's digit count — codex r7 #2/#3, so a coverable enum / numeric
+    field's own bytes are counted, not just its key).
+
+    UTF-8 BYTES, not Python chars (codex r7 #4): every decoded token spans >=1
+    byte, so a byte count is a PROVABLE upper bound on token count — a multi-byte
+    tool name or key that a ``len(str(...))`` char count would UNDER-reserve (1
+    char, several tokens) is bounded correctly. The guard therefore OVER-reserves
+    and never claims room it can't back. It remains a heuristic, not a proof of the
+    compiled grammar's exact minimum; the truly unpriceable shapes are declined
+    upstream (``_line1_schema_has_uncoverable_constraint``), so we lean conservative
+    and fall back to the forced-prefix path when unsure.
     """
     tools = getattr(request, "tools", None) or []
     worst = 0
@@ -835,38 +885,42 @@ def _line1_min_call_tokens(request) -> int:
             if isinstance(fn, dict)
             else getattr(fn, "parameters", None)
         )
-        cost = len(name) if isinstance(name, str) else 0
+        cost = len(name.encode("utf-8")) if isinstance(name, str) else 0
         if isinstance(params, dict):
             required = params.get("required")
+            props = params.get("properties")
             if isinstance(required, list):
-                # Each required key must be emitted as ``"key":<value>,`` — count
-                # the key plus a small fixed allowance for quotes/colon/value/comma.
-                cost += sum(len(str(k)) + 6 for k in required)
+                # Each required key is emitted as ``"key":<value>,`` — 4 punctuation
+                # bytes (two quotes, colon, comma) + the key's own UTF-8 bytes + the
+                # shortest legal value's UTF-8 bytes for that property's schema.
+                for k in required:
+                    sub = props.get(k) if isinstance(props, dict) else None
+                    cost += (
+                        len(str(k).encode("utf-8")) + 4 + _line1_min_value_bytes(sub)
+                    )
         worst = max(worst, cost)
     return _LINE1_CALL_ENVELOPE_TOKENS + worst
 
 
-# JSON-Schema keywords that can push a VALID instance's minimum size ARBITRARILY
-# above the flat name+required-skeleton floor ``_line1_min_call_tokens`` models
-# (codex r3 #2): a 1,000-char ``minLength`` / ``const``, an ``enum`` value, a
-# ``minItems`` array of objects, a ``pattern`` forcing a long literal, a
-# ``minProperties`` map, or a required NESTED object whose own required fields the
-# flat estimator never descends into. We do NOT try to price these exactly (that
-# needs compiling+measuring the grammar); instead their mere PRESENCE anywhere in
-# a forced tool's schema makes the floor unprovable, so a BOUNDED request declines
-# the gate to the forced-prefix fallback (non-regressive) rather than admit a gate
-# whose call might not fit.
+# JSON-Schema keywords whose minimal VALID instance the byte-priced floor
+# ``_line1_min_call_tokens`` cannot bound, because their length is not a discrete
+# per-field value we can serialize and measure (codex r3 #2 / r7):
+#   * ``minLength`` — a string forced to N chars (N unbounded, char->byte fuzzy),
+#   * ``minItems`` — an array forced to N (possibly nested) elements,
+#   * ``minProperties`` — a map forced to N members,
+#   * ``pattern`` — a regex that can force an arbitrarily long literal.
+# Their mere PRESENCE anywhere in a forced tool's schema makes the floor unprovable,
+# so a BOUNDED request declines the gate to the forced-prefix fallback
+# (non-regressive) rather than admit a gate whose call might not fit.
 #
-# ``enum`` (codex r6 B1): reverted to blanket-unbounded. An enum member's own bytes
-# are never added to ``_line1_min_call_tokens`` (which prices only the required-key
-# SKELETON), and whether a minimal instance even instantiates a given enum depends
-# on which schema branch (``oneOf`` / ``anyOf`` / ``items`` / optional-vs-required)
-# the grammar takes — undecidable for the flat estimator. So an ``enum`` makes the
-# exact floor unprovable exactly like the other keywords here; a bounded request
-# declines to the (non-regressive) forced-prefix fallback rather than admit a gate
-# whose shortest valid call might not fit a tight ``max_tokens``.
+# ``enum`` / ``const`` / numeric bounds (``minimum`` etc.) are DELIBERATELY NOT here
+# (codex r7 #2/#3): each is a discrete value whose shortest legal serialization
+# ``_line1_min_value_bytes`` prices exactly into the floor, so the gate stays
+# engaged for the canonical enum-/range-constrained tool arg instead of always
+# falling back to the unconstrained forced prefix — while a pathologically long
+# member / bound still inflates the priced floor and declines on its own.
 _LINE1_UNBOUNDED_MIN_KEYWORDS = frozenset(
-    {"minLength", "minItems", "minProperties", "const", "pattern", "enum"}
+    {"minLength", "minItems", "minProperties", "pattern"}
 )
 
 
@@ -906,12 +960,13 @@ def _line1_schema_has_uncoverable_constraint(schema, _depth: int = 0) -> bool:
         for sub in items:
             if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
                 return True
+    # A combinator's PRESENCE is uncoverable (codex r7): ``_line1_min_value_bytes``
+    # prices only a flat scalar's own keywords, so it cannot see a ``const`` / long
+    # value hidden inside a branch, nor decide which ``anyOf`` / ``oneOf`` branch a
+    # minimal instance takes. Decline rather than risk under-pricing the minimum.
     for combinator in ("allOf", "anyOf", "oneOf"):
-        branch = schema.get(combinator)
-        if isinstance(branch, list):
-            for sub in branch:
-                if _line1_schema_has_uncoverable_constraint(sub, _depth + 1):
-                    return True
+        if combinator in schema:
+            return True
     defs = schema.get("$defs") or schema.get("definitions")
     if isinstance(defs, dict):
         for sub in defs.values():
@@ -1060,12 +1115,27 @@ def _line1_split_reasoning_for_tool_parse(reasoning_parser, text):
     SGLang (``_build_chat_response``: ``parse_non_stream`` then ``_process_tool_
     calls`` on the cleaned text) do for EVERY reasoning model — split reasoning off
     FIRST, then parse tool calls only on the remainder. Because the split runs on
-    the DECODED string, a tool-call opener that appears inside ``<think>`` — whether
-    a single special token OR reassembled from ordinary sub-tokens — is discarded
-    before the tool parser ever sees it. That is the structural (not best-effort)
-    close for codex r4 #4: masking the opener token id at generation time cannot
-    prove the trigger TEXT is unspellable inside the think span, but reasoning-first
-    extraction makes the span invisible to the tool parser regardless of spelling.
+    the DECODED string, a tool-call opener that appears inside ``<think>`` is
+    discarded before the tool parser ever sees it. That is the structural (not
+    best-effort) close for codex r4 #4: masking the opener token id at generation
+    time cannot prove the trigger TEXT is unspellable inside the think span, but
+    reasoning-first extraction discards that span before the parser runs.
+
+    KNOWN RESIDUAL (codex r7 #1), matching upstream: the split boundary is the
+    DECODED ``</think>`` text, whereas the runtime grammar gate opens on the ATOMIC
+    ``</think>`` token id (``ReasonerGrammarObject``: ``int(t) == reasoning_end_id``).
+    The two agree for every honest model (a reasoning model emits ``</think>`` as its
+    template's atomic special token), but an ADVERSARIAL model that sub-token-SPELLS
+    both ``</think>`` and a tool opener inside its reasoning could plant a false text
+    boundary the splitter honours. We deliberately do NOT preserve a token-id
+    boundary here: (a) vLLM/SGLang — the sources this mirrors — also split on decoded
+    text and carry the same residual, so closing it would EXCEED the upstream
+    contract raullen scoped this to; (b) it is strictly NON-REGRESSIVE — the pre-line①
+    path parsed tool calls on the ENTIRE raw output including all reasoning, so
+    reasoning-first extraction only ever SHRINKS this surface; (c) the coupled budget
+    force-closes the real atomic ``</think>`` regardless, so a well-behaved call still
+    lands after the true boundary. A token-id-anchored split (thread the gen-time gate
+    position into post-processing) is the sound-but-beyond-upstream follow-up.
 
     FAIL CLOSED (codex r5 #3, r6 B2/B3): the configured ``cfg.reasoning_parser``
     (consistent with ``_finalize_content_and_reasoning``) is tried first, but its

@@ -2741,11 +2741,15 @@ def test_line1_resolve_tool_start_exclusion_ids():
 
 
 def test_line1_completion_limit_declines_uncoverable_schema():
-    # codex r3 #2 — a BOUNDED request whose schema carries a value/shape constraint
-    # the flat floor cannot price (minLength / const / nested-required / $ref) must
-    # DECLINE the gate rather than admit a call that might not fit.
+    # codex r3 #2 / r7 #2-#4 — the completion-limit gate. A DISCRETE serializable
+    # value keyword (enum / const / numeric bound) is PRICED into the byte floor and
+    # stays coverable; shape/length-forcing keywords the flat pricer cannot bound
+    # (minLength / minItems / minProperties / pattern / nested-required / $ref /
+    # combinators) DECLINE a bounded request to the (non-regressive) forced-prefix
+    # fallback.
     from vllm_mlx.routes.chat import (
         _line1_completion_limit_ok,
+        _line1_min_call_tokens,
         _line1_schema_has_uncoverable_constraint,
     )
 
@@ -2760,29 +2764,88 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     assert _line1_schema_has_uncoverable_constraint(plain) is False
     assert _line1_completion_limit_ok(_Req(plain)) is True
 
-    # ``enum`` is UNCOVERABLE (codex r6 B1 revert): an enum member's own bytes are
-    # never priced into the flat floor, and whether a minimal instance instantiates a
-    # given enum depends on the schema branch taken — undecidable for the estimator.
-    # Even a short enum therefore declines to the (non-regressive) forced-prefix path.
+    # codex r7 #2: a short enum is COVERABLE — its shortest member is PRICED into the
+    # floor (not blanket-declined), so the canonical enum-constrained arg keeps the
+    # grammar engaged when there is room, instead of always dropping to forced-prefix.
     small_enum = {"type": "object", "properties": {"a": {"enum": ["celsius", "f"]}}}
-    assert _line1_schema_has_uncoverable_constraint(small_enum) is True
-    assert _line1_completion_limit_ok(_Req(small_enum)) is False
+    assert _line1_schema_has_uncoverable_constraint(small_enum) is False
+    assert _line1_completion_limit_ok(_Req(small_enum)) is True
 
-    # Each uncoverable keyword forces a decline for a BOUNDED request.
+    # codex r7 #2/#3 (pricing, retroactively closing r6 B1): the enum member's / the
+    # numeric bound's OWN bytes enter the floor, so a value too large for a TIGHT
+    # max_tokens declines even though the keyword itself is "coverable".
+    long_enum = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"enum": ["y" * 200]}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(long_enum) is False
+    assert _line1_min_call_tokens(_Req(long_enum)) > 200  # the 200-byte member priced
+    assert _line1_completion_limit_ok(_Req(long_enum, max_tokens=4096)) is True  # room
+    assert (
+        _line1_completion_limit_ok(_Req(long_enum, max_tokens=128)) is False
+    )  # priced out
+
+    big_min = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"type": "integer", "minimum": 10**40}},
+    }
+    assert _line1_schema_has_uncoverable_constraint(big_min) is False
+    assert _line1_min_call_tokens(_Req(big_min)) > 40  # 41-digit boundary priced
+    assert _line1_completion_limit_ok(_Req(big_min, max_tokens=80)) is False
+
+    # A small const / small numeric bound is priced cheaply → stays engaged.
+    assert (
+        _line1_completion_limit_ok(
+            _Req({"type": "object", "properties": {"a": {"const": "ok"}}})
+        )
+        is True
+    )
+    assert (
+        _line1_completion_limit_ok(
+            _Req(
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer", "minimum": 0}},
+                }
+            )
+        )
+        is True
+    )
+
+    # codex r7 #4: a multi-byte identifier a ``len(str(...))`` char count would
+    # UNDER-reserve is bounded by UTF-8 BYTES (>=1 byte per token), so its floor
+    # exceeds the naive char count.
+    multibyte = {
+        "type": "object",
+        "required": ["日本語"],
+        "properties": {"日本語": {"type": "string"}},
+    }
+    assert _line1_min_call_tokens(_Req(multibyte)) > len("日本語") + 6
+
+    # Shape/length-forcing keywords the flat pricer cannot bound → DECLINE (bounded).
     for params in (
         {"type": "object", "properties": {"a": {"type": "string", "minLength": 1000}}},
-        {"type": "object", "properties": {"a": {"const": "x" * 500}}},
         {
             "type": "object",
             "properties": {"a": {"type": "string", "pattern": "^.{99}$"}},
         },
-        # any enum (short or long) is unbounded for the flat floor
-        {"type": "object", "properties": {"a": {"enum": ["y" * 200]}}},
         {"type": "object", "properties": {"a": {"type": "array", "minItems": 3}}},
-        # nested required object whose inner constraint the flat floor never descends
+        {"type": "object", "properties": {"a": {"type": "object", "minProperties": 4}}},
+        # combinator PRESENCE is uncoverable — the pricer can't see the minimal branch
+        {"type": "object", "properties": {"a": {"anyOf": [{"const": "x" * 500}]}}},
+        {"type": "object", "properties": {"a": {"oneOf": [{"type": "string"}]}}},
+        # nested required object whose inner skeleton the flat floor never descends
         {
             "type": "object",
-            "properties": {"a": {"type": "object", "properties": {"b": {"const": 1}}}},
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "required": ["b"],
+                    "properties": {"b": {"type": "string"}},
+                }
+            },
         },
         {"$ref": "#/$defs/Foo"},
     ):
@@ -2793,7 +2856,16 @@ def test_line1_completion_limit_declines_uncoverable_schema():
     # max_tokens=None request with such a schema must ALSO decline (the flat context
     # floor cannot price the schema minimum, so the gate would strand the call).
     assert (
-        _line1_completion_limit_ok(_Req({"const": "x" * 500}, max_tokens=None)) is False
+        _line1_completion_limit_ok(
+            _Req(
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string", "minLength": 1000}},
+                },
+                max_tokens=None,
+            )
+        )
+        is False
     )
 
     # codex r4 #2 — a NESTED ``required`` (no value keyword at all) is uncoverable
@@ -3144,9 +3216,7 @@ def test_line1_split_reasoning_for_tool_parse():
     # reasoning is None must be IGNORED and the helper must fall through to the literal
     # split — the in-<think> marker must NOT survive into the returned string.
     leaky = "<think>plot <tool_call>evil</tool_call></think>call"
-    assert (
-        _line1_split_reasoning_for_tool_parse(_RP((None, leaky)), leaky) == "call"
-    )
+    assert _line1_split_reasoning_for_tool_parse(_RP((None, leaky)), leaky) == "call"
     # (None, None) — parser found no reasoning markers → "" (empty, safe).
     assert _line1_split_reasoning_for_tool_parse(_RP((None, None)), "x") == ""
 
