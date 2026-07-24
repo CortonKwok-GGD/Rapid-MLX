@@ -2074,34 +2074,64 @@ def _mtp_path_label(model_path: str, cfg: "ModelConfig") -> str:
     return "disabled"
 
 
+# Upper bounds for the small metadata files this module reads off local
+# disk. A cached/hostile checkpoint could ship a multi-gigabyte ``config.json``
+# or ``model.safetensors.index.json``; both are normally < 1 MB, so reject
+# anything wildly larger before handing it to ``json`` rather than allocate
+# the read (codex #1202 round 3). Generous headroom over real checkpoints.
+_CONFIG_JSON_MAX_BYTES = 8_000_000
+_SAFETENSORS_INDEX_MAX_BYTES = 64_000_000
+
+
+def _read_bounded_json(path: str, max_bytes: int) -> Any:
+    """Parse JSON from ``path`` iff it is at most ``max_bytes``; else ``None``.
+
+    Size-checks before reading so an oversized/hostile file can't force a
+    huge allocation. Returns ``None`` on oversize, missing file, or any
+    parse/IO error (callers treat that as "couldn't read").
+    """
+    import json as _json
+    import os as _os
+
+    try:
+        if _os.path.getsize(path) > max_bytes:
+            return None
+        with open(path, "rb") as fh:
+            return _json.loads(fh.read(max_bytes))
+    except Exception:
+        return None
+
+
 def _load_hf_config_cached(model_path: str, cfg: "ModelConfig") -> "dict | None":
     """Read ``config.json`` for ``model_path`` from the LOCAL HF cache only.
 
     No network fetch — mirrors ``cli._gather_kv_cache_dtype_inputs``. Handles
     both a local checkpoint directory (``config.json`` on disk) and an HF
     repo id resolved through ``huggingface_hub.try_to_load_from_cache``.
-    Returns ``None`` on any miss / parse failure so callers degrade to the
-    weight-free label rather than crash.
+    Returns ``None`` on any miss / parse failure, on an oversized file, or
+    when the parsed value is not a JSON object — so callers always get a
+    ``dict`` or ``None`` and degrade to the weight-free label rather than
+    crash (codex #1202 round 3).
     """
-    import json as _json
     import os as _os
 
     hf_path = getattr(cfg, "hf_path", None) or model_path
     try:
         # Local checkpoint directory passed straight through.
         local = _os.path.join(str(hf_path), "config.json")
-        if _os.path.isfile(local):
-            with open(local) as fh:
-                return _json.load(fh)
-        from huggingface_hub import try_to_load_from_cache as _cache_lookup
+        path: str | None = local if _os.path.isfile(local) else None
+        if path is None:
+            from huggingface_hub import try_to_load_from_cache as _cache_lookup
 
-        cached = _cache_lookup(repo_id=str(hf_path), filename="config.json")
-        if cached and _os.path.exists(cached):
-            with open(cached) as fh:
-                return _json.load(fh)
+            cached = _cache_lookup(repo_id=str(hf_path), filename="config.json")
+            if isinstance(cached, str) and _os.path.isfile(cached):
+                path = cached
     except Exception:
         return None
-    return None
+    if path is None:
+        return None
+    data = _read_bounded_json(path, _CONFIG_JSON_MAX_BYTES)
+    return data if isinstance(data, dict) else None
 
 
 # ``model_type`` values whose native MTP head tensors are named with an
@@ -2140,8 +2170,9 @@ def _local_weight_tensor_names(
     hf_path = getattr(cfg, "hf_path", None) or model_path
 
     def _from_index(path: str) -> "list[str] | None":
-        with open(path) as fh:
-            data = _json.load(fh)
+        # Bounded read — a hostile/oversized index must not force a huge
+        # allocation (codex #1202 round 3).
+        data = _read_bounded_json(path, _SAFETENSORS_INDEX_MAX_BYTES)
         weight_map = data.get("weight_map") if isinstance(data, dict) else None
         # A syntactically valid but structurally broken index (missing /
         # empty ``weight_map``) must NOT be read as "zero tensors" — that
@@ -2208,16 +2239,16 @@ def _local_weight_tensor_names(
 
 
 def _weight_names_have_mtp_head(tensor_names: "list[str]") -> bool:
-    """True when any tensor name carries an ``mtp`` path segment.
+    """True when any tensor name carries an exact ``mtp`` path segment.
 
     The native Qwen3.5 / Qwen3.6 MTP head lives at ``model.mtp.*``; a
-    published sidecar carries ``mtp.*``. Matching a dot-delimited segment
-    that starts with ``mtp`` (``mtp``, ``mtp.layers``…) identifies the head
-    without false-matching unrelated tensors.
+    published sidecar carries ``mtp.*`` — in both cases ``mtp`` is its own
+    dot-delimited segment. Matching the EXACT segment (``seg == "mtp"``, not
+    a ``startswith`` prefix) avoids counting unrelated tensors like
+    ``mtp_adapter`` / ``mtp_cache`` as proof the head exists, which would
+    wrongly suppress the declared-but-absent diagnosis (codex #1202 round 3).
     """
-    return any(
-        seg.startswith("mtp") for name in tensor_names for seg in name.split(".")
-    )
+    return any(seg == "mtp" for name in tensor_names for seg in name.split("."))
 
 
 def _mtp_declared_absent_layers(model_path: str, cfg: "ModelConfig") -> int | None:

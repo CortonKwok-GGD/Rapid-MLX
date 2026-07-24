@@ -2812,11 +2812,19 @@ class TestMtpDeclaredAbsentReconciliation:
     def test_weight_names_have_mtp_head_detector(self):
         # Direct unit for the segment matcher used to confirm head presence.
         assert auto_config_mod._weight_names_have_mtp_head(self._WITH_MTP_TENSORS)
+        # Sidecar layout (``mtp.*`` prefix) is also a valid exact segment.
+        assert auto_config_mod._weight_names_have_mtp_head(
+            ["mtp.layers.0.q_proj.weight"]
+        )
         assert not auto_config_mod._weight_names_have_mtp_head(self._NO_MTP_TENSORS)
-        # ``mtp`` must match only as a path segment, not a substring of an
-        # unrelated token.
+        # ``mtp`` must match only as an EXACT dot-delimited segment — neither a
+        # substring of an unrelated token nor a ``mtp``-prefixed sibling module
+        # (codex #1202 round 3).
         assert not auto_config_mod._weight_names_have_mtp_head(
             ["model.layers.0.attempts.weight"]
+        )
+        assert not auto_config_mod._weight_names_have_mtp_head(
+            ["model.mtp_adapter.0.weight", "model.mtp_cache.weight"]
         )
 
     def test_none_when_spec_decode_on(self, monkeypatch):
@@ -3005,3 +3013,56 @@ class TestLocalWeightTensorNames:
             )
             is None
         )
+
+    def test_oversized_index_returns_none(self, tmp_path, monkeypatch):
+        import json
+
+        self._write(
+            tmp_path,
+            "model.safetensors.index.json",
+            json.dumps({"weight_map": {"model.mtp.w": "s.safetensors"}}).encode(),
+        )
+        # Force the bound below the file size so the size-cap path trips
+        # without writing a genuinely huge file.
+        monkeypatch.setattr(auto_config_mod, "_SAFETENSORS_INDEX_MAX_BYTES", 4)
+        assert (
+            auto_config_mod._local_weight_tensor_names(
+                str(tmp_path), self._cfg(tmp_path)
+            )
+            is None
+        )
+
+
+class TestLoadHfConfigCached:
+    """``_load_hf_config_cached`` must always return a ``dict`` or ``None`` —
+    never a bare JSON scalar/list — and must bound the read (codex #1202
+    round 3), so a malformed cached ``config.json`` can't crash ``info``.
+    """
+
+    def _write_config(self, directory, data: bytes):
+        import os
+
+        with open(os.path.join(str(directory), "config.json"), "wb") as fh:
+            fh.write(data)
+
+    def test_non_dict_config_returns_none(self, tmp_path):
+        # A JSON list is valid JSON but not a config object ⇒ None, not a list.
+        self._write_config(tmp_path, b'["not", "a", "config"]')
+        cfg = ModelConfig(hf_path=str(tmp_path))
+        assert auto_config_mod._load_hf_config_cached(str(tmp_path), cfg) is None
+
+    def test_dict_config_returns_dict(self, tmp_path):
+        import json
+
+        self._write_config(tmp_path, json.dumps({"model_type": "qwen3_5"}).encode())
+        cfg = ModelConfig(hf_path=str(tmp_path))
+        out = auto_config_mod._load_hf_config_cached(str(tmp_path), cfg)
+        assert isinstance(out, dict) and out["model_type"] == "qwen3_5"
+
+    def test_oversized_config_returns_none(self, tmp_path, monkeypatch):
+        import json
+
+        self._write_config(tmp_path, json.dumps({"model_type": "qwen3_5"}).encode())
+        monkeypatch.setattr(auto_config_mod, "_CONFIG_JSON_MAX_BYTES", 2)
+        cfg = ModelConfig(hf_path=str(tmp_path))
+        assert auto_config_mod._load_hf_config_cached(str(tmp_path), cfg) is None
