@@ -1967,22 +1967,48 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     ``mlx>=0.31.2`` floor pyproject declares, and 0.32.0) — they do
     NOT: every fp32/bf16/fp16 combination below (module built fp32
     with mismatched scales/biases, and the reverse: module built
-    bf16 with mismatched scales) runs to completion and returns a
-    finite tensor, never raises. MLX silently promotes/computes
+    bf16 with mismatched scales) runs to completion AND returns the
+    RIGHT numbers, never raising. MLX silently promotes/computes
     across floating dtypes here, it does not enforce an exact match.
 
-    This test is the tripwire: if a future MLX bump starts raising on
-    ANY of these combinations, this test fails FIRST — before an
-    operator sees an intermittent empty response — and the by-role
-    dtype check in ``qwen3_5_inject.py`` (which currently accepts any
-    floating dtype for scales/biases) needs to be tightened to an
-    exact-match check for the affected op.
+    "Tolerate" is asserted as numerical CLOSENESS to a matched-dtype
+    baseline, not merely finiteness (codex BLOCKING on PR #1206): a
+    future MLX that silently returned finite-but-wrong output for a
+    mixed-dtype call would keep a finiteness-only test green, so each
+    mismatched case is compared against its own matched-dtype control
+    within a generous tolerance (well above the measured ~0.02-abs
+    bf16-rounding noise at this magnitude, far below the
+    order-of-magnitude error garbage would produce).
+
+    This test is the tripwire: if a future MLX bump starts raising on —
+    OR silently corrupting — ANY of these combinations, this test fails
+    FIRST, before an operator sees an intermittent empty response, and
+    the by-role dtype check in ``qwen3_5_inject.py`` (which currently
+    accepts any floating dtype for scales/biases) needs to be tightened
+    to an exact-match check for the affected op.
     """
     import mlx.core as _mx
     import mlx.nn as _nn
 
     group_size, bits = 64, 4
     in_dims = out_dims = 128
+
+    # Generous tolerance: tracks the "MLX still does the math across the
+    # dtype mismatch" contract without being brittle to bf16/fp16
+    # rounding, while still failing a truly divergent ("finite garbage")
+    # result.
+    _ATOL, _RTOL = 0.2, 0.1
+
+    def _close(mismatch, baseline):
+        return bool(
+            _mx.all(
+                _mx.isfinite(mismatch)
+                & (
+                    _mx.abs(mismatch.astype(_mx.float32) - baseline.astype(_mx.float32))
+                    <= _ATOL + _RTOL * _mx.abs(baseline.astype(_mx.float32))
+                )
+            ).item()
+        )
 
     def quantized_linear(param_dtype):
         lin = _nn.Linear(in_dims, out_dims, bias=False)
@@ -1991,12 +2017,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         _mx.eval(qlin.parameters())
         return qlin
 
-    fp32_layer = quantized_linear(_mx.float32)
-    bf16_layer = quantized_linear(_mx.bfloat16)
-    x_fp32 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.float32)
-    x_bf16 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.bfloat16)
-
-    def matmul_ok(x, weight, scales, biases):
+    def matmul(x, weight, scales, biases):
         out = _mx.quantized_matmul(
             x,
             weight,
@@ -2007,44 +2028,64 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
             bits=bits,
         )
         _mx.eval(out)
-        assert bool(_mx.all(_mx.isfinite(out)).item()), (
-            "mismatched-dtype matmul produced non-finite output"
-        )
         return out
 
-    # fp32 module, scales/biases forced to bf16 / fp16 (both directions
-    # the codex finding names: "module built for fp32 activations but
-    # scales forced to bf16 or fp16").
-    matmul_ok(
-        x_fp32,
-        fp32_layer.weight,
-        fp32_layer.scales.astype(_mx.bfloat16),
-        fp32_layer.biases,
+    fp32_layer = quantized_linear(_mx.float32)
+    bf16_layer = quantized_linear(_mx.bfloat16)
+    x_fp32 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.float32)
+    x_bf16 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.bfloat16)
+
+    # fp32 module + fp32 input: matched-dtype baseline, then every
+    # scales/biases-forced-to-bf16/fp16 mismatch must land close to it
+    # ("module built for fp32 activations but scales forced to bf16/fp16").
+    ctrl_fp32 = matmul(x_fp32, fp32_layer.weight, fp32_layer.scales, fp32_layer.biases)
+    assert _close(
+        matmul(
+            x_fp32,
+            fp32_layer.weight,
+            fp32_layer.scales.astype(_mx.bfloat16),
+            fp32_layer.biases,
+        ),
+        ctrl_fp32,
     )
-    matmul_ok(
-        x_fp32,
-        fp32_layer.weight,
-        fp32_layer.scales,
-        fp32_layer.biases.astype(_mx.bfloat16),
+    assert _close(
+        matmul(
+            x_fp32,
+            fp32_layer.weight,
+            fp32_layer.scales,
+            fp32_layer.biases.astype(_mx.bfloat16),
+        ),
+        ctrl_fp32,
     )
-    matmul_ok(
-        x_fp32,
-        fp32_layer.weight,
-        fp32_layer.scales.astype(_mx.float16),
-        fp32_layer.biases,
+    assert _close(
+        matmul(
+            x_fp32,
+            fp32_layer.weight,
+            fp32_layer.scales.astype(_mx.float16),
+            fp32_layer.biases,
+        ),
+        ctrl_fp32,
     )
-    matmul_ok(
-        x_fp32,
-        fp32_layer.weight,
-        fp32_layer.scales.astype(_mx.bfloat16),
-        fp32_layer.biases.astype(_mx.bfloat16),
+    assert _close(
+        matmul(
+            x_fp32,
+            fp32_layer.weight,
+            fp32_layer.scales.astype(_mx.bfloat16),
+            fp32_layer.biases.astype(_mx.bfloat16),
+        ),
+        ctrl_fp32,
     )
-    # ... "and the reverse": bf16 module, scales forced to fp32.
-    matmul_ok(
-        x_bf16,
-        bf16_layer.weight,
-        bf16_layer.scales.astype(_mx.float32),
-        bf16_layer.biases,
+    # ... "and the reverse": bf16 module + bf16 input baseline, then
+    # scales forced to fp32 must land close to it.
+    ctrl_bf16 = matmul(x_bf16, bf16_layer.weight, bf16_layer.scales, bf16_layer.biases)
+    assert _close(
+        matmul(
+            x_bf16,
+            bf16_layer.weight,
+            bf16_layer.scales.astype(_mx.float32),
+            bf16_layer.biases,
+        ),
+        ctrl_bf16,
     )
 
     # The MoE path (SwitchGLU / QuantizedSwitchLinear -> gather_qmm) —
@@ -2054,7 +2095,8 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     # (a) fp32 module/input with mismatched bf16/fp16 sidecar scales, and
     # (b) the reverse — a bf16 module/input with mismatched fp32 scales,
     # which is exactly the "fp32 scales for a bf16 MoE module" config the
-    # by-role check accepts.
+    # by-role check accepts. Each mismatch is checked against its own
+    # matched-dtype baseline, same as the dense path above.
     from mlx_lm.models.switch_layers import SwitchGLU
 
     num_experts, top_k = 4, 2
@@ -2071,7 +2113,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         _mx.eval(switch.parameters())
         return switch
 
-    def gather_qmm_ok(gate, x_moe, scales, biases):
+    def gather_qmm(gate, x_moe, scales, biases):
         out = _mx.gather_qmm(
             x_moe,
             gate.weight,
@@ -2083,35 +2125,64 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
             bits=bits,
         )
         _mx.eval(out)
-        assert bool(_mx.all(_mx.isfinite(out)).item())
+        return out
 
-    # (a) fp32 MoE module + fp32 input, scales/biases forced to bf16 / fp16.
+    # (a) fp32 MoE module + fp32 input: matched baseline, then bf16/fp16
+    # scales/biases mismatches must land close to it.
     fp32_switch = make_switch(_mx.float32)
     fp32_gate = fp32_switch.gate_proj
     assert fp32_gate.scales.dtype == _mx.float32
     x_moe_fp32 = _mx.random.uniform(shape=(1, 3, in_dims)).astype(_mx.float32)
-    gather_qmm_ok(
-        fp32_gate, x_moe_fp32, fp32_gate.scales.astype(_mx.bfloat16), fp32_gate.biases
+    ctrl_moe_fp32 = gather_qmm(
+        fp32_gate, x_moe_fp32, fp32_gate.scales, fp32_gate.biases
     )
-    gather_qmm_ok(
-        fp32_gate, x_moe_fp32, fp32_gate.scales, fp32_gate.biases.astype(_mx.float16)
+    assert _close(
+        gather_qmm(
+            fp32_gate,
+            x_moe_fp32,
+            fp32_gate.scales.astype(_mx.bfloat16),
+            fp32_gate.biases,
+        ),
+        ctrl_moe_fp32,
+    )
+    assert _close(
+        gather_qmm(
+            fp32_gate,
+            x_moe_fp32,
+            fp32_gate.scales,
+            fp32_gate.biases.astype(_mx.float16),
+        ),
+        ctrl_moe_fp32,
     )
 
-    # (b) the reverse: bf16 MoE module + bf16 input, scales/biases forced
-    # to fp32 — the "fp32 scales for a bf16 MoE module" config the by-role
-    # check accepts and the comment claims tolerance for.
+    # (b) the reverse: bf16 MoE module + bf16 input matched baseline, then
+    # scales/biases forced to fp32 — the "fp32 scales for a bf16 MoE
+    # module" config the by-role check accepts and the comment claims
+    # tolerance for — must land close to it.
     bf16_switch = make_switch(_mx.bfloat16)
     bf16_gate = bf16_switch.gate_proj
     assert bf16_gate.scales.dtype == _mx.bfloat16
     x_moe_bf16 = _mx.random.uniform(shape=(1, 3, in_dims)).astype(_mx.bfloat16)
-    gather_qmm_ok(
-        bf16_gate, x_moe_bf16, bf16_gate.scales.astype(_mx.float32), bf16_gate.biases
+    ctrl_moe_bf16 = gather_qmm(
+        bf16_gate, x_moe_bf16, bf16_gate.scales, bf16_gate.biases
     )
-    gather_qmm_ok(
-        bf16_gate,
-        x_moe_bf16,
-        bf16_gate.scales.astype(_mx.float32),
-        bf16_gate.biases.astype(_mx.float32),
+    assert _close(
+        gather_qmm(
+            bf16_gate,
+            x_moe_bf16,
+            bf16_gate.scales.astype(_mx.float32),
+            bf16_gate.biases,
+        ),
+        ctrl_moe_bf16,
+    )
+    assert _close(
+        gather_qmm(
+            bf16_gate,
+            x_moe_bf16,
+            bf16_gate.scales.astype(_mx.float32),
+            bf16_gate.biases.astype(_mx.float32),
+        ),
+        ctrl_moe_bf16,
     )
 
 
