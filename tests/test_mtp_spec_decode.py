@@ -2134,6 +2134,19 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
     reading ``nn.Module.load_weights``/``update``; but the conclusion
     the comment reached, that the loose check is safe, holds anyway —
     for the real reason documented above, not the stated one.)
+
+    Hardened per an independent codex review of THIS PR (two BLOCKING
+    findings): (1) the test never verified the corrupted dtype was
+    actually installed post-inject — a ``strict=False`` load that
+    silently reverted to the template's original fp32 scale would
+    have gone green without ever exercising the claimed mismatch;
+    (2) asserting only shape + finiteness would also pass for
+    "finite garbage" or a forward path that happens to ignore the
+    corrupted tensor. Both are closed below: the victim parameter's
+    installed dtype/values are asserted BEFORE ``mtp_forward`` runs,
+    and the resulting logits are compared against an
+    otherwise-identical fp32-scale CONTROL forward within an
+    explicit tolerance.
     """
     import mlx.core as _mx
     import mlx.nn as _nn
@@ -2168,10 +2181,20 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
         k for k in sorted(flat) if k.endswith(".scales") and not k.startswith("fc.")
     )
     assert flat[victim].dtype == _mx.float32
+    # Snapshot the UNCORRUPTED tensors before mutating ``flat`` below —
+    # this becomes the CONTROL sidecar for the numerical-closeness check
+    # further down. Every key except ``victim`` is the same array object
+    # in both dicts (``.astype`` below returns a NEW array rather than
+    # mutating in place, so it only touches ``flat[victim]``) — the
+    # mismatch and control sidecars therefore differ in exactly one
+    # tensor's dtype, an apples-to-apples control.
+    control_flat = dict(flat)
     flat[victim] = flat[victim].astype(_mx.bfloat16)
-    _mx.save_safetensors(str(tmp_path / "model.safetensors"), flat)
+    mismatch_dir = tmp_path / "mismatch"
+    mismatch_dir.mkdir()
+    _mx.save_safetensors(str(mismatch_dir / "model.safetensors"), flat)
 
-    injected = inject_mtp_support(base, mtp_sidecar=str(tmp_path))
+    injected = inject_mtp_support(base, mtp_sidecar=str(mismatch_dir))
     assert injected is True, (
         "inject_mtp_support refused a shape-correct sidecar whose only "
         "defect is a mismatched-but-floating scales dtype; the by-role "
@@ -2179,6 +2202,25 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
         "be *some* floating dtype)."
     )
     assert validate_mtp_support(base) is True
+
+    # [codex BLOCKING #1] Prove the corruption was ACTUALLY installed on
+    # the live module BEFORE trusting a downstream forward pass to have
+    # exercised it. ``load_weights(strict=False)`` assigns verbatim (no
+    # ``.astype`` — see the module docstring above and the injector's own
+    # comment); if it had somehow reverted to the template's original
+    # fp32 scale instead, the rest of this test would be vacuous — green
+    # without ever exercising the claimed mismatch.
+    installed = dict(tree_flatten(base.mtp.parameters()))
+    assert installed[victim].dtype == _mx.bfloat16, (
+        f"expected the corrupted sidecar tensor {victim!r} to land on "
+        f"base.mtp as bfloat16 (proving the loose by-role check accepted "
+        f"a REAL dtype mismatch); got {installed[victim].dtype} instead — "
+        f"if this fires, load_weights(strict=False) silently reverted the "
+        f"corruption and the rest of this test never exercised it."
+    )
+    assert bool(_mx.array_equal(installed[victim], flat[victim]).item()), (
+        f"installed {victim!r} values differ from what the sidecar shipped"
+    )
 
     # The draft forward must run without raising — this is the exact call
     # path (QuantizedLinear.__call__ -> mx.quantized_matmul) the codex
@@ -2189,6 +2231,43 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
     _mx.eval(logits)
     assert logits.shape[-1] == int(args.vocab_size)
     assert bool(_mx.all(_mx.isfinite(logits)).item())
+
+    # [codex BLOCKING #2] Shape + finiteness alone would also pass for
+    # "finite garbage" or a forward path that happens to ignore the
+    # corrupted tensor. Re-inject the SAME ``base`` against an otherwise
+    # byte-identical CONTROL sidecar whose ``victim`` tensor kept its
+    # original fp32 dtype — this only replaces ``base.mtp`` with a fresh
+    # module; ``base.model`` / ``base.lm_head``, already quantized above,
+    # are untouched — and assert the mismatched-dtype logits are
+    # numerically CLOSE to the control's.
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+    _mx.save_safetensors(str(control_dir / "model.safetensors"), control_flat)
+    assert inject_mtp_support(base, mtp_sidecar=str(control_dir)) is True
+    control_logits = base.mtp_forward(hidden, next_ids, base.make_mtp_cache())
+    _mx.eval(control_logits)
+
+    # Tolerance: empirically, corrupting one non-fc ``.scales`` tensor from
+    # fp32 to bf16 in this exact fixture (hidden_size=64, group_size=32,
+    # bits=4, 1 MTP layer) produces a max per-logit absolute drift of
+    # ~6e-4 to ~2e-3 against control logits with |value| up to ~1.5-1.8
+    # (measured across 8 random seeds locally) — consistent with a single
+    # bf16 rounding (relative precision ~2**-8 ~= 0.0039) propagated
+    # through one quantized matmul + norm + lm_head, the same
+    # order-of-magnitude drift the PR body's own probe showed
+    # (``out[0,:4]``: fp32 ``[0.34953, -0.30505, -0.37162, -0.24791]`` vs
+    # bf16 ``[0.35309, -0.29941, -0.37214, -0.24651]``, diffs ~4e-4 to
+    # 6e-3). ``atol=rtol=1e-2`` gives several-fold headroom over the
+    # observed worst case while still being tight enough that a truly
+    # divergent ("finite garbage") forward would fail it.
+    assert bool(_mx.allclose(logits, control_logits, rtol=1e-2, atol=1e-2).item()), (
+        "mismatched-dtype draft logits diverge from the fp32-scale control "
+        "beyond bf16-rounding tolerance — either the mismatch is no longer "
+        "silently tolerated (see "
+        "test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype) "
+        "or the forward path is producing something other than a "
+        "rounding-level perturbation of the control."
+    )
 
 
 def test_inject_refuses_mixed_bit_sidecar_fail_safe(tmp_path):
