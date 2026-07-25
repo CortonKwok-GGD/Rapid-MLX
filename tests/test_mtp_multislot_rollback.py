@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Multi-slot GatedDeltaNet rollback for chain-of-K MTP.
+"""Single-pass GatedDeltaNet rollback for chain-of-K MTP.
 
-Locks the ``cache_patch`` contract that the verify chunk-split records a
-``(conv, ssm)`` snapshot at EVERY draft boundary (keyed by
-``n_from_end = 1..K``), and that each snapshot equals the recurrent state
-after processing exactly ``S - n_from_end`` tokens — so
-``_rollback_draft(n)`` can restore to any accepted depth without leaving
-rejected draft state in the cache.
+Locks the ``cache_patch`` contract that the verify forward runs as ONE
+fused ``gated_delta_update`` (no per-boundary segment splitting) and
+stashes a rollback CLOSURE on the cache. The closure recomputes the
+``(conv, ssm)`` state after keeping the first ``S - n_to_drop`` verify
+positions — byte-exact with the true ``(S - n_to_drop)``-token recurrent
+state — so ``_rollback_draft(n)`` can restore to any accepted depth on a
+partial chain-of-K accept without leaving rejected draft state in the
+cache.
 
-Regression for the chain-of-K-on-hybrid work (PR feat/mtp-hybrid-chain-of-k):
-before the multi-slot rewrite only a single boundary was snapshotted, so
-partial accept at depth < K was unrepresentable.
+Regression for the single-pass rewrite (PR perf/mtp-single-pass-gdn-
+rollback): the previous implementation split the verify into ``K+1``
+separate ``gated_delta_update`` calls to materialize a snapshot at every
+boundary — ~K+1 GDN kernel launches per layer per round, measured as the
+dominant MTP verify cost. The single-pass path pays one fused scan and
+only recomputes on the rare rejection.
 """
 
 import mlx.core as mx
@@ -45,16 +50,16 @@ def _build_gated_delta_net():
 
 
 @pytest.mark.parametrize("K", [1, 2, 3])
-def test_multislot_chunksplit_snapshots_every_boundary(K):  # noqa: N803  (K = draft width)
-    """Every ``n_to_drop`` in 1..K has a snapshot equal to the true
-    ``(S - n)``-token recurrent state."""
+def test_rollback_closure_recomputes_true_boundary(K):  # noqa: N803  (K = draft width)
+    """The stashed rollback closure recomputes the exact ``(S - n)``-token
+    recurrent state for every ``n_to_drop`` in 1..K."""
     mx.random.seed(0)
     from mlx_lm.models.cache import ArraysCache
 
     from vllm_mlx.spec_decode.mtp import cache_patch
 
-    # Install the chunk-split patch; keep a handle to the unpatched forward
-    # for reference (single-call, no snapshots).
+    # Install the single-pass patch; keep a handle to the unpatched forward
+    # for the independent reference states.
     cache_patch.patch_gated_delta_net_for_mtp()
     orig_call = cache_patch._orig_gated_delta_call
     assert orig_call is not None
@@ -72,42 +77,40 @@ def test_multislot_chunksplit_snapshots_every_boundary(K):  # noqa: N803  (K = d
         mx.eval(c[0], c[1])
         return c
 
-    # Patched multi-slot run over the (K+1)-token verify window.
+    # Single-pass patched run over the (K+1)-token verify window.
     c_pat = fresh_cache()
     c_pat.snapshot_offsets = list(range(1, K + 1))
     layer(verify, mask=None, cache=c_pat)
     mx.eval(c_pat[0], c_pat[1])
 
-    assert c_pat.rollback_states is not None, "chunk-split must record snapshots"
-    assert set(c_pat.rollback_states) == set(range(1, K + 1)), (
-        "chunk-split must snapshot every 1..K draft boundary "
-        f"(got {sorted(c_pat.rollback_states)})"
+    assert c_pat.rollback_recompute is not None, (
+        "single-pass verify must stash a rollback closure"
     )
 
-    # Each snapshot at n_from_end == the state after processing the first
-    # (S - n) verify tokens, computed independently via the original forward.
-    # This compares two DIFFERENT computation paths (a mid-sequence boundary in
-    # one long conv1d vs a fresh short forward), so a tight float tolerance —
-    # not exact equality — is the correct bar; observed divergence is ~1e-7.
+    # For each n_to_drop, the closure must reproduce the state after
+    # processing the first (S - n) verify tokens, computed independently via
+    # the original forward. The closure rescans ``[0:keep]`` from the same
+    # pre-window anchor with the same kernel, so a tight float tolerance —
+    # not exact equality — is the correct bar (observed divergence ~1e-7).
     S = K + 1
     for n in range(1, K + 1):
         c_ref = fresh_cache()
         orig_call(layer, verify[:, : S - n], mask=None, cache=c_ref)
         mx.eval(c_ref[0], c_ref[1])
-        conv_snap, ssm_snap = c_pat.rollback_states[n]
-        assert float(mx.max(mx.abs(conv_snap - c_ref[0]))) < 1e-5, (
-            f"conv snapshot at n_from_end={n} diverges from the true "
-            f"{S - n}-token state"
+        conv_keep, ssm_keep = c_pat.rollback_recompute(n)
+        mx.eval(conv_keep, ssm_keep)
+        assert float(mx.max(mx.abs(conv_keep - c_ref[0]))) < 1e-5, (
+            f"conv rollback at n_to_drop={n} diverges from the true {S - n}-token state"
         )
-        assert float(mx.max(mx.abs(ssm_snap - c_ref[1]))) < 1e-5, (
-            f"ssm snapshot at n_from_end={n} diverges from the true {S - n}-token state"
+        assert float(mx.max(mx.abs(ssm_keep - c_ref[1]))) < 1e-5, (
+            f"ssm rollback at n_to_drop={n} diverges from the true {S - n}-token state"
         )
 
 
 def test_patched_forward_output_matches_unsplit():
-    """The chunk-split forward is byte-equal to the unsplit forward for the
-    confirmed tokens (the split only exposes intermediate state; it must not
-    change the output or the final cache state)."""
+    """The single-pass verify forward is byte-equal to the unpatched forward
+    for the confirmed tokens (it must not change the output or the final
+    cache state — it only additionally stashes the rollback closure)."""
     mx.random.seed(1)
     from mlx_lm.models.cache import ArraysCache
 
@@ -136,11 +139,11 @@ def test_patched_forward_output_matches_unsplit():
     out_pat = layer(verify, mask=None, cache=c_pat)
     mx.eval(out_pat, c_pat[0], c_pat[1])
 
-    # EXACT equality — the chunk-split is a pure sequential scan over the same
-    # tokens in the same order, so per-token logits and the final (conv, ssm)
-    # state are bit-identical to the unsplit forward. A tolerance here would let
-    # a logit-changing regression slip through and quietly break the lossless
-    # speculative-decoding contract.
-    assert bool(mx.array_equal(out_orig, out_pat)), "chunk-split changed the output"
-    assert bool(mx.array_equal(c_orig[0], c_pat[0])), "chunk-split changed conv state"
-    assert bool(mx.array_equal(c_orig[1], c_pat[1])), "chunk-split changed ssm state"
+    # EXACT equality — the single-pass path runs the SAME one fused
+    # ``gated_delta_update`` over the same tokens as the unpatched forward,
+    # so per-token logits and the final (conv, ssm) state are bit-identical.
+    # A tolerance here would let a logit-changing regression slip through and
+    # quietly break the lossless speculative-decoding contract.
+    assert bool(mx.array_equal(out_orig, out_pat)), "single-pass changed the output"
+    assert bool(mx.array_equal(c_orig[0], c_pat[0])), "single-pass changed conv state"
+    assert bool(mx.array_equal(c_orig[1], c_pat[1])), "single-pass changed ssm state"

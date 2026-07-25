@@ -346,49 +346,44 @@ def mtp_generate_step(
 
     def _clear_rollback():
         for c in model_cache:
-            if hasattr(c, "rollback_states"):
-                c.rollback_states = None
+            if hasattr(c, "rollback_recompute"):
+                c.rollback_recompute = None
 
     def _rollback_draft(n_to_drop: int = 1):
         """Restore caches by dropping the last ``n_to_drop`` draft tokens.
 
-        SSM layers (ArraysCache): restore the (conv, ssm) snapshot saved
-        by the GatedDeltaNet multi-slot chunk-split at the boundary that
-        is ``n_to_drop`` tokens from the end of the verify sequence
-        (``cache.rollback_states[n_to_drop]``). The chunk-split snapshots
-        every draft boundary (1..K positions from end), so partial accept
-        at any depth on chain-of-K is representable.
+        SSM layers (ArraysCache): call the rollback closure the single-pass
+        verify forward stashed on the cache (``cache.rollback_recompute``).
+        It recomputes the (conv, ssm) state after the first
+        ``S - n_to_drop`` verify positions from the pre-window anchor with
+        one short ``gated_delta_update`` — byte-exact with the true
+        ``(S - n_to_drop)``-token recurrent state — so partial accept at any
+        depth on chain-of-K is representable without per-round snapshotting.
 
         Attention layers (KVCache): trim the last ``n_to_drop`` draft
         entries.
         """
         for c in model_cache:
-            # SSM / linear-attention layers carry the ``rollback_states`` slot
-            # (patched onto ArraysCache); KVCache does not.
-            if hasattr(c, "rollback_states"):
-                states = c.rollback_states
-                if states is None:
-                    # No snapshot recorded — the chunk-split bailed (e.g. a
-                    # tensor-parallel target). Drafting on such a target should
-                    # have been disabled upstream (``_ssm_is_tp``); fail loudly
-                    # rather than leave the recurrent state silently un-rolled-back.
+            # SSM / linear-attention layers carry the ``rollback_recompute``
+            # slot (patched onto ArraysCache); KVCache does not.
+            if hasattr(c, "rollback_recompute"):
+                recompute = c.rollback_recompute
+                if recompute is None:
+                    # No closure recorded — the single-pass path bailed (e.g.
+                    # a tensor-parallel target, or S < 2). Drafting on such a
+                    # target should have been disabled upstream
+                    # (``_ssm_is_tp``); fail loudly rather than leave the
+                    # recurrent state silently un-rolled-back.
                     raise AssertionError(
-                        "SSM cache has no rollback snapshot (chunk-split was "
-                        "skipped, e.g. tensor-parallel target). MTP speculative "
-                        "rollback is unsupported here; drafting should have been "
-                        "disabled."
+                        "SSM cache has no rollback closure (single-pass verify "
+                        "did not stash one, e.g. tensor-parallel target). MTP "
+                        "speculative rollback is unsupported here; drafting "
+                        "should have been disabled."
                     )
-                snap = states.get(n_to_drop)
-                if snap is None:
-                    raise AssertionError(
-                        f"_rollback_draft(n_to_drop={n_to_drop}) on SSM cache: "
-                        f"no snapshot at that offset (have {sorted(states)}). "
-                        "Multi-slot chunk-split should record every 1..K boundary."
-                    )
-                conv_snap, ssm_snap = snap
-                c[0] = conv_snap
-                c[1] = ssm_snap
-                # Rewind the position the chunk-split advanced via
+                conv_keep, ssm_keep = recompute(n_to_drop)
+                c[0] = conv_keep
+                c[1] = ssm_keep
+                # Rewind the position the forward advanced via
                 # ``cache.advance(S)``. ``ArraysCache.advance`` is a plain
                 # ``lengths -= N`` / ``left_padding -= N`` (no zero-clamp), so
                 # adding back ``n_to_drop`` recovers the EXACT boundary metadata
@@ -400,7 +395,7 @@ def mtp_generate_step(
                     c.lengths = c.lengths + n_to_drop
                 if getattr(c, "left_padding", None) is not None:
                     c.left_padding = c.left_padding + n_to_drop
-                c.rollback_states = None
+                c.rollback_recompute = None
             elif c.is_trimmable():
                 c.trim(n_to_drop)
 

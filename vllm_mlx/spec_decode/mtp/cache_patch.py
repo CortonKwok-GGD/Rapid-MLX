@@ -184,6 +184,12 @@ def patch_gated_delta_net_for_mtp() -> bool:
             ArraysCache.snapshot_offsets = None  # type: ignore[attr-defined]
         if "rollback_states" not in ArraysCache.__dict__:
             ArraysCache.rollback_states = None  # type: ignore[attr-defined]
+        # ``rollback_recompute``: a per-layer closure the single-pass verify
+        # forward stashes so ``_rollback_draft(n)`` can recompute the
+        # accepted-prefix (conv, ssm) state on the rare draft rejection —
+        # replaces the old materialized per-boundary snapshot dict.
+        if "rollback_recompute" not in ArraysCache.__dict__:
+            ArraysCache.rollback_recompute = None  # type: ignore[attr-defined]
 
         _orig_gated_delta_call = GatedDeltaNet.__call__
 
@@ -201,13 +207,24 @@ def patch_gated_delta_net_for_mtp() -> bool:
             if cache is None or not offsets or S < 2 or self.sharding_group is not None:
                 return _orig_gated_delta_call(self, inputs, mask=mask, cache=cache)
 
-            # --- Multi-slot chunk-split path ---
+            # --- Single-pass forward + lazy recompute-on-reject ---
             # ``cache`` is the PER-LAYER ArraysCache for this one
-            # GatedDeltaNet instance; writes below affect only it. The
-            # generator's _rollback_draft walks every cache and restores
-            # each instance's own snapshots independently.
-            cache.rollback_states = {}
-
+            # GatedDeltaNet instance; writes below affect only it.
+            #
+            # The verify window (S = K+1 tokens) is run as ONE fused
+            # ``gated_delta_update`` — byte-equal to the unsplit forward.
+            # The previous implementation split the scan into K+1 segments
+            # to materialize a (conv, ssm) snapshot at every draft boundary
+            # (K+1 kernel launches per GDN layer per verify round — measured
+            # as the dominant MTP cost, ~30% of throughput at K=2). Because
+            # ~90% of rounds accept every draft and never roll back, that
+            # snapshot work is wasted almost every round. Instead we run one
+            # fused scan and stash a cheap rollback CLOSURE; only on the rare
+            # rejection does ``_rollback_draft`` call it to recompute the
+            # accepted-prefix state with ONE short scan from the pre-window
+            # state. Since ``gated_delta_update`` is a pure sequential scan,
+            # rescanning ``[0:keep]`` from that anchor is byte-exact with the
+            # true keep-token state the old snapshot stored.
             qkv = self.in_proj_qkv(inputs)
             z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
             b = self.in_proj_b(inputs)
@@ -239,45 +256,72 @@ def patch_gated_delta_net_for_mtp() -> bool:
                 )
             ]
 
-            state = cache[1] if cache else None
+            # Pre-window SSM state (before this verify window) — the anchor
+            # every rollback recomputes from. ``cache[1]`` is overwritten
+            # with the post-scan state below, so keep a reference here.
+            pre_ssm = cache[1] if cache else None
             inv_scale = k.shape[-1] ** -0.5
             q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
             k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-            # Walk the sequence in segments between consecutive snapshot
-            # boundaries, threading the SSM state. Two consecutive
-            # gated_delta_update calls compose exactly to a single call
-            # over the union (verified: pure sequential scan), so the
-            # per-segment path is byte-equal to the unsplit forward while
-            # exposing the intermediate state at each boundary.
-            boundaries = offsets + [S]
-            prev = 0
-            outs = []
-            st = state
-            for o in boundaries:
-                ms = mask[:, prev:o] if mask is not None else None
-                out_seg, st = gated_delta_update(
-                    q[:, prev:o],
-                    k[:, prev:o],
-                    v[:, prev:o],
-                    a[:, prev:o],
-                    b[:, prev:o],
-                    self.A_log,
-                    self.dt_bias,
-                    st,
-                    ms,
-                    use_kernel=not self.training,
-                )
-                outs.append(out_seg)
-                if o < S:
-                    # Snapshot (conv, ssm) after processing ``o`` tokens.
-                    # Keyed by n_from_end = S - o so _rollback_draft(n)
-                    # (n = tokens to drop) restores directly.
-                    conv_o = mx.contiguous(conv_input[:, o : o + n_keep, :])
-                    cache.rollback_states[S - o] = (conv_o, st)
-                prev = o
+            # Single fused scan over the whole verify window.
+            out, st = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                pre_ssm,
+                mask,
+                use_kernel=not self.training,
+            )
 
-            out = mx.concatenate(outs, axis=1)
+            # Rollback closure: recompute (conv, ssm) after keeping the
+            # first ``S - n_to_drop`` positions, from the pre-window state.
+            # Captures the per-position tensors by default-arg so each GDN
+            # layer's closure is independent and evaluates lazily (q/k/v are
+            # already materialized by the verify sync, so this is just the
+            # short scan, no re-projection).
+            _use_kernel = not self.training
+
+            def _recompute_boundary(
+                n_to_drop,
+                *,
+                _pre=pre_ssm,
+                _q=q,
+                _k=k,
+                _v=v,
+                _a=a,
+                _b=b,
+                _conv=conv_input,
+                _mask=mask,
+                _slen=S,
+                _nk=n_keep,
+                _alog=self.A_log,
+                _dt=self.dt_bias,
+                _uk=_use_kernel,
+            ):
+                keep = _slen - n_to_drop
+                ms = _mask[:, :keep] if _mask is not None else None
+                _, st_keep = gated_delta_update(
+                    _q[:, :keep],
+                    _k[:, :keep],
+                    _v[:, :keep],
+                    _a[:, :keep],
+                    _b[:, :keep],
+                    _alog,
+                    _dt,
+                    _pre,
+                    ms,
+                    use_kernel=_uk,
+                )
+                conv_keep = mx.contiguous(_conv[:, keep : keep + _nk, :])
+                return conv_keep, st_keep
+
+            cache.rollback_recompute = _recompute_boundary
+
             cache[1] = st
             # Advance by the FULL S — mirrors upstream cache.advance(S).
             cache.advance(S)
