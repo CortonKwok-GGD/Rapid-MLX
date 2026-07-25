@@ -20,6 +20,7 @@ model actually enforces:
 
 Pure Pydantic construction — no server, fully hermetic.
 """
+
 from __future__ import annotations
 
 import math

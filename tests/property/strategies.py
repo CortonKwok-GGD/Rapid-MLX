@@ -8,6 +8,7 @@ enough to run on every commit if each example is cheap. Model-requiring
 metamorphic properties (streaming == non-streaming, temp=0 determinism)
 are deliberately out of scope and belong in the integration suite.
 """
+
 from __future__ import annotations
 
 import mlx.core as mx

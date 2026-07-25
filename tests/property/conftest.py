@@ -15,6 +15,7 @@ test modules, so ``load_profile`` is in effect for every ``@given`` here
 without any per-test decoration. No other test in the repo uses
 Hypothesis, so loading the profile globally is inert elsewhere.
 """
+
 from hypothesis import HealthCheck, settings
 
 PROFILE_NAME = "rapid_mlx_property"
