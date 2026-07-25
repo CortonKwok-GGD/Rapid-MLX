@@ -16,15 +16,22 @@ here (first try or after a rerun) is non-deterministic — a flake
 candidate. One that reproduces its failure is likely a real bug, and is
 reported as such (``full_unit`` already blocked on it).
 
-Two soundness guards (codex #1222):
+Classification is on POSITIVE outcomes (``-rA`` gives every test's final
+verdict): a node id that PASSED on the isolated re-run is the flake
+candidate; one that FAILED/ERRORed again reproduces; anything that merely
+went missing from the summary (skipped, deselected, never collected) is
+reported as inconclusive, never called a flake.
+
+Soundness guards (codex #1222):
   * Classification only runs when the re-run exits with a code we can
     reason about (0 = all passed, 1 = some failed). Anything else
     (collection error, crash, usage error) is inconclusive → we skip
     rather than mislabel a real failure as a flake.
   * The re-run is launched in its own session; on timeout the whole
     process group is SIGKILLed (race-free — the leader is unreaped at
-    that point, so its pgid is still reserved), so a test that spawned
-    an inference server / GPU worker can't leak into later steps.
+    that point, so its pgid is still reserved), and the post-kill output
+    drain is time-bounded, so a test that spawned an inference server /
+    GPU worker can neither leak into later steps nor wedge the gate.
 
 If ``pytest-rerunfailures`` is not installed, the step skips cleanly —
 the plugin is an optional [test]/[dev] extra, not a required one.
@@ -51,6 +58,10 @@ from ..quarantine import QuarantineError, is_quarantined, load_quarantine_from_r
 _MAX_RERUN_IDS = 25
 _RERUNS = 3
 _RERUN_TIMEOUT_S = 900
+# Upper bound on the post-kill output drain. If a descendant escaped the
+# process group (e.g. via its own setsid) and still holds the pipe open,
+# we abandon the drain rather than let it hang the whole gate.
+_DRAIN_TIMEOUT_S = 10
 # pytest exit codes we can classify: 0 = all passed, 1 = some failed.
 # 2 (interrupted), 3 (internal), 4 (usage), 5 (no tests) are abnormal —
 # treating an unlisted id as "passed" would then mislabel real failures.
@@ -131,6 +142,13 @@ class FlakeTrackingStep(Step):
             f"--reruns={_RERUNS}",
             "-q",
             "--no-header",
+            # -rA => list every test's final outcome (PASSED/FAILED/…) in
+            # the short summary. We classify a flake candidate on a
+            # *positive* PASSED, not on mere absence from FAILED — so a
+            # test that got SKIPPED / deselected / never ran on the
+            # isolated re-run is inconclusive, not a false flake
+            # (codex #1222 r2).
+            "-rA",
             "-p",
             "no:cacheprovider",
         ]
@@ -162,12 +180,17 @@ class FlakeTrackingStep(Step):
                 artifacts=[str(rerun_log)],
             )
 
-        # A test still FAILED/ERRORed on isolated re-run (with reruns) →
-        # reproduces → likely a real bug. Everything else in the sample
-        # passed this time → non-deterministic → flake candidate.
+        # Classify on POSITIVE outcomes, not on absence (codex #1222 r2):
+        #   * PASSED on isolated re-run → was red in the suite, green now
+        #     → non-deterministic → flake candidate.
+        #   * FAILED/ERROR again → reproduces → likely a real bug.
+        #   * anything else (SKIPPED / deselected / never collected) →
+        #     INCONCLUSIVE — reported, but NOT called a flake.
+        passed = set(summary_node_ids(proc.stdout, "PASSED"))
         still_bad = set(summary_node_ids(proc.stdout, "FAILED", "ERROR"))
-        candidates = [i for i in sample if i not in still_bad]
+        candidates = [i for i in sample if i in passed]
         reproduced = [i for i in sample if i in still_bad]
+        inconclusive = [i for i in sample if i not in passed and i not in still_bad]
 
         # Split candidates by whether they're already covered.
         new_candidates = [i for i in candidates if not is_quarantined(i, entries)]
@@ -180,15 +203,19 @@ class FlakeTrackingStep(Step):
             "flake_candidates_new": new_candidates,
             "flake_candidates_known": known_flakes,
             "reproduced_likely_real": reproduced,
+            "inconclusive": inconclusive,
         }
         cand_path = ctx.artifact_path("flake-candidates.json")
         cand_path.write_text(json.dumps(payload, indent=2))
 
-        details = _render(new_candidates, known_flakes, reproduced, truncated)
+        details = _render(
+            new_candidates, known_flakes, reproduced, inconclusive, truncated
+        )
         summary = (
             f"{len(new_candidates)} new flake candidate(s), "
             f"{len(reproduced)} reproduced, "
-            f"{len(known_flakes)} known-flaky — advisory"
+            f"{len(known_flakes)} known-flaky, "
+            f"{len(inconclusive)} inconclusive — advisory"
         )
         return StepResult(
             name=self.name,
@@ -208,7 +235,9 @@ def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.Completed
     (pgid == pid). On timeout the child has not been reaped, so its pgid
     is still reserved — killpg is race-free (the safe pre-reap case). We
     kill BEFORE the final ``communicate`` so a descendant holding the
-    pipe open can't hang the drain.
+    pipe open can't hang the drain, and the drain itself is time-bounded
+    so even a group-escaping descendant can't wedge the gate (codex
+    #1222 r2).
     """
     proc = subprocess.Popen(  # noqa: S603
         cmd,
@@ -222,9 +251,30 @@ def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.Completed
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
-        out, err = proc.communicate()
+        out, err = _drain_bounded(proc)
         raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _drain_bounded(proc: subprocess.Popen) -> tuple[str, str]:
+    """Drain the child's pipes after a kill, but never block forever.
+
+    The normal case returns immediately (the group is dead). If a
+    descendant escaped the process group and still holds the write end
+    open, the bounded ``communicate`` raises again — we then re-kill,
+    force the pipes closed, and give up on the tail so the gate proceeds
+    instead of hanging (macOS has no cgroup to contain such an escape)."""
+    try:
+        return proc.communicate(timeout=_DRAIN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        return "", ""
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -243,6 +293,7 @@ def _render(
     new_candidates: list[str],
     known_flakes: list[str],
     reproduced: list[str],
+    inconclusive: list[str],
     truncated: int,
 ) -> str:
     parts: list[str] = []
@@ -264,6 +315,12 @@ def _render(
             "**Already quarantined** (confirmed still flaky):\n```\n"
             + "\n".join(known_flakes)
             + "\n```"
+        )
+    if inconclusive:
+        parts.append(
+            "**Inconclusive** (didn't positively pass or fail on isolated "
+            "re-run — skipped, deselected, or not collected; NOT classified "
+            "as a flake):\n```\n" + "\n".join(inconclusive) + "\n```"
         )
     if truncated > 0:
         parts.append(

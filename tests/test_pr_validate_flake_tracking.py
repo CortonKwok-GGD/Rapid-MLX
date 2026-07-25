@@ -13,8 +13,11 @@ Units under test:
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import textwrap
 import time
 
 import pytest
@@ -119,6 +122,32 @@ class TestSummaryNodeIds:
     def test_default_label_is_failed(self):
         assert summary_node_ids(_summary("FAILED tests/a.py::t")) == ["tests/a.py::t"]
 
+    def test_requires_padded_banner_not_bare_substring(self):
+        # A bare "short test summary" line (no '=' padding) is NOT the real
+        # pytest banner and must not open a summary block.
+        text = (
+            "some test printed: short test summary\n"
+            "FAILED tests/evil.py::forged - injected\n"
+        )
+        assert summary_node_ids(text, "FAILED") == []
+
+    def test_forged_banner_in_captured_output_is_ignored(self):
+        # A malicious/careless test prints a fully-padded fake banner in its
+        # captured stdout (which renders ABOVE the real summary). Taking the
+        # LAST banner means the genuine final summary wins, so the real
+        # failure can't be masked by a forged quarantined id (codex r2).
+        text = (
+            "==== FAILURES ====\n"
+            "____ test_evil ____\n"
+            "----- Captured stdout call -----\n"
+            "==================== short test summary info ====================\n"
+            "FAILED tests/quarantined.py::known_flake - forged\n"
+            "==================== short test summary info ====================\n"
+            "FAILED tests/real.py::genuine - AssertionError\n"
+            "==== 1 failed in 0.10s ====\n"
+        )
+        assert summary_node_ids(text, "FAILED") == ["tests/real.py::genuine"]
+
 
 # --------------------------------------------------------------------------
 # quarantine.py — file loader
@@ -149,6 +178,22 @@ class TestLoadQuarantine:
         p.write_text("- a\n- b\n")
         with pytest.raises(QuarantineError):
             load_quarantine(p)
+
+    @pytest.mark.parametrize("body", ["[]\n", "false\n", "0\n"])
+    def test_falsey_non_mapping_root_raises(self, tmp_path, body):
+        # A present-but-falsey root ([] / false / 0) is a schema violation,
+        # NOT an empty registry — it must raise, not be swallowed (codex r2).
+        p = tmp_path / "q.yaml"
+        p.write_text(body)
+        with pytest.raises(QuarantineError):
+            load_quarantine(p)
+
+    def test_empty_file_is_empty_registry(self, tmp_path):
+        # An absent document (empty / all-comments → None root) IS a valid
+        # empty registry.
+        p = tmp_path / "q.yaml"
+        p.write_text("# just a comment\n")
+        assert load_quarantine(p) == []
 
     def test_tests_must_be_list(self, tmp_path):
         p = tmp_path / "q.yaml"
@@ -512,6 +557,40 @@ class TestFlakeTrackingContract:
         assert res.status == "skip"
         assert "abnormally" in res.summary
 
+    def test_classifies_on_positive_outcomes(self, ctx_factory, monkeypatch):
+        # Three sampled failures; the -rA re-run reports one PASSED (flake
+        # candidate), one FAILED again (reproduced), and one that only went
+        # SKIPPED — which must land in `inconclusive`, NOT be called a flake
+        # just because it's absent from FAILED (codex r2).
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary(
+                "FAILED tests/x.py::a - X",
+                "FAILED tests/x.py::b - X",
+                "FAILED tests/x.py::c - X",
+            )
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+        rerun = (
+            "==================== short test summary info ====================\n"
+            "PASSED tests/x.py::a\n"
+            "FAILED tests/x.py::b - AssertionError\n"
+            "SKIPPED [1] tests/x.py::c:1: conditionally skipped\n"
+            "==== 1 failed, 1 passed, 1 skipped in 0.20s ====\n"
+        )
+        monkeypatch.setattr(
+            flake_mod, "_run_session", lambda *a, **k: _completed(1, rerun)
+        )
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert data["flake_candidates_new"] == ["tests/x.py::a"]
+        assert data["reproduced_likely_real"] == ["tests/x.py::b"]
+        assert data["inconclusive"] == ["tests/x.py::c"]
+
 
 class TestFlakeTrackingClassification:
     """Drive a real pytest subprocess so the flake-vs-real split is
@@ -567,6 +646,51 @@ class TestRunSession:
                 timeout=0.5,
             )
         assert time.monotonic() - t0 < 10.0
+
+    def test_timeout_kills_grandchild_in_group(self, tmp_path):
+        # Prove it's a process-GROUP kill, not just proc.kill(): the child
+        # spawns a long-lived grandchild in the SAME group (no setsid) and
+        # records its pid. On timeout, killpg must reap the grandchild too —
+        # a bare proc.kill() on the direct child would leave it alive
+        # (codex #1222 r2).
+        pidfile = tmp_path / "grandchild.pid"
+        child_prog = textwrap.dedent(
+            f"""
+            import subprocess, sys, time
+            gc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(120)"]
+            )
+            with open({str(pidfile)!r}, "w") as f:
+                f.write(str(gc.pid))
+                f.flush()
+            time.sleep(120)
+            """
+        )
+        t0 = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_session(
+                [sys.executable, "-c", child_prog], cwd=str(tmp_path), timeout=3
+            )
+        assert time.monotonic() - t0 < 20.0
+
+        gc_pid = int(pidfile.read_text().strip())
+        # killpg SIGKILL is async; poll briefly for the grandchild to die.
+        deadline = time.monotonic() + 5.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(gc_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.1)
+        if alive:
+            # Clean up before failing so we don't leak a 120s sleeper.
+            try:
+                os.kill(gc_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            pytest.fail(f"grandchild {gc_pid} survived the process-group kill")
 
 
 class TestRegistration:

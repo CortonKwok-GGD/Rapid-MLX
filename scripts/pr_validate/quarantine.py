@@ -106,10 +106,16 @@ def load_quarantine_from_ref(
 
 def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
     try:
-        raw = yaml.safe_load(text) or {}
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise QuarantineError(f"{source}: not valid YAML: {e}") from e
 
+    # Only an ABSENT document (empty file / all comments → None) is an
+    # empty registry. A falsey-but-present root such as ``[]`` / ``false``
+    # / ``0`` is a schema violation and must surface, not be swallowed by
+    # ``or {}`` (codex #1222 r2).
+    if raw is None:
+        raw = {}
     if not isinstance(raw, dict):
         raise QuarantineError(
             f"{source}: must be a mapping with a 'tests' key, got {type(raw).__name__}"
