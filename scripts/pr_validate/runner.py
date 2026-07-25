@@ -22,6 +22,7 @@ from .steps.cl_description_quality import CLDescriptionQualityStep
 from .steps.codex_review import CodexReviewStep
 from .steps.diff_coverage import DiffCoverageStep
 from .steps.fetch import FetchStep
+from .steps.flake_tracking import FlakeTrackingStep
 from .steps.full_unit import FullUnitStep
 from .steps.lint import LintStep
 from .steps.stress_e2e_bench import StressE2EBenchStep
@@ -68,6 +69,14 @@ STEPS: list[Step] = [
     LintStep(),  # 2 — ruff check + format
     TargetedTestsStep(),  # 3 — diff-aware test selection + neg control
     FullUnitStep(),  # 4 — full pytest, gated on blast radius
+    # 4.5 — ADVISORY flake classification (never gates; dev-flow ③).
+    # Placed right after full_unit because it reads full-unit.log and
+    # re-runs only the tests that failed (a tiny set — usually zero), so
+    # it's cheap. In default mode it runs even when full_unit blocked,
+    # which is exactly when "is this red a flake?" matters most; note it
+    # is still skipped under user-opted --fail-fast (a known slice-1
+    # limitation — CI reruns locally to get the classification).
+    FlakeTrackingStep(),
     StressE2EBenchStep(),  # 5 — stress + e2e + bench (multi-model × agents)
     # 6 — ADVISORY patch-coverage measurement (never gates). Last on
     # purpose: it re-runs the FULL unit suite under coverage instrumentation

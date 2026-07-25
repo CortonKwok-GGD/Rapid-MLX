@@ -9,6 +9,14 @@ For medium and high blast PRs, runs the same set we use locally:
 Pre-existing failures on main are NOT filtered here — that's step 3's
 job. This step validates "the suite as-is is still green"; if main is
 broken that's a separate problem and we want to surface it loudly.
+
+Quarantine (dev-flow ③): a failure whose node id is listed in
+``quarantine.yaml`` is reported but does NOT block the PR. This exists
+so a single CONFIRMED flake can't force the "rerun until green" ritual
+that quietly destroys gate credibility. The split is fail-safe — an
+unreadable registry falls back to an empty quarantine, so a broken file
+can only make the gate *stricter*, never pass something it otherwise
+wouldn't. A non-quarantined failure still blocks, exactly as before.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ import sys
 
 from ..base import Step, StepResult
 from ..context import Context
+from ..quarantine import QuarantineError, load_quarantine, partition_failures
 
 
 class FullUnitStep(Step):
@@ -64,21 +73,92 @@ class FullUnitStep(Step):
                 artifacts=[str(log_path)],
             )
 
-        # On failure, extract the per-test FAILED lines for the
-        # scorecard's detail block — much more useful than dumping the
-        # whole log inline.
-        failed = _extract_failed_lines(proc.stdout)
-        details = ["**Failed tests:**\n```", *failed[:30], "```"]
-        if len(failed) > 30:
-            details.append(f"\n…and {len(failed) - 30} more — see {log_path}")
+        # Non-zero exit. Extract the per-test node ids so we can consult
+        # the quarantine registry.
+        failed_ids = _failed_node_ids(proc.stdout)
 
+        # If pytest exited non-zero but we parsed NO per-test failures,
+        # this is a collection/internal/xdist-level error we can't name —
+        # never quarantine what we can't identify. Block on the raw exit.
+        if not failed_ids:
+            raw = _extract_failed_lines(proc.stdout)
+            body = raw[:30] if raw else ["(no FAILED lines — see log)"]
+            details = [
+                "**pytest failed with no parseable test ids:**\n```",
+                *body,
+                "```",
+            ]
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=summary_line or f"pytest exited {proc.returncode}",
+                details="\n".join(details),
+                artifacts=[str(log_path)],
+            )
+
+        # Fail-safe: an unreadable registry means "no quarantine", i.e.
+        # every failure blocks. A broken file can only make us stricter.
+        registry_note = ""
+        try:
+            entries = load_quarantine()
+        except QuarantineError as e:
+            entries = []
+            registry_note = (
+                f"\n\n⚠️ quarantine registry unreadable — treating every "
+                f"failure as blocking: {e}"
+            )
+        blocking, quarantined = partition_failures(failed_ids, entries)
+
+        details = _render_details(blocking, quarantined, log_path) + registry_note
+
+        if blocking:
+            # Real failures present → still a red, regardless of any
+            # quarantined flakes riding along.
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=summary_line or f"pytest exited {proc.returncode}",
+                details=details,
+                artifacts=[str(log_path)],
+            )
+
+        # Every failure was a known flake → do NOT block, but say so
+        # loudly so a quarantined red is never mistaken for a clean run.
         return StepResult(
             name=self.name,
-            status="fail",
-            summary=summary_line or f"pytest exited {proc.returncode}",
-            details="\n".join(details),
+            status="pass",
+            summary=(
+                f"{len(quarantined)} known-flaky test(s) failed "
+                f"(quarantined, non-blocking) — {summary_line}"
+                if summary_line
+                else f"{len(quarantined)} known-flaky test(s) failed "
+                f"(quarantined, non-blocking)"
+            ),
+            details=details,
             artifacts=[str(log_path)],
         )
+
+
+def _render_details(blocking: list[str], quarantined: list[str], log_path) -> str:
+    """Scorecard detail block — blocking failures first (the actionable
+    part), then any quarantined flakes that rode along (visible, but
+    flagged non-blocking)."""
+    parts: list[str] = []
+    if blocking:
+        shown = blocking[:30]
+        parts.append("**Failed tests (blocking):**\n```\n" + "\n".join(shown) + "\n```")
+        if len(blocking) > 30:
+            parts.append(f"…and {len(blocking) - 30} more — see {log_path}")
+    if quarantined:
+        shown = quarantined[:30]
+        parts.append(
+            "**Quarantined flakes that failed (non-blocking):**\n```\n"
+            + "\n".join(shown)
+            + "\n```"
+        )
+        if len(quarantined) > 30:
+            parts.append(f"…and {len(quarantined) - 30} more — see {log_path}")
+    return "\n\n".join(parts)
 
 
 def _last_summary_line(stdout: str) -> str:
@@ -105,3 +185,23 @@ def _extract_failed_lines(stdout: str) -> list[str]:
             if line.startswith("FAILED"):
                 out.append(line)
     return out
+
+
+def _failed_node_ids(stdout: str) -> list[str]:
+    """Extract pytest node ids from the short-summary FAILED lines.
+
+    A FAILED line looks like ``FAILED tests/foo.py::test_bar - AssertionError``
+    or bare ``FAILED tests/foo.py::test_bar``. The node id is the token
+    after ``FAILED `` and before the ``  - <message>`` separator pytest
+    inserts (space-dash-space). Parametrized ids can contain spaces
+    inside ``[...]``, so we split on the first ``" - "`` rather than on
+    whitespace.
+    """
+    ids: list[str] = []
+    for line in _extract_failed_lines(stdout):
+        rest = line[len("FAILED ") :] if line.startswith("FAILED ") else line
+        # Strip the trailing " - <error message>" if present.
+        node_id = rest.split(" - ", 1)[0].strip()
+        if node_id:
+            ids.append(node_id)
+    return ids
