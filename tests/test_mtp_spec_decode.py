@@ -105,6 +105,16 @@ def _reset_mtp_module_state():
     sys.modules["mlx_lm.generate"].generation_stream = mx.default_stream(
         mx.default_device()
     )
+    # Un-stick the global MLX RNG after each test. A test that calls
+    # ``mx.random.seed(N)`` for its own determinism would otherwise leave
+    # the process-global RNG pinned at that seed, making the NEXT test's
+    # unseeded ``mx.random.*`` draws depend on whether the seeding test
+    # ran first (codex NIT on PR #1206). Reseeding from OS entropy here
+    # restores the fresh, order-independent RNG every other test assumes,
+    # while a self-seeding test stays fully deterministic within itself.
+    import os
+
+    mx.random.seed(int.from_bytes(os.urandom(8), "little") & 0x7FFFFFFFFFFFFFFF)
 
 
 # ---------------------------------------------------------------------------
@@ -1991,7 +2001,10 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     import mlx.nn as _nn
 
     # Deterministic: fix the seed so the exercised values and any
-    # numerical failure are reproducible (codex NIT on PR #1206).
+    # numerical failure are reproducible (codex NIT on PR #1206). The
+    # autouse ``_reset_mtp_module_state`` fixture reseeds the global RNG
+    # from entropy at teardown, so this fixed seed does NOT leak into
+    # subsequent tests.
     _mx.random.seed(0)
 
     group_size, bits = 64, 4
@@ -2101,7 +2114,11 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         ctrl_fp32,
     )
     # ... "and the reverse": bf16 module + bf16 input baseline, then
-    # scales forced to fp32 must land close to it.
+    # scales AND/OR biases forced to fp32 must land close to it (both the
+    # scales-only and the scales+biases variants — a bf16 module with an
+    # fp32 bias is a config production accepts, so cover it too; codex
+    # BLOCKING on PR #1206).
+    assert bf16_layer.biases.dtype == _mx.bfloat16
     ctrl_bf16 = matmul(x_bf16, bf16_layer.weight, bf16_layer.scales, bf16_layer.biases)
     assert _close(
         matmul(
@@ -2109,6 +2126,24 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
             bf16_layer.weight,
             _forced(bf16_layer.scales, _mx.float32),
             bf16_layer.biases,
+        ),
+        ctrl_bf16,
+    )
+    assert _close(
+        matmul(
+            x_bf16,
+            bf16_layer.weight,
+            bf16_layer.scales,
+            _forced(bf16_layer.biases, _mx.float32),
+        ),
+        ctrl_bf16,
+    )
+    assert _close(
+        matmul(
+            x_bf16,
+            bf16_layer.weight,
+            _forced(bf16_layer.scales, _mx.float32),
+            _forced(bf16_layer.biases, _mx.float32),
         ),
         ctrl_bf16,
     )
@@ -2191,12 +2226,22 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     ctrl_moe_bf16 = gather_qmm(
         bf16_gate, x_moe_bf16, bf16_gate.scales, bf16_gate.biases
     )
+    assert bf16_gate.biases.dtype == _mx.bfloat16
     assert _close(
         gather_qmm(
             bf16_gate,
             x_moe_bf16,
             _forced(bf16_gate.scales, _mx.float32),
             bf16_gate.biases,
+        ),
+        ctrl_moe_bf16,
+    )
+    assert _close(
+        gather_qmm(
+            bf16_gate,
+            x_moe_bf16,
+            bf16_gate.scales,
+            _forced(bf16_gate.biases, _mx.float32),
         ),
         ctrl_moe_bf16,
     )
