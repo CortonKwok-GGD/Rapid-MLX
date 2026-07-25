@@ -44,6 +44,17 @@ def mlx_kv_tensors(draw, *, max_rows: int = 6, max_groups: int = 4):
     than element-by-element: shrinking a 3072-float list adds no signal
     for these whole-tensor numeric invariants, and the seed keeps every
     failing example perfectly reproducible while staying fast.
+
+    ``dist`` covers, per group of ``group_size`` consecutive elements:
+
+    * ``normal`` / ``uniform`` — general spread,
+    * ``bimodal`` — mass at the group extrema (worst case for affine
+      min/max quantization),
+    * ``constant`` — every element in a group equal, at a nonzero
+      per-group offset (zero quantization step — the divide-by-step
+      edge),
+    * ``narrow`` — a tiny variation around a large nonzero per-group
+      offset (the affine-precision / catastrophic-cancellation edge).
     """
     bits = draw(st.sampled_from(QUANT_BITS))
     group_size = draw(st.sampled_from(QUANT_GROUP_SIZES))
@@ -51,7 +62,7 @@ def mlx_kv_tensors(draw, *, max_rows: int = 6, max_groups: int = 4):
     rows = draw(st.integers(min_value=1, max_value=max_rows))
     scale = draw(st.sampled_from(_MAGNITUDE_SCALES))
     seed = draw(st.integers(min_value=0, max_value=2**31 - 1))
-    dist = draw(st.sampled_from(("normal", "uniform", "bimodal")))
+    dist = draw(st.sampled_from(("normal", "uniform", "bimodal", "constant", "narrow")))
 
     head_dim = group_size * n_groups
     rng = np.random.default_rng(seed)
@@ -59,10 +70,20 @@ def mlx_kv_tensors(draw, *, max_rows: int = 6, max_groups: int = 4):
         base = rng.standard_normal((rows, head_dim))
     elif dist == "uniform":
         base = rng.uniform(-1.0, 1.0, size=(rows, head_dim))
-    else:  # bimodal — pushes mass toward the group extrema, the worst
-        # case for affine min/max quantization.
+    elif dist == "bimodal":  # mass at the group extrema — worst case for
+        # affine min/max quantization.
         base = rng.choice((-1.0, 1.0), size=(rows, head_dim))
         base = base + 0.05 * rng.standard_normal((rows, head_dim))
+    elif dist == "constant":  # every element in a group identical, at a
+        # nonzero per-group offset -> (max - min) == 0, i.e. step == 0.
+        offsets = rng.standard_normal((rows, n_groups, 1))
+        base = np.repeat(offsets, group_size, axis=2).reshape(rows, head_dim)
+    else:  # "narrow" — a tiny variation around a LARGE per-group offset,
+        # stressing affine precision (the reconstruction floor is set by
+        # the offset magnitude, not the group range).
+        offsets = rng.standard_normal((rows, n_groups, 1)) * 10.0
+        jitter = 1e-3 * rng.standard_normal((rows, n_groups, group_size))
+        base = (np.repeat(offsets, group_size, axis=2) + jitter).reshape(rows, head_dim)
     x = mx.array((base * scale).astype(np.float32))
     return x, group_size, bits
 
@@ -98,14 +119,27 @@ def out_of_range_finite_floats(
     lo: float,
     hi: float,
     *,
+    lo_inclusive: bool = True,
+    hi_inclusive: bool = True,
     span: float = 1e6,
 ) -> st.SearchStrategy:
-    """Finite floats strictly below ``lo`` or strictly above ``hi``.
+    """Finite floats that are INVALID for the range with the given
+    inclusivity — the values a correct validator must reject.
+
+    Bound-inclusivity aware (the Fix-1 gap): when a bound is *exclusive*
+    the endpoint itself is invalid, so it is included in the generated
+    set. For ``top_p``'s ``(0, 1]`` this makes ``0.0`` reachable — without
+    it a regression that started accepting ``top_p == 0.0`` would stay
+    green.
+
+    * always: strictly below ``lo`` and strictly above ``hi``,
+    * when ``lo`` is exclusive: the exact endpoint ``lo`` (e.g. ``0.0``),
+    * when ``hi`` is exclusive: the exact endpoint ``hi``.
 
     Hypothesis realizes ``exclude_min`` / ``exclude_max`` with
-    ``math.nextafter``, so every drawn value is a representable float
-    *distinct* from the bound — no float-rounding value can silently land
-    ON the (accepted) boundary and turn a rejection property flaky.
+    ``math.nextafter``, so every strictly-outside value is a representable
+    float *distinct* from the bound — no float-rounding value can silently
+    land ON an accepted boundary and turn a rejection property flaky.
     """
     below = st.floats(
         min_value=lo - span,
@@ -121,4 +155,11 @@ def out_of_range_finite_floats(
         allow_nan=False,
         allow_infinity=False,
     )
-    return st.one_of(below, above)
+    branches = [below, above]
+    # An EXCLUSIVE bound means the endpoint value is itself invalid and
+    # must appear in the invalid set.
+    if not lo_inclusive:
+        branches.append(st.just(float(lo)))
+    if not hi_inclusive:
+        branches.append(st.just(float(hi)))
+    return st.one_of(branches)

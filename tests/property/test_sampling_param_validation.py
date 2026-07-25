@@ -102,15 +102,51 @@ def test_nonfinite_always_rejected(build, fields, data):
 @pytest.mark.parametrize("build,fields", _MODEL_SPECS)
 @given(data=st.data())
 def test_out_of_range_finite_rejected(build, fields, data):
-    """Finite values strictly outside the documented range raise
-    ``ValidationError``."""
+    """Finite values outside the documented range raise ``ValidationError``.
+
+    Bound-inclusivity aware: for an exclusive bound (e.g. ``top_p``'s
+    ``gt=0.0``) the endpoint itself is invalid and is drawn too, so a
+    regression that started accepting ``top_p == 0.0`` fails here.
+    """
     field = data.draw(st.sampled_from(sorted(fields)))
-    lo, hi, _lo_incl, _hi_incl = fields[field]
-    bad = data.draw(out_of_range_finite_floats(lo, hi))
-    # Guard the strategy's own contract: the drawn value really is outside.
-    assert math.isfinite(bad) and (bad < lo or bad > hi)
+    lo, hi, lo_incl, hi_incl = fields[field]
+    bad = data.draw(
+        out_of_range_finite_floats(lo, hi, lo_inclusive=lo_incl, hi_inclusive=hi_incl)
+    )
+    # Guard the strategy's own contract: the drawn value really is invalid
+    # for this range + inclusivity.
+    assert math.isfinite(bad)
+    is_invalid = (
+        bad < lo
+        or bad > hi
+        or (bad == lo and not lo_incl)
+        or (bad == hi and not hi_incl)
+    )
+    assert is_invalid, f"strategy produced an in-range value {bad!r}"
     with pytest.raises(ValidationError):
         build(**{field: bad})
+
+
+@pytest.mark.parametrize("build,fields", _MODEL_SPECS)
+def test_excluded_endpoints_rejected(build, fields):
+    """Every EXCLUSIVE range endpoint is rejected — explicitly, not just
+    via fuzzing. In practice this pins ``top_p == 0.0`` (range ``(0, 1]``)
+    on every model that enforces it, so a future loosening to ``ge=0.0``
+    can't slip through green.
+    """
+    checked_any = False
+    for field, (lo, hi, lo_incl, hi_incl) in fields.items():
+        if not lo_incl:
+            checked_any = True
+            with pytest.raises(ValidationError):
+                build(**{field: float(lo)})
+        if not hi_incl:
+            checked_any = True
+            with pytest.raises(ValidationError):
+                build(**{field: float(hi)})
+    # Sanity: the spec table must contain at least one exclusive bound
+    # (top_p), otherwise this test would silently assert nothing.
+    assert checked_any
 
 
 @pytest.mark.parametrize("build,fields", _MODEL_SPECS)

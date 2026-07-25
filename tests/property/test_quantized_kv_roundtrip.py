@@ -38,6 +38,16 @@ from .strategies import QUANT_GROUP_SIZES, mlx_kv_tensors
 
 pytestmark = pytest.mark.property
 
+
+def _raw(a) -> tuple:
+    """``(dtype, shape, raw-bytes)`` of an MLX array via a contiguous NumPy
+    copy. Compares the underlying BIT pattern — unlike ``mx.array_equal``,
+    this distinguishes ``+0.0`` from ``-0.0`` and any other byte-level
+    difference, which is exactly what the "byte-exact" claim requires."""
+    n = np.ascontiguousarray(np.array(a))
+    return (n.dtype.str, n.shape, n.tobytes())
+
+
 # Extra examples for the pure-integer ``supported_group_size`` properties:
 # they carry no MLX cost, so a wider sweep is essentially free and buys
 # denser coverage of the divisibility lattice.
@@ -121,16 +131,24 @@ def test_roundtrip_error_bounded_by_group_step(t):
     """Reconstruction error is bounded by each group's OWN quantization
     step — the differential, data-derived bound, not a magic epsilon.
 
-    For every group of ``group_size`` consecutive elements along the head
-    axis, affine quantization spaces the reconstruction levels by
-    ``step = (max - min) / (2**bits - 1)``. Any value in the group
-    therefore dequantizes to within one step of its true value. (MLX's
-    affine quantizer is *not* round-to-nearest, so the tight bound is a
-    full step, not step/2 — verified empirically: the observed worst case
-    is ~0.99 step.) The tolerance's only non-data term is ``rel`` — a
-    float32-rounding slack on the ``scale*q + bias`` recombination — and
-    it is applied *relative to the group's magnitude*, never as a fixed
-    absolute number.
+    Two MLX-specific facts make the bound what it is (both verified
+    empirically, not assumed):
+
+    * MLX affine quantization is ZERO-POINT-INCLUSIVE: the grid it lays
+      down always spans zero, so the effective range is
+      ``[min(gmin, 0), max(gmax, 0)]`` — NOT ``[gmin, gmax]``. A group of
+      all-negative (or all-positive) values at a nonzero offset therefore
+      gets a step set by its *distance from zero*, and every value can
+      land a full such step away. Using ``gmax - gmin`` here would be
+      wrong (it under-bounds these offset groups) — the ``constant`` /
+      ``narrow`` strategy distributions exercise exactly that case.
+    * The quantizer is *not* round-to-nearest, so the tight bound is a
+      full step, not step/2 (observed worst case ~0.98 step).
+
+    ``step`` below is the zero-inclusive step; the only non-data term is
+    ``rel`` — a float32 recombination slack applied *relative to the
+    group magnitude*, never a fixed absolute number. For a constant group
+    the step is 0 and the reconstruction is exact.
     """
     x, gs, bits = t
     dq = _dequantize(_quantize(x, gs, bits), gs, bits)
@@ -144,18 +162,21 @@ def test_roundtrip_error_bounded_by_group_step(t):
 
     gmin = xg.min(axis=-1)
     gmax = xg.max(axis=-1)
-    step = (gmax - gmin) / (2**bits - 1)  # per-group quantization step
+    # Zero-inclusive effective range — the range MLX actually quantizes
+    # over (see docstring). Never divides by step, so step == 0 (constant
+    # group) is safe and demands exact reconstruction.
+    eff_step = (np.maximum(gmax, 0.0) - np.minimum(gmin, 0.0)) / (2**bits - 1)
     err = np.abs(dg - xg).max(axis=-1)  # per-group worst reconstruction err
 
     rel = 1e-4  # float32 recombination slack (data-relative, below)
     magnitude = np.maximum(np.abs(gmin), np.abs(gmax))
-    tol = step * (1.0 + rel) + rel * magnitude
+    tol = eff_step * (1.0 + rel) + rel * magnitude
 
     worst = float(np.max(err - tol))
     assert np.all(err <= tol), (
         f"round-trip error exceeded per-group step bound by {worst:.3e} "
         f"(gs={gs}, bits={bits}); max err/step="
-        f"{float(np.max(err / np.maximum(step, 1e-30))):.4f}"
+        f"{float(np.max(err / np.maximum(eff_step, 1e-30))):.4f}"
     )
 
 
@@ -182,32 +203,56 @@ def test_requantization_reaches_a_byte_exact_fixed_point(t):
     group extrema can shift the grid, so the first re-quantization
     ``|z - y|`` can be a *full* quantization step (empirically up to ~1
     step). The sound metamorphic invariant is CONVERGENCE: after the
-    second round-trip the tensor is a genuine fixed point of
-    quant->dequant, and a third round-trip reproduces it byte-for-byte.
-    This guards against unbounded drift under repeated cache
-    save/restore cycles.
+    second round-trip ``z`` is a genuine fixed point of quant->dequant.
+
+    The "byte-exact" wording is PATH (a) — verified empirically to hold
+    across the generated space (constant + narrow-range groups included):
+    at the fixed point ``z`` BOTH
+
+      * the dequantized tensor (``w == z`` at the raw-byte level — signed
+        zero and all, not just ``mx.array_equal`` which folds ``+0.0`` and
+        ``-0.0``), AND
+      * the full quantized STATE — the ``[packed, scales, biases]`` triple
+        (dtype, shape, and raw bytes)
+
+    reproduce byte-for-byte. This guards against unbounded drift under
+    repeated cache save/restore cycles (``state`` serializes the triple).
     """
     x, gs, bits = t
     y = _dequantize(_quantize(x, gs, bits), gs, bits)
     z = _dequantize(_quantize(y, gs, bits), gs, bits)
-    w = _dequantize(_quantize(z, gs, bits), gs, bits)
 
     # (a) the first drift is bounded by one of y's own quantization steps
     #     — re-quantization never amplifies error beyond a single step.
+    #     Same zero-inclusive step as test_roundtrip_error_bounded_by_group_step.
     yn = np.array(y, dtype=np.float32)
     zn = np.array(z, dtype=np.float32)
     rows, head_dim = yn.shape
     n_groups = head_dim // gs
     yg = yn.reshape(rows, n_groups, gs)
     zg = zn.reshape(rows, n_groups, gs)
-    step_y = (yg.max(axis=-1) - yg.min(axis=-1)) / (2**bits - 1)
+    y_min = yg.min(axis=-1)
+    y_max = yg.max(axis=-1)
+    eff_step_y = (np.maximum(y_max, 0.0) - np.minimum(y_min, 0.0)) / (2**bits - 1)
     drift = np.abs(zg - yg).max(axis=-1)
     rel = 1e-4
-    magnitude = np.maximum(np.abs(yg.min(axis=-1)), np.abs(yg.max(axis=-1)))
-    assert np.all(drift <= step_y * (1.0 + rel) + rel * magnitude)
+    magnitude = np.maximum(np.abs(y_min), np.abs(y_max))
+    assert np.all(drift <= eff_step_y * (1.0 + rel) + rel * magnitude)
 
-    # (b) the second round-trip is a byte-exact fixed point: z is stable.
-    assert bool(mx.array_equal(w, z).item()), (
-        f"quant->dequant did not converge to a fixed point (gs={gs}, "
-        f"bits={bits}): max|w - z|={float(np.max(np.abs(np.array(w) - zn))):.3e}"
+    # (b) z is a byte-exact fixed point. Quantize z (its stored state),
+    #     read it back to w, then quantize w — both the dequantized tensor
+    #     and the quantized triple must reproduce byte-for-byte.
+    q_z = _quantize(z, gs, bits)  # quantized STATE of z
+    w = _dequantize(q_z, gs, bits)
+    q_w = _quantize(w, gs, bits)  # quantized STATE of w
+
+    # (b1) dequantized tensor is byte-identical (catches signed zero).
+    assert _raw(w) == _raw(z), (
+        f"dequant fixed point not byte-exact (gs={gs}, bits={bits}): "
+        f"max|w - z|={float(np.max(np.abs(np.array(w) - zn))):.3e}"
     )
+    # (b2) quantized state (packed/scales/biases) is byte-identical.
+    for name, mz, mw in zip(("packed", "scales", "biases"), q_z, q_w):
+        assert _raw(mz) == _raw(mw), (
+            f"quantized {name} not a byte-exact fixed point (gs={gs}, bits={bits})"
+        )
