@@ -121,10 +121,14 @@ def out_of_range_finite_floats(
     *,
     lo_inclusive: bool = True,
     hi_inclusive: bool = True,
-    span: float = 1e6,
 ) -> st.SearchStrategy:
     """Finite floats that are INVALID for the range with the given
     inclusivity — the values a correct validator must reject.
+
+    Spans the ENTIRE finite range on each side (no artificial outer cap):
+    strictly ``< lo`` reaches down to ``-1.8e308`` and strictly ``> hi``
+    up to ``+1.8e308``, so large magnitudes like ``1e308`` are exercised —
+    a validator that only bounded, say, ``|x| < 1e6`` would be caught.
 
     Bound-inclusivity aware (the Fix-1 gap): when a bound is *exclusive*
     the endpoint itself is invalid, so it is included in the generated
@@ -132,7 +136,8 @@ def out_of_range_finite_floats(
     it a regression that started accepting ``top_p == 0.0`` would stay
     green.
 
-    * always: strictly below ``lo`` and strictly above ``hi``,
+    * always: strictly below ``lo`` and strictly above ``hi`` (full finite
+      range),
     * when ``lo`` is exclusive: the exact endpoint ``lo`` (e.g. ``0.0``),
     * when ``hi`` is exclusive: the exact endpoint ``hi``.
 
@@ -142,7 +147,6 @@ def out_of_range_finite_floats(
     land ON an accepted boundary and turn a rejection property flaky.
     """
     below = st.floats(
-        min_value=lo - span,
         max_value=lo,
         exclude_max=True,
         allow_nan=False,
@@ -150,7 +154,6 @@ def out_of_range_finite_floats(
     )
     above = st.floats(
         min_value=hi,
-        max_value=hi + span,
         exclude_min=True,
         allow_nan=False,
         allow_infinity=False,

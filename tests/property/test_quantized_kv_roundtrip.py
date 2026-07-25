@@ -25,7 +25,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from vllm_mlx.quantized_batch_cache import (
@@ -68,6 +68,15 @@ _requested = st.integers(min_value=1, max_value=512)
 
 @given(head_dim=_head_dims, requested=_requested)
 @_INT_SWEEP
+# Pin the documented pathological dims so they ALWAYS run, not just by
+# chance: 80/96/100 divide no supported size at requested=128, 256 picks
+# 128; the clean cases (128@128 -> 128, 64@64 -> 64) guard the happy path.
+@example(head_dim=80, requested=128)
+@example(head_dim=96, requested=128)
+@example(head_dim=100, requested=128)
+@example(head_dim=256, requested=128)
+@example(head_dim=128, requested=128)
+@example(head_dim=64, requested=64)
 def test_supported_group_size_is_the_largest_valid_divisor(head_dim, requested):
     """The result is ``None`` or the LARGEST of {32,64,128} that is both
     ``<= requested`` and divides ``head_dim``."""
@@ -122,7 +131,12 @@ def test_roundtrip_preserves_shape(t):
     cache stores 3 packed tensors but the model must read back exactly
     ``(rows, head_dim)``."""
     x, gs, bits = t
-    dq = _dequantize(_quantize(x, gs, bits), gs, bits)
+    q = _quantize(x, gs, bits)
+    dq = _dequantize(q, gs, bits)
+    # MLX is lazy: ``.shape`` is known from the graph WITHOUT running the
+    # kernel, so a quantize/dequantize that would fault on eval could still
+    # pass a shape-only check. Force the kernels to actually run first.
+    mx.eval(*q, dq)
     assert dq.shape == x.shape
 
 
@@ -147,11 +161,19 @@ def test_roundtrip_error_bounded_by_group_step(t):
 
     ``step`` below is the zero-inclusive step; the only non-data term is
     ``rel`` — a float32 recombination slack applied *relative to the
-    group magnitude*, never a fixed absolute number. For a constant group
-    the step is 0 and the reconstruction is exact.
+    group magnitude*, never a fixed absolute number. Constant groups: an
+    ALL-ZERO group has both raw range 0 AND zero-inclusive step 0; a
+    NONZERO constant group has raw range 0 but a *nonzero* effective step
+    ``abs(value) / (2**bits - 1)`` (its distance from zero). Either way the
+    single value reconstructs exactly, well inside ``tol``.
     """
     x, gs, bits = t
-    dq = _dequantize(_quantize(x, gs, bits), gs, bits)
+    q = _quantize(x, gs, bits)
+    dq = _dequantize(q, gs, bits)
+    # Force MLX's lazy quantize/dequantize kernels to actually run before
+    # the numeric assertion rests on their output (the np conversions below
+    # also eval, but keep this explicit so the intent survives a refactor).
+    mx.eval(*q, dq)
 
     xn = np.array(x, dtype=np.float32)
     dn = np.array(dq, dtype=np.float32)
@@ -163,8 +185,9 @@ def test_roundtrip_error_bounded_by_group_step(t):
     gmin = xg.min(axis=-1)
     gmax = xg.max(axis=-1)
     # Zero-inclusive effective range — the range MLX actually quantizes
-    # over (see docstring). Never divides by step, so step == 0 (constant
-    # group) is safe and demands exact reconstruction.
+    # over (see docstring). Never divides by eff_step, so an all-zero group
+    # (eff_step == 0) is safe; a nonzero constant group has a nonzero
+    # eff_step but still reconstructs exactly.
     eff_step = (np.maximum(gmax, 0.0) - np.minimum(gmin, 0.0)) / (2**bits - 1)
     err = np.abs(dg - xg).max(axis=-1)  # per-group worst reconstruction err
 
@@ -189,8 +212,12 @@ def test_quantize_is_deterministic(t):
     a = _quantize(x, gs, bits)
     b = _quantize(x, gs, bits)
     assert len(a) == len(b) == 3
+    # Byte-exact via ``_raw`` (dtype + shape + raw bytes), NOT
+    # ``mx.array_equal`` — the latter folds +0.0/-0.0 and can compare
+    # across dtypes, so it would not actually verify the "byte-identical"
+    # claim the cache's serialization depends on. ``_raw`` forces eval too.
     for name, ma, mb in zip(("packed", "scales", "biases"), a, b):
-        assert bool(mx.array_equal(ma, mb).item()), f"{name} tensor not deterministic"
+        assert _raw(ma) == _raw(mb), f"{name} tensor not byte-identical"
 
 
 @given(t=mlx_kv_tensors())
@@ -221,6 +248,7 @@ def test_requantization_reaches_a_byte_exact_fixed_point(t):
     x, gs, bits = t
     y = _dequantize(_quantize(x, gs, bits), gs, bits)
     z = _dequantize(_quantize(y, gs, bits), gs, bits)
+    mx.eval(y, z)  # run the round-trip kernels before asserting on them
 
     # (a) the first drift is bounded by one of y's own quantization steps
     #     — re-quantization never amplifies error beyond a single step.
@@ -245,6 +273,7 @@ def test_requantization_reaches_a_byte_exact_fixed_point(t):
     q_z = _quantize(z, gs, bits)  # quantized STATE of z
     w = _dequantize(q_z, gs, bits)
     q_w = _quantize(w, gs, bits)  # quantized STATE of w
+    mx.eval(*q_z, w, *q_w)  # run the re-quantize kernels before asserting
 
     # (b1) dequantized tensor is byte-identical (catches signed zero).
     assert _raw(w) == _raw(z), (
