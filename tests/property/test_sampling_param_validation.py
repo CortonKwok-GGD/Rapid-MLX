@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Property-based generalization of the H-10 sampling-param fix.
+
+H-10 closed a silent-burn class: a NaN / out-of-range ``temperature`` or
+``top_p`` HTTP-200'd straight into a Metal kernel and crashed the server.
+The regression tests pin single example values; these properties pin the
+invariant *over the entire float space*:
+
+* every non-finite float is rejected,
+* every finite value strictly outside the documented range is rejected,
+* every finite value inside the range is accepted AND stored unchanged.
+
+Each request model documents its own range, so we assert only what that
+model actually enforces:
+
+* OpenAI ``ChatCompletionRequest`` / ``CompletionRequest``:
+  ``temperature`` in ``[0, 2]``, ``top_p`` in ``(0, 1]``.
+* Anthropic ``AnthropicRequest``: ``temperature`` in ``[0, 1]``,
+  ``top_p`` in ``(0, 1]``.
+
+Pure Pydantic construction — no server, fully hermetic.
+"""
+from __future__ import annotations
+
+import math
+
+import pytest
+from hypothesis import given
+from hypothesis import strategies as st
+from pydantic import ValidationError
+
+from vllm_mlx.api.anthropic_models import AnthropicRequest
+from vllm_mlx.api.models import ChatCompletionRequest, CompletionRequest
+
+from .strategies import (
+    in_range_floats,
+    nonfinite_floats,
+    out_of_range_finite_floats,
+)
+
+pytestmark = pytest.mark.property
+
+
+# --- minimal valid constructors -----------------------------------------
+# Each builder supplies only the required fields for that model so the
+# sampling param under test is the sole variable.
+
+
+def _build_chat(**kw) -> ChatCompletionRequest:
+    return ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **kw)
+
+
+def _build_completion(**kw) -> CompletionRequest:
+    return CompletionRequest(prompt="hi", **kw)
+
+
+def _build_anthropic(**kw) -> AnthropicRequest:
+    return AnthropicRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=16,
+        **kw,
+    )
+
+
+# (label, builder, {field: (lo, hi, lo_inclusive, hi_inclusive)}).
+# Ranges are read straight off the Field(...) bounds + field validators in
+# api/models.py and api/anthropic_models.py — assert only what the code
+# guarantees.
+_MODEL_SPECS = [
+    pytest.param(
+        _build_chat,
+        {"temperature": (0.0, 2.0, True, True), "top_p": (0.0, 1.0, False, True)},
+        id="chat",
+    ),
+    pytest.param(
+        _build_completion,
+        {"temperature": (0.0, 2.0, True, True), "top_p": (0.0, 1.0, False, True)},
+        id="completion",
+    ),
+    pytest.param(
+        _build_anthropic,
+        {"temperature": (0.0, 1.0, True, True), "top_p": (0.0, 1.0, False, True)},
+        id="anthropic",
+    ),
+]
+
+
+@pytest.mark.parametrize("build,fields", _MODEL_SPECS)
+@given(data=st.data())
+def test_nonfinite_always_rejected(build, fields, data):
+    """Constructing any of these models with a non-finite ``temperature``
+    or ``top_p`` raises ``ValidationError`` (never a silent 200 → kernel).
+    """
+    field = data.draw(st.sampled_from(sorted(fields)))
+    bad = data.draw(nonfinite_floats())
+    with pytest.raises(ValidationError):
+        build(**{field: bad})
+
+
+@pytest.mark.parametrize("build,fields", _MODEL_SPECS)
+@given(data=st.data())
+def test_out_of_range_finite_rejected(build, fields, data):
+    """Finite values strictly outside the documented range raise
+    ``ValidationError``."""
+    field = data.draw(st.sampled_from(sorted(fields)))
+    lo, hi, _lo_incl, _hi_incl = fields[field]
+    bad = data.draw(out_of_range_finite_floats(lo, hi))
+    # Guard the strategy's own contract: the drawn value really is outside.
+    assert math.isfinite(bad) and (bad < lo or bad > hi)
+    with pytest.raises(ValidationError):
+        build(**{field: bad})
+
+
+@pytest.mark.parametrize("build,fields", _MODEL_SPECS)
+@given(data=st.data())
+def test_in_range_accepted_and_preserved(build, fields, data):
+    """Finite values inside the range construct OK and are stored exactly
+    as passed — no silent clamping or coercion."""
+    field = data.draw(st.sampled_from(sorted(fields)))
+    lo, hi, lo_incl, hi_incl = fields[field]
+    value = data.draw(
+        in_range_floats(lo, hi, lo_inclusive=lo_incl, hi_inclusive=hi_incl)
+    )
+    req = build(**{field: value})
+    assert getattr(req, field) == value
