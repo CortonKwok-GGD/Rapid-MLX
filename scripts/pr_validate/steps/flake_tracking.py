@@ -277,11 +277,16 @@ def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.Completed
 def _drain_bounded(proc: subprocess.Popen) -> tuple[str, str]:
     """Drain the child's pipes after a kill, but never block forever.
 
-    The normal case returns immediately (the group is dead). If a
-    descendant escaped the process group and still holds the write end
-    open, the bounded ``communicate`` raises again — we then re-kill,
-    force the pipes closed, and give up on the tail so the gate proceeds
-    instead of hanging (macOS has no cgroup to contain such an escape)."""
+    The normal case returns immediately (the group is dead) with the full
+    captured output. If a descendant escaped the process group and still
+    holds the write end open, the bounded ``communicate`` raises again —
+    we then re-kill, force the pipes closed, and REAP the direct child so
+    it can't be left a zombie (the group leader is already SIGKILLed, so
+    the bounded ``wait`` returns promptly — codex #1222 r4). The tail of
+    output is unrecoverable on this rare double-timeout path: CPython does
+    not expose the bytes buffered inside a timed-out ``communicate``, so
+    we return empties and rely on the module docstring's honest note that
+    a setsid-escaping descendant is not portably containable on macOS."""
     try:
         return proc.communicate(timeout=_DRAIN_TIMEOUT_S)
     except subprocess.TimeoutExpired:
@@ -292,6 +297,12 @@ def _drain_bounded(proc: subprocess.Popen) -> tuple[str, str]:
                     stream.close()
                 except OSError:
                     pass
+        # Reap the (already-killed) direct child; bounded so a wedged
+        # waitpid can't hang the gate either.
+        try:
+            proc.wait(timeout=_DRAIN_TIMEOUT_S)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
         return "", ""
 
 

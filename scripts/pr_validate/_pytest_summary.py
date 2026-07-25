@@ -38,12 +38,11 @@ def summary_node_ids(text: str, *labels: str) -> list[str]:
     """Node ids pytest lists under the given short-summary labels.
 
     A summary line is ``<LABEL> <nodeid>[ - <message>]``; the node id is
-    everything between the label and the ``" - "`` message separator.
-    Parametrized ids can hold spaces inside ``[...]``, so we split on
-    ``" - "`` rather than on whitespace. (A param value literally
-    containing ``" - "`` is inherently ambiguous in pytest's own text
-    output and is not handled — that is a pytest-format limitation, not
-    one we can resolve here.)
+    everything between the label and the ``" - "`` message separator. A
+    parametrized id can itself contain ``" - "`` inside its ``[...]``
+    (e.g. ``test_x[a - b]``), so we only treat a ``" - "`` that occurs
+    *after* the final ``]`` as the separator — inside the bracket it's
+    part of the id (codex #1222 r4).
 
     Only lines inside the genuine ``short test summary info`` banner block
     count — a ``FAILED`` token in a traceback (or a forged banner) above
@@ -67,8 +66,22 @@ def summary_node_ids(text: str, *labels: str) -> list[str]:
             break
         for label in wanted:
             if line.startswith(label + " "):
-                node_id = line[len(label) + 1 :].split(" - ", 1)[0].strip()
+                node_id = _strip_message(line[len(label) + 1 :])
                 if node_id:
                     out.append(node_id)
                 break
     return out
+
+
+def _strip_message(rest: str) -> str:
+    """Return the node id from a ``<nodeid>[ - <message>]`` tail.
+
+    The message separator is the first ``" - "`` that falls *after* the
+    node id's final ``]`` (or the first one at all, for an unparametrized
+    id). This keeps a ``" - "`` inside a parametrization bracket as part
+    of the id instead of truncating it (codex #1222 r4)."""
+    bracket_end = rest.rfind("]")
+    search_from = bracket_end + 1 if bracket_end != -1 else 0
+    sep = rest.find(" - ", search_from)
+    node_id = rest if sep == -1 else rest[:sep]
+    return node_id.strip()

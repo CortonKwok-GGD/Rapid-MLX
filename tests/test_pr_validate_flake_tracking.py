@@ -100,6 +100,19 @@ class TestSummaryNodeIds:
         )
         assert out == ["tests/a.py::test_x[a b c]"]
 
+    def test_param_id_with_dash_space_not_truncated(self):
+        # A param value containing " - " must NOT be cut at the first
+        # occurrence — the separator is the one after the final ']'
+        # (codex #1222 r4).
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x[a - b] - AssertionError"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x[a - b]"]
+
+    def test_param_id_with_dash_space_no_message(self):
+        out = summary_node_ids(_summary("FAILED tests/a.py::test_x[a - b]"), "FAILED")
+        assert out == ["tests/a.py::test_x[a - b]"]
+
     def test_ignores_failed_outside_summary(self):
         text = (
             "tests/a.py::test_x FAILED in call setup\n"  # pre-summary noise
@@ -725,6 +738,32 @@ class TestRunSession:
             except ProcessLookupError:
                 pass
             pytest.fail(f"grandchild {gc_pid} survived the process-group kill")
+
+    def test_double_timeout_reaps_direct_child(self, monkeypatch):
+        # If the post-kill drain ALSO times out (a group-escaping
+        # descendant holds the pipe), _drain_bounded must still reap the
+        # direct child so it isn't left a zombie (codex #1222 r4). Driven
+        # with a stub so it's deterministic and fast.
+        class _FakeProc:
+            def __init__(self):
+                self.stdout = None
+                self.stderr = None
+                self.pid = 999999
+                self.wait_called = False
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+
+            def wait(self, timeout=None):
+                self.wait_called = True
+                return -9
+
+        monkeypatch.setattr(flake_mod.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(flake_mod.os, "killpg", lambda pgid, sig: None)
+        fake = _FakeProc()
+        out, err = flake_mod._drain_bounded(fake)
+        assert (out, err) == ("", "")
+        assert fake.wait_called  # direct child was reaped, not orphaned
 
 
 class TestRegistration:
