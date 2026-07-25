@@ -1976,9 +1976,9 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     future MLX that silently returned finite-but-wrong output for a
     mixed-dtype call would keep a finiteness-only test green, so each
     mismatched case is compared against its own matched-dtype control
-    within a generous tolerance (well above the measured ~0.02-abs
-    bf16-rounding noise at this magnitude, far below the
-    order-of-magnitude error garbage would produce).
+    under a fixed seed and a bounded max abs error (~3x the measured
+    worst-case bf16/fp16 rounding drift, far below the fraction-of-
+    magnitude error garbage would produce — see ``_MAX_ABS_ERR``).
 
     This test is the tripwire: if a future MLX bump starts raising on —
     OR silently corrupting — ANY of these combinations, this test fails
@@ -1990,25 +1990,45 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     import mlx.core as _mx
     import mlx.nn as _nn
 
+    # Deterministic: fix the seed so the exercised values and any
+    # numerical failure are reproducible (codex NIT on PR #1206).
+    _mx.random.seed(0)
+
     group_size, bits = 64, 4
     in_dims = out_dims = 128
 
-    # Generous tolerance: tracks the "MLX still does the math across the
-    # dtype mismatch" contract without being brittle to bf16/fp16
-    # rounding, while still failing a truly divergent ("finite garbage")
-    # result.
-    _ATOL, _RTOL = 0.2, 0.1
+    # Bounded max-error tolerance. Under the fixed seed above, the worst
+    # per-element abs error across ALL cases below (dense + MoE, both
+    # directions) is ~0.016 — a single bf16/fp16 rounding of scales/biases
+    # (relative precision ~2**-8 ~= 0.004) propagated through one
+    # quantized matmul, against control outputs whose |value| runs up to
+    # ~1.5. ``_MAX_ABS_ERR = 0.05`` is ~3x that measured worst case — tight
+    # enough that a materially corrupted / "finite garbage" result (off by
+    # a fraction of the ~1.5 magnitude, i.e. >> 0.05) fails, loose enough
+    # to absorb rounding without flaking. (codex BLOCKING on PR #1206: the
+    # earlier atol=0.2/rtol=0.1 permitted magnitude-comparable error.)
+    _MAX_ABS_ERR = 0.05
 
     def _close(mismatch, baseline):
+        err = _mx.abs(mismatch.astype(_mx.float32) - baseline.astype(_mx.float32))
         return bool(
-            _mx.all(
-                _mx.isfinite(mismatch)
-                & (
-                    _mx.abs(mismatch.astype(_mx.float32) - baseline.astype(_mx.float32))
-                    <= _ATOL + _RTOL * _mx.abs(baseline.astype(_mx.float32))
-                )
-            ).item()
+            _mx.all(_mx.isfinite(mismatch)).item()
+            and _mx.max(err).item() <= _MAX_ABS_ERR
         )
+
+    def _forced(tensor, dtype):
+        """Cast ``tensor`` to ``dtype``, asserting the cast is a REAL
+        dtype change (not a no-op) — else an allegedly-mismatched case
+        would silently exercise matched dtypes (codex BLOCKING on PR #1206).
+        """
+        assert tensor.dtype != dtype, (
+            f"expected a dtype MISMATCH but operand is already {dtype}; "
+            f".astype({dtype}) would be a no-op and the case would not "
+            f"exercise mixed dtypes"
+        )
+        out = tensor.astype(dtype)
+        assert out.dtype == dtype
+        return out
 
     def quantized_linear(param_dtype):
         lin = _nn.Linear(in_dims, out_dims, bias=False)
@@ -2034,6 +2054,11 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
     bf16_layer = quantized_linear(_mx.bfloat16)
     x_fp32 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.float32)
     x_bf16 = _mx.random.uniform(shape=(1, in_dims)).astype(_mx.bfloat16)
+    # Baseline dtypes must be what we think they are, so the ``_forced``
+    # casts below are genuine mismatches (codex BLOCKING on PR #1206).
+    assert fp32_layer.scales.dtype == _mx.float32
+    assert fp32_layer.biases.dtype == _mx.float32
+    assert bf16_layer.scales.dtype == _mx.bfloat16
 
     # fp32 module + fp32 input: matched-dtype baseline, then every
     # scales/biases-forced-to-bf16/fp16 mismatch must land close to it
@@ -2043,7 +2068,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         matmul(
             x_fp32,
             fp32_layer.weight,
-            fp32_layer.scales.astype(_mx.bfloat16),
+            _forced(fp32_layer.scales, _mx.bfloat16),
             fp32_layer.biases,
         ),
         ctrl_fp32,
@@ -2053,7 +2078,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
             x_fp32,
             fp32_layer.weight,
             fp32_layer.scales,
-            fp32_layer.biases.astype(_mx.bfloat16),
+            _forced(fp32_layer.biases, _mx.bfloat16),
         ),
         ctrl_fp32,
     )
@@ -2061,7 +2086,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         matmul(
             x_fp32,
             fp32_layer.weight,
-            fp32_layer.scales.astype(_mx.float16),
+            _forced(fp32_layer.scales, _mx.float16),
             fp32_layer.biases,
         ),
         ctrl_fp32,
@@ -2070,8 +2095,8 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         matmul(
             x_fp32,
             fp32_layer.weight,
-            fp32_layer.scales.astype(_mx.bfloat16),
-            fp32_layer.biases.astype(_mx.bfloat16),
+            _forced(fp32_layer.scales, _mx.bfloat16),
+            _forced(fp32_layer.biases, _mx.bfloat16),
         ),
         ctrl_fp32,
     )
@@ -2082,7 +2107,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         matmul(
             x_bf16,
             bf16_layer.weight,
-            bf16_layer.scales.astype(_mx.float32),
+            _forced(bf16_layer.scales, _mx.float32),
             bf16_layer.biases,
         ),
         ctrl_bf16,
@@ -2140,7 +2165,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         gather_qmm(
             fp32_gate,
             x_moe_fp32,
-            fp32_gate.scales.astype(_mx.bfloat16),
+            _forced(fp32_gate.scales, _mx.bfloat16),
             fp32_gate.biases,
         ),
         ctrl_moe_fp32,
@@ -2150,7 +2175,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
             fp32_gate,
             x_moe_fp32,
             fp32_gate.scales,
-            fp32_gate.biases.astype(_mx.float16),
+            _forced(fp32_gate.biases, _mx.float16),
         ),
         ctrl_moe_fp32,
     )
@@ -2170,7 +2195,7 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         gather_qmm(
             bf16_gate,
             x_moe_bf16,
-            bf16_gate.scales.astype(_mx.float32),
+            _forced(bf16_gate.scales, _mx.float32),
             bf16_gate.biases,
         ),
         ctrl_moe_bf16,
@@ -2179,8 +2204,8 @@ def test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype():
         gather_qmm(
             bf16_gate,
             x_moe_bf16,
-            bf16_gate.scales.astype(_mx.float32),
-            bf16_gate.biases.astype(_mx.float32),
+            _forced(bf16_gate.scales, _mx.float32),
+            _forced(bf16_gate.biases, _mx.float32),
         ),
         ctrl_moe_bf16,
     )
@@ -2338,6 +2363,36 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
         "test_quantized_matmul_and_gather_qmm_tolerate_mismatched_floating_dtype) "
         "or the forward path is producing something other than a "
         "rounding-level perturbation of the control."
+    )
+
+    # [codex BLOCKING] Execution-sensitivity guard: the closeness check
+    # above is only meaningful if ``mtp_forward`` ACTUALLY consumes the
+    # ``victim`` tensor — an ``allclose`` that passes because the forward
+    # IGNORES the corrupted tensor would be vacuous (the mismatch and
+    # control forwards would then be trivially identical). Prove
+    # consumption by re-injecting with the victim's VALUES scaled up 8x
+    # (kept fp32, a legitimate sidecar) and asserting the draft logits
+    # move materially: a dead-code tensor would leave them unchanged.
+    # ``victim`` is ``layers.0.mlp.down_proj.scales`` here — squarely on
+    # the single-step forward path (fc -> decoder layer -> norm ->
+    # lm_head) — so an 8x scale shift moves logits by O(1) (measured
+    # ~1.5 against a control |logit| up to ~1.8), vs the ~1e-3 bf16
+    # mismatch drift; ``> 0.1`` sits ~15x above the mismatch noise floor
+    # and far below the perturbation's real effect.
+    pert_flat = dict(control_flat)
+    pert_flat[victim] = control_flat[victim] * 8.0
+    pert_dir = tmp_path / "perturbed"
+    pert_dir.mkdir()
+    _mx.save_safetensors(str(pert_dir / "model.safetensors"), pert_flat)
+    assert inject_mtp_support(base, mtp_sidecar=str(pert_dir)) is True
+    pert_logits = base.mtp_forward(hidden, next_ids, base.make_mtp_cache())
+    _mx.eval(pert_logits)
+    max_shift = float(_mx.max(_mx.abs(pert_logits - control_logits)).item())
+    assert max_shift > 0.1, (
+        f"scaling {victim!r} 8x left the draft logits essentially unchanged "
+        f"(max shift {max_shift:.4g}); mtp_forward is not consuming that "
+        f"tensor, so the numerical-closeness control check above is vacuous "
+        f"— pick a victim tensor the one-step forward actually executes."
     )
 
 
