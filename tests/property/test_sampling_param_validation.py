@@ -64,52 +64,66 @@ def _build_anthropic(**kw) -> AnthropicRequest:
     )
 
 
-# (label, builder, {field: (lo, hi, lo_inclusive, hi_inclusive)}).
+# Plain spec data: (label, builder, {field: (lo, hi, lo_inclusive, hi_inclusive)}).
 # Ranges are read straight off the Field(...) bounds + field validators in
 # api/models.py and api/anthropic_models.py — assert only what the code
 # guarantees.
-_MODEL_SPECS = [
-    pytest.param(
+_SPECS = [
+    (
+        "chat",
         _build_chat,
         {"temperature": (0.0, 2.0, True, True), "top_p": (0.0, 1.0, False, True)},
-        id="chat",
     ),
-    pytest.param(
+    (
+        "completion",
         _build_completion,
         {"temperature": (0.0, 2.0, True, True), "top_p": (0.0, 1.0, False, True)},
-        id="completion",
     ),
-    pytest.param(
+    (
+        "anthropic",
         _build_anthropic,
         {"temperature": (0.0, 1.0, True, True), "top_p": (0.0, 1.0, False, True)},
-        id="anthropic",
     ),
 ]
 
+# Per-model params (the whole field dict) for the explicit endpoint sweep.
+_MODEL_SPECS = [
+    pytest.param(build, fields, id=label) for label, build, fields in _SPECS
+]
 
-@pytest.mark.parametrize("build,fields", _MODEL_SPECS)
+# Per-(model, field) params so Hypothesis is REQUIRED to exercise EVERY
+# field/model combination. Drawing the field inside the property (the old
+# ``sampled_from``) left coverage probabilistic: a validator broken on a
+# field that happened not to be drawn could stay green. Parametrizing the
+# field makes each combination its own guaranteed test case.
+_FIELD_SPECS = [
+    pytest.param(build, field, bounds, id=f"{label}-{field}")
+    for label, build, fields in _SPECS
+    for field, bounds in sorted(fields.items())
+]
+
+
+@pytest.mark.parametrize("build,field,bounds", _FIELD_SPECS)
 @given(data=st.data())
-def test_nonfinite_always_rejected(build, fields, data):
+def test_nonfinite_always_rejected(build, field, bounds, data):
     """Constructing any of these models with a non-finite ``temperature``
     or ``top_p`` raises ``ValidationError`` (never a silent 200 → kernel).
     """
-    field = data.draw(st.sampled_from(sorted(fields)))
     bad = data.draw(nonfinite_floats())
     with pytest.raises(ValidationError):
         build(**{field: bad})
 
 
-@pytest.mark.parametrize("build,fields", _MODEL_SPECS)
+@pytest.mark.parametrize("build,field,bounds", _FIELD_SPECS)
 @given(data=st.data())
-def test_out_of_range_finite_rejected(build, fields, data):
+def test_out_of_range_finite_rejected(build, field, bounds, data):
     """Finite values outside the documented range raise ``ValidationError``.
 
     Bound-inclusivity aware: for an exclusive bound (e.g. ``top_p``'s
     ``gt=0.0``) the endpoint itself is invalid and is drawn too, so a
     regression that started accepting ``top_p == 0.0`` fails here.
     """
-    field = data.draw(st.sampled_from(sorted(fields)))
-    lo, hi, lo_incl, hi_incl = fields[field]
+    lo, hi, lo_incl, hi_incl = bounds
     bad = data.draw(
         out_of_range_finite_floats(lo, hi, lo_inclusive=lo_incl, hi_inclusive=hi_incl)
     )
@@ -149,13 +163,18 @@ def test_excluded_endpoints_rejected(build, fields):
     assert checked_any
 
 
-@pytest.mark.parametrize("build,fields", _MODEL_SPECS)
+@pytest.mark.parametrize("build,field,bounds", _FIELD_SPECS)
 @given(data=st.data())
-def test_in_range_accepted_and_preserved(build, fields, data):
-    """Finite values inside the range construct OK and are stored exactly
-    as passed — no silent clamping or coercion."""
-    field = data.draw(st.sampled_from(sorted(fields)))
-    lo, hi, lo_incl, hi_incl = fields[field]
+def test_in_range_accepted_and_preserved(build, field, bounds, data):
+    """Finite values inside the range construct OK and are stored under
+    numeric equality — no silent clamping or coercion.
+
+    Scope note: signed-zero normalization (``-0.0`` stored as ``0.0``) is
+    deliberately out of scope — the two are numerically equal and
+    behaviourally inert for sampling, so this asserts ``==`` (numeric),
+    not IEEE-754 byte identity.
+    """
+    lo, hi, lo_incl, hi_incl = bounds
     value = data.draw(
         in_range_floats(lo, hi, lo_inclusive=lo_incl, hi_inclusive=hi_incl)
     )
