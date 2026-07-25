@@ -24,9 +24,21 @@ from __future__ import annotations
 import subprocess
 import sys
 
+from .._pytest_summary import summary_node_ids
 from ..base import Step, StepResult
 from ..context import Context
-from ..quarantine import QuarantineError, load_quarantine, partition_failures
+from ..quarantine import (
+    QuarantineError,
+    load_quarantine_from_ref,
+    partition_failures,
+)
+
+# pytest exit code 1 is the ordinary "some tests failed" outcome — the
+# only one where the FAILED list fully explains the red. 2 (interrupted),
+# 3 (internal error), 4 (usage), 5 (no tests) all mean something the
+# FAILED list can't account for, so the quarantine downgrade must NOT
+# apply. See https://docs.pytest.org/en/stable/reference/exit-codes.html
+_PYTEST_TESTS_FAILED = 1
 
 
 class FullUnitStep(Step):
@@ -73,39 +85,49 @@ class FullUnitStep(Step):
                 artifacts=[str(log_path)],
             )
 
-        # Non-zero exit. Extract the per-test node ids so we can consult
-        # the quarantine registry.
-        failed_ids = _failed_node_ids(proc.stdout)
+        # Non-zero exit. Extract the per-test node ids (FAILED) and any
+        # ERROR entries (collection / fixture failures) separately.
+        failed_ids = summary_node_ids(proc.stdout, "FAILED")
+        error_ids = summary_node_ids(proc.stdout, "ERROR")
 
-        # If pytest exited non-zero but we parsed NO per-test failures,
-        # this is a collection/internal/xdist-level error we can't name —
-        # never quarantine what we can't identify. Block on the raw exit.
-        if not failed_ids:
-            raw = _extract_failed_lines(proc.stdout)
-            body = raw[:30] if raw else ["(no FAILED lines — see log)"]
-            details = [
-                "**pytest failed with no parseable test ids:**\n```",
-                *body,
-                "```",
-            ]
+        # The quarantine downgrade is only sound when the ONLY thing that
+        # went wrong is ordinary, named test failures we can reason about:
+        #   * exit code exactly 1 (not interrupted / internal / usage), and
+        #   * at least one parseable FAILED id, and
+        #   * NO ERROR entries (an errored test isn't a quarantinable flake
+        #     — the suite couldn't even complete it).
+        # Anything else blocks unconditionally — we never quarantine what
+        # we can't fully account for (codex #1222).
+        only_test_failures = (
+            proc.returncode == _PYTEST_TESTS_FAILED
+            and bool(failed_ids)
+            and not error_ids
+        )
+        if not only_test_failures:
             return StepResult(
                 name=self.name,
                 status="fail",
                 summary=summary_line or f"pytest exited {proc.returncode}",
-                details="\n".join(details),
+                details=_render_unaccounted(
+                    proc.returncode, failed_ids, error_ids, log_path
+                ),
                 artifacts=[str(log_path)],
             )
 
-        # Fail-safe: an unreadable registry means "no quarantine", i.e.
-        # every failure blocks. A broken file can only make us stricter.
+        # Read the registry from the PROTECTED base revision, not the
+        # candidate checkout — a PR must not be able to quarantine its own
+        # failing tests (codex #1222). Fail-safe: any read error → empty
+        # quarantine → every failure blocks (stricter, never looser).
         registry_note = ""
         try:
-            entries = load_quarantine()
+            entries = load_quarantine_from_ref(
+                ctx.base_sha or ctx.base_branch, ctx.repo_root
+            )
         except QuarantineError as e:
             entries = []
             registry_note = (
-                f"\n\n⚠️ quarantine registry unreadable — treating every "
-                f"failure as blocking: {e}"
+                f"\n\n⚠️ base quarantine registry unreadable — treating "
+                f"every failure as blocking: {e}"
             )
         blocking, quarantined = partition_failures(failed_ids, entries)
 
@@ -161,6 +183,29 @@ def _render_details(blocking: list[str], quarantined: list[str], log_path) -> st
     return "\n\n".join(parts)
 
 
+def _render_unaccounted(
+    returncode: int,
+    failed_ids: list[str],
+    error_ids: list[str],
+    log_path,
+) -> str:
+    """Detail block for a red the quarantine logic must NOT relax — an
+    abnormal exit code, an ERROR entry, or no parseable failures. Shows
+    whatever we could name plus why it's blocking."""
+    parts: list[str] = [
+        f"**Blocking — not eligible for quarantine** (pytest exit "
+        f"{returncode}; quarantine only applies to exit "
+        f"{_PYTEST_TESTS_FAILED} with no errors)."
+    ]
+    if failed_ids:
+        parts.append("**FAILED:**\n```\n" + "\n".join(failed_ids[:30]) + "\n```")
+    if error_ids:
+        parts.append("**ERROR:**\n```\n" + "\n".join(error_ids[:30]) + "\n```")
+    if not failed_ids and not error_ids:
+        parts.append(f"(no parseable FAILED/ERROR node ids — see {log_path})")
+    return "\n\n".join(parts)
+
+
 def _last_summary_line(stdout: str) -> str:
     """Pytest writes its overall summary as the very last non-empty
     line wrapped in '====' decorations. Return without decorations."""
@@ -169,39 +214,3 @@ def _last_summary_line(stdout: str) -> str:
         if line.startswith("=") and ("passed" in line or "failed" in line):
             return line.strip("= ").strip()
     return ""
-
-
-def _extract_failed_lines(stdout: str) -> list[str]:
-    """Return the lines pytest's short summary section labels FAILED."""
-    out = []
-    in_summary = False
-    for line in (stdout or "").splitlines():
-        if "short test summary" in line:
-            in_summary = True
-            continue
-        if in_summary:
-            if line.startswith("="):
-                break
-            if line.startswith("FAILED"):
-                out.append(line)
-    return out
-
-
-def _failed_node_ids(stdout: str) -> list[str]:
-    """Extract pytest node ids from the short-summary FAILED lines.
-
-    A FAILED line looks like ``FAILED tests/foo.py::test_bar - AssertionError``
-    or bare ``FAILED tests/foo.py::test_bar``. The node id is the token
-    after ``FAILED `` and before the ``  - <message>`` separator pytest
-    inserts (space-dash-space). Parametrized ids can contain spaces
-    inside ``[...]``, so we split on the first ``" - "`` rather than on
-    whitespace.
-    """
-    ids: list[str] = []
-    for line in _extract_failed_lines(stdout):
-        rest = line[len("FAILED ") :] if line.startswith("FAILED ") else line
-        # Strip the trailing " - <error message>" if present.
-        node_id = rest.split(" - ", 1)[0].strip()
-        if node_id:
-            ids.append(node_id)
-    return ids

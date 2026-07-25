@@ -1,33 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the flake-tracking system (dev-flow proposal item ③).
 
-Three units under test:
-  * ``quarantine.py`` — registry loader + node-id matcher (pure).
-  * ``full_unit.py`` — quarantine-aware pass/fail split of a failure set.
-  * ``flake_tracking.py`` — advisory classification of full_unit failures
-    (flake candidate vs reproduced-real), driven against a real pytest
-    subprocess so the classification is proven, not mocked.
+Units under test:
+  * ``_pytest_summary.summary_node_ids`` — shared FAILED/ERROR parser.
+  * ``quarantine.py`` — registry loader (file + git base ref) + matcher.
+  * ``full_unit.py`` — quarantine-aware pass/fail split, exit-code and
+    ERROR guards, base-revision registry source.
+  * ``flake_tracking.py`` — advisory classification (flake vs reproduced),
+    exit-code guard, and process-group timeout kill.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import time
 
 import pytest
 
+from scripts.pr_validate._pytest_summary import summary_node_ids
 from scripts.pr_validate.context import Context
 from scripts.pr_validate.quarantine import (
     QuarantineEntry,
     QuarantineError,
     load_quarantine,
+    load_quarantine_from_ref,
     node_id_matches,
     partition_failures,
 )
 from scripts.pr_validate.steps import flake_tracking as flake_mod
 from scripts.pr_validate.steps import full_unit as full_unit_mod
-from scripts.pr_validate.steps.flake_tracking import FlakeTrackingStep
-from scripts.pr_validate.steps.full_unit import FullUnitStep, _failed_node_ids
+from scripts.pr_validate.steps.flake_tracking import FlakeTrackingStep, _run_session
+from scripts.pr_validate.steps.full_unit import FullUnitStep
 
 # --------------------------------------------------------------------------
 # helpers
@@ -48,6 +53,10 @@ def _passed(n: int = 10) -> str:
     return f"==== {n} passed in 1.00s ====\n"
 
 
+def _completed(returncode: int, stdout: str = "", stderr: str = ""):
+    return subprocess.CompletedProcess(["pytest"], returncode, stdout, stderr)
+
+
 @pytest.fixture
 def ctx_factory(tmp_path, monkeypatch):
     """Context.__post_init__ insists on a repo-root cwd (a pyproject)."""
@@ -66,21 +75,64 @@ def ctx_factory(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# quarantine.py — loader
+# _pytest_summary.summary_node_ids
+# --------------------------------------------------------------------------
+
+
+class TestSummaryNodeIds:
+    def test_plain_failed(self):
+        assert summary_node_ids(_summary("FAILED tests/a.py::test_x"), "FAILED") == [
+            "tests/a.py::test_x"
+        ]
+
+    def test_strips_message(self):
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x - AssertionError: nope"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x"]
+
+    def test_parametrized_with_spaces(self):
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x[a b c] - ValueError"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x[a b c]"]
+
+    def test_ignores_failed_outside_summary(self):
+        text = (
+            "tests/a.py::test_x FAILED in call setup\n"  # pre-summary noise
+            + _summary("FAILED tests/a.py::test_x")
+        )
+        assert summary_node_ids(text, "FAILED") == ["tests/a.py::test_x"]
+
+    def test_multiple_labels(self):
+        text = _summary(
+            "FAILED tests/a.py::test_x - X",
+            "ERROR tests/a.py::test_y - Y",
+        )
+        assert summary_node_ids(text, "FAILED") == ["tests/a.py::test_x"]
+        assert summary_node_ids(text, "ERROR") == ["tests/a.py::test_y"]
+        assert summary_node_ids(text, "FAILED", "ERROR") == [
+            "tests/a.py::test_x",
+            "tests/a.py::test_y",
+        ]
+
+    def test_default_label_is_failed(self):
+        assert summary_node_ids(_summary("FAILED tests/a.py::t")) == ["tests/a.py::t"]
+
+
+# --------------------------------------------------------------------------
+# quarantine.py — file loader
 # --------------------------------------------------------------------------
 
 
 class TestLoadQuarantine:
     def test_loads_shipped_registry(self):
-        # Default path = the quarantine.yaml we ship. It must parse and
-        # contain the seeded G8 signal flake.
         entries = load_quarantine()
         ids = {e.id for e in entries}
         assert (
             "tests/test_signal_observability.py::"
             "test_subprocess_sighup_default_disposition_dumps_and_stays_alive" in ids
         )
-        # Every shipped entry carries a justification.
         assert all(e.reason for e in entries)
 
     def test_missing_file_is_empty(self, tmp_path):
@@ -135,6 +187,75 @@ class TestLoadQuarantine:
 
 
 # --------------------------------------------------------------------------
+# quarantine.py — git base-ref loader (a PR must not quarantine itself)
+# --------------------------------------------------------------------------
+
+
+class TestLoadQuarantineFromRef:
+    def test_returns_entries_from_git_show(self, tmp_path, monkeypatch):
+        yaml_text = "tests:\n  - id: a.py::t\n    reason: r\n"
+        monkeypatch.setattr(
+            "scripts.pr_validate.quarantine.subprocess.run",
+            lambda *a, **k: _completed(0, yaml_text),
+        )
+        (entry,) = load_quarantine_from_ref("BASE", tmp_path)
+        assert entry.id == "a.py::t"
+
+    def test_absent_at_ref_is_empty(self, tmp_path, monkeypatch):
+        # git show returns 128 when the path doesn't exist at that rev.
+        monkeypatch.setattr(
+            "scripts.pr_validate.quarantine.subprocess.run",
+            lambda *a, **k: _completed(128, "", "fatal: path does not exist"),
+        )
+        assert load_quarantine_from_ref("BASE", tmp_path) == []
+
+    def test_git_missing_is_empty_not_raise(self, tmp_path, monkeypatch):
+        def boom(*a, **k):
+            raise FileNotFoundError("git not found")
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", boom)
+        # Fail-safe: infra hiccup → empty quarantine (stricter gate).
+        assert load_quarantine_from_ref("BASE", tmp_path) == []
+
+    def test_malformed_at_ref_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "scripts.pr_validate.quarantine.subprocess.run",
+            lambda *a, **k: _completed(0, "tests: [unclosed\n"),
+        )
+        with pytest.raises(QuarantineError):
+            load_quarantine_from_ref("BASE", tmp_path)
+
+    def test_real_git_show_roundtrip(self, tmp_path):
+        # End-to-end proof the actual `git show <ref>:<path>` path works.
+        import os
+
+        def git(*args):
+            subprocess.run(
+                ["git", *args],
+                cwd=tmp_path,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t",
+                    "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@t",
+                },
+            )
+
+        git("init", "-q")
+        rel = "scripts/pr_validate/quarantine.yaml"
+        (tmp_path / "scripts" / "pr_validate").mkdir(parents=True)
+        (tmp_path / rel).write_text("tests:\n  - id: x.py::t\n    reason: r\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "seed")
+        (entry,) = load_quarantine_from_ref("HEAD", tmp_path)
+        assert entry.id == "x.py::t"
+
+
+# --------------------------------------------------------------------------
 # quarantine.py — matcher / partition
 # --------------------------------------------------------------------------
 
@@ -147,8 +268,6 @@ class TestNodeIdMatch:
         assert node_id_matches("a.py::t[x-1]", "a.py::t")
 
     def test_base_entry_does_not_match_prefix_sibling(self):
-        # "a.py::t" must NOT swallow "a.py::t_extra" — a real bug risk if
-        # we matched on bare startswith without the '[' guard.
         assert not node_id_matches("a.py::t_extra", "a.py::t")
 
     def test_specific_param_entry_is_exact_only(self):
@@ -183,37 +302,6 @@ class TestPartition:
 
 
 # --------------------------------------------------------------------------
-# full_unit.py — FAILED-line node id parsing
-# --------------------------------------------------------------------------
-
-
-class TestFailedNodeIds:
-    def test_plain(self):
-        assert _failed_node_ids(_summary("FAILED tests/a.py::test_x")) == [
-            "tests/a.py::test_x"
-        ]
-
-    def test_with_message(self):
-        out = _failed_node_ids(
-            _summary("FAILED tests/a.py::test_x - AssertionError: nope")
-        )
-        assert out == ["tests/a.py::test_x"]
-
-    def test_parametrized_with_spaces(self):
-        out = _failed_node_ids(
-            _summary("FAILED tests/a.py::test_x[a b c] - ValueError")
-        )
-        assert out == ["tests/a.py::test_x[a b c]"]
-
-    def test_ignores_failed_outside_summary_section(self):
-        text = (
-            "tests/a.py::test_x FAILED in call setup\n"  # pre-summary noise
-            + _summary("FAILED tests/a.py::test_x")
-        )
-        assert _failed_node_ids(text) == ["tests/a.py::test_x"]
-
-
-# --------------------------------------------------------------------------
 # full_unit.py — quarantine-aware verdict (subprocess mocked)
 # --------------------------------------------------------------------------
 
@@ -225,23 +313,26 @@ class TestFullUnitQuarantineAware:
 
         monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
 
+    def _patch_quarantine(self, monkeypatch, entries):
+        monkeypatch.setattr(
+            full_unit_mod, "load_quarantine_from_ref", lambda *a, **k: entries
+        )
+
     def test_clean_pass(self, ctx_factory, monkeypatch):
         self._patch_pytest(monkeypatch, 0, _passed())
         res = FullUnitStep().run(ctx_factory())
         assert res.status == "pass"
 
     def test_blocking_failure_fails(self, ctx_factory, monkeypatch):
-        monkeypatch.setattr(full_unit_mod, "load_quarantine", lambda: [])
+        self._patch_quarantine(monkeypatch, [])
         self._patch_pytest(monkeypatch, 1, _summary("FAILED tests/a.py::test_real - X"))
         res = FullUnitStep().run(ctx_factory())
         assert res.status == "fail"
         assert "tests/a.py::test_real" in res.details
 
     def test_all_quarantined_passes_but_loud(self, ctx_factory, monkeypatch):
-        monkeypatch.setattr(
-            full_unit_mod,
-            "load_quarantine",
-            lambda: [QuarantineEntry(id="tests/a.py::test_flaky")],
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
         )
         self._patch_pytest(
             monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
@@ -252,10 +343,8 @@ class TestFullUnitQuarantineAware:
         assert "tests/a.py::test_flaky" in res.details
 
     def test_mixed_blocks_and_shows_both(self, ctx_factory, monkeypatch):
-        monkeypatch.setattr(
-            full_unit_mod,
-            "load_quarantine",
-            lambda: [QuarantineEntry(id="tests/a.py::test_flaky")],
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
         )
         self._patch_pytest(
             monkeypatch,
@@ -268,13 +357,47 @@ class TestFullUnitQuarantineAware:
         res = FullUnitStep().run(ctx_factory())
         assert res.status == "fail"
         assert "test_real" in res.details
-        assert "test_flaky" in res.details  # quarantined still surfaced
+        assert "test_flaky" in res.details
+
+    def test_error_entry_blocks_even_if_failed_quarantined(
+        self, ctx_factory, monkeypatch
+    ):
+        # A quarantined FAILED riding along with an ERROR (collection /
+        # fixture failure) must still BLOCK — an errored test is not a
+        # quarantinable flake.
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        self._patch_pytest(
+            monkeypatch,
+            1,
+            _summary(
+                "FAILED tests/a.py::test_flaky - X",
+                "ERROR tests/a.py::test_boom - fixture blew up",
+            ),
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "test_boom" in res.details
+
+    def test_abnormal_exit_blocks(self, ctx_factory, monkeypatch):
+        # Exit 2 (interrupted) with an otherwise-quarantined failure must
+        # still block — the exit code says something the FAILED list
+        # can't account for.
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        self._patch_pytest(
+            monkeypatch, 2, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
 
     def test_unreadable_registry_fails_safe(self, ctx_factory, monkeypatch):
-        def boom():
+        def boom(*a, **k):
             raise QuarantineError("broken registry")
 
-        monkeypatch.setattr(full_unit_mod, "load_quarantine", boom)
+        monkeypatch.setattr(full_unit_mod, "load_quarantine_from_ref", boom)
         self._patch_pytest(
             monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
         )
@@ -285,15 +408,33 @@ class TestFullUnitQuarantineAware:
         assert "unreadable" in res.details
 
     def test_nonzero_exit_without_node_ids_blocks(self, ctx_factory, monkeypatch):
-        # Collection/internal error: exit 1 but no FAILED short-summary.
         self._patch_pytest(monkeypatch, 1, "==== 1 error in 0.50s ====\n")
         res = FullUnitStep().run(ctx_factory())
         assert res.status == "fail"
-        assert "no parseable test ids" in res.details
+
+    def test_registry_sourced_from_base_revision(self, ctx_factory, monkeypatch):
+        # The gate must read the registry from the PROTECTED base, not the
+        # candidate checkout — assert full_unit passes ctx.base_sha to the
+        # loader (so a PR can't quarantine its own failing tests).
+        captured = {}
+
+        def fake_loader(ref, repo_root, *a, **k):
+            captured["ref"] = ref
+            return [QuarantineEntry(id="tests/a.py::test_flaky")]
+
+        monkeypatch.setattr(full_unit_mod, "load_quarantine_from_ref", fake_loader)
+        self._patch_pytest(
+            monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        ctx = ctx_factory()
+        ctx.base_sha = "deadbeefbase"
+        res = FullUnitStep().run(ctx)
+        assert captured["ref"] == "deadbeefbase"
+        assert res.status == "pass"  # quarantined → non-blocking
 
 
 # --------------------------------------------------------------------------
-# flake_tracking.py — advisory step
+# flake_tracking.py — advisory step contract
 # --------------------------------------------------------------------------
 
 
@@ -327,8 +468,8 @@ class TestFlakeTrackingContract:
         assert res.status == "skip"
         assert "rerunfailures" in res.summary
 
-    def test_advisory_never_errors(self, ctx_factory, monkeypatch):
-        ctx = ctx_factory()
+    def _prime(self, ctx, monkeypatch):
+        """full-unit.log with a failure + plugin present."""
         ctx.artifact_path("full-unit.log").write_text(
             _summary("FAILED tests/a.py::t - X")
         )
@@ -336,29 +477,40 @@ class TestFlakeTrackingContract:
             flake_mod.importlib.util, "find_spec", lambda name: object()
         )
 
+    def test_advisory_never_errors(self, ctx_factory, monkeypatch):
+        ctx = ctx_factory()
+        self._prime(ctx, monkeypatch)
+
         def boom(*a, **k):
             raise RuntimeError("kaboom")
 
-        monkeypatch.setattr(flake_mod.subprocess, "run", boom)
+        monkeypatch.setattr(flake_mod, "_run_session", boom)
         res = FlakeTrackingStep().run(ctx)
         assert res.status == "skip"  # downgraded, NOT a blocking error
 
     def test_timeout_skips(self, ctx_factory, monkeypatch):
         ctx = ctx_factory()
-        ctx.artifact_path("full-unit.log").write_text(
-            _summary("FAILED tests/a.py::t - X")
-        )
-        monkeypatch.setattr(
-            flake_mod.importlib.util, "find_spec", lambda name: object()
-        )
+        self._prime(ctx, monkeypatch)
 
         def timeout(*a, **k):
             raise subprocess.TimeoutExpired(cmd="pytest", timeout=1)
 
-        monkeypatch.setattr(flake_mod.subprocess, "run", timeout)
+        monkeypatch.setattr(flake_mod, "_run_session", timeout)
         res = FlakeTrackingStep().run(ctx)
         assert res.status == "skip"
         assert "exceeded" in res.summary
+
+    def test_abnormal_rerun_exit_skips(self, ctx_factory, monkeypatch):
+        ctx = ctx_factory()
+        self._prime(ctx, monkeypatch)
+        # Re-run exits 2 (interrupted/collection) — cannot infer "passed"
+        # from absence in FAILED, so classification must bail.
+        monkeypatch.setattr(
+            flake_mod, "_run_session", lambda *a, **k: _completed(2, "boom")
+        )
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "skip"
+        assert "abnormally" in res.summary
 
 
 class TestFlakeTrackingClassification:
@@ -367,9 +519,6 @@ class TestFlakeTrackingClassification:
 
     def test_classifies_flake_vs_real(self, ctx_factory, tmp_path):
         pytest.importorskip("pytest_rerunfailures")
-        # A genuinely flaky test (fails the first attempt, passes on the
-        # rerun via a filesystem counter) alongside a deterministic
-        # failure.
         (tmp_path / "test_sample.py").write_text(
             "import pathlib\n"
             "_c = pathlib.Path(__file__).with_name('.count')\n"
@@ -381,7 +530,6 @@ class TestFlakeTrackingClassification:
             "    assert False\n"
         )
         ctx = ctx_factory()
-        # full_unit's log: both failed the full suite.
         ctx.artifact_path("full-unit.log").write_text(
             _summary(
                 "FAILED test_sample.py::test_flaky - AssertionError",
@@ -393,6 +541,32 @@ class TestFlakeTrackingClassification:
         data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
         assert "test_sample.py::test_flaky" in data["flake_candidates_new"]
         assert "test_sample.py::test_real" in data["reproduced_likely_real"]
+
+
+# --------------------------------------------------------------------------
+# flake_tracking._run_session — process-group timeout kill
+# --------------------------------------------------------------------------
+
+
+class TestRunSession:
+    def test_normal_completion(self, tmp_path):
+        proc = _run_session(
+            [sys.executable, "-c", "print('hi')"], cwd=str(tmp_path), timeout=30
+        )
+        assert proc.returncode == 0
+        assert "hi" in proc.stdout
+
+    def test_timeout_raises_bounded(self, tmp_path):
+        # A child that would sleep far past the timeout must raise
+        # TimeoutExpired quickly (not hang), and the kill path must run.
+        t0 = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_session(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                cwd=str(tmp_path),
+                timeout=0.5,
+            )
+        assert time.monotonic() - t0 < 10.0
 
 
 class TestRegistration:

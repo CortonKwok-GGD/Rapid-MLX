@@ -16,24 +16,34 @@ here (first try or after a rerun) is non-deterministic — a flake
 candidate. One that reproduces its failure is likely a real bug, and is
 reported as such (``full_unit`` already blocked on it).
 
-The re-run set is tiny (only the failures — usually zero), so a plain
-``subprocess.run`` with a timeout is enough; none of the bounded-tail /
-process-group machinery the full-suite ``diff_coverage`` run needs. If
-``pytest-rerunfailures`` is not installed, the step skips cleanly — the
-plugin is an optional [test]/[dev] extra, not a required one.
+Two soundness guards (codex #1222):
+  * Classification only runs when the re-run exits with a code we can
+    reason about (0 = all passed, 1 = some failed). Anything else
+    (collection error, crash, usage error) is inconclusive → we skip
+    rather than mislabel a real failure as a flake.
+  * The re-run is launched in its own session; on timeout the whole
+    process group is SIGKILLed (race-free — the leader is unreaped at
+    that point, so its pgid is still reserved), so a test that spawned
+    an inference server / GPU worker can't leak into later steps.
+
+If ``pytest-rerunfailures`` is not installed, the step skips cleanly —
+the plugin is an optional [test]/[dev] extra, not a required one.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import signal
 import subprocess
 import sys
 import traceback
 
+from .._pytest_summary import summary_node_ids
 from ..base import Step, StepResult
 from ..context import Context
-from ..quarantine import QuarantineError, is_quarantined, load_quarantine
+from ..quarantine import QuarantineError, is_quarantined, load_quarantine_from_ref
 
 # Cap on how many failed ids we re-run. If main is broken with hundreds
 # of reds, re-running them all (× reruns) would blow the budget for no
@@ -41,6 +51,10 @@ from ..quarantine import QuarantineError, is_quarantined, load_quarantine
 _MAX_RERUN_IDS = 25
 _RERUNS = 3
 _RERUN_TIMEOUT_S = 900
+# pytest exit codes we can classify: 0 = all passed, 1 = some failed.
+# 2 (interrupted), 3 (internal), 4 (usage), 5 (no tests) are abnormal —
+# treating an unlisted id as "passed" would then mislabel real failures.
+_CLASSIFIABLE_EXITS = (0, 1)
 
 
 class FlakeTrackingStep(Step):
@@ -77,7 +91,7 @@ class FlakeTrackingStep(Step):
                 summary="no full-unit.log to classify",
             )
 
-        original_failed = _failed_ids(log_path.read_text())
+        original_failed = summary_node_ids(log_path.read_text(), "FAILED")
         if not original_failed:
             return StepResult(
                 name=self.name,
@@ -95,10 +109,13 @@ class FlakeTrackingStep(Step):
                 ),
             )
 
-        # Fail-safe: advisory, so a broken registry just means "nothing
-        # is known-flaky yet" for the purpose of the report.
+        # Report against the ACTIVE (protected base) quarantine, same
+        # source the gate uses. Fail-safe: a broken/absent registry just
+        # means "nothing known-flaky yet" for the report.
         try:
-            entries = load_quarantine()
+            entries = load_quarantine_from_ref(
+                ctx.base_sha or ctx.base_branch, ctx.repo_root
+            )
         except QuarantineError:
             entries = []
 
@@ -118,13 +135,7 @@ class FlakeTrackingStep(Step):
             "no:cacheprovider",
         ]
         try:
-            proc = subprocess.run(  # noqa: S603
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=str(ctx.repo_root),
-                timeout=_RERUN_TIMEOUT_S,
-            )
+            proc = _run_session(cmd, cwd=str(ctx.repo_root), timeout=_RERUN_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return StepResult(
                 name=self.name,
@@ -136,10 +147,25 @@ class FlakeTrackingStep(Step):
             )
         rerun_log.write_text((proc.stdout or "") + (proc.stderr or ""))
 
-        # A test that still failed/errored on isolated re-run (with
-        # reruns) reproduces → likely a real bug. Everything else in the
-        # sample passed this time → non-deterministic → flake candidate.
-        still_bad = set(_bad_ids(proc.stdout))
+        # Guard: only classify when the re-run exit code is one we can
+        # interpret. On an abnormal exit, "absent from FAILED/ERROR" no
+        # longer implies "passed" — bail rather than mislabel real
+        # failures as flakes (codex #1222).
+        if proc.returncode not in _CLASSIFIABLE_EXITS:
+            return StepResult(
+                name=self.name,
+                status="skip",
+                summary=(
+                    f"flake re-run exited abnormally (code {proc.returncode}) "
+                    f"— classification inconclusive, skipped"
+                ),
+                artifacts=[str(rerun_log)],
+            )
+
+        # A test still FAILED/ERRORed on isolated re-run (with reruns) →
+        # reproduces → likely a real bug. Everything else in the sample
+        # passed this time → non-deterministic → flake candidate.
+        still_bad = set(summary_node_ids(proc.stdout, "FAILED", "ERROR"))
         candidates = [i for i in sample if i not in still_bad]
         reproduced = [i for i in sample if i in still_bad]
 
@@ -171,6 +197,46 @@ class FlakeTrackingStep(Step):
             details=details,
             artifacts=[str(cand_path), str(rerun_log)],
         )
+
+
+def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run ``cmd`` in its own session and, on timeout, SIGKILL the whole
+    process group so test-spawned descendants (inference servers, GPU
+    workers) can't leak into later validation steps (codex #1222).
+
+    ``start_new_session=True`` makes the child a session/group leader
+    (pgid == pid). On timeout the child has not been reaped, so its pgid
+    is still reserved — killpg is race-free (the safe pre-reap case). We
+    kill BEFORE the final ``communicate`` so a descendant holding the
+    pipe open can't hang the drain.
+    """
+    proc = subprocess.Popen(  # noqa: S603
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        out, err = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        # Group already gone, or getpgid raced the exit — best-effort
+        # kill the direct child and move on.
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _render(
@@ -206,42 +272,3 @@ def _render(
             f"re-run this pass._"
         )
     return "\n\n".join(parts) if parts else "no classification produced"
-
-
-def _failed_ids(text: str) -> list[str]:
-    """Node ids pytest labels FAILED in its short-summary section."""
-    return _summary_ids(text, prefixes=("FAILED",))
-
-
-def _bad_ids(text: str) -> list[str]:
-    """Node ids pytest labels FAILED or ERROR — an ERROR on re-run is
-    not a pass, so it counts as 'reproduced', not a flake candidate."""
-    return _summary_ids(text, prefixes=("FAILED", "ERROR"))
-
-
-def _summary_ids(text: str, prefixes: tuple[str, ...]) -> list[str]:
-    """Parse node ids out of pytest's short test summary block.
-
-    A summary line is ``<LABEL> <nodeid>[ - <message>]``; the node id is
-    everything between the label and the ``" - "`` message separator
-    (parametrized ids can hold spaces inside ``[...]``, so we split on
-    ``" - "`` rather than whitespace).
-    """
-    out: list[str] = []
-    in_summary = False
-    for line in (text or "").splitlines():
-        if "short test summary" in line:
-            in_summary = True
-            continue
-        if not in_summary:
-            continue
-        if line.startswith("="):
-            break
-        for prefix in prefixes:
-            if line.startswith(prefix + " "):
-                rest = line[len(prefix) + 1 :]
-                node_id = rest.split(" - ", 1)[0].strip()
-                if node_id:
-                    out.append(node_id)
-                break
-    return out

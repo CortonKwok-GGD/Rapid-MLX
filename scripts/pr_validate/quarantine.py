@@ -24,6 +24,7 @@ Design notes:
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,11 @@ from pathlib import Path
 import yaml
 
 DEFAULT_QUARANTINE_PATH = Path(__file__).with_name("quarantine.yaml")
+
+# Registry location relative to the repo root — used to read it out of a
+# git revision (the protected base) rather than the candidate checkout.
+QUARANTINE_REL_PATH = "scripts/pr_validate/quarantine.yaml"
+_GIT_SHOW_TIMEOUT_S = 30
 
 
 class QuarantineError(Exception):
@@ -49,42 +55,82 @@ class QuarantineEntry:
 
 
 def load_quarantine(path: Path | None = None) -> list[QuarantineEntry]:
-    """Parse the quarantine registry.
+    """Parse the quarantine registry from a file on disk.
 
     Missing file → ``[]`` (legitimate: no quarantine configured).
     Present but malformed → ``QuarantineError`` (author mistake).
+
+    NOTE for gating callers: prefer ``load_quarantine_from_ref`` so the
+    registry is read from the protected base, not the candidate checkout
+    (otherwise a PR could quarantine its own failing tests). This
+    file-path form is for tests and for reading the shipped default.
     """
     path = path or DEFAULT_QUARANTINE_PATH
     if not path.exists():
         return []
+    return _parse_quarantine_text(path.read_text(), source=str(path))
 
+
+def load_quarantine_from_ref(
+    ref: str,
+    repo_root: Path,
+    rel_path: str = QUARANTINE_REL_PATH,
+) -> list[QuarantineEntry]:
+    """Read the registry from a git revision (the PROTECTED base) via
+    ``git show <ref>:<rel_path>``, NOT from the working tree — so the
+    same PR being validated cannot add its own failing tests to the
+    allowlist and make them non-blocking (codex #1222).
+
+    Absent at ``ref`` (the revision predates the registry, or any other
+    git non-zero) → ``[]``: a base without the file has no quarantine,
+    and falling back to empty keeps the gate *stricter*, never looser.
+    A malformed file that IS present at ``ref`` → ``QuarantineError``
+    (the caller fails safe to empty).
+    """
     try:
-        raw = yaml.safe_load(path.read_text()) or {}
+        proc = subprocess.run(  # noqa: S603
+            ["git", "show", f"{ref}:{rel_path}"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root),
+            timeout=_GIT_SHOW_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # git missing / not a repo / timeout → treat as no quarantine
+        # (stricter gate). Never let an infra hiccup loosen the gate.
+        return []
+    if proc.returncode != 0:
+        return []
+    return _parse_quarantine_text(proc.stdout, source=f"{ref}:{rel_path}")
+
+
+def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
+    try:
+        raw = yaml.safe_load(text) or {}
     except yaml.YAMLError as e:
-        raise QuarantineError(f"quarantine file is not valid YAML: {e}") from e
+        raise QuarantineError(f"{source}: not valid YAML: {e}") from e
 
     if not isinstance(raw, dict):
         raise QuarantineError(
-            f"quarantine file must be a mapping with a 'tests' key, "
-            f"got {type(raw).__name__}"
+            f"{source}: must be a mapping with a 'tests' key, got {type(raw).__name__}"
         )
     tests = raw.get("tests", [])
     if tests is None:
         tests = []
     if not isinstance(tests, list):
         raise QuarantineError(
-            f"quarantine 'tests' must be a list, got {type(tests).__name__}"
+            f"{source}: 'tests' must be a list, got {type(tests).__name__}"
         )
 
     entries: list[QuarantineEntry] = []
     for i, item in enumerate(tests):
         if not isinstance(item, dict):
             raise QuarantineError(
-                f"quarantine test #{i} must be a mapping, got {type(item).__name__}"
+                f"{source}: test #{i} must be a mapping, got {type(item).__name__}"
             )
         node_id = item.get("id")
         if not isinstance(node_id, str) or not node_id.strip():
-            raise QuarantineError(f"quarantine test #{i} needs a non-empty string 'id'")
+            raise QuarantineError(f"{source}: test #{i} needs a non-empty string 'id'")
         entries.append(
             QuarantineEntry(
                 id=node_id.strip(),
