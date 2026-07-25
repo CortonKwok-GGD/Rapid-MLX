@@ -2288,6 +2288,23 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
     and the resulting logits are compared against an
     otherwise-identical fp32-scale CONTROL forward within an
     explicit tolerance.
+
+    Hardened AGAIN, terminally, per THREE independent codex reviews of
+    THIS PR unanimously flagging the same residual gap: the
+    tolerance-vs-CONTROL ``allclose`` above can still pass VACUOUSLY —
+    if ``mtp_forward`` never actually reads the selected ``victim``
+    tensor (an unused param, or one that's off the single-token compute
+    path), the mismatch and control logits are trivially identical
+    regardless of whether a dtype mismatch is tolerated on a tensor the
+    forward actually uses. Two things close this for good, below: (1)
+    ``victim`` is no longer "whatever sorts first" — it is a fixed
+    choice on a compute path a single-token forward provably always
+    takes (see the comment at its assignment); (2) an execution-
+    sensitivity guard re-injects the SAME control sidecar with
+    ``victim``'s values scaled 8x and asserts the draft logits move
+    materially — a dead-code tensor would leave them unchanged. Together
+    with the two proofs above, this completes the chain: installed ->
+    participates -> tolerated.
     """
     import mlx.core as _mx
     import mlx.nn as _nn
@@ -2316,10 +2333,38 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
     # Corrupt ONE floating tensor's DTYPE (fp32 -> bf16) while keeping its
     # shape and values (up to bf16 precision) intact — exactly the
     # "shape-correct but mismatched float dtype" shape the codex finding
-    # describes. Target a non-fc ``.scales`` tensor so the fc-inference
-    # step (which reads fc's own tensors) is unaffected.
-    victim = next(
-        k for k in sorted(flat) if k.endswith(".scales") and not k.startswith("fc.")
+    # describes.
+    #
+    # Victim selection [terminal hardening, PR #1206 — three independent
+    # codex runs unanimously flagged this]: a self-attention projection's
+    # ``.scales``, NOT "the lexicographically-first non-fc ``.scales``
+    # tensor" (the prior selection, which happened to resolve to
+    # ``layers.0.mlp.down_proj.scales`` in this fixture). That pick was
+    # only safe by coincidence: ``num_experts == 0`` here makes the MLP
+    # dense, so ``down_proj`` is unconditionally on-path today — but a
+    # SparseMoeBlock fixture (one field-flip away) routes tokens to a
+    # top-k subset of experts, so a lexicographically-first expert
+    # projection could go UNUSED for a given routing draw on a given
+    # input, silently reopening the exact vacuous-participation loophole
+    # this test exists to close. Attention has no such conditional path:
+    # ``Qwen3NextAttention.__call__`` (``mlx_lm.models.qwen3_next``,
+    # imported as ``Attention`` in ``head.py``) unconditionally computes
+    # ``self.o_proj(output * mx.sigmoid(gate))`` on every call regardless
+    # of batch/sequence length or MoE config, and
+    # ``_MTPDecoderLayer.__call__`` (``head.py``) adds that result
+    # straight into the residual stream (``h = x + r`` — never gated,
+    # never skipped) — so ``o_proj``'s scale provably participates in
+    # EVERY single-token MTP forward, by construction of the vendored
+    # module, not by accident of dict key ordering. (The execution-
+    # sensitivity guard further below still empirically PROVES this for
+    # whichever victim is chosen — this static pick just means that
+    # proof is backed by an analytical guarantee too, not only an
+    # empirically-measured threshold.)
+    victim = "layers.0.self_attn.o_proj.scales"
+    assert victim in flat, (
+        f"expected {victim!r} among the MTP module's flattened floating "
+        f"parameters; got {sorted(flat)} instead — did head.py's layer "
+        f"count/attention field naming change?"
     )
     assert flat[victim].dtype == _mx.float32
     # Snapshot the UNCORRUPTED tensors before mutating ``flat`` below —
@@ -2388,14 +2433,15 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
     control_logits = base.mtp_forward(hidden, next_ids, base.make_mtp_cache())
     _mx.eval(control_logits)
 
-    # Tolerance: empirically, corrupting one non-fc ``.scales`` tensor from
-    # fp32 to bf16 in this exact fixture (hidden_size=64, group_size=32,
+    # Tolerance: empirically, corrupting ``layers.0.self_attn.o_proj.scales``
+    # from fp32 to bf16 in this exact fixture (hidden_size=64, group_size=32,
     # bits=4, 1 MTP layer) produces a max per-logit absolute drift of
-    # ~6e-4 to ~2e-3 against control logits with |value| up to ~1.5-1.8
+    # ~7e-4 to ~4.1e-3 against control logits with |value| up to ~1.5-1.8
     # (measured across 8 random seeds locally) — consistent with a single
     # bf16 rounding (relative precision ~2**-8 ~= 0.0039) propagated
     # through one quantized matmul + norm + lm_head, the same
-    # order-of-magnitude drift the PR body's own probe showed
+    # order-of-magnitude drift the PR body's own probe showed for a
+    # different (also non-fc) victim tensor
     # (``out[0,:4]``: fp32 ``[0.34953, -0.30505, -0.37162, -0.24791]`` vs
     # bf16 ``[0.35309, -0.29941, -0.37214, -0.24651]``, diffs ~4e-4 to
     # 6e-3). ``atol=rtol=1e-2`` gives several-fold headroom over the
@@ -2418,12 +2464,14 @@ def test_inject_accepts_sidecar_with_mismatched_floating_scales_dtype_and_drafts
     # consumption by re-injecting with the victim's VALUES scaled up 8x
     # (kept fp32, a legitimate sidecar) and asserting the draft logits
     # move materially: a dead-code tensor would leave them unchanged.
-    # ``victim`` is ``layers.0.mlp.down_proj.scales`` here — squarely on
-    # the single-step forward path (fc -> decoder layer -> norm ->
-    # lm_head) — so an 8x scale shift moves logits by O(1) (measured
-    # ~1.5 against a control |logit| up to ~1.8), vs the ~1e-3 bf16
-    # mismatch drift; ``> 0.1`` sits ~15x above the mismatch noise floor
-    # and far below the perturbation's real effect.
+    # ``victim`` is ``layers.0.self_attn.o_proj.scales`` here — squarely
+    # on the single-step forward path (self_attn's residual contribution
+    # ``h = x + r`` inside ``_MTPDecoderLayer.__call__``, see the
+    # ``victim = ...`` comment above for the analytical argument) — so an
+    # 8x scale shift moves logits by O(1) (measured ~1.37 against a
+    # control |logit| up to ~1.8), vs the ~1e-3 bf16 mismatch drift;
+    # ``> 0.1`` sits well above the mismatch noise floor and far below
+    # the perturbation's real effect.
     pert_flat = dict(control_flat)
     pert_flat[victim] = control_flat[victim] * 8.0
     pert_dir = tmp_path / "perturbed"
