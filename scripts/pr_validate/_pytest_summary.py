@@ -19,6 +19,18 @@ import re
 # in its own captured stdout can't be mistaken for the real section,
 # because we take the LAST banner and captured output always renders in
 # the FAILURES section *above* the genuine summary (codex #1222 r2).
+#
+# Scope of the guarantee (codex #1222 r3): this defeats the REALISTIC
+# vectors — an accidental "short test summary" string, and captured
+# stdout above the summary. It does NOT defend against an author who
+# deliberately weaponizes their own test process (e.g. an ``atexit``
+# handler that prints a forged banner *after* pytest's genuine summary).
+# That is out of scope by design: the gate runs the candidate's code
+# in-process, so a hostile author owning the interpreter has strictly
+# easier sabotage routes (``@pytest.mark.skip``, deleting the test,
+# xfail) and no in-process report source — junit-xml included, since it
+# too can be rewritten from an ``atexit`` handler — is tamper-proof
+# against them. We defend against mistakes and flakes, not self-sabotage.
 _SUMMARY_BANNER = re.compile(r"^=+\s*short test summary info\s*=+$")
 
 

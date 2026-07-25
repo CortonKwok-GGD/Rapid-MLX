@@ -64,6 +64,14 @@ class FullUnitStep(Step):
             "--ignore=tests/test_event_loop.py",
             "-q",
             "--no-header",
+            # PIN the short-summary contents: always list FAILED and ERROR
+            # node ids regardless of any future default change. The
+            # quarantine downgrade's soundness rests on being able to SEE
+            # every error (a fixture/collection error must never be
+            # silently absent from the summary and mistaken for "only
+            # ordinary test failures" — codex #1222 r3). -rfE is explicit
+            # so the gate never depends on pytest's implicit default.
+            "-rfE",
             # Don't stop on first failure — we want the full count for
             # the scorecard ("3 failed, 2080 passed" is more actionable
             # than "1 failed, ???? passed").

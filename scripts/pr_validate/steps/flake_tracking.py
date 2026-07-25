@@ -29,9 +29,20 @@ Soundness guards (codex #1222):
     rather than mislabel a real failure as a flake.
   * The re-run is launched in its own session; on timeout the whole
     process group is SIGKILLed (race-free — the leader is unreaped at
-    that point, so its pgid is still reserved), and the post-kill output
-    drain is time-bounded, so a test that spawned an inference server /
-    GPU worker can neither leak into later steps nor wedge the gate.
+    that point, so its pgid is still reserved), sweeping in-group
+    descendants, and the post-kill drain is time-bounded so it can't
+    WEDGE the gate.
+
+Containment is best-effort, not absolute (codex #1222 r3, honestly
+scoped): a descendant that escapes its group via its own ``setsid()``,
+or a detached-stdio survivor of a *normally*-exiting re-run, is not
+portably reapable on macOS — there is no cgroup / job object, and once
+the group leader is reaped pgid recycling makes a post-reap ``killpg``
+unsafe (it could SIGKILL an unrelated, recycled group). We do NOT sweep
+after normal completion for that reason; this is the same trade-off
+accepted in #1220. In practice a pytest re-run does neither of these,
+and this step is advisory (never gates), so the residual leak is
+tolerated rather than papered over with an unsafe kill.
 
 If ``pytest-rerunfailures`` is not installed, the step skips cleanly —
 the plugin is an optional [test]/[dev] extra, not a required one.
@@ -154,7 +165,11 @@ class FlakeTrackingStep(Step):
         ]
         try:
             proc = _run_session(cmd, cwd=str(ctx.repo_root), timeout=_RERUN_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            # Persist whatever we drained before the kill so a human can
+            # see which re-run hung, instead of discarding it (codex
+            # #1222 r3). _run_session attaches the partial output/stderr.
+            rerun_log.write_text((e.output or "") + (e.stderr or ""))
             return StepResult(
                 name=self.name,
                 status="skip",
@@ -162,6 +177,7 @@ class FlakeTrackingStep(Step):
                     f"flake re-run exceeded {_RERUN_TIMEOUT_S}s on "
                     f"{len(sample)} test(s) — skipped (non-blocking)"
                 ),
+                artifacts=[str(rerun_log)],
             )
         rerun_log.write_text((proc.stdout or "") + (proc.stderr or ""))
 
@@ -228,8 +244,10 @@ class FlakeTrackingStep(Step):
 
 def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
     """Run ``cmd`` in its own session and, on timeout, SIGKILL the whole
-    process group so test-spawned descendants (inference servers, GPU
-    workers) can't leak into later validation steps (codex #1222).
+    process group so in-group test-spawned descendants (inference
+    servers, GPU workers) are swept before later validation steps
+    (codex #1222). Best-effort: a setsid-escaping descendant is not
+    portably containable on macOS — see the module docstring.
 
     ``start_new_session=True`` makes the child a session/group leader
     (pgid == pid). On timeout the child has not been reaped, so its pgid

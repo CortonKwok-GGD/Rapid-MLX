@@ -425,6 +425,20 @@ class TestFullUnitQuarantineAware:
         assert res.status == "fail"
         assert "test_boom" in res.details
 
+    def test_gate_pins_error_reporting(self, ctx_factory, monkeypatch):
+        # The quarantine downgrade's soundness rests on ERROR lines always
+        # appearing in the summary. The command must pin -rfE so it never
+        # depends on pytest's implicit default (codex #1222 r3).
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, _passed(), "")
+
+        monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
+        FullUnitStep().run(ctx_factory())
+        assert "-rfE" in captured["cmd"]
+
     def test_abnormal_exit_blocks(self, ctx_factory, monkeypatch):
         # Exit 2 (interrupted) with an otherwise-quarantined failure must
         # still block — the exit code says something the FAILED list
@@ -544,6 +558,26 @@ class TestFlakeTrackingContract:
         res = FlakeTrackingStep().run(ctx)
         assert res.status == "skip"
         assert "exceeded" in res.summary
+
+    def test_timeout_persists_drained_output(self, ctx_factory, monkeypatch):
+        # On timeout the partial output must be written to flake-rerun.log
+        # and attached, so a human can see which re-run hung (codex r3).
+        ctx = ctx_factory()
+        self._prime(ctx, monkeypatch)
+
+        def timeout(*a, **k):
+            raise subprocess.TimeoutExpired(
+                cmd="pytest", timeout=1, output="partial stdout here", stderr="err tail"
+            )
+
+        monkeypatch.setattr(flake_mod, "_run_session", timeout)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "skip"
+        log = ctx.artifact_path("flake-rerun.log")
+        assert log.exists()
+        body = log.read_text()
+        assert "partial stdout here" in body and "err tail" in body
+        assert str(log) in res.artifacts
 
     def test_abnormal_rerun_exit_skips(self, ctx_factory, monkeypatch):
         ctx = ctx_factory()
