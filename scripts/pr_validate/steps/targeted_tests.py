@@ -279,6 +279,14 @@ _PYTEST_CMD = [
     # repo's own ``addopts`` is empty, so this is a no-op on the trusted base.
     "-o",
     "addopts=",
+    # Re-apply the marker exclusion the repo's addopts carried (slow /
+    # integration / needle need real models or a live server). ``-o addopts=``
+    # above dropped it, so re-specify it HARDCODED — exactly as full_unit does
+    # — so the selection can't be widened/narrowed by candidate config and
+    # targeted keeps the same exclusion it inherited before the addopts was
+    # neutralized (codex #1222 r26).
+    "-m",
+    "not slow and not integration and not needle",
     "-q",
     "--no-header",
     "--tb=no",  # we don't render tracebacks here; the artifact has them
@@ -489,11 +497,23 @@ def _run_on_main(
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+_SUMMARY_RE = re.compile(
+    r"\b\d+ (passed|failed|error|skipped|xfailed|xpassed|deselected)\b"
+)
+
+
 def _last_summary_line(stdout: str) -> str:
+    # Match pytest's final counts line whether or not it carries the ``====``
+    # bars. In verbose mode the line is fenced (``==== 3 passed in 1s ====``),
+    # but once the inherited ``-v`` is dropped (``-o addopts=`` neutralizes the
+    # repo addopts) pytest prints it bar-less (``3 passed in 1s``), so a
+    # ``startswith("=")`` rule would miss it and fall back to a bare "exit 0"
+    # (codex #1222 r26). Anchor on the ``<n> <outcome>`` shape + the timing
+    # suffix instead so both forms are recognized.
     for line in reversed((stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("=") and ("passed" in line or "failed" in line):
-            return line.strip("= ").strip()
+        stripped = line.strip().strip("=").strip()
+        if _SUMMARY_RE.search(stripped) and " in " in stripped:
+            return stripped
     return ""
 
 

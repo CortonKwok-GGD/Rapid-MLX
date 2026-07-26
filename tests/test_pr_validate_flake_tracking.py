@@ -35,6 +35,7 @@ from scripts.pr_validate.context import Context
 from scripts.pr_validate.quarantine import (
     QuarantineEntry,
     QuarantineError,
+    _has_param_suffix,
     effective_quarantine,
     load_quarantine,
     load_quarantine_from_ref,
@@ -689,6 +690,29 @@ class TestNodeIdMatch:
 
     def test_unrelated(self):
         assert not node_id_matches("a.py::t", "b.py::t")
+
+    def test_has_param_suffix_only_inspects_final_component(self):
+        # codex #1222 r27: the parametrization bracket is only in the last
+        # ``::`` component — a "[" in the directory/class path is not a param.
+        assert _has_param_suffix("a.py::t[x]")
+        assert _has_param_suffix("tests/[legacy]/a.py::TestC::t[x-1]")
+        assert not _has_param_suffix("tests/[legacy]/a.py::t")
+        assert not _has_param_suffix("tests/models/[v2]/a.py::TestC::t")
+
+    def test_family_matches_under_bracketed_directory(self):
+        # A test beneath a bracket-named directory must still get family
+        # coverage — the "[" is in the path, not a param suffix (codex r27).
+        entry = "tests/models/[legacy]/test_x.py::test_y"
+        assert node_id_matches(entry + "[a-1]", entry, family=True)
+        assert not node_id_matches(entry + "[a-1]", entry)  # exact by default
+
+    def test_family_disabled_when_final_component_parametrized(self):
+        # Even under a bracket dir, an entry whose FINAL component is already
+        # parametrized is exact-only (family can't widen a specific param).
+        entry = "tests/[legacy]/test_x.py::test_y[a]"
+        assert not node_id_matches(
+            "tests/[legacy]/test_x.py::test_y[b]", entry, family=True
+        )
 
 
 class TestPartition:
@@ -2659,6 +2683,78 @@ class TestNodeidReporter:
         assert rerun, ("expected RERUN records under --reruns", rows)
         assert "test_flaky.py::test_always_bad" in rerun
 
+    def test_strict_xpass_logged_failed_and_carries_no_wasxfail(self, tmp_path):
+        # codex #1222 r27 (finding 2) REBUTTAL, locked as committed evidence.
+        # Claim: a strict-xfail test that unexpectedly PASSES is logged FAILED
+        # and, if quarantined, wrongly waived — "fix: detect report.wasxfail".
+        # EMPIRICALLY a strict XPASS report has outcome=='failed' but NO
+        # wasxfail (only the NON-strict xpass and the as-expected xfail carry
+        # it), so the proposed detection can't fire — the premise is false. The
+        # scenario is also not reachable: the allowlist is base-protected
+        # (candidates can't add), and a flaky (quarantined) test that is ALSO
+        # xfail(strict=True) is self-contradictory. A conftest captures the
+        # report to prove the wasxfail attribute is unset.
+        (tmp_path / "conftest.py").write_text(
+            textwrap.dedent(
+                """
+                import pathlib
+                _obs = pathlib.Path(__file__).with_name('.obs')
+
+                def pytest_runtest_logreport(report):
+                    if (report.when == 'call'
+                            and report.nodeid.endswith('::test_strict_xpass')):
+                        wx = getattr(report, 'wasxfail', '<UNSET>')
+                        _obs.write_text(f'{report.outcome}|{wx!r}')
+                """
+            )
+        )
+        (tmp_path / "test_xp.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+
+                @pytest.mark.xfail(strict=True, reason='exp')
+                def test_strict_xpass():
+                    assert True  # unexpectedly passes -> strict -> XPASS-as-fail
+                """
+            )
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        repo_root = self._repo_root()
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, repo_root
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-o",
+                "addopts=",
+                *plugin_args,
+                "test_xp.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        rows = [
+            tuple(ln.split("\t", 1))
+            for ln in log_path.read_text(encoding="utf-8").splitlines()
+            if "\t" in ln
+        ]
+        failed = [nid for label, nid in rows if label == "FAILED"]
+        # (a) The strict XPASS is recorded as a plain FAILED …
+        assert "test_xp.py::test_strict_xpass" in failed
+        # (b) … and the report carried NO wasxfail, so codex's wasxfail-based
+        # detection is inapplicable — the finding's premise is empirically false.
+        outcome, wasxfail = (tmp_path / ".obs").read_text().split("|", 1)
+        assert outcome == "failed"
+        assert wasxfail == "'<UNSET>'"
+
     def _session_records(self, log_path):
         if not log_path.exists():
             return []
@@ -3259,3 +3355,33 @@ class TestTargetedTestsUntrustedRun:
         )
         assert result.failed == ["tests/a.py::t"]
         assert result.structured is True
+
+    def test_pytest_cmd_reapplies_marker_exclusion(self):
+        # `-o addopts=` drops the repo's addopts, which carried
+        # `-m "not slow and not integration and not needle"`. That exclusion
+        # must be RE-SPECIFIED on the gating command or targeted would start
+        # running slow/integration/needle tests it used to inherit-exclude
+        # (codex #1222 r26 regression, caught in r27). Mirrors full_unit.
+        cmd = list(targeted_mod._PYTEST_CMD)
+        mexpr = "not slow and not integration and not needle"
+        # present as a value, and immediately preceded by the `-m` flag (not
+        # the leading `python -m pytest`).
+        assert mexpr in cmd
+        assert cmd[cmd.index(mexpr) - 1] == "-m"
+
+    def test_last_summary_line_parses_barless_quiet_mode(self):
+        # Once `-v` is dropped (via `-o addopts=`) pytest prints the counts
+        # line WITHOUT the ==== bars; the parser must still find it rather than
+        # fall back to a bare "exit N" (codex #1222 r27).
+        stdout = "........\n261 passed, 2 skipped in 10.86s\n"
+        assert (
+            targeted_mod._last_summary_line(stdout) == "261 passed, 2 skipped in 10.86s"
+        )
+
+    def test_last_summary_line_parses_fenced_and_failures(self):
+        assert (
+            targeted_mod._last_summary_line("==== 5 failed, 3 passed in 2.0s ====")
+            == "5 failed, 3 passed in 2.0s"
+        )
+        # No summary at all → empty (caller falls back to the exit code).
+        assert targeted_mod._last_summary_line("collecting...\n") == ""

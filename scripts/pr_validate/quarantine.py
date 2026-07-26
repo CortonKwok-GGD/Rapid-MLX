@@ -349,18 +349,35 @@ def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
     return entries
 
 
+def _has_param_suffix(node_id: str) -> bool:
+    """True iff the node id's FINAL component carries a ``[...]`` parameter
+    suffix (``tests/x.py::TestC::test_y[p]``).
+
+    Only the last ``::`` component can hold a parametrization bracket; a ``[``
+    earlier in the path is a directory or class name (e.g. a test living under
+    ``tests/models/[legacy]/test_x.py::test_y``). Searching the WHOLE id for
+    ``[`` wrongly disabled family matching for such tests (codex #1222 r27)."""
+    return "[" in node_id.rsplit("::", 1)[-1]
+
+
 def node_id_matches(failed_id: str, entry_id: str, *, family: bool = False) -> bool:
     """True iff a failed node id is covered by a quarantine entry.
 
     EXACT match by default. Only when ``family`` is set does a base
-    (no-bracket) entry also cover every parametrization (``entry_id`` +
+    (unparametrized) entry also cover every parametrization (``entry_id`` +
     ``[...]``) — exact-by-default keeps a newly-added, deterministically
     failing parametrization from being silently waived (codex #1222 r14).
     """
     if failed_id == entry_id:
         return True
-    # Family coverage is OPT-IN and only meaningful for a base entry.
-    if family and "[" not in entry_id and failed_id.startswith(entry_id + "["):
+    # Family coverage is OPT-IN and only meaningful for a base (unparametrized)
+    # entry — gated on the FINAL component's suffix, not any ``[`` in the path,
+    # so a test under a bracket-named directory can still use it (codex r27).
+    if (
+        family
+        and not _has_param_suffix(entry_id)
+        and failed_id.startswith(entry_id + "[")
+    ):
         return True
     return False
 

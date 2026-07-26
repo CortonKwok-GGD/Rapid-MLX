@@ -141,6 +141,25 @@ def session_completed(path: Path) -> bool:
     positive collected count and ``ran >= collected``. Anything else —
     missing, malformed, duplicated — withholds trust, the safe direction.
 
+    SCOPE (codex #1222 r27): this proves every SELECTED item finished; it does
+    NOT prove the selection itself was the whole real suite. ``collected`` is
+    pytest's count under candidate-controlled collection — a committed
+    ``pytest.ini`` (``python_files`` / ``norecursedirs``) or a ``conftest.py``
+    collection hook (``pytest_collection_modifyitems`` / ``collect_ignore`` /
+    ``pytest_ignore_collect``) could reduce ``tests/`` to a handful of passing
+    tests and still yield a truthful ``ran == collected``. A base-derived
+    count/manifest cross-check does NOT close this soundly: the SAME in-process
+    access that shrinks the set can SURGICALLY deselect the one regression test
+    (``collected`` drops by 1, under any ratio floor) or reparametrize its id,
+    so a count guard would only catch the crudest variant while advertising a
+    completeness it can't deliver. This is the documented in-process-hostile-
+    author residual — a candidate with commit access to shared test
+    infrastructure has strictly easier sabotage routes (a fixture that
+    monkeypatches the code under test, an ``atexit`` forging this very record);
+    the quarantine downgrade is scoped to mistakes and flakes, not such an
+    author, and the PR body states this plainly rather than shipping a guard we
+    can't keep.
+
     Kept here (not in a step) so ``full_unit`` and ``flake_tracking`` share
     ONE completeness definition and can't drift on it."""
     records = raw_session_records(path)
