@@ -84,19 +84,31 @@ def _strip_message(rest: str) -> str:
     (``test_x - AssertionError: [1]`` → ``test_x``) — the earlier
     ``rfind("]")`` approach got the latter wrong (codex #1222 r5).
 
-    Known limitation (codex #1222 r6): a node id whose EXPLICIT param id
-    contains an *unmatched* bracket (e.g. ``ids=["["]`` → ``test_x[[]``)
-    leaves the depth counter unbalanced, so the message is absorbed into
-    the returned id. This is irreducible in pytest's terminal output —
-    ``nodeid - message`` is genuinely ambiguous when the id may hold
-    ``" - "`` and unbalanced ``[]`` while the message may hold anything.
-    It fails SAFE: a mangled id won't match a (normal) quarantine entry,
-    so the failure BLOCKS rather than being wrongly downgraded, and a
-    mistargeted advisory re-run just yields an inconclusive result. A
-    structured report (junit-xml) was considered and rejected: its
+    Ambiguity is resolved by failing SAFE, never by guessing. Two cases:
+
+      * ``r6``: a node id whose EXPLICIT param id holds an *unmatched*
+        bracket (``ids=["["]`` → ``test_x[[]``) leaves the depth counter
+        unbalanced, so the message is absorbed into the returned id.
+      * ``r9``: a param id that itself contains ``"] - ["`` (e.g.
+        ``test_x[a] - [b]``) makes the inner ``]`` close the depth
+        prematurely, so the FIRST depth-0 ``" - "`` lands *inside* the
+        param sequence. Splitting there would truncate to ``test_x[a]`` —
+        which could wrongly match a shorter quarantine entry and DOWNGRADE
+        a real failure. To prevent that, a candidate split is rejected when
+        the message it would produce begins with ``"["`` (the tell-tale of
+        a mid-param split, or a genuine bracket-leading message we equally
+        can't disambiguate). We then return the whole line as the id.
+
+    Both cases return a mangled id that won't match a normal quarantine
+    entry, so the failure BLOCKS rather than being wrongly waived, and a
+    mistargeted advisory re-run just yields an inconclusive result. The
+    r4/r5 common cases are unaffected — their message begins with the
+    exception text (``AssertionError: …``) or a bare word, not ``"["``.
+
+    A structured report (junit-xml) was considered and rejected: its
     ``classname``/``name`` split can't be mapped back to a pytest node id
-    unambiguously for class-based / deep-package tests, trading this rare
-    safe failure for a common-path matching risk."""
+    unambiguously for class-based / deep-package tests, trading these rare
+    safe failures for a common-path matching risk."""
     depth = 0
     i = 0
     n = len(rest)
@@ -108,6 +120,13 @@ def _strip_message(rest: str) -> str:
             if depth > 0:
                 depth -= 1
         elif depth == 0 and rest.startswith(" - ", i):
+            # A message beginning with "[" means we can't tell a genuine
+            # bracket-leading message from a split taken in the MIDDLE of a
+            # bracketed param sequence ("test_x[a] - [b]"). Fail safe:
+            # return the whole line so an ambiguous id can't be wrongly
+            # matched against a shorter quarantine entry (codex #1222 r9).
+            if rest[i + 3 :].startswith("["):
+                return rest.strip()
             return rest[:i].strip()
         i += 1
     return rest.strip()

@@ -149,6 +149,36 @@ class TestSummaryNodeIds:
         )
         assert out == ["tests/a.py::test_x[[] - AssertionError"]
 
+    def test_param_id_with_bracket_dash_bracket_no_message(self):
+        # A param id containing "] - [" (e.g. ids=["a] - [b"]) makes the
+        # inner ']' close depth early. With no message, failing safe returns
+        # the WHOLE line — which is exactly the correct node id here.
+        out = summary_node_ids(_summary("FAILED tests/a.py::test_x[a] - [b]"), "FAILED")
+        assert out == ["tests/a.py::test_x[a] - [b]"]
+
+    def test_param_id_with_bracket_dash_bracket_and_message_fails_safe(self):
+        # DOCUMENTED r9 limitation: the same "] - [" param WITH a message is
+        # irreducibly ambiguous. We must NOT truncate to "test_x[a]" (which
+        # could wrongly match a shorter quarantine entry and downgrade a real
+        # failure), so we fail SAFE and return the whole line — it won't match
+        # a normal entry, so the failure BLOCKS. Locked as an intentional
+        # trade-off, not a silent regression.
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x[a] - [b] - AssertionError"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x[a] - [b] - AssertionError"]
+
+    def test_bracket_leading_message_fails_safe_not_mismatched(self):
+        # A genuine bracket-LEADING message ("[Errno 2] …") on a plain test
+        # is equally indistinguishable from a mid-param split, so it also
+        # fails safe (returns the whole line). This never mis-waives; at
+        # worst a quarantined flake with such a message blocks instead of
+        # being downgraded — the safe direction (codex #1222 r9).
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x - [Errno 2] no such file"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x - [Errno 2] no such file"]
+
     def test_ignores_failed_outside_summary(self):
         text = (
             "tests/a.py::test_x FAILED in call setup\n"  # pre-summary noise
@@ -818,6 +848,38 @@ class TestFlakeTrackingContract:
         # ...and the cap still bounds the total re-run set.
         rerun_ids = [c for c in captured["cmd"] if c.startswith("tests/x.py::")]
         assert len(rerun_ids) == flake_mod._MAX_RERUN_IDS
+
+    def test_all_quarantined_sampled_even_past_cap(self, ctx_factory, monkeypatch):
+        # When quarantined failures ALONE exceed the cap, every one is still
+        # re-run — the cap bounds only the non-quarantined remainder (codex
+        # #1222 r9 nit): dropping a quarantined failure would silently skip
+        # the graveyard check the step promises.
+        n_q = flake_mod._MAX_RERUN_IDS + 5
+        q_ids = [f"tests/x.py::q{i}" for i in range(n_q)]
+        other_ids = [f"tests/x.py::o{i}" for i in range(10)]
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary(*[f"FAILED {i} - X" for i in q_ids + other_ids])
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(
+            flake_mod,
+            "load_quarantine_from_ref",
+            lambda *a, **k: [QuarantineEntry(id=i) for i in q_ids],
+        )
+        captured = {}
+
+        def _capture(cmd, cwd, timeout):
+            captured["cmd"] = cmd
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", _capture)
+        FlakeTrackingStep().run(ctx)
+        rerun = set(captured["cmd"])
+        assert all(q in rerun for q in q_ids)  # every quarantined id re-run
+        assert not any(o in rerun for o in other_ids)  # cap spent on quarantined
 
 
 class TestFlakeTrackingClassification:

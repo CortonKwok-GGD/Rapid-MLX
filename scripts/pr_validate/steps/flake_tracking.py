@@ -163,15 +163,19 @@ class FlakeTrackingStep(Step):
         except QuarantineError:
             entries = []
 
-        # Cap the re-run set, but check EVERY quarantined failure first
-        # (codex #1222 r8 nit): a graveyard candidate — a quarantined test
-        # that may have stopped flaking — is the highest-value review
-        # signal, so it must never be dropped by the cap just because it
-        # sorted past the 25th id. The cap then applies to the advisory
-        # non-quarantined remainder.
+        # Check EVERY quarantined failure, then fill the rest of the cap
+        # with non-quarantined candidates (codex #1222 r8→r9 nit): a
+        # graveyard candidate — a quarantined test that may have stopped
+        # flaking — is the highest-value review signal, so it must NEVER be
+        # dropped by the cap. The cap bounds only the advisory
+        # non-quarantined remainder; if quarantined failures alone exceed
+        # _MAX_RERUN_IDS we re-run all of them anyway (they're the whole
+        # point). In practice the human-curated registry is tiny, so this
+        # is a handful at most.
         q_failed = [i for i in original_failed if is_quarantined(i, entries)]
         other_failed = [i for i in original_failed if not is_quarantined(i, entries)]
-        sample = (q_failed + other_failed)[:_MAX_RERUN_IDS]
+        remaining = max(0, _MAX_RERUN_IDS - len(q_failed))
+        sample = q_failed + other_failed[:remaining]
         truncated = len(original_failed) - len(sample)
 
         rerun_log = ctx.artifact_path("flake-rerun.log")
