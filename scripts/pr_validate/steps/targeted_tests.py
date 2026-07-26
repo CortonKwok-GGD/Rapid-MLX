@@ -38,9 +38,14 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 from .. import _nodeid_reporter
-from .._pytest_summary import rerun_detected
+from .._pytest_summary import (
+    report_log_node_ids,
+    rerun_detected,
+    session_completed,
+)
 from ..base import GATING_PYTEST_GUARD, Step, StepResult
 from ..context import Context
 
@@ -84,9 +89,7 @@ class TargetedTestsStep(Step):
         # PR head here too.
         pr_log = ctx.artifact_path("targeted-pr.log")
         pr_nodeids = ctx.artifact_path("targeted-pr-nodeids.tsv")
-        pr_summary, pr_failed, pr_reran = _run_pytest(
-            targets, pr_log, ctx.repo_root, pr_nodeids
-        )
+        pr = _run_pytest(targets, pr_log, ctx.repo_root, pr_nodeids)
 
         # A GATING run must never rerun. targeted_tests is the FIRST — and,
         # for a low-blast PR where full_unit is skipped, the ONLY — gating
@@ -96,11 +99,11 @@ class TargetedTestsStep(Step):
         # and if full_unit never runs, nothing else would catch the rerun
         # (codex #1222 r24). Any RERUN record → a real failure may have been
         # retried to green → block, regardless of the scraped FAILED set.
-        if pr_reran:
+        if pr.reran:
             return StepResult(
                 name=self.name,
                 status="fail",
-                summary=f"{pr_summary} (gating run reran a test)",
+                summary=f"{pr.summary} (gating run reran a test)",
                 details="⚠️ the targeted gating run reran at least one test — "
                 "pytest-rerunfailures was active despite the by-name block, so "
                 "it was smuggled in under a different name. A rerun can retry a "
@@ -109,13 +112,37 @@ class TargetedTestsStep(Step):
                 artifacts=[str(pr_log)],
             )
 
-        if not pr_failed:
+        # An empty scraped FAILED list is only a genuine PASS when the run
+        # actually finished as an ORDINARY pass (exit 0) or fail (exit 1).
+        # ``_run_pytest`` scrapes only ``FAILED`` summary lines, so a
+        # collection error, a usage error, "no tests collected", or an early
+        # ``pytest.exit`` would otherwise slip through as a false green with
+        # an empty FAILED set — the same class of hole full_unit closes with
+        # its exit-code / ERROR / session-completeness checks (codex #1222
+        # r25). Gate on those signals BEFORE trusting an empty FAILED list.
+        untrusted = _untrusted_run_reason(pr.returncode, pr.errored, pr.complete)
+        if untrusted:
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=f"{pr.summary} (untrusted targeted run)",
+                details=(
+                    f"⚠️ the targeted run cannot be trusted as green: {untrusted}. "
+                    "An empty FAILED list is not accepted as a pass on an "
+                    "abnormal/truncated run — blocking fail-safe."
+                ),
+                artifacts=[str(pr_log)],
+            )
+
+        if not pr.failed:
             return StepResult(
                 name=self.name,
                 status="pass",
-                summary=f"{pr_summary} (in {len(targets)} target file(s))",
+                summary=f"{pr.summary} (in {len(targets)} target file(s))",
                 artifacts=[str(pr_log)],
             )
+
+        pr_failed = pr.failed
 
         # Failures on PR branch — run negative control on main.
         ctx.run_log(
@@ -251,18 +278,70 @@ _PYTEST_CMD = [
 ]
 
 
+class _PytestRun(NamedTuple):
+    """Result of a targeted pytest run.
+
+    ``failed`` is the scraped ``FAILED`` node-id list (empty => none scraped).
+    ``reran`` / ``errored`` / ``complete`` come from the structured reporter
+    when it was injected; without it (``nodeid_log`` absent / plugin
+    unimportable) they degrade to the trusting defaults ``False`` / ``False``
+    / ``True`` so a legacy no-reporter run behaves as before. ``returncode``
+    is always pytest's real exit code."""
+
+    summary: str
+    failed: list[str]
+    reran: bool
+    returncode: int
+    errored: bool
+    complete: bool
+
+
+def _untrusted_run_reason(returncode: int, errored: bool, complete: bool) -> str | None:
+    """Why a targeted run can't be trusted as a clean pass/fail, or ``None``.
+
+    An empty scraped ``FAILED`` list only means "clean" when the run finished
+    as an ordinary pass (exit 0) or fail (exit 1). Any OTHER exit — collection
+    error (2), internal error (3), usage error (4), no tests collected (5) — or
+    a structured ``ERROR`` record (a collection / setup / teardown failure,
+    which NEVER appears as a ``FAILED`` summary line so it can't be
+    negative-control filtered), or a truncated session (an early
+    ``pytest.exit`` / crash before the session-finish record) would otherwise
+    slip through as a false green with an empty FAILED set (codex #1222 r25).
+    ``errored`` / ``complete`` are only meaningful when the structured reporter
+    ran; the caller passes the trusting defaults otherwise."""
+    if returncode not in (0, 1):
+        return (
+            f"pytest exited {returncode} (not a plain pass=0 / fail=1 — a "
+            "collection/usage/internal error, or no tests were collected)"
+        )
+    if errored:
+        return (
+            "the structured log recorded an ERROR (collection or "
+            "setup/teardown failure), which never scrapes as a FAILED line"
+        )
+    if not complete:
+        return (
+            "pytest did not run to completion (an early pytest.exit / crash "
+            "before the session-finish record) — a truncated run is not green"
+        )
+    return None
+
+
 def _run_pytest(
     targets: list[str], log_path: Path, cwd: Path, nodeid_log: Path | None = None
-) -> tuple[str, list[str], bool]:
-    """Run pytest against ``targets``. Returns (one-line summary, list of
-    FAILED node IDs, reran) where ``reran`` is True iff the run reran a test
-    (a gating run must never rerun). Empty failed list => clean run.
+) -> _PytestRun:
+    """Run pytest against ``targets``. Returns a ``_PytestRun`` — the one-line
+    summary, scraped FAILED node IDs, and the structured-reporter signals
+    (``reran`` / ``errored`` / ``complete``) plus the real exit code. A gating
+    run must never rerun; and an empty FAILED list is only trusted as a pass
+    when the exit code + reporter signals confirm an ordinary complete run
+    (see ``_untrusted_run_reason``).
 
     When ``nodeid_log`` is given and the reporter plugin is importable, the
-    run emits the structured RERUN record used for the name-independent
-    rerun backstop. ``cwd`` (the PR head worktree) must contain the reporter
-    module — it does, since this PR adds it; the negative-control run on the
-    protected base does NOT inject it (the base predates the plugin)."""
+    run emits the structured RERUN / ERROR / SESSIONFINISH records those
+    signals read from. ``cwd`` (the PR head worktree) must contain the
+    reporter module — it does, since this PR adds it; the negative-control run
+    on the protected base does NOT inject it (the base predates the plugin)."""
     cmd = [*_PYTEST_CMD, *targets]
     env = dict(os.environ)
     env.pop("PYTEST_ADDOPTS", None)
@@ -273,7 +352,7 @@ def _run_pytest(
         )
         cmd += plugin_args
         # Start-sentinel so an empty log is distinguishable from "plugin
-        # never ran" (mirrors full_unit); rerun detection reads it below.
+        # never ran" (mirrors full_unit); the signals below read it back.
         nodeid_log.write_text("", encoding="utf-8")
     proc = subprocess.run(  # noqa: S603
         cmd,
@@ -285,8 +364,24 @@ def _run_pytest(
     log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
     summary = _last_summary_line(proc.stdout) or f"exit {proc.returncode}"
     failed = _extract_failed_node_ids(proc.stdout)
-    reran = bool(inject and nodeid_log.exists() and rerun_detected(nodeid_log))
-    return summary, failed, reran
+    # Reporter-derived signals. Without the reporter we can't prove
+    # completeness / distinguish ERROR from a clean run, so degrade to the
+    # trusting defaults (reran=False, errored=False, complete=True) — the
+    # exit-code check in _untrusted_run_reason still applies either way.
+    reran = errored = False
+    complete = True
+    if inject and nodeid_log.exists():
+        reran = rerun_detected(nodeid_log)
+        errored = bool(report_log_node_ids(nodeid_log, "ERROR"))
+        complete = session_completed(nodeid_log)
+    return _PytestRun(
+        summary=summary,
+        failed=failed,
+        reran=reran,
+        returncode=proc.returncode,
+        errored=errored,
+        complete=complete,
+    )
 
 
 def _run_on_main(

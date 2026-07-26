@@ -356,9 +356,14 @@ class FullUnitStep(Step):
                 base_entries = load_quarantine_from_ref(ctx.base_sha, ctx.repo_root)
             except QuarantineError as e:
                 entries = []
+                # The exception message can echo candidate-controlled
+                # registry text (a bad node id / reason from the PR's own
+                # quarantine.yaml), so render it as a single JSON-quoted line
+                # — a raw newline/backtick would otherwise spoof a scorecard
+                # heading or fence out of this note (codex #1222 r25).
                 registry_note = (
                     f"\n\n⚠️ base quarantine registry unreadable — treating "
-                    f"every failure as blocking: {e}"
+                    f"every failure as blocking: {render_fence_safe(str(e))}"
                 )
             else:
                 # Intersect base with the CANDIDATE registry so a
@@ -396,10 +401,14 @@ class FullUnitStep(Step):
                         )
                     except QuarantineError as e:
                         entries = []
+                        # Single-line JSON render — the candidate CONTROLS
+                        # this registry, so its error text is fully attacker-
+                        # chosen and must not reach the scorecard raw (codex
+                        # #1222 r25).
                         registry_note = (
                             f"\n\n⚠️ candidate quarantine registry unreadable — "
                             f"failing closed to an empty quarantine (every "
-                            f"failure blocks): {e}"
+                            f"failure blocks): {render_fence_safe(str(e))}"
                         )
                     else:
                         entries = effective_quarantine(base_entries, cand_entries)

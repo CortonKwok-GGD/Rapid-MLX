@@ -1150,6 +1150,31 @@ class TestFullUnitQuarantineAware:
         assert res.status == "fail"
         assert "unreadable" in res.details
 
+    def test_registry_error_message_is_single_line_sanitized(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r25: a QuarantineError message can echo candidate-
+        # controlled registry text (a bad node id / reason from the PR's own
+        # quarantine.yaml). Interpolated RAW into the scorecard note, a newline
+        # + "## heading" would forge a scorecard section; render_fence_safe
+        # collapses it to a single escaped JSON line, so the hostile text
+        # survives for the reader but can NEVER inject a raw newline/heading.
+        hostile = "bad id\n## FORGED HEADING\n```\nnot a real fence"
+
+        def boom(*a, **k):
+            raise QuarantineError(hostile)
+
+        monkeypatch.setattr(full_unit_mod, "load_quarantine_from_ref", boom)
+        self._patch_pytest(
+            monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        # No raw newline-injected heading anywhere in the rendered note …
+        assert "\n## FORGED HEADING" not in res.details
+        # … but the text is preserved as an escaped single-line JSON string.
+        assert "\\n## FORGED HEADING" in res.details
+
     def test_nonzero_exit_without_node_ids_blocks(self, ctx_factory, monkeypatch):
         self._patch_pytest(monkeypatch, 1, "==== 1 error in 0.50s ====\n")
         res = FullUnitStep().run(ctx_factory())
@@ -3004,10 +3029,10 @@ class TestTargetedTestsRerunBackstop:
             return subprocess.CompletedProcess(cmd, 1, "==== 1 failed in 1s ====\n", "")
 
         monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
-        summary, failed, reran = targeted_mod._run_pytest(
+        result = targeted_mod._run_pytest(
             ["tests/a.py"], tmp_path / "log.txt", tmp_path, nodeid_log
         )
-        assert reran is True
+        assert result.reran is True
 
     def test_run_pytest_no_rerun_is_false(self, tmp_path, monkeypatch):
         nodeid_log = tmp_path / "n.tsv"
@@ -3020,10 +3045,10 @@ class TestTargetedTestsRerunBackstop:
             return subprocess.CompletedProcess(cmd, 1, "==== 1 failed in 1s ====\n", "")
 
         monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
-        _, _, reran = targeted_mod._run_pytest(
+        result = targeted_mod._run_pytest(
             ["tests/a.py"], tmp_path / "log.txt", tmp_path, nodeid_log
         )
-        assert reran is False
+        assert result.reran is False
 
     def test_run_blocks_when_pr_run_reran(self, ctx_factory, monkeypatch):
         ctx = ctx_factory(["vllm_mlx/scheduler.py"])
@@ -3033,10 +3058,13 @@ class TestTargetedTestsRerunBackstop:
         monkeypatch.setattr(
             targeted_mod,
             "_run_pytest",
-            lambda *a, **k: (
-                "1 failed, 2 passed",
-                ["tests/test_scheduler.py::t"],
-                True,
+            lambda *a, **k: targeted_mod._PytestRun(
+                summary="1 failed, 2 passed",
+                failed=["tests/test_scheduler.py::t"],
+                reran=True,
+                returncode=1,
+                errored=False,
+                complete=True,
             ),
         )
         res = targeted_mod.TargetedTestsStep().run(ctx)
@@ -3053,3 +3081,132 @@ class TestTargetedTestsRerunBackstop:
         src = inspect.getsource(targeted_mod._run_on_main)
         assert "build_invocation" not in src
         assert "_nodeid_reporter" not in src
+
+
+class TestTargetedTestsUntrustedRun:
+    """An empty scraped FAILED list is only a genuine pass when the run
+    finished as an ordinary pass (0) or fail (1). A collection error, usage
+    error, "no tests collected", a structured ERROR (which never scrapes as a
+    FAILED line), or an early ``pytest.exit`` must NOT slip through as a false
+    green (codex #1222 r25)."""
+
+    def test_reason_none_for_ordinary_pass_or_fail(self):
+        assert targeted_mod._untrusted_run_reason(0, False, True) is None
+        assert targeted_mod._untrusted_run_reason(1, False, True) is None
+
+    def test_reason_flags_abnormal_exit(self):
+        for code in (2, 3, 4, 5):
+            reason = targeted_mod._untrusted_run_reason(code, False, True)
+            assert reason and str(code) in reason
+
+    def test_reason_flags_error_record(self):
+        reason = targeted_mod._untrusted_run_reason(0, True, True)
+        assert reason and "ERROR" in reason
+
+    def test_reason_flags_incomplete_session(self):
+        reason = targeted_mod._untrusted_run_reason(0, False, False)
+        assert reason and "completion" in reason
+
+    def _patch_run_pytest(self, monkeypatch, ctx_factory, run):
+        ctx = ctx_factory(["vllm_mlx/scheduler.py"])
+        monkeypatch.setattr(
+            targeted_mod, "_select_test_files", lambda c: ["tests/test_scheduler.py"]
+        )
+        monkeypatch.setattr(targeted_mod, "_run_pytest", lambda *a, **k: run)
+        return ctx
+
+    def test_run_blocks_on_collection_error_empty_failed(
+        self, ctx_factory, monkeypatch
+    ):
+        # Exit 2 + ERROR record + EMPTY FAILED (a collection failure scrapes no
+        # FAILED summary line). Pre-r25 this passed as a false green because the
+        # gate only checked the empty FAILED list.
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="1 error in 0.5s",
+                failed=[],
+                reran=False,
+                returncode=2,
+                errored=True,
+                complete=False,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+        assert "untrusted" in res.summary
+
+    def test_run_blocks_on_error_record_with_exit_one(self, ctx_factory, monkeypatch):
+        # Exit 1 but only a setup/teardown ERROR (no scrapable FAILED) — still
+        # must block, not pass on the empty FAILED list.
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="1 error in 0.5s",
+                failed=[],
+                reran=False,
+                returncode=1,
+                errored=True,
+                complete=True,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+
+    def test_run_blocks_on_incomplete_session(self, ctx_factory, monkeypatch):
+        # Exit 0 but a truncated session (early pytest.exit before the
+        # session-finish record) → not accepted as green.
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="truncated",
+                failed=[],
+                reran=False,
+                returncode=0,
+                errored=False,
+                complete=False,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+
+    def test_run_passes_on_clean_exit_zero(self, ctx_factory, monkeypatch):
+        # The hardening must not break the happy path: exit 0, complete, no
+        # errors, empty FAILED → pass.
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="3 passed in 0.5s",
+                failed=[],
+                reran=False,
+                returncode=0,
+                errored=False,
+                complete=True,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "pass"
+
+    def test_run_pytest_populates_error_and_incomplete(self, tmp_path, monkeypatch):
+        # _run_pytest reads ERROR + session-completeness from the structured
+        # log, not just RERUN, and always carries the real exit code.
+        nodeid_log = tmp_path / "n.tsv"
+
+        def fake_run(cmd, **kw):
+            env = kw.get("env") or {}
+            log = env.get("PR_VALIDATE_NODEID_LOG")
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("ERROR\ttests/a.py::t\n")  # no SESSIONFINISH → incomplete
+            return subprocess.CompletedProcess(cmd, 2, "", "")
+
+        monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
+        result = targeted_mod._run_pytest(
+            ["tests/a.py"], tmp_path / "log.txt", tmp_path, nodeid_log
+        )
+        assert result.errored is True
+        assert result.complete is False
+        assert result.returncode == 2

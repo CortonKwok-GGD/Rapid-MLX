@@ -26,6 +26,7 @@ Design notes:
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -142,6 +143,13 @@ def load_quarantine_from_ref(
             encoding="utf-8",
             cwd=str(repo_root),
             timeout=_GIT_SHOW_TIMEOUT_S,
+            # Pin the locale so the "missing path" stderr fragments matched
+            # below are git's stable C-locale English, not a translated
+            # message under a non-English LANG — otherwise a legitimately
+            # absent registry would misclassify as a hard error (codex #1222
+            # r25). LC_ALL wins over LANG/LC_MESSAGES; set both for belt-and-
+            # braces.
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
         )
     except FileNotFoundError as e:
         # git not installed / not on PATH — infra failure, not "no registry".
