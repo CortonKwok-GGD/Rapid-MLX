@@ -76,7 +76,8 @@ import subprocess
 import sys
 import traceback
 
-from .._pytest_summary import summary_node_ids
+from .. import _nodeid_reporter
+from .._pytest_summary import report_log_node_ids, summary_node_ids
 from ..base import Step, StepResult
 from ..context import Context
 from ..quarantine import QuarantineError, is_quarantined, load_quarantine_from_ref
@@ -135,7 +136,13 @@ class FlakeTrackingStep(Step):
                 summary="no full-unit.log to classify",
             )
 
-        original_failed = summary_node_ids(log_path.read_text(), "FAILED")
+        # Prefer full_unit's STRUCTURED node-id log (exact ids); fall back
+        # to scraping its text log only if the plugin didn't run there.
+        nodeid_log = ctx.artifact_path("full-unit-nodeids.tsv")
+        if nodeid_log.exists():
+            original_failed = report_log_node_ids(nodeid_log, "FAILED")
+        else:
+            original_failed = summary_node_ids(log_path.read_text(), "FAILED")
         if not original_failed:
             return StepResult(
                 name=self.name,
@@ -153,15 +160,17 @@ class FlakeTrackingStep(Step):
                 ),
             )
 
-        # Report against the ACTIVE (protected base) quarantine, same
-        # source full_unit's downgrade uses. Fail-safe: a broken/absent
-        # registry just means "nothing known-flaky yet" for the report.
-        try:
-            entries = load_quarantine_from_ref(
-                ctx.base_sha or ctx.base_branch, ctx.repo_root
-            )
-        except QuarantineError:
-            entries = []
+        # Report against the ACTIVE quarantine, read from the IMMUTABLE base
+        # SHA — same protected source full_unit's downgrade uses, and never
+        # the mutable branch ref a candidate could rewrite (codex #1222 r10).
+        # Fail-safe: no SHA / a broken registry just means "nothing
+        # known-flaky yet" for the advisory report.
+        entries = []
+        if ctx.base_sha:
+            try:
+                entries = load_quarantine_from_ref(ctx.base_sha, ctx.repo_root)
+            except QuarantineError:
+                entries = []
 
         # Check EVERY quarantined failure, then fill the rest of the cap
         # with non-quarantined candidates (codex #1222 r8→r9 nit): a
@@ -179,6 +188,9 @@ class FlakeTrackingStep(Step):
         truncated = len(original_failed) - len(sample)
 
         rerun_log = ctx.artifact_path("flake-rerun.log")
+        rerun_nodeids = ctx.artifact_path("flake-rerun-nodeids.tsv")
+        if rerun_nodeids.exists():
+            rerun_nodeids.unlink()
         cmd = [
             sys.executable,
             "-m",
@@ -191,17 +203,28 @@ class FlakeTrackingStep(Step):
             # (codex #1222 r6) — same reason as full_unit.
             "--color=no",
             # -rA => list every test's final outcome (PASSED/FAILED/…) in
-            # the short summary. We classify a flake candidate on a
-            # *positive* PASSED, not on mere absence from FAILED — so a
-            # test that got SKIPPED / deselected / never ran on the
-            # isolated re-run is inconclusive, not a false flake
-            # (codex #1222 r2).
+            # the short summary. Used as the FALLBACK when the structured
+            # node-id plugin isn't available; the plugin path classifies on
+            # exact ``report.nodeid`` instead. Either way we classify on a
+            # *positive* PASSED, not on mere absence from FAILED — a test
+            # SKIPPED / deselected / never run is inconclusive, not a false
+            # flake (codex #1222 r2).
             "-rA",
             "-p",
             "no:cacheprovider",
         ]
+        # Emit the structured node-id log (with PASSED, which the classifier
+        # needs) so flake-vs-real is decided on exact ids, not summary text.
+        rerun_env = None
+        if _nodeid_reporter.available():
+            plugin_args, rerun_env = _nodeid_reporter.build_invocation(
+                rerun_nodeids, ctx.repo_root, log_passes=True
+            )
+            cmd += plugin_args
         try:
-            proc = _run_session(cmd, cwd=str(ctx.repo_root), timeout=_RERUN_TIMEOUT_S)
+            proc = _run_session(
+                cmd, cwd=str(ctx.repo_root), timeout=_RERUN_TIMEOUT_S, env=rerun_env
+            )
         except subprocess.TimeoutExpired as e:
             # Persist whatever we drained before the kill so a human can
             # see which re-run hung, instead of discarding it (codex
@@ -239,8 +262,14 @@ class FlakeTrackingStep(Step):
         #   * FAILED/ERROR again → reproduces → likely a real bug.
         #   * anything else (SKIPPED / deselected / never collected) →
         #     INCONCLUSIVE — reported, but NOT called a flake.
-        passed = set(summary_node_ids(proc.stdout, "PASSED"))
-        still_bad = set(summary_node_ids(proc.stdout, "FAILED", "ERROR"))
+        # Prefer the structured node-id log (exact ids); fall back to
+        # scraping the summary only if the plugin didn't run (codex r10).
+        if rerun_nodeids.exists():
+            passed = set(report_log_node_ids(rerun_nodeids, "PASSED"))
+            still_bad = set(report_log_node_ids(rerun_nodeids, "FAILED", "ERROR"))
+        else:
+            passed = set(summary_node_ids(proc.stdout, "PASSED"))
+            still_bad = set(summary_node_ids(proc.stdout, "FAILED", "ERROR"))
         candidates = [i for i in sample if i in passed]
         reproduced = [i for i in sample if i in still_bad]
         inconclusive = [i for i in sample if i not in passed and i not in still_bad]
@@ -277,7 +306,8 @@ class FlakeTrackingStep(Step):
             reproduced_new,
             reproduced_known,
             inconclusive,
-            truncated,
+            sampled=len(sample),
+            total=len(original_failed),
         )
 
         # The "quarantine graveyard" signal (codex #1222 r7 → r8): a
@@ -311,12 +341,17 @@ class FlakeTrackingStep(Step):
         )
 
 
-def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
+def _run_session(
+    cmd: list[str], cwd: str, timeout: int, env: dict | None = None
+) -> subprocess.CompletedProcess:
     """Run ``cmd`` in its own session and, on timeout, SIGKILL the whole
     process group so in-group test-spawned descendants (inference
     servers, GPU workers) are swept before later validation steps
     (codex #1222). Best-effort: a setsid-escaping descendant is not
     portably containable on macOS — see the module docstring.
+
+    ``env`` (when given) is the subprocess environment — used to carry the
+    ``_nodeid_reporter`` plugin's log path + PYTHONPATH; ``None`` inherits.
 
     ``start_new_session=True`` makes the child a session/group leader
     (pgid == pid). On timeout the child has not been reaped, so its pgid
@@ -333,6 +368,7 @@ def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.Completed
         text=True,
         cwd=cwd,
         start_new_session=True,
+        env=env,
     )
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -393,7 +429,9 @@ def _render(
     reproduced_new: list[str],
     reproduced_known: list[str],
     inconclusive: list[str],
-    truncated: int,
+    *,
+    sampled: int,
+    total: int,
 ) -> str:
     parts: list[str] = []
     if new_candidates:
@@ -429,10 +467,10 @@ def _render(
             "re-run — skipped, deselected, or not collected; NOT classified "
             "as a flake):\n```\n" + "\n".join(inconclusive) + "\n```"
         )
-    if truncated > 0:
+    if total > sampled:
         parts.append(
-            f"_Sampled the first {_MAX_RERUN_IDS} of "
-            f"{_MAX_RERUN_IDS + truncated} failures — {truncated} not "
-            f"re-run this pass._"
+            f"_Re-ran {sampled} of {total} failures (quarantined first, then "
+            f"non-quarantined up to the cap) — {total - sampled} not re-run "
+            f"this pass._"
         )
     return "\n\n".join(parts) if parts else "no classification produced"

@@ -24,7 +24,8 @@ from __future__ import annotations
 import subprocess
 import sys
 
-from .._pytest_summary import summary_node_ids
+from .. import _nodeid_reporter
+from .._pytest_summary import report_log_node_ids, summary_node_ids
 from ..base import Step, StepResult
 from ..context import Context
 from ..quarantine import (
@@ -81,8 +82,25 @@ class FullUnitStep(Step):
             # the scorecard ("3 failed, 2080 passed" is more actionable
             # than "1 failed, ???? passed").
         ]
+
+        # Emit a STRUCTURED node-id log via the _nodeid_reporter plugin so
+        # the quarantine partition uses pytest's exact ``report.nodeid``
+        # instead of scraping the ambiguous terminal summary (codex #1222
+        # r4→r10). A stale log from a prior run would poison the read, so
+        # start clean; fall back to summary parsing if the plugin can't be
+        # loaded (never pass an unloadable ``-p`` — that's a usage error).
+        nodeid_log = ctx.artifact_path("full-unit-nodeids.tsv")
+        if nodeid_log.exists():
+            nodeid_log.unlink()
+        run_env = None
+        if _nodeid_reporter.available():
+            plugin_args, run_env = _nodeid_reporter.build_invocation(
+                nodeid_log, ctx.repo_root
+            )
+            cmd += plugin_args
+
         proc = subprocess.run(  # noqa: S603
-            cmd, capture_output=True, text=True, cwd=str(ctx.repo_root)
+            cmd, capture_output=True, text=True, cwd=str(ctx.repo_root), env=run_env
         )
         log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
 
@@ -99,9 +117,15 @@ class FullUnitStep(Step):
             )
 
         # Non-zero exit. Extract the per-test node ids (FAILED) and any
-        # ERROR entries (collection / fixture failures) separately.
-        failed_ids = summary_node_ids(proc.stdout, "FAILED")
-        error_ids = summary_node_ids(proc.stdout, "ERROR")
+        # ERROR entries (collection / fixture failures) separately —
+        # preferring the structured plugin log (exact node ids) and
+        # falling back to terminal-summary parsing only if it didn't run.
+        if nodeid_log.exists():
+            failed_ids = report_log_node_ids(nodeid_log, "FAILED")
+            error_ids = report_log_node_ids(nodeid_log, "ERROR")
+        else:
+            failed_ids = summary_node_ids(proc.stdout, "FAILED")
+            error_ids = summary_node_ids(proc.stdout, "ERROR")
 
         # The quarantine downgrade is only sound when the ONLY thing that
         # went wrong is ordinary, named test failures we can reason about:
@@ -129,19 +153,29 @@ class FullUnitStep(Step):
 
         # Read the registry from the PROTECTED base revision, not the
         # candidate checkout — a PR must not be able to quarantine its own
-        # failing tests (codex #1222). Fail-safe: any read error → empty
-        # quarantine → every failure blocks (stricter, never looser).
+        # failing tests (codex #1222). Pin to the IMMUTABLE base SHA
+        # (``baseRefOid``, resolved at fetch before any candidate code
+        # ran); never fall back to the mutable ``base_branch`` ref, which a
+        # candidate test could rewrite (``git branch -f main …``) between
+        # the pytest run above and this load, then serve its own allowlist
+        # (codex #1222 r10). No SHA → fail CLOSED to an empty quarantine.
         registry_note = ""
-        try:
-            entries = load_quarantine_from_ref(
-                ctx.base_sha or ctx.base_branch, ctx.repo_root
-            )
-        except QuarantineError as e:
+        if not ctx.base_sha:
             entries = []
             registry_note = (
-                f"\n\n⚠️ base quarantine registry unreadable — treating "
-                f"every failure as blocking: {e}"
+                "\n\n⚠️ no immutable base SHA available — treating every "
+                "failure as blocking (quarantine requires a protected base "
+                "commit; the mutable branch ref is not trusted)."
             )
+        else:
+            try:
+                entries = load_quarantine_from_ref(ctx.base_sha, ctx.repo_root)
+            except QuarantineError as e:
+                entries = []
+                registry_note = (
+                    f"\n\n⚠️ base quarantine registry unreadable — treating "
+                    f"every failure as blocking: {e}"
+                )
         blocking, quarantined = partition_failures(failed_ids, entries)
 
         details = _render_details(blocking, quarantined, log_path) + registry_note

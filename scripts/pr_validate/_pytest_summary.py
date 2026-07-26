@@ -1,15 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared parser for pytest's short-summary section.
+"""Extract failing/passing node ids from a pytest run.
 
 Two steps (``full_unit`` — quarantine partition — and ``flake_tracking``
-— rerun classification) need to pull node ids out of pytest's short test
-summary. Keeping one parser here means the FAILED/ERROR extraction can't
-drift between them (a divergence would silently mis-gate).
+— rerun classification) need node ids out of a pytest run. There are two
+sources, in order of preference:
+
+  * ``report_log_node_ids`` — reads the STRUCTURED log written by the
+    ``_nodeid_reporter`` plugin (``report.nodeid``, exact + unambiguous).
+    This is the source of truth; use it whenever the plugin ran.
+  * ``summary_node_ids`` — a FALLBACK that scrapes pytest's terminal
+    short-summary when the plugin didn't run. It is irreducibly ambiguous
+    for exotic parametrized ids (see ``_strip_message``); it fails SAFE
+    (an ambiguous id won't match a quarantine entry → the failure blocks).
+
+Keeping both here means the two steps can't drift on how a failure set is
+derived (a divergence would silently mis-gate).
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # pytest writes the section header as a full-width separator banner:
 # ``==================== short test summary info ====================``.
@@ -32,6 +43,27 @@ import re
 # too can be rewritten from an ``atexit`` handler — is tamper-proof
 # against them. We defend against mistakes and flakes, not self-sabotage.
 _SUMMARY_BANNER = re.compile(r"^=+\s*short test summary info\s*=+$")
+
+
+def report_log_node_ids(path: Path, *labels: str) -> list[str]:
+    """Node ids the ``_nodeid_reporter`` plugin recorded under ``labels``.
+
+    The log is append-only ``<LABEL>\\t<nodeid>`` lines (see
+    ``_nodeid_reporter``). Returns the ids for the requested labels
+    (default ``FAILED``), first-seen order, de-duplicated. Unlike
+    ``summary_node_ids`` there is NO parsing ambiguity — ``report.nodeid``
+    is pytest's own canonical id. The caller is responsible for checking
+    the file exists (a missing log means the plugin didn't run → fall back
+    to ``summary_node_ids``)."""
+    wanted = set(labels or ("FAILED",))
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        label, tab, nodeid = line.partition("\t")
+        if tab and label in wanted and nodeid and nodeid not in seen:
+            seen.add(nodeid)
+            out.append(nodeid)
+    return out
 
 
 def summary_node_ids(text: str, *labels: str) -> list[str]:

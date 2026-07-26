@@ -88,11 +88,13 @@ def load_quarantine_from_ref(
     same PR being validated cannot add its own failing tests to the
     allowlist and make them non-blocking (codex #1222).
 
-    Absent at ``ref`` (the revision predates the registry, or any other
-    git non-zero) → ``[]``: a base without the file has no quarantine,
-    and falling back to empty keeps the gate *stricter*, never looser.
-    A malformed file that IS present at ``ref`` → ``QuarantineError``
-    (the caller fails safe to empty).
+    Note the outcomes carefully (codex #1222 r10): only a CONFIRMED
+    missing path → ``[]`` (the base predates the registry; empty keeps the
+    gate stricter, never looser). Every other failure — git absent, a
+    timeout, a bad ref, a non-UTF-8 or malformed blob — raises
+    ``QuarantineError`` so the gating caller falls back to empty *and
+    reports it loudly*, instead of a silent empty that's indistinguishable
+    from "nothing is quarantined". Never let an infra hiccup pass unseen.
     """
     try:
         proc = subprocess.run(  # noqa: S603
@@ -103,17 +105,31 @@ def load_quarantine_from_ref(
             cwd=str(repo_root),
             timeout=_GIT_SHOW_TIMEOUT_S,
         )
-    except (OSError, subprocess.SubprocessError):
-        # git missing / not a repo / timeout → treat as no quarantine
-        # (stricter gate). Never let an infra hiccup loosen the gate.
-        return []
+    except FileNotFoundError as e:
+        # git not installed / not on PATH — infra failure, not "no registry".
+        raise QuarantineError(f"git unavailable to read {ref}:{rel_path}: {e}") from e
+    except subprocess.TimeoutExpired as e:
+        raise QuarantineError(
+            f"git show timed out after {_GIT_SHOW_TIMEOUT_S}s reading {ref}:{rel_path}"
+        ) from e
+    except (OSError, subprocess.SubprocessError) as e:
+        raise QuarantineError(f"git show failed for {ref}:{rel_path}: {e}") from e
     except UnicodeDecodeError as e:
         # A non-UTF-8 blob at ref is malformed → QuarantineError so the
         # gating caller fails safe to empty, not an unhandled ValueError
         # (codex #1222 r5).
         raise QuarantineError(f"{ref}:{rel_path}: not valid UTF-8: {e}") from e
     if proc.returncode != 0:
-        return []
+        # git exits 128 for BOTH "path absent at this ref" (legitimate) and
+        # real errors (bad ref, not a repo). Only a confirmed missing PATH
+        # is an empty registry; anything else is surfaced.
+        stderr = (proc.stderr or "").lower()
+        if "does not exist in" in stderr or "exists on disk, but not in" in stderr:
+            return []
+        raise QuarantineError(
+            f"git show failed for {ref}:{rel_path} (exit {proc.returncode}): "
+            f"{(proc.stderr or '').strip()}"
+        )
     return _parse_quarantine_text(proc.stdout, source=f"{ref}:{rel_path}")
 
 
@@ -150,11 +166,30 @@ def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
         node_id = item.get("id")
         if not isinstance(node_id, str) or not node_id.strip():
             raise QuarantineError(f"{source}: test #{i} needs a non-empty string 'id'")
+        node_id = node_id.strip()
+        # ``reason`` and ``added`` are MANDATORY audit data — every entry is
+        # a hole in the gate, and an undocumented one (no rationale, no
+        # date) is how a permanent silent waiver creeps in. Enforce them so
+        # a bare ``{id: …}`` can't slip a test onto the allowlist without a
+        # paper trail (codex #1222 r10). ``issue`` stays optional (not every
+        # flake has a tracker link yet).
+        reason = str(item.get("reason", "") or "").strip()
+        added = str(item.get("added", "") or "").strip()
+        if not reason:
+            raise QuarantineError(
+                f"{source}: test #{i} ('{node_id}') needs a non-empty 'reason' "
+                f"— document WHY it is flaky"
+            )
+        if not added:
+            raise QuarantineError(
+                f"{source}: test #{i} ('{node_id}') needs a non-empty 'added' "
+                f"date (YYYY-MM-DD)"
+            )
         entries.append(
             QuarantineEntry(
-                id=node_id.strip(),
-                reason=str(item.get("reason", "") or "").strip(),
-                added=str(item.get("added", "") or "").strip(),
+                id=node_id,
+                reason=reason,
+                added=added,
                 issue=str(item.get("issue", "") or "").strip(),
             )
         )

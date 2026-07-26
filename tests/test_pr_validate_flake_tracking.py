@@ -72,6 +72,10 @@ def ctx_factory(tmp_path, monkeypatch):
         # steps' should_run predicate is satisfied.
         ctx.files_changed = files_changed or ["vllm_mlx/scheduler.py"]
         ctx.work_dir = tmp_path / "work"
+        # A truthy immutable base SHA so the quarantine load path runs
+        # (steps read the registry only from base_sha now — codex r10).
+        # Tests exercising the no-SHA fail-closed path clear it explicitly.
+        ctx.base_sha = "basesha0000000000000000000000000000000000"
         return ctx
 
     return _make
@@ -311,12 +315,29 @@ class TestLoadQuarantine:
         p.write_text("tests:\n")
         assert load_quarantine(p) == []
 
-    def test_optional_fields_default_empty(self, tmp_path):
+    def test_issue_optional_reason_added_present(self, tmp_path):
+        # reason + added are mandatory audit data; issue stays optional
+        # (not every flake has a tracker yet) — codex #1222 r10.
         p = tmp_path / "q.yaml"
-        p.write_text("tests:\n  - id: a.py::t\n")
+        p.write_text(
+            "tests:\n  - id: a.py::t\n    reason: flaky\n    added: 2026-01-01\n"
+        )
         (entry,) = load_quarantine(p)
         assert entry.id == "a.py::t"
-        assert entry.reason == "" and entry.added == "" and entry.issue == ""
+        assert entry.reason == "flaky" and entry.added == "2026-01-01"
+        assert entry.issue == ""
+
+    def test_missing_reason_raises(self, tmp_path):
+        p = tmp_path / "q.yaml"
+        p.write_text("tests:\n  - id: a.py::t\n    added: 2026-01-01\n")
+        with pytest.raises(QuarantineError, match="reason"):
+            load_quarantine(p)
+
+    def test_missing_added_raises(self, tmp_path):
+        p = tmp_path / "q.yaml"
+        p.write_text("tests:\n  - id: a.py::t\n    reason: flaky\n")
+        with pytest.raises(QuarantineError, match="added"):
+            load_quarantine(p)
 
 
 # --------------------------------------------------------------------------
@@ -326,7 +347,7 @@ class TestLoadQuarantine:
 
 class TestLoadQuarantineFromRef:
     def test_returns_entries_from_git_show(self, tmp_path, monkeypatch):
-        yaml_text = "tests:\n  - id: a.py::t\n    reason: r\n"
+        yaml_text = "tests:\n  - id: a.py::t\n    reason: r\n    added: 2026-01-01\n"
         monkeypatch.setattr(
             "scripts.pr_validate.quarantine.subprocess.run",
             lambda *a, **k: _completed(0, yaml_text),
@@ -335,20 +356,45 @@ class TestLoadQuarantineFromRef:
         assert entry.id == "a.py::t"
 
     def test_absent_at_ref_is_empty(self, tmp_path, monkeypatch):
-        # git show returns 128 when the path doesn't exist at that rev.
+        # git show returns 128 with a "does not exist in" message when the
+        # PATH isn't in that rev's tree — a legitimate empty registry (the
+        # base predates the file), NOT an infra failure (codex #1222 r10).
         monkeypatch.setattr(
             "scripts.pr_validate.quarantine.subprocess.run",
-            lambda *a, **k: _completed(128, "", "fatal: path does not exist"),
+            lambda *a, **k: _completed(
+                128, "", "fatal: path 'q.yaml' does not exist in 'BASE'"
+            ),
         )
         assert load_quarantine_from_ref("BASE", tmp_path) == []
 
-    def test_git_missing_is_empty_not_raise(self, tmp_path, monkeypatch):
+    def test_git_missing_raises(self, tmp_path, monkeypatch):
+        # git not on PATH is an INFRA failure, not "no registry" — it must
+        # raise so full_unit reports the fail-safe fallback loudly instead
+        # of silently behaving as if nothing is quarantined (codex r10).
         def boom(*a, **k):
             raise FileNotFoundError("git not found")
 
         monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", boom)
-        # Fail-safe: infra hiccup → empty quarantine (stricter gate).
-        assert load_quarantine_from_ref("BASE", tmp_path) == []
+        with pytest.raises(QuarantineError):
+            load_quarantine_from_ref("BASE", tmp_path)
+
+    def test_git_timeout_raises(self, tmp_path, monkeypatch):
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", boom)
+        with pytest.raises(QuarantineError):
+            load_quarantine_from_ref("BASE", tmp_path)
+
+    def test_bad_ref_git_error_raises(self, tmp_path, monkeypatch):
+        # A non-"missing path" git error (bad ref, not a repo) must surface,
+        # not be swallowed as an empty registry (codex #1222 r10).
+        monkeypatch.setattr(
+            "scripts.pr_validate.quarantine.subprocess.run",
+            lambda *a, **k: _completed(128, "", "fatal: invalid object name 'BASE'"),
+        )
+        with pytest.raises(QuarantineError):
+            load_quarantine_from_ref("BASE", tmp_path)
 
     def test_malformed_at_ref_raises(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -392,7 +438,9 @@ class TestLoadQuarantineFromRef:
         git("init", "-q")
         rel = "scripts/pr_validate/quarantine.yaml"
         (tmp_path / "scripts" / "pr_validate").mkdir(parents=True)
-        (tmp_path / rel).write_text("tests:\n  - id: x.py::t\n    reason: r\n")
+        (tmp_path / rel).write_text(
+            "tests:\n  - id: x.py::t\n    reason: r\n    added: 2026-01-01\n"
+        )
         git("add", "-A")
         git("commit", "-q", "-m", "seed")
         (entry,) = load_quarantine_from_ref("HEAD", tmp_path)
@@ -733,7 +781,7 @@ class TestFlakeTrackingContract:
         monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
         captured = {}
 
-        def fake(cmd, cwd, timeout):
+        def fake(cmd, cwd, timeout, env=None):
             captured["cmd"] = cmd
             return _completed(0, _passed())
 
@@ -838,7 +886,7 @@ class TestFlakeTrackingContract:
         )
         captured = {}
 
-        def _capture(cmd, cwd, timeout):
+        def _capture(cmd, cwd, timeout, env=None):
             captured["cmd"] = cmd
             return _completed(0, _passed())
 
@@ -871,7 +919,7 @@ class TestFlakeTrackingContract:
         )
         captured = {}
 
-        def _capture(cmd, cwd, timeout):
+        def _capture(cmd, cwd, timeout, env=None):
             captured["cmd"] = cmd
             return _completed(0, _passed())
 
@@ -886,8 +934,15 @@ class TestFlakeTrackingClassification:
     """Drive a real pytest subprocess so the flake-vs-real split is
     proven end-to-end, not mocked."""
 
-    def test_classifies_flake_vs_real(self, ctx_factory, tmp_path):
+    def test_classifies_flake_vs_real_fallback(
+        self, ctx_factory, tmp_path, monkeypatch
+    ):
+        # Exercises the terminal-summary FALLBACK classification path with a
+        # real subprocess. The structured-plugin path can't load here (the
+        # fake repo root has no `scripts` package), so force the fallback;
+        # the dedicated plugin round-trip is proven in TestNodeidReporter.
         pytest.importorskip("pytest_rerunfailures")
+        monkeypatch.setattr(flake_mod._nodeid_reporter, "available", lambda: False)
         (tmp_path / "test_sample.py").write_text(
             "import pathlib\n"
             "_c = pathlib.Path(__file__).with_name('.count')\n"
@@ -910,6 +965,122 @@ class TestFlakeTrackingClassification:
         data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
         assert "test_sample.py::test_flaky" in data["flake_candidates_new"]
         assert "test_sample.py::test_real" in data["reproduced_likely_real"]
+
+
+# --------------------------------------------------------------------------
+# _nodeid_reporter — structured node-id log (the parse-ambiguity fix)
+# --------------------------------------------------------------------------
+
+
+class TestNodeidReporter:
+    """Prove the plugin round-trips real ``report.nodeid`` values through a
+    genuine pytest subprocess, using the ACTUAL repo root on PYTHONPATH so
+    the risky ``-p scripts.pr_validate._nodeid_reporter`` import is exercised
+    end-to-end (not mocked). This is what lets full_unit/flake_tracking stop
+    scraping the ambiguous terminal summary."""
+
+    def _repo_root(self):
+        # _nodeid_reporter.py lives at <root>/scripts/pr_validate/ — climb two.
+        import pathlib
+
+        return pathlib.Path(flake_mod._nodeid_reporter.__file__).resolve().parents[2]
+
+    def test_plugin_writes_structured_log(self, tmp_path):
+        (tmp_path / "test_outcomes.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+
+                def test_ok():
+                    assert True
+
+                # A node id that would defeat any terminal-summary text rule:
+                # it contains ' - ' and unbalanced brackets. report.nodeid is
+                # exact, so the structured log must capture it verbatim.
+                @pytest.mark.parametrize("x", ["a - b]"])
+                def test_param(x):
+                    assert False
+
+                @pytest.fixture
+                def broken():
+                    raise RuntimeError("setup boom")
+
+                def test_setup_error(broken):
+                    assert True
+                """
+            )
+        )
+        # A second module that fails to even collect → ERROR (collection).
+        (tmp_path / "test_uncollectable.py").write_text(
+            "import this_module_does_not_exist_xyz  # noqa: F401\n"
+        )
+
+        log_path = tmp_path / "nodeids.tsv"
+        repo_root = self._repo_root()
+        assert flake_mod._nodeid_reporter.available()
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, repo_root, log_passes=True
+        )
+
+        subprocess.run(
+            # --continue-on-collection-errors so the collection ERROR and the
+            # call/setup outcomes are all recorded in ONE run (pytest would
+            # otherwise abort the whole session on the first collection error).
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "--continue-on-collection-errors",
+                *plugin_args,
+                "test_outcomes.py",
+                "test_uncollectable.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        assert log_path.exists(), "plugin never wrote the structured log"
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        rows = [tuple(ln.split("\t", 1)) for ln in lines if "\t" in ln]
+
+        passed = {nid for label, nid in rows if label == "PASSED"}
+        failed = {nid for label, nid in rows if label == "FAILED"}
+        errored = {nid for label, nid in rows if label == "ERROR"}
+
+        assert "test_outcomes.py::test_ok" in passed
+        # The bracket/dash-laden parametrization is captured EXACTLY — the
+        # whole point of the structured reporter over summary scraping.
+        assert "test_outcomes.py::test_param[a - b]]" in failed
+        # Setup-phase failure is an ERROR, not a FAILED (mirrors -rfE).
+        assert any("test_setup_error" in nid for nid in errored)
+        # Collection failure is an ERROR keyed on the uncollectable module.
+        assert any("test_uncollectable.py" in nid for nid in errored)
+        # A pass is never mis-logged as a failure.
+        assert "test_outcomes.py::test_ok" not in failed
+
+    def test_passes_not_logged_without_opt_in(self, tmp_path):
+        (tmp_path / "test_only_pass.py").write_text("def test_ok():\n    assert True\n")
+        log_path = tmp_path / "nodeids.tsv"
+        repo_root = self._repo_root()
+        # log_passes defaults False → the 14k-pass full suite stays lean.
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, repo_root
+        )
+        subprocess.run(
+            [sys.executable, "-m", "pytest", *plugin_args, "test_only_pass.py"],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # No failures/errors and passes opted out → nothing to write. The
+        # file may be absent or empty; either way, no PASSED rows.
+        if log_path.exists():
+            assert "PASSED" not in log_path.read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
