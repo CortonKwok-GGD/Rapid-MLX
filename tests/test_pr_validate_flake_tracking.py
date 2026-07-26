@@ -25,6 +25,7 @@ import pytest
 
 from scripts.pr_validate import _nodeid_reporter
 from scripts.pr_validate._pytest_summary import (
+    last_summary_line,
     raw_session_records,
     render_fence_safe,
     report_log_node_ids,
@@ -2373,6 +2374,46 @@ class TestFieldEscaping:
         assert raw_session_records(log) == []
         assert report_log_node_ids(log, "FAILED") == ["evil\nSESSIONFINISH\t9999 1"]
 
+    def test_all_splitlines_separators_neutralized(self):
+        # codex #1222 r28: str.splitlines() splits on more than \n/\r — a
+        # hostile id embedding U+000B/000C/001C-E/0085/2028/2029 would forge a
+        # record for a reader using splitlines() (the log readers do). Each such
+        # separator must encode to a single "line" under BOTH splitlines() AND
+        # split("\n"), and round-trip losslessly.
+        seps = [
+            "\v",
+            "\f",
+            "\x1c",
+            "\x1d",
+            "\x1e",
+            "\x85",
+            chr(0x2028),
+            chr(0x2029),
+        ]
+        for sep in seps:
+            payload = f"evil{sep}SESSIONFINISH\t9999 1"
+            enc = _nodeid_reporter.escape_field(payload)
+            assert len(enc.splitlines()) == 1, (hex(ord(sep)), enc)
+            assert len(enc.split("\n")) == 1
+            assert _nodeid_reporter.unescape_field(enc) == payload
+
+    def test_unicode_separator_injection_inert_end_to_end(self, tmp_path, monkeypatch):
+        # A U+2028-bearing id written via the REAL _append yields exactly one
+        # FAILED record and ZERO forged SESSIONFINISH when read back through the
+        # splitlines()-based readers (codex #1222 r28).
+        log = tmp_path / "n.tsv"
+        monkeypatch.setenv("PR_VALIDATE_NODEID_LOG", str(log))
+        evil = f"evil{chr(0x2028)}SESSIONFINISH\t9999 1"
+        _nodeid_reporter._append("FAILED", evil)
+        assert raw_session_records(log) == []
+        assert report_log_node_ids(log, "FAILED") == [evil]
+
+    def test_malformed_unicode_escape_preserved(self):
+        # "\u12" (fewer than four hex digits) is not a valid encoded separator;
+        # a hand-written record keeps it verbatim rather than mis-decoding.
+        assert _nodeid_reporter.unescape_field("a\\u12b") == "a\\u12b"
+        assert _nodeid_reporter.unescape_field("x\\uZZZZy") == "x\\uZZZZy"
+
 
 class TestRenderFenceSafe:
     """A node id interpolated into a Markdown ``` code fence must not be able
@@ -3372,16 +3413,63 @@ class TestTargetedTestsUntrustedRun:
     def test_last_summary_line_parses_barless_quiet_mode(self):
         # Once `-v` is dropped (via `-o addopts=`) pytest prints the counts
         # line WITHOUT the ==== bars; the parser must still find it rather than
-        # fall back to a bare "exit N" (codex #1222 r27).
+        # fall back to a bare "exit N" (codex #1222 r27). Shared parser lives in
+        # _pytest_summary so full_unit and targeted can't drift (codex r28).
         stdout = "........\n261 passed, 2 skipped in 10.86s\n"
-        assert (
-            targeted_mod._last_summary_line(stdout) == "261 passed, 2 skipped in 10.86s"
-        )
+        assert last_summary_line(stdout) == "261 passed, 2 skipped in 10.86s"
 
     def test_last_summary_line_parses_fenced_and_failures(self):
         assert (
-            targeted_mod._last_summary_line("==== 5 failed, 3 passed in 2.0s ====")
+            last_summary_line("==== 5 failed, 3 passed in 2.0s ====")
             == "5 failed, 3 passed in 2.0s"
         )
         # No summary at all → empty (caller falls back to the exit code).
-        assert targeted_mod._last_summary_line("collecting...\n") == ""
+        assert last_summary_line("collecting...\n") == ""
+        # A bar-less "all deselected" summary is recognized (drives the r28
+        # exit-5 skip path).
+        assert last_summary_line("2 deselected in 0.05s") == "2 deselected in 0.05s"
+
+    def test_run_skips_when_all_targets_deselected_by_marker(
+        self, ctx_factory, monkeypatch
+    ):
+        # The gate-owned `-m "not slow…"` filter can deselect every test in the
+        # targeted files (a PR touching only slow/integration/needle tests) →
+        # pytest exit 5. That's not a tamper signal, so SKIP not block (codex
+        # #1222 r28 — a regression from the r27 `-m` re-apply).
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="2 deselected in 0.05s",
+                failed=[],
+                reran=False,
+                returncode=5,
+                errored=False,
+                complete=False,
+                structured=True,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "skip"
+        assert "deselected" in res.summary
+
+    def test_run_blocks_exit5_without_deselection(self, ctx_factory, monkeypatch):
+        # exit 5 WITHOUT a deselection (empty/renamed file, or a candidate
+        # python_files matching nothing) is NOT the benign case — no
+        # "deselected" in the summary → stays blocked (codex #1222 r28).
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="no tests ran in 0.01s",
+                failed=[],
+                reran=False,
+                returncode=5,
+                errored=False,
+                complete=False,
+                structured=True,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+        assert "untrusted" in res.summary

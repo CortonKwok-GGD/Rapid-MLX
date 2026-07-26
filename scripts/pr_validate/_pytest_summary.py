@@ -121,6 +121,29 @@ def render_fence_safe(node_id: str) -> str:
     return json.dumps(node_id, ensure_ascii=False)
 
 
+_SUMMARY_COUNTS_RE = re.compile(
+    r"\b\d+ (passed|failed|error|skipped|xfailed|xpassed|deselected)\b"
+)
+
+
+def last_summary_line(stdout: str) -> str:
+    """pytest's final counts line, WITH or WITHOUT the ``====`` bars.
+
+    In verbose mode the line is fenced (``==== 3 passed in 1s ====``); once the
+    inherited ``-v`` is dropped (``-o addopts=`` neutralizes the repo addopts)
+    pytest prints it bar-less (``3 passed in 1s``). A ``startswith("=")`` rule
+    would miss the bar-less form and degrade the step summary to a bare
+    "exit N" (codex #1222 r27/r28). Anchor on the ``<n> <outcome> … in <t>s``
+    shape so both forms are recognized. Shared by ``targeted_tests`` and
+    ``full_unit`` so the two can't drift. Returns "" when there is no counts
+    line (the caller falls back to the exit code)."""
+    for line in reversed((stdout or "").splitlines()):
+        stripped = line.strip().strip("=").strip()
+        if _SUMMARY_COUNTS_RE.search(stripped) and " in " in stripped:
+            return stripped
+    return ""
+
+
 def session_completed(path: Path) -> bool:
     """True iff the reporter's session-finish record proves pytest ran the
     WHOLE collected suite — the precondition for a sound quarantine

@@ -42,6 +42,7 @@ from typing import NamedTuple
 
 from .. import _nodeid_reporter
 from .._pytest_summary import (
+    last_summary_line,
     report_log_node_ids,
     rerun_detected,
     session_completed,
@@ -109,6 +110,31 @@ class TargetedTestsStep(Step):
                 "it was smuggled in under a different name. A rerun can retry a "
                 "real failure into a pass, so this run is not trusted; reruns "
                 "must be OFF for the gate.",
+                artifacts=[str(pr_log)],
+            )
+
+        # The gate-owned ``-m "not slow and not integration and not needle"``
+        # filter can legitimately deselect EVERY test in the targeted files (a
+        # PR touching only slow/integration/needle tests), which makes pytest
+        # exit 5 ("no tests collected"). That is NOT a tamper signal — nothing
+        # gate-relevant remained to run — so SKIP rather than block on the exit
+        # code (codex #1222 r28, a regression from the r27 ``-m`` re-apply). A
+        # no-collection run WITHOUT a deselection (an empty/renamed file, or a
+        # candidate ``python_files`` matching nothing) has no "deselected" in
+        # pytest's summary and no structured ERROR, so it stays BLOCKED by
+        # ``_untrusted_run_reason`` below. The summary is pytest's own output;
+        # candidate addopts is already neutralized (``-o addopts=``), and the
+        # ``-m`` filter is gate-owned, so "deselected" can't be candidate-forged
+        # (a conftest that deselects everything is the documented collection
+        # residual, and full_unit still runs the whole suite regardless).
+        if pr.returncode == 5 and "deselected" in pr.summary and not pr.errored:
+            return StepResult(
+                name=self.name,
+                status="skip",
+                summary=(
+                    f"{pr.summary} (all targets deselected by the gate "
+                    f"marker filter — nothing gate-relevant to run)"
+                ),
                 artifacts=[str(pr_log)],
             )
 
@@ -407,7 +433,7 @@ def _run_pytest(
         env=env,
     )
     log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
-    summary = _last_summary_line(proc.stdout) or f"exit {proc.returncode}"
+    summary = last_summary_line(proc.stdout) or f"exit {proc.returncode}"
     # Reporter-derived signals. Without the reporter we can't prove
     # completeness / distinguish ERROR from a clean run, so degrade to the
     # trusting defaults (structured=False, reran/errored=False, complete=True)
@@ -495,26 +521,6 @@ def _run_on_main(
         # In case `git worktree remove` failed, nuke the dir.
         if tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
-
-
-_SUMMARY_RE = re.compile(
-    r"\b\d+ (passed|failed|error|skipped|xfailed|xpassed|deselected)\b"
-)
-
-
-def _last_summary_line(stdout: str) -> str:
-    # Match pytest's final counts line whether or not it carries the ``====``
-    # bars. In verbose mode the line is fenced (``==== 3 passed in 1s ====``),
-    # but once the inherited ``-v`` is dropped (``-o addopts=`` neutralizes the
-    # repo addopts) pytest prints it bar-less (``3 passed in 1s``), so a
-    # ``startswith("=")`` rule would miss it and fall back to a bare "exit 0"
-    # (codex #1222 r26). Anchor on the ``<n> <outcome>`` shape + the timing
-    # suffix instead so both forms are recognized.
-    for line in reversed((stdout or "").splitlines()):
-        stripped = line.strip().strip("=").strip()
-        if _SUMMARY_RE.search(stripped) and " in " in stripped:
-            return stripped
-    return ""
 
 
 _FAIL_RE = re.compile(r"^FAILED\s+(\S+)")

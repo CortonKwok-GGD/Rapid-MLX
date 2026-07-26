@@ -173,32 +173,55 @@ def build_invocation(
     return args, env
 
 
+# Every character ``str.splitlines()`` treats as a line boundary BEYOND
+# ``\n`` / ``\r`` (handled by their own named escapes). A consumer that reads
+# the log with ``splitlines()`` — the readers in ``_pytest_summary`` do —
+# would break a record on ANY of these, so a hostile node id embedding one
+# would still forge a second record (a fake ``SESSIONFINISH`` / ``PASSED``),
+# the r23 injection channel via a separator the original escape missed (codex
+# #1222 r28). None has a legitimate place in a pytest node id; each is encoded
+# as a ``\uXXXX`` escape so the written value is a single "line" under BOTH
+# ``splitlines()`` and ``split("\n")``.
+_EXTRA_LINE_SEPARATORS = (
+    "\v",  # U+000B LINE TABULATION
+    "\f",  # U+000C FORM FEED
+    "\x1c",  # U+001C FILE SEPARATOR
+    "\x1d",  # U+001D GROUP SEPARATOR
+    "\x1e",  # U+001E RECORD SEPARATOR
+    "\x85",  # U+0085 NEXT LINE
+    "\u2028",  # U+2028 LINE SEPARATOR
+    "\u2029",  # U+2029 PARAGRAPH SEPARATOR
+)
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
 def escape_field(value: str) -> str:
     """Encode a value field so it round-trips through the one-record-per-line
-    log even when it embeds the tab/newline the format uses as delimiters.
+    log even when it embeds a delimiter or a line-boundary character.
 
     A node id is untrusted text (a hostile ``pytest_make_parametrize_id``
-    can smuggle a literal ``\\t``/``\\n`` into it), so an unescaped write
-    would let it forge additional log records. Escape the BACKSLASH first,
-    then tab / newline / carriage-return, so the written value occupies
-    exactly one physical line with no injectable delimiter and decodes
-    back losslessly (codex #1222 r23)."""
-    return (
-        value.replace("\\", "\\\\")
-        .replace("\t", "\\t")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-    )
+    can smuggle a literal ``\\t``/``\\n`` — or a Unicode line separator like
+    ``\\u2028`` — into it), so an unescaped write would let it forge additional
+    log records. Escape the BACKSLASH first, then tab / newline / CR, then
+    every OTHER character ``str.splitlines()`` recognizes (as ``\\uXXXX``), so
+    the written value occupies exactly one physical line under any line-split
+    definition and decodes back losslessly (codex #1222 r23/r28)."""
+    value = value.replace("\\", "\\\\")
+    value = value.replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    for sep in _EXTRA_LINE_SEPARATORS:
+        value = value.replace(sep, f"\\u{ord(sep):04x}")
+    return value
 
 
 def unescape_field(value: str) -> str:
     """Inverse of ``escape_field``. Scans left-to-right so an escaped
     backslash (``\\\\``) is consumed as one literal ``\\`` and can't pair
-    with a following ``t``/``n``/``r`` to fabricate a control char
-    (``\\\\t`` decodes to ``\\`` + ``t``, NOT a tab). An unknown escape or a
-    trailing lone backslash is preserved verbatim — the writer never emits
-    those, so this only keeps a hand-written/raw record intact rather than
-    corrupting it."""
+    with a following ``t``/``n``/``r``/``uXXXX`` to fabricate a control char
+    (``\\\\t`` decodes to ``\\`` + ``t``, NOT a tab). An unknown escape, a
+    malformed ``\\u`` (not four hex digits), or a trailing lone backslash is
+    preserved verbatim — the writer never emits those, so this only keeps a
+    hand-written/raw record intact rather than corrupting it."""
     if "\\" not in value:
         return value
     out: list[str] = []
@@ -213,6 +236,13 @@ def unescape_field(value: str) -> str:
                 out.append(decoded)
                 i += 2
                 continue
+            # ``\uXXXX`` (exactly four hex digits) → the encoded separator.
+            if nxt == "u" and i + 6 <= n:
+                hexdigits = value[i + 2 : i + 6]
+                if all(ch in _HEX_DIGITS for ch in hexdigits):
+                    out.append(chr(int(hexdigits, 16)))
+                    i += 6
+                    continue
         out.append(c)
         i += 1
     return "".join(out)

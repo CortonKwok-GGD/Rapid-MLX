@@ -27,6 +27,7 @@ import sys
 
 from .. import _nodeid_reporter
 from .._pytest_summary import (
+    last_summary_line,
     render_fence_safe,
     report_log_node_ids,
     summary_node_ids,
@@ -163,7 +164,7 @@ class FullUnitStep(Step):
 
         # Pull the summary line: pytest ends with a line like
         # "==== 3 failed, 2080 passed, 17 skipped in 25.56s ===="
-        summary_line = _last_summary_line(proc.stdout)
+        summary_line = last_summary_line(proc.stdout)
 
         # A GATING run must NEVER rerun a test. GATING_PYTEST_GUARD disables
         # pytest-rerunfailures by name, but name-based ``-p no:<name>``
@@ -489,13 +490,3 @@ def _render_unaccounted(
     if not failed_ids and not error_ids:
         parts.append(f"(no parseable FAILED/ERROR node ids — see {log_path})")
     return "\n\n".join(parts)
-
-
-def _last_summary_line(stdout: str) -> str:
-    """Pytest writes its overall summary as the very last non-empty
-    line wrapped in '====' decorations. Return without decorations."""
-    for line in reversed((stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("=") and ("passed" in line or "failed" in line):
-            return line.strip("= ").strip()
-    return ""
