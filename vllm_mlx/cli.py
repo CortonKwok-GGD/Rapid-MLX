@@ -6448,10 +6448,15 @@ def info_command(args):
                 f"  MTP: config declares mtp_num_hidden_layers={_declared_absent} "
                 "but the MTP head weights are absent in this checkpoint."
             )
+            # Put options FIRST and separate the positional model target with
+            # ``--`` so a local model path that begins with ``-`` (or the
+            # quoting above) isn't parsed by argparse as a serve option — the
+            # copy-paste remedy must work for such paths too.
             print(
                 "  Attach a separately-published MTP head, e.g.:\n"
-                f"    rapid-mlx serve {_serve_target} "
-                """--speculative-config '{"method":"mtp","model":"<head-repo>"}'"""
+                "    rapid-mlx serve "
+                """--speculative-config '{"method":"mtp","model":"<head-repo>"}' """
+                f"-- {_serve_target}"
             )
             print(
                 "  (or re-convert the base checkpoint with an MTP-preserving convert)."

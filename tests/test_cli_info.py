@@ -106,9 +106,11 @@ def test_info_prints_mtp_sidecar_note_when_head_declared_but_absent(
     assert """--speculative-config '{"method":"mtp","model":"<head-repo>"}'""" in out, (
         f"complete sidecar serve command missing from note:\n{out}"
     )
-    # The serve command must carry the user-typed alias, not the HF path.
-    assert "rapid-mlx serve qwen3.6-27b-8bit" in out, (
-        f"note should reference the alias the user typed:\n{out}"
+    # The serve command must carry the user-typed alias, not the HF path —
+    # placed after the ``--`` option/positional separator so a ``-``-prefixed
+    # local path can't be misparsed as a serve option (codex #1202 round 6).
+    assert "-- qwen3.6-27b-8bit" in out, (
+        f"note should reference the alias the user typed (after ``--``):\n{out}"
     )
 
 
