@@ -3468,6 +3468,62 @@ class TestTargetedTestsRerunBackstop:
         assert "build_invocation" not in src
         assert "_nodeid_reporter" not in src
 
+    def test_negative_control_strips_pytest_addopts(self, tmp_path, monkeypatch):
+        # codex #1222 r34: the base negative control must strip PYTEST_ADDOPTS
+        # from its subprocess env, SYMMETRIC with the PR-side run. Otherwise an
+        # inherited option (e.g. ``--runxfail``) applied only on base could make
+        # base report a node as FAILED that the PR side does not, so a real PR
+        # regression is misclassified as pre-existing and waived — a false green.
+        base_root = tmp_path / "base"
+        base_root.mkdir()
+        (base_root / "test_x.py").write_text("def test_x(): assert True\n")
+        monkeypatch.setattr(
+            targeted_mod.tempfile, "mkdtemp", lambda prefix="": str(base_root)
+        )
+        monkeypatch.setenv("PYTEST_ADDOPTS", "--runxfail")
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            if cmd and cmd[0] == "git":  # worktree add / remove
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            captured["env"] = kw.get("env")  # the pytest invocation
+            return subprocess.CompletedProcess(cmd, 0, "1 passed in 0.1s\n", "")
+
+        monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
+        targeted_mod._run_on_main(
+            ["test_x.py"], tmp_path / "log.txt", tmp_path, "basesha"
+        )
+        assert captured.get("env") is not None
+        assert "PYTEST_ADDOPTS" not in captured["env"]
+
+    def test_run_pytest_marks_clean_all_deselected(self, tmp_path):
+        # codex #1222 r34: a genuine all-deselected run (every target test
+        # carries a filtered marker) records a structured ``SESSIONFINISH 0 0``
+        # with no failures → _run_pytest reports all_deselected_clean True (the
+        # gate for the benign exit-5 skip). A run with a real failure does NOT.
+        repo_root = Path(targeted_mod.__file__).resolve().parents[3]
+        allslow = tmp_path / "test_allslow.py"
+        allslow.write_text(
+            "import pytest\n"
+            "@pytest.mark.slow\n"
+            "def test_a(): assert True\n"
+            "@pytest.mark.slow\n"
+            "def test_b(): assert True\n"
+        )
+        clean = targeted_mod._run_pytest(
+            [str(allslow)], tmp_path / "d.log", repo_root, nodeid_log=tmp_path / "d.tsv"
+        )
+        assert clean.structured is True
+        assert clean.all_deselected_clean is True
+        assert "deselected" in clean.summary
+
+        failing = tmp_path / "test_boom.py"
+        failing.write_text("def test_boom(): assert False\n")
+        bad = targeted_mod._run_pytest(
+            [str(failing)], tmp_path / "e.log", repo_root, nodeid_log=tmp_path / "e.tsv"
+        )
+        assert bad.all_deselected_clean is False  # a real failure is not "clean"
+
 
 class TestTargetedTestsUntrustedRun:
     """An empty FAILED list is only a genuine pass when the run finished as an
@@ -3698,6 +3754,7 @@ class TestTargetedTestsUntrustedRun:
                 errored=False,
                 complete=False,
                 structured=True,
+                all_deselected_clean=True,  # structured proof: SESSIONFINISH 0 0
             ),
         )
         res = targeted_mod.TargetedTestsStep().run(ctx)
@@ -3721,7 +3778,8 @@ class TestTargetedTestsUntrustedRun:
     def test_run_blocks_exit5_without_deselection(self, ctx_factory, monkeypatch):
         # exit 5 WITHOUT a deselection (empty/renamed file, or a candidate
         # python_files matching nothing) is NOT the benign case — no
-        # "deselected" in the summary → stays blocked (codex #1222 r28).
+        # "deselected" in the summary → stays blocked (codex #1222 r28). Even
+        # with a clean structured proof, the missing "deselected" is what blocks.
         ctx = self._patch_run_pytest(
             monkeypatch,
             ctx_factory,
@@ -3733,11 +3791,60 @@ class TestTargetedTestsUntrustedRun:
                 errored=False,
                 complete=False,
                 structured=True,
+                all_deselected_clean=True,
             ),
         )
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "fail"
         assert "untrusted" in res.summary
+
+    def test_run_blocks_exit5_deselected_but_run_failed(self, ctx_factory, monkeypatch):
+        # codex #1222 r34: a candidate hook could normalize a run that actually
+        # FAILED to exit 5 with a "deselected" summary and steal the benign
+        # skip. Without the structured clean-zero-selection proof
+        # (all_deselected_clean False — the reporter recorded a FAILED, so it is
+        # NOT ``SESSIONFINISH 0 0`` with no failures), the exit-5 skip is denied
+        # and the run BLOCKS.
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="1 failed, 2 deselected in 0.05s",
+                failed=["tests/a.py::test_real"],
+                reran=False,
+                returncode=5,
+                errored=False,
+                complete=False,
+                structured=True,
+                all_deselected_clean=False,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+
+    def test_run_blocks_exit5_deselected_without_structured_proof(
+        self, ctx_factory, monkeypatch
+    ):
+        # exit 5 + "deselected" but NO structured proof (reporter didn't run, so
+        # all_deselected_clean is the trusting default False) → the skip is
+        # denied and the run BLOCKS (fails safe). Only a positive
+        # ``SESSIONFINISH 0 0`` earns the non-blocking skip (codex #1222 r34).
+        ctx = self._patch_run_pytest(
+            monkeypatch,
+            ctx_factory,
+            targeted_mod._PytestRun(
+                summary="2 deselected in 0.05s",
+                failed=[],
+                reran=False,
+                returncode=5,
+                errored=False,
+                complete=True,
+                structured=False,
+                all_deselected_clean=False,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
 
     def test_run_pytest_fallback_scrape_preserves_spaced_param_ids(
         self, tmp_path, monkeypatch

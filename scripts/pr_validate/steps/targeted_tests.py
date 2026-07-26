@@ -42,6 +42,7 @@ from typing import NamedTuple
 from .. import _nodeid_reporter
 from .._pytest_summary import (
     last_summary_line,
+    raw_session_records,
     render_fence_safe,
     report_log_node_ids,
     rerun_detected,
@@ -152,7 +153,21 @@ class TargetedTestsStep(Step):
         # added marker or conftest hook). We therefore SKIP (never false-block
         # legitimate reclassification) but make it LOUD so a reviewer is
         # prompted to confirm the deselection is intentional.
-        if pr.returncode == 5 and "deselected" in pr.summary and not pr.errored:
+        #
+        # GATE (codex #1222 r34): grant this non-blocking skip ONLY on
+        # ``all_deselected_clean`` — the reporter's structured proof of a benign
+        # zero-selection run (exactly ``SESSIONFINISH 0 0`` with NO
+        # FAILED/ERROR/RERUN). Exit 5 + "deselected" ALONE is not enough: a
+        # candidate hook could normalize a run that actually FAILED (or was
+        # truncated) to exit 5 with a "deselected" summary and steal the skip.
+        # Requiring positive structured proof that nothing failed and nothing
+        # ran closes that; if the reporter didn't run, the proof is absent →
+        # skip denied → falls through to ``_untrusted_run_reason`` (blocks).
+        if (
+            pr.returncode == 5
+            and "deselected" in pr.summary
+            and pr.all_deselected_clean
+        ):
             return StepResult(
                 name=self.name,
                 status="skip",
@@ -378,7 +393,15 @@ class _PytestRun(NamedTuple):
     ``False`` so a legacy no-reporter run behaves as before. ``returncode`` is
     always pytest's real exit code; ``structured`` records whether the reporter
     ran, so the exit-code / completeness / unaccounted-exit checks know when
-    they may trust the reporter-derived fields."""
+    they may trust the reporter-derived fields.
+
+    ``all_deselected_clean`` is the STRUCTURED proof of a benign zero-selection
+    run — the reporter recorded exactly ``SESSIONFINISH 0 0`` (nothing was
+    collected/run) with NO FAILED/ERROR/RERUN. It gates the exit-5
+    all-deselected skip so a candidate can't force an exit-5-with-``deselected``
+    summary over a run that actually FAILED and steal a non-blocking skip
+    (codex #1222 r34). Without the reporter it is the trusting default False,
+    so a fallback exit-5 is not granted the skip (fails safe → blocks)."""
 
     summary: str
     failed: list[str]
@@ -387,6 +410,7 @@ class _PytestRun(NamedTuple):
     errored: bool
     complete: bool
     structured: bool
+    all_deselected_clean: bool = False
 
 
 def _untrusted_run_reason(run: _PytestRun) -> str | None:
@@ -493,10 +517,24 @@ def _run_pytest(
         # record is written per failing outcome and can't be turned off from
         # candidate config (codex #1222 r26).
         failed = report_log_node_ids(nodeid_log, "FAILED")
+        # Structured proof of a BENIGN zero-selection run: exactly one
+        # ``SESSIONFINISH 0 0`` record (nothing collected/run to completion)
+        # AND no failing outcomes. This gates the exit-5 all-deselected skip so
+        # a forced exit-5-with-``deselected`` summary over a run that actually
+        # failed can't steal a non-blocking skip (codex #1222 r34).
+        all_deselected_clean = (
+            raw_session_records(nodeid_log) == ["0 0"]
+            and not failed
+            and not errored
+            and not reran
+        )
     else:
         reran = errored = False
         complete = True
         failed = summary_node_ids(proc.stdout, "FAILED")
+        # No reporter → we can't prove a clean zero-selection; the exit-5 skip
+        # is therefore denied on the fallback path (fails safe → blocks).
+        all_deselected_clean = False
     return _PytestRun(
         summary=summary,
         failed=failed,
@@ -505,6 +543,7 @@ def _run_pytest(
         errored=errored,
         complete=complete,
         structured=structured,
+        all_deselected_clean=all_deselected_clean,
     )
 
 
@@ -543,11 +582,23 @@ def _run_on_main(
                 )
                 return []
 
+            # Strip PYTEST_ADDOPTS from the base subprocess env too — the
+            # PR-side run pops it (it bites THROUGH ``-o addopts=``), so the
+            # negative control MUST do the same or the comparison is asymmetric:
+            # an inherited ``PYTEST_ADDOPTS=--runxfail`` (etc.) applied only on
+            # base could make base report a node as FAILED that the PR side does
+            # not, so a real PR regression gets misclassified as pre-existing
+            # and waived — a FALSE GREEN (codex #1222 r34). ``_PYTEST_CMD``
+            # already makes the two runs command-symmetric; this makes them
+            # env-symmetric.
+            base_env = dict(os.environ)
+            base_env.pop("PYTEST_ADDOPTS", None)
             proc = subprocess.run(  # noqa: S603
                 [*_PYTEST_CMD, *existing_targets],
                 capture_output=True,
                 text=True,
                 cwd=str(tmp),
+                env=base_env,
             )
             log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
             # Space-preserving scrape (NOT a ``\S+`` grab): the PR side records
