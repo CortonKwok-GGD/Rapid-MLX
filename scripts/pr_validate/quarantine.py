@@ -15,11 +15,13 @@ Design notes:
     gating step catches the error and falls back to an EMPTY quarantine,
     i.e. a *stricter* gate: a broken registry can never make the gate
     pass something it otherwise wouldn't.
-  * Matching is by exact pytest node id, with one deliberate
-    convenience: an entry id carrying no ``[...]`` also matches every
-    parametrization of that test (``foo::test`` quarantines
-    ``foo::test[a]`` and ``foo::test[b]``). An entry that DOES name a
-    specific parametrization matches only that one.
+  * Matching is by EXACT pytest node id by default (codex #1222 r14).
+    An entry may opt into parameter-family matching with ``family: true``,
+    which makes a base (no-bracket) id also cover every parametrization
+    (``foo::test`` then quarantines ``foo::test[a]`` and ``foo::test[b]``).
+    Exact-by-default is deliberate: a PR that adds a NEW, deterministically
+    failing parametrization to a listed test must not have it silently
+    waived — family coverage is a reviewed decision, made once at the base.
 """
 
 from __future__ import annotations
@@ -47,12 +49,19 @@ class QuarantineError(Exception):
 @dataclass(frozen=True)
 class QuarantineEntry:
     """One known-flaky test. ``id`` is a pytest node id; the rest is
-    human bookkeeping the scorecard can echo back."""
+    human bookkeeping the scorecard can echo back.
+
+    ``family`` opts a base (no-bracket) entry into matching EVERY
+    parametrization of the test, not just the exact id. It defaults False
+    so that adding a new, deterministically-failing parametrization to a
+    quarantined test is never silently waived without an explicit,
+    base-reviewed decision (codex #1222 r14)."""
 
     id: str
     reason: str = ""
     added: str = ""
     issue: str = ""
+    family: bool = False
 
 
 def load_quarantine(path: Path | None = None) -> list[QuarantineEntry]:
@@ -216,34 +225,46 @@ def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
                 f"{source}: test #{i} ('{node_id}') 'added' must be canonical "
                 f"YYYY-MM-DD, got {added!r} (expected {parsed.isoformat()})"
             )
+        # ``family`` is an explicit, reviewed opt-in — a strict boolean so a
+        # stray string can't be truthy-by-accident and silently widen the
+        # allowlist to every parametrization (codex #1222 r14).
+        family = item.get("family", False)
+        if not isinstance(family, bool):
+            raise QuarantineError(
+                f"{source}: test #{i} ('{node_id}') 'family' must be a boolean, "
+                f"got {type(family).__name__}"
+            )
         entries.append(
             QuarantineEntry(
                 id=node_id,
                 reason=reason,
                 added=added,
                 issue=str(item.get("issue", "") or "").strip(),
+                family=family,
             )
         )
     return entries
 
 
-def node_id_matches(failed_id: str, entry_id: str) -> bool:
+def node_id_matches(failed_id: str, entry_id: str, *, family: bool = False) -> bool:
     """True iff a failed node id is covered by a quarantine entry.
 
-    Exact match, OR the entry names a whole test and the failure is one
-    of its parametrizations (``entry_id`` + ``[...]``).
+    EXACT match by default. Only when ``family`` is set does a base
+    (no-bracket) entry also cover every parametrization (``entry_id`` +
+    ``[...]``) — exact-by-default keeps a newly-added, deterministically
+    failing parametrization from being silently waived (codex #1222 r14).
     """
     if failed_id == entry_id:
         return True
-    # A base entry (no bracket of its own) covers every parametrization.
-    if "[" not in entry_id and failed_id.startswith(entry_id + "["):
+    # Family coverage is OPT-IN and only meaningful for a base entry.
+    if family and "[" not in entry_id and failed_id.startswith(entry_id + "["):
         return True
     return False
 
 
 def is_quarantined(failed_id: str, entries: Iterable[QuarantineEntry]) -> bool:
     """True iff any entry covers ``failed_id``."""
-    return any(node_id_matches(failed_id, e.id) for e in entries)
+    return any(node_id_matches(failed_id, e.id, family=e.family) for e in entries)
 
 
 def partition_failures(

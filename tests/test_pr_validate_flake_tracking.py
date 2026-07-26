@@ -360,6 +360,30 @@ class TestLoadQuarantine:
         with pytest.raises(QuarantineError, match="added"):
             load_quarantine(p)
 
+    def test_family_field_defaults_false_and_parses_true(self, tmp_path):
+        # codex #1222 r14: family is an optional boolean, default False.
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n"
+            "  - id: a.py::t\n    reason: flaky\n    added: 2026-01-01\n"
+            "  - id: b.py::t\n    reason: flaky\n    added: 2026-01-01\n"
+            "    family: true\n"
+        )
+        a, b = load_quarantine(p)
+        assert a.family is False
+        assert b.family is True
+
+    def test_non_boolean_family_raises(self, tmp_path):
+        # A truthy string must not silently widen the allowlist — family
+        # must be a real boolean (codex #1222 r14).
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n  - id: a.py::t\n    reason: flaky\n    added: 2026-01-01\n"
+            '    family: "yes"\n'
+        )
+        with pytest.raises(QuarantineError, match="family"):
+            load_quarantine(p)
+
 
 # --------------------------------------------------------------------------
 # quarantine.py — git base-ref loader (a PR must not quarantine itself)
@@ -525,11 +549,21 @@ class TestNodeIdMatch:
     def test_exact(self):
         assert node_id_matches("a.py::t", "a.py::t")
 
-    def test_param_family(self):
-        assert node_id_matches("a.py::t[x-1]", "a.py::t")
+    def test_param_family_requires_opt_in(self):
+        # codex #1222 r14: a base entry covers parametrizations ONLY with
+        # family=True — exact by default so a new failing param isn't
+        # silently waived.
+        assert node_id_matches("a.py::t[x-1]", "a.py::t", family=True)
+
+    def test_exact_by_default_does_not_match_params(self):
+        assert not node_id_matches("a.py::t[x-1]", "a.py::t")
+
+    def test_family_only_expands_base_entry(self):
+        # family on an already-specific param id doesn't widen it.
+        assert not node_id_matches("a.py::t[y]", "a.py::t[x]", family=True)
 
     def test_base_entry_does_not_match_prefix_sibling(self):
-        assert not node_id_matches("a.py::t_extra", "a.py::t")
+        assert not node_id_matches("a.py::t_extra", "a.py::t", family=True)
 
     def test_specific_param_entry_is_exact_only(self):
         assert node_id_matches("a.py::t[x]", "a.py::t[x]")
@@ -553,13 +587,23 @@ class TestPartition:
         assert blocking == ["a.py::x"]
         assert quarantined == []
 
-    def test_param_family_all_quarantined(self):
-        entries = [QuarantineEntry(id="a.py::t")]
+    def test_param_family_all_quarantined_with_opt_in(self):
+        entries = [QuarantineEntry(id="a.py::t", family=True)]
         blocking, quarantined = partition_failures(
             ["a.py::t[1]", "a.py::t[2]"], entries
         )
         assert blocking == []
         assert quarantined == ["a.py::t[1]", "a.py::t[2]"]
+
+    def test_base_entry_without_family_blocks_new_params(self):
+        # codex #1222 r14: without family=True, a base entry does NOT waive
+        # parametrizations — a newly-added failing case still blocks.
+        entries = [QuarantineEntry(id="a.py::t")]
+        blocking, quarantined = partition_failures(
+            ["a.py::t[1]", "a.py::t[2]"], entries
+        )
+        assert blocking == ["a.py::t[1]", "a.py::t[2]"]
+        assert quarantined == []
 
 
 # --------------------------------------------------------------------------
@@ -759,6 +803,45 @@ class TestFullUnitQuarantineAware:
         monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
         FullUnitStep().run(ctx_factory())
         assert "--maxfail=0" in captured["cmd"]
+
+    def test_neutralizes_candidate_addopts_and_env(self, ctx_factory, monkeypatch):
+        # codex #1222 r14: --maxfail=0 alone does NOT stop --stepwise, so the
+        # gate clears the candidate's ini addopts (-o addopts=) AND strips
+        # PYTEST_ADDOPTS from the subprocess env, re-applying its OWN marker
+        # filter so selection can't be steered by candidate config.
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            captured["env"] = kw.get("env")
+            return subprocess.CompletedProcess(cmd, 0, _passed(), "")
+
+        monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
+        monkeypatch.setenv("PYTEST_ADDOPTS", "--stepwise")
+        FullUnitStep().run(ctx_factory())
+        assert "-o" in captured["cmd"]
+        assert "addopts=" in captured["cmd"]
+        assert "not slow and not integration and not needle" in captured["cmd"]
+        assert "PYTEST_ADDOPTS" not in (captured["env"] or {})
+
+    def test_early_stop_withholds_downgrade(self, ctx_factory, monkeypatch):
+        # codex #1222 r14: a conftest can set --stepwise programmatically even
+        # with addopts cleared. If pytest terminated the session early, the
+        # suite is incomplete — a later real regression may not have run — so
+        # the quarantine downgrade is withheld and every failure blocks.
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        stdout = (
+            "==== short test summary info ====\n"
+            "FAILED tests/a.py::test_flaky - X\n"
+            "!!!!!!!! Interrupted: Test failed, continuing next run. !!!!!!!!\n"
+            "==== 1 failed in 0.20s ====\n"
+        )
+        self._patch_pytest(monkeypatch, 1, stdout)
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"  # withheld despite being listed
+        assert "terminated the session early" in res.details
 
 
 # --------------------------------------------------------------------------

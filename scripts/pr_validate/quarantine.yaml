@@ -15,12 +15,16 @@
 #     human promotes a confirmed one here. Never auto-populate.
 #   * NEVER add an entry to silence a real regression. A test that fails
 #     deterministically is a bug, not a flake — fix the code or the test.
-#   * Match is by EXACT pytest node id (an entry with no ``[param]`` also
-#     matches every parametrization of that test — see quarantine.py).
+#   * Match is by EXACT pytest node id. To cover every parametrization of a
+#     test with one base (no-bracket) entry, set ``family: true`` — an
+#     explicit, reviewed opt-in (a new failing parametrization is otherwise
+#     NOT waived without review). See quarantine.py.
 #   * Keep the list SMALL. Every entry is a hole in the gate; each must
 #     carry a reason, an added-date, and an issue link where one exists.
 #
-# Schema: ``tests`` is a list of {id, reason, added, issue}.
+# Schema: ``tests`` is a list of {id, reason, added, issue, family?}.
+#   ``added`` must be a canonical YYYY-MM-DD date; ``family`` is an optional
+#   boolean (default false).
 tests:
   - id: "tests/test_signal_observability.py::test_subprocess_sighup_default_disposition_dumps_and_stays_alive"
     reason: >-

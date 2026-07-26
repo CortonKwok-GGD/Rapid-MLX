@@ -21,6 +21,7 @@ wouldn't. A non-quarantined failure still blocks, exactly as before.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -63,6 +64,21 @@ class FullUnitStep(Step):
             "tests/",
             "--ignore=tests/integrations",
             "--ignore=tests/test_event_loop.py",
+            # Neutralize candidate-controlled config: -o addopts= drops the
+            # pytest.ini / pyproject addopts wholesale so a planted -x /
+            # --maxfail / --stepwise / -p no:<reporter> / weaponized -m
+            # filter can't steer the gate (--maxfail=0 alone does NOT stop
+            # --stepwise — codex #1222 r14). We then RE-SPECIFY the marker
+            # filter we actually want below; PYTEST_ADDOPTS is cleared from
+            # the subprocess env for the same reason.
+            "-o",
+            "addopts=",
+            # Re-apply the same exclusions the repo's addopts carried
+            # (slow / integration / needle need real models or a live
+            # server). Hardcoded here so the SELECTION can't be widened or
+            # narrowed by candidate config.
+            "-m",
+            "not slow and not integration and not needle",
             "-q",
             "--no-header",
             # Force color OFF so the summary/label parsing can't be broken
@@ -98,10 +114,15 @@ class FullUnitStep(Step):
         nodeid_log = ctx.artifact_path("full-unit-nodeids.tsv")
         if nodeid_log.exists():
             nodeid_log.unlink()
-        run_env = None
+        # Build the subprocess env with PYTEST_ADDOPTS stripped — it bites
+        # THROUGH ``-o addopts=`` (that only overrides the ini file), so a
+        # candidate env var could still inject --stepwise / -x otherwise
+        # (codex #1222 r14). Done regardless of plugin availability.
+        run_env = dict(os.environ)
+        run_env.pop("PYTEST_ADDOPTS", None)
         if _nodeid_reporter.available():
             plugin_args, run_env = _nodeid_reporter.build_invocation(
-                nodeid_log, ctx.repo_root
+                nodeid_log, ctx.repo_root, base_env=run_env
             )
             cmd += plugin_args
 
@@ -181,6 +202,25 @@ class FullUnitStep(Step):
                 + "\n\n⚠️ structured node-id log absent (reporter plugin did "
                 "not run) — quarantine downgrade withheld; every failure "
                 "blocks.",
+                artifacts=[str(log_path)],
+            )
+
+        # A quarantine downgrade is only sound on a COMPLETE run. If pytest
+        # terminated the session early — --stepwise / -x / --maxfail (a
+        # conftest can still set these programmatically even with addopts
+        # cleared) or any interrupt — a later real regression may simply not
+        # have run yet, so the FAILED set doesn't account for the whole
+        # suite. Withhold the downgrade and block (codex #1222 r14). The
+        # banners pytest prints for these are unambiguous.
+        if _stopped_early(proc.stdout):
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=summary_line or "pytest stopped early",
+                details=_render_details(failed_ids, [], log_path)
+                + "\n\n⚠️ pytest terminated the session early (--stepwise / "
+                "-x / --maxfail / interrupt) — the suite did not complete, so "
+                "the quarantine downgrade is withheld; every failure blocks.",
                 artifacts=[str(log_path)],
             )
 
@@ -284,6 +324,20 @@ def _render_unaccounted(
     if not failed_ids and not error_ids:
         parts.append(f"(no parseable FAILED/ERROR node ids — see {log_path})")
     return "\n\n".join(parts)
+
+
+def _stopped_early(stdout: str) -> bool:
+    """True iff pytest terminated the session EARLY (—x / --maxfail /
+    --stepwise / an interrupt) instead of running the whole suite.
+
+    Its interruption banners are unambiguous and stable: ``-x`` / maxfail
+    print ``… stopping after N failures …`` and --stepwise / keyboard /
+    collection interrupts print ``Interrupted: …``. Both land at the left
+    margin (captured test output is indented under its test), so a false
+    positive is unlikely; if one did occur it would only WITHHOLD a
+    downgrade (block), which is the safe direction."""
+    text = stdout or ""
+    return "stopping after" in text or "Interrupted:" in text
 
 
 def _last_summary_line(stdout: str) -> str:
