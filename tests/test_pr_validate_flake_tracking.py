@@ -3453,6 +3453,13 @@ class TestTargetedTestsUntrustedRun:
         assert res.status == "skip"
         assert "deselected" in res.summary
 
+    def test_last_summary_line_recognizes_plural_errors(self):
+        # pytest pluralizes the error outcome ("1 error" vs "2 errors"), so an
+        # error-only run summary must still be recognized or the step summary
+        # degrades to a bare "exit 2" (codex #1222 r29).
+        assert last_summary_line("2 errors in 0.10s") == "2 errors in 0.10s"
+        assert last_summary_line("==== 1 error in 0.1s ====") == "1 error in 0.1s"
+
     def test_run_blocks_exit5_without_deselection(self, ctx_factory, monkeypatch):
         # exit 5 WITHOUT a deselection (empty/renamed file, or a candidate
         # python_files matching nothing) is NOT the benign case — no
@@ -3473,3 +3480,78 @@ class TestTargetedTestsUntrustedRun:
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "fail"
         assert "untrusted" in res.summary
+
+    def test_run_pytest_fallback_scrape_preserves_spaced_param_ids(
+        self, tmp_path, monkeypatch
+    ):
+        # Without the reporter, _run_pytest scrapes stdout — and the scrape must
+        # be space-preserving (summary_node_ids), NOT a `\S+` grab, so a failing
+        # param id containing spaces is captured whole. Otherwise it couldn't
+        # match the base negative control's parse of the same id and a
+        # pre-existing failure would be misclassified as a PR-only regression
+        # (codex #1222 r29).
+        stdout = (
+            "==== short test summary info ====\n"
+            "FAILED tests/a.py::test_x[param with spaces] - AssertionError\n"
+            "==== 1 failed in 0.1s ====\n"
+        )
+
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 1, stdout, "")
+
+        monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
+        result = targeted_mod._run_pytest(
+            ["tests/a.py"], tmp_path / "log.txt", tmp_path
+        )
+        assert result.structured is False
+        assert result.failed == ["tests/a.py::test_x[param with spaces]"]
+
+    def test_negative_control_scrape_matches_canonical_reporter_id(self, tmp_path):
+        # The base negative control scrapes stdout (summary_node_ids); the PR
+        # side records report.nodeid via the reporter. To classify a shared
+        # failure as pre-existing (not a PR-only regression), the two parsers
+        # must yield the SAME id — even when the param id contains spaces. Run a
+        # real pytest and prove parity end-to-end (codex #1222 r29). Pre-fix the
+        # base used `^FAILED\s+(\S+)`, truncating `test_x[a b c]` to `test_x[a`.
+        import pathlib
+
+        (tmp_path / "test_spaced.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+
+                @pytest.mark.parametrize("x", ["a b c"])
+                def test_x(x):
+                    assert False
+                """
+            )
+        )
+        repo_root = (
+            pathlib.Path(targeted_mod._nodeid_reporter.__file__).resolve().parents[2]
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = targeted_mod._nodeid_reporter.build_invocation(
+            log_path, repo_root
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-rfE",
+                *plugin_args,
+                "test_spaced.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        canonical = report_log_node_ids(log_path, "FAILED")
+        scraped = summary_node_ids(proc.stdout, "FAILED")
+        assert canonical == ["test_spaced.py::test_x[a b c]"]
+        # Parity: base scrape == PR canonical id → shared failure classified
+        # pre-existing, not a false regression.
+        assert scraped == canonical

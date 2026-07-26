@@ -32,7 +32,6 @@ on PR → real regression → BLOCK.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -46,6 +45,7 @@ from .._pytest_summary import (
     report_log_node_ids,
     rerun_detected,
     session_completed,
+    summary_node_ids,
 )
 from ..base import GATING_PYTEST_GUARD, Step, StepResult
 from ..context import Context
@@ -454,7 +454,7 @@ def _run_pytest(
     else:
         reran = errored = False
         complete = True
-        failed = _extract_failed_node_ids(proc.stdout)
+        failed = summary_node_ids(proc.stdout, "FAILED")
     return _PytestRun(
         summary=summary,
         failed=failed,
@@ -508,7 +508,15 @@ def _run_on_main(
                 cwd=str(tmp),
             )
             log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
-            return _extract_failed_node_ids(proc.stdout)
+            # Space-preserving scrape (NOT a ``\S+`` grab): the PR side now
+            # records canonical ``report.nodeid`` via the reporter, so a
+            # pre-existing failure whose param id contains spaces —
+            # ``test_x[param with spaces]`` — must be parsed whole here too,
+            # or the truncated base id wouldn't match the PR id and the
+            # pre-existing failure would be misclassified as a PR-only
+            # regression (codex #1222 r29). The base predates the reporter,
+            # so we scrape its stdout rather than inject the plugin.
+            return summary_node_ids(proc.stdout, "FAILED")
         finally:
             # Remove the worktree even if pytest crashed.
             subprocess.run(  # noqa: S603
@@ -521,26 +529,6 @@ def _run_on_main(
         # In case `git worktree remove` failed, nuke the dir.
         if tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
-
-
-_FAIL_RE = re.compile(r"^FAILED\s+(\S+)")
-
-
-def _extract_failed_node_ids(stdout: str) -> list[str]:
-    """Pull the FAILED <node_id> lines from pytest's short summary."""
-    out = []
-    in_summary = False
-    for line in (stdout or "").splitlines():
-        if "short test summary" in line:
-            in_summary = True
-            continue
-        if in_summary:
-            if line.startswith("="):
-                break
-            m = _FAIL_RE.match(line)
-            if m:
-                out.append(m.group(1))
-    return out
 
 
 def _failed_block(items: list[str]) -> str:

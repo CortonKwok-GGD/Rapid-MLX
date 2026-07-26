@@ -121,8 +121,11 @@ def render_fence_safe(node_id: str) -> str:
     return json.dumps(node_id, ensure_ascii=False)
 
 
+# ``errors?`` — pytest pluralizes the error outcome ("1 error" vs "2 errors"),
+# so an error-only run summary ("2 errors in 0.10s") must still match or it
+# degrades to a bare "exit 2" (codex #1222 r29).
 _SUMMARY_COUNTS_RE = re.compile(
-    r"\b\d+ (passed|failed|error|skipped|xfailed|xpassed|deselected)\b"
+    r"\b\d+ (passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b"
 )
 
 
