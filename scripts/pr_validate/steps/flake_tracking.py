@@ -298,9 +298,26 @@ class FlakeTrackingStep(Step):
         # it must be a reproduction, never a flake candidate. Subtracting
         # ``still_bad`` from the passed set makes the three buckets disjoint
         # and gives badness the last word.
-        candidates = [i for i in sample if i in passed and i not in still_bad]
+        #
+        # Collection-error targets need special handling (codex #1222 r17): a
+        # collection ERROR id is a MODULE / DIR path (no "::"), and on a clean
+        # re-run its CONTAINED tests log PASSED under their own "::"-bearing
+        # ids — the target id itself never logs a PASSED. So a collection
+        # flake that recovered would fall through to "inconclusive" forever.
+        # Treat a collection target that did NOT re-error (absent from
+        # still_bad) as a recovered flake candidate: it errored in the suite,
+        # collected cleanly in isolation → non-deterministic collection.
+        candidates = [
+            i
+            for i in sample
+            if i not in still_bad and (i in passed or _is_collection_target(i))
+        ]
         reproduced = [i for i in sample if i in still_bad]
-        inconclusive = [i for i in sample if i not in passed and i not in still_bad]
+        inconclusive = [
+            i
+            for i in sample
+            if i not in still_bad and i not in passed and not _is_collection_target(i)
+        ]
 
         # Split candidates by whether they're already covered.
         new_candidates = [i for i in candidates if not is_quarantined(i, entries)]
@@ -367,6 +384,15 @@ class FlakeTrackingStep(Step):
             details=details,
             artifacts=[str(cand_path), str(rerun_log)],
         )
+
+
+def _is_collection_target(node_id: str) -> bool:
+    """True for a collection-error id — a module / directory path with no
+    ``::`` test component. pytest reports a collection failure against the
+    module/dir, whose contained tests re-run under their own ``::`` ids, so
+    the target itself never logs a PASSED and needs recovery handled
+    explicitly (codex #1222 r17)."""
+    return "::" not in node_id
 
 
 def _run_session(

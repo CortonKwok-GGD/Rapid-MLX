@@ -120,11 +120,23 @@ class FullUnitStep(Step):
         # (codex #1222 r14). Done regardless of plugin availability.
         run_env = dict(os.environ)
         run_env.pop("PYTEST_ADDOPTS", None)
-        if _nodeid_reporter.available():
+        # ``structured`` means the reporter was INJECTED, decided HERE — not
+        # inferred later from ``nodeid_log.exists()``. The reporter creates
+        # the file only when it appends the first outcome / SESSIONFINISH, so
+        # a hard ``os._exit(0)`` before the first test leaves NO file, which
+        # ``exists()`` would misread as "plugin unavailable" and trust the
+        # zero exit on a fully-truncated run (codex #1222 r17). We instead
+        # pre-create the log as a START SENTINEL right after injecting, so its
+        # existence is decoupled from whether any record was written: an
+        # injected run with an empty/record-less log → no completion record →
+        # withhold, never "unavailable → trust exit code".
+        structured = _nodeid_reporter.available()
+        if structured:
             plugin_args, run_env = _nodeid_reporter.build_invocation(
                 nodeid_log, ctx.repo_root, base_env=run_env
             )
             cmd += plugin_args
+            nodeid_log.write_text("", encoding="utf-8")
 
         proc = subprocess.run(  # noqa: S603
             cmd, capture_output=True, text=True, cwd=str(ctx.repo_root), env=run_env
@@ -134,11 +146,6 @@ class FullUnitStep(Step):
         # Pull the summary line: pytest ends with a line like
         # "==== 3 failed, 2080 passed, 17 skipped in 25.56s ===="
         summary_line = _last_summary_line(proc.stdout)
-
-        # Did the STRUCTURED reporter run? Its log carries pytest's exact
-        # node ids AND the session-completion record; a downgrade / clean
-        # pass is only trusted on the exact structured source (codex r13).
-        structured = nodeid_log.exists()
 
         if proc.returncode == 0:
             # A clean exit is only trustworthy on a COMPLETE run: os._exit(0)

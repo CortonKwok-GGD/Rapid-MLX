@@ -645,6 +645,7 @@ class TestFullUnitQuarantineAware:
         ran=100,
         collected=100,
         session_value=None,
+        write_log=True,
     ):
         def fake_run(cmd, **kw):
             # Simulate the reporter plugin: when structured logging is on,
@@ -652,10 +653,12 @@ class TestFullUnitQuarantineAware:
             # the real plugin would have written. full_unit reads THAT for
             # the quarantine decision (the summary is only a fallback, and a
             # downgrade is withheld entirely when the structured log is
-            # absent — codex #1222 r13).
+            # absent — codex #1222 r13). ``write_log=False`` simulates a hard
+            # os._exit before the first append: the plugin writes NOTHING, so
+            # only full_unit's own start sentinel remains (codex #1222 r17).
             env = kw.get("env") or {}
             log = env.get("PR_VALIDATE_NODEID_LOG")
-            if structured and log:
+            if structured and log and write_log:
                 rows = [
                     f"{label}\t{nid}"
                     for label in ("FAILED", "ERROR")
@@ -817,10 +820,12 @@ class TestFullUnitQuarantineAware:
     def test_downgrade_withheld_without_structured_log(self, ctx_factory, monkeypatch):
         # codex #1222 r13: the quarantine downgrade must rest on the exact
         # structured node ids, never the ambiguous summary fallback. If the
-        # reporter log is absent (plugin couldn't load, or a candidate
-        # disabled it via pytest config), grant NO downgrade — a would-be
-        # quarantined failure BLOCKS, so a mis-split fallback id can never
-        # wrongly match a family entry and waive a real red.
+        # reporter can't be injected (available() False), grant NO downgrade —
+        # a would-be quarantined failure BLOCKS, so a mis-split fallback id can
+        # never wrongly match a family entry and waive a real red. (r17: "no
+        # structured log" now means available() False, since an injected
+        # plugin always leaves a start sentinel.)
+        monkeypatch.setattr(full_unit_mod._nodeid_reporter, "available", lambda: False)
         self._patch_quarantine(
             monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
         )
@@ -977,13 +982,25 @@ class TestFullUnitQuarantineAware:
         assert res.status == "pass"
 
     def test_clean_exit_without_plugin_trusts_exit_code(self, ctx_factory, monkeypatch):
-        # If the reporter couldn't be injected at all (no structured log),
+        # If the reporter genuinely can't be injected (available() False),
         # there's no completeness signal to check — a green exit falls back to
-        # the exit code (the degraded, non-candidate path). structured=False
-        # simulates the plugin not writing a log.
+        # the exit code (the degraded, non-candidate path).
+        monkeypatch.setattr(full_unit_mod._nodeid_reporter, "available", lambda: False)
         self._patch_pytest(monkeypatch, 0, _passed(), structured=False)
         res = FullUnitStep().run(ctx_factory())
         assert res.status == "pass"
+
+    def test_clean_exit_injected_but_no_output_blocks(self, ctx_factory, monkeypatch):
+        # codex #1222 r17 B1: a hard os._exit(0) before the first report
+        # leaves the log UNwritten (not even empty). full_unit pre-creates a
+        # start sentinel when it injects the plugin, so injection is known
+        # independent of any append — the empty sentinel + exit 0 blocks,
+        # instead of being misread as "plugin unavailable → trust exit code".
+        # write_log=False simulates the plugin writing nothing at all.
+        self._patch_pytest(monkeypatch, 0, _passed(), write_log=False)
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "did not run to completion" in res.details
 
 
 # --------------------------------------------------------------------------
@@ -1100,6 +1117,61 @@ class TestFlakeTrackingContract:
         monkeypatch.setattr(flake_mod, "_run_session", _capture)
         FlakeTrackingStep().run(ctx)
         assert "tests/x.py::errored" in captured["cmd"]
+
+    def test_recovered_collection_error_is_candidate(self, ctx_factory, monkeypatch):
+        # codex #1222 r17 NIT: a collection ERROR id is a MODULE / DIR path
+        # (no "::"); on a clean re-run its CONTAINED tests log PASSED under
+        # their own "::" ids, but the module id itself never logs a PASSED —
+        # so a recovered collection flake would wrongly land in `inconclusive`
+        # forever. A collection target that did NOT re-error is a recovered
+        # flake candidate instead.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text("ERROR\ttests/mod.py\n")
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            # Clean re-run: the module collected fine and its test passed; the
+            # module id itself logs nothing.
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/mod.py::test_a\n"
+            )
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/mod.py" in data["flake_candidates_new"]
+        assert "tests/mod.py" not in data["inconclusive"]
+
+    def test_reproduced_collection_error_not_candidate(self, ctx_factory, monkeypatch):
+        # The inverse: a collection target that RE-ERRORS on re-run reproduces
+        # (still_bad) and must NOT be a candidate — badness takes precedence
+        # over the collection-recovery rule.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text("ERROR\ttests/mod.py\n")
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "ERROR\ttests/mod.py\n"
+            )
+            return _completed(1, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/mod.py" not in data["flake_candidates_new"]
+        assert "tests/mod.py" in data["reproduced_likely_real"]
 
     def test_reruns_error_nodeids_fallback(self, ctx_factory, monkeypatch):
         # Same NIT via the terminal-summary FALLBACK (no structured log): an
@@ -1837,6 +1909,40 @@ class TestNodeidReporter:
         # 3 distinct tests all ran to completion → ran == collected == 3,
         # even though the flaky one produced ~5 setup reports.
         assert self._session_records(log_path) == ["3 3"]
+
+    def test_no_log_written_on_hard_exit_zero_before_tests(self, tmp_path):
+        # codex #1222 r17 B1: os._exit(0) at collection time (here from a
+        # conftest imported before any test runs) kills pytest before any
+        # setup report or sessionfinish, so the reporter writes NOTHING — the
+        # log file is never even created. This is exactly why full_unit
+        # pre-creates a start sentinel: without it, "no file" would be
+        # misread as "plugin unavailable" and the zero exit trusted on a
+        # fully-truncated run. (The plugin itself cannot defend this; the
+        # sentinel in full_unit does.)
+        (tmp_path / "conftest.py").write_text("import os\nos._exit(0)\n")
+        (tmp_path / "test_never.py").write_text("def test_a(): assert True\n")
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root()
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-p",
+                "no:cacheprovider",
+                *plugin_args,
+                "test_never.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert not log_path.exists()  # plugin wrote nothing → sentinel needed
 
 
 # --------------------------------------------------------------------------
