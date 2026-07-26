@@ -3065,6 +3065,7 @@ class TestTargetedTestsRerunBackstop:
                 returncode=1,
                 errored=False,
                 complete=True,
+                structured=True,
             ),
         )
         res = targeted_mod.TargetedTestsStep().run(ctx)
@@ -3084,28 +3085,70 @@ class TestTargetedTestsRerunBackstop:
 
 
 class TestTargetedTestsUntrustedRun:
-    """An empty scraped FAILED list is only a genuine pass when the run
-    finished as an ordinary pass (0) or fail (1). A collection error, usage
-    error, "no tests collected", a structured ERROR (which never scrapes as a
-    FAILED line), or an early ``pytest.exit`` must NOT slip through as a false
-    green (codex #1222 r25)."""
+    """An empty FAILED list is only a genuine pass when the run finished as an
+    ordinary pass (0) or fail (1). A collection error, usage error, "no tests
+    collected", a structured ERROR (which never scrapes as a FAILED line), an
+    early ``pytest.exit``, or an exit-1 with a suppressed failure summary must
+    NOT slip through as a false green (codex #1222 r25/r26)."""
+
+    @staticmethod
+    def _run(
+        returncode,
+        *,
+        errored=False,
+        complete=True,
+        failed=(),
+        reran=False,
+        structured=True,
+    ):
+        return targeted_mod._PytestRun(
+            summary="s",
+            failed=list(failed),
+            reran=reran,
+            returncode=returncode,
+            errored=errored,
+            complete=complete,
+            structured=structured,
+        )
 
     def test_reason_none_for_ordinary_pass_or_fail(self):
-        assert targeted_mod._untrusted_run_reason(0, False, True) is None
-        assert targeted_mod._untrusted_run_reason(1, False, True) is None
+        assert targeted_mod._untrusted_run_reason(self._run(0)) is None
+        # exit 1 is trusted only when a concrete failure accounts for it.
+        assert (
+            targeted_mod._untrusted_run_reason(self._run(1, failed=["tests/a.py::t"]))
+            is None
+        )
 
     def test_reason_flags_abnormal_exit(self):
         for code in (2, 3, 4, 5):
-            reason = targeted_mod._untrusted_run_reason(code, False, True)
+            reason = targeted_mod._untrusted_run_reason(self._run(code))
             assert reason and str(code) in reason
 
     def test_reason_flags_error_record(self):
-        reason = targeted_mod._untrusted_run_reason(0, True, True)
+        reason = targeted_mod._untrusted_run_reason(self._run(0, errored=True))
         assert reason and "ERROR" in reason
 
     def test_reason_flags_incomplete_session(self):
-        reason = targeted_mod._untrusted_run_reason(0, False, False)
+        reason = targeted_mod._untrusted_run_reason(self._run(0, complete=False))
         assert reason and "completion" in reason
+
+    def test_reason_flags_unaccounted_exit_one(self):
+        # exit 1 but the structured log has NO FAILED/RERUN record → the
+        # summary was suppressed; the empty FAILED list must not pass (r26).
+        reason = targeted_mod._untrusted_run_reason(
+            self._run(1, failed=[], reran=False, structured=True)
+        )
+        assert reason and "exited 1" in reason
+
+    def test_reason_unaccounted_exit_one_only_when_structured(self):
+        # Without the reporter we can't prove the record set, so we don't
+        # second-guess an exit-1 (the degraded, non-candidate path).
+        assert (
+            targeted_mod._untrusted_run_reason(
+                self._run(1, failed=[], structured=False)
+            )
+            is None
+        )
 
     def _patch_run_pytest(self, monkeypatch, ctx_factory, run):
         ctx = ctx_factory(["vllm_mlx/scheduler.py"])
@@ -3124,14 +3167,7 @@ class TestTargetedTestsUntrustedRun:
         ctx = self._patch_run_pytest(
             monkeypatch,
             ctx_factory,
-            targeted_mod._PytestRun(
-                summary="1 error in 0.5s",
-                failed=[],
-                reran=False,
-                returncode=2,
-                errored=True,
-                complete=False,
-            ),
+            self._run(2, errored=True, complete=False),
         )
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "fail"
@@ -3141,34 +3177,26 @@ class TestTargetedTestsUntrustedRun:
         # Exit 1 but only a setup/teardown ERROR (no scrapable FAILED) — still
         # must block, not pass on the empty FAILED list.
         ctx = self._patch_run_pytest(
-            monkeypatch,
-            ctx_factory,
-            targeted_mod._PytestRun(
-                summary="1 error in 0.5s",
-                failed=[],
-                reran=False,
-                returncode=1,
-                errored=True,
-                complete=True,
-            ),
+            monkeypatch, ctx_factory, self._run(1, errored=True)
         )
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "fail"
+
+    def test_run_blocks_on_unaccounted_exit_one(self, ctx_factory, monkeypatch):
+        # Exit 1, structured, but empty FAILED + no RERUN — the failure summary
+        # was suppressed. Must block, not pass (codex #1222 r26).
+        ctx = self._patch_run_pytest(
+            monkeypatch, ctx_factory, self._run(1, failed=[], reran=False)
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+        assert "untrusted" in res.summary
 
     def test_run_blocks_on_incomplete_session(self, ctx_factory, monkeypatch):
         # Exit 0 but a truncated session (early pytest.exit before the
         # session-finish record) → not accepted as green.
         ctx = self._patch_run_pytest(
-            monkeypatch,
-            ctx_factory,
-            targeted_mod._PytestRun(
-                summary="truncated",
-                failed=[],
-                reran=False,
-                returncode=0,
-                errored=False,
-                complete=False,
-            ),
+            monkeypatch, ctx_factory, self._run(0, complete=False)
         )
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "fail"
@@ -3176,18 +3204,7 @@ class TestTargetedTestsUntrustedRun:
     def test_run_passes_on_clean_exit_zero(self, ctx_factory, monkeypatch):
         # The hardening must not break the happy path: exit 0, complete, no
         # errors, empty FAILED → pass.
-        ctx = self._patch_run_pytest(
-            monkeypatch,
-            ctx_factory,
-            targeted_mod._PytestRun(
-                summary="3 passed in 0.5s",
-                failed=[],
-                reran=False,
-                returncode=0,
-                errored=False,
-                complete=True,
-            ),
-        )
+        ctx = self._patch_run_pytest(monkeypatch, ctx_factory, self._run(0))
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "pass"
 
@@ -3210,3 +3227,35 @@ class TestTargetedTestsUntrustedRun:
         assert result.errored is True
         assert result.complete is False
         assert result.returncode == 2
+        assert result.structured is True
+
+    def test_pytest_cmd_neutralizes_candidate_addopts(self):
+        # "-o" immediately followed by "addopts=" must be on the shared gating
+        # command so a candidate pytest.ini / pyproject addopts (a planted
+        # --deselect / -m filter / -x / -rN) can't steer this gating run
+        # (codex #1222 r26).
+        cmd = list(targeted_mod._PYTEST_CMD)
+        assert any(
+            cmd[i] == "-o" and cmd[i + 1] == "addopts=" for i in range(len(cmd) - 1)
+        )
+
+    def test_run_pytest_uses_structured_failed_not_scrape(self, tmp_path, monkeypatch):
+        # The reporter's FAILED record is authoritative even when the stdout
+        # short summary is blank (summary suppressed): the scrape would return
+        # [] but the structured read must still surface the failure (r26).
+        nodeid_log = tmp_path / "n.tsv"
+
+        def fake_run(cmd, **kw):
+            env = kw.get("env") or {}
+            log = env.get("PR_VALIDATE_NODEID_LOG")
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("FAILED\ttests/a.py::t\nSESSIONFINISH\t1 1\n")
+            # stdout carries NO "short test summary" section → scrape sees [].
+            return subprocess.CompletedProcess(cmd, 1, "1 failed in 0.1s\n", "")
+
+        monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
+        result = targeted_mod._run_pytest(
+            ["tests/a.py"], tmp_path / "log.txt", tmp_path, nodeid_log
+        )
+        assert result.failed == ["tests/a.py::t"]
+        assert result.structured is True

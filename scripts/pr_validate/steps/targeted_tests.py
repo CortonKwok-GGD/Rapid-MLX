@@ -120,7 +120,7 @@ class TargetedTestsStep(Step):
         # an empty FAILED set — the same class of hole full_unit closes with
         # its exit-code / ERROR / session-completeness checks (codex #1222
         # r25). Gate on those signals BEFORE trusting an empty FAILED list.
-        untrusted = _untrusted_run_reason(pr.returncode, pr.errored, pr.complete)
+        untrusted = _untrusted_run_reason(pr)
         if untrusted:
             return StepResult(
                 name=self.name,
@@ -267,9 +267,33 @@ _PYTEST_CMD = [
     sys.executable,
     "-m",
     "pytest",
+    # Neutralize candidate-controlled config: ``-o addopts=`` drops the
+    # pytest.ini / pyproject ``addopts`` wholesale, so a planted ``--deselect``
+    # / weaponized ``-m`` filter / ``-x`` / ``-rN`` can't steer this GATING run
+    # — a subset that omits the changed failing test would otherwise exit 0 and
+    # false-pass (codex #1222 r26). Every option we rely on is spelled out
+    # explicitly below (never inherited from addopts), and ``PYTEST_ADDOPTS``
+    # is popped from the subprocess env in ``_run_pytest`` because it bites
+    # THROUGH ``-o addopts=`` (that only overrides the ini file). Shared by the
+    # PR run AND the negative control so both stay hermetic and symmetric — the
+    # repo's own ``addopts`` is empty, so this is a no-op on the trusted base.
+    "-o",
+    "addopts=",
     "-q",
     "--no-header",
     "--tb=no",  # we don't render tracebacks here; the artifact has them
+    # Force color OFF and PIN the short summary to list FAILED + ERROR. The
+    # negative control (`_run_on_main`) runs on the pre-plugin base and so
+    # CANNOT use the structured reporter — it must scrape stdout, and that
+    # scrape has to be a stable, ANSI-free summary regardless of an inherited
+    # PY_COLORS or a future pytest default (mirrors full_unit, codex #1222 r6).
+    "--color=no",
+    "-rfE",
+    # No early stop — a candidate ``-x`` / ``--maxfail`` must not truncate the
+    # failure set the negative control compares (a command-line ``--maxfail=0``
+    # overrides any ini one); an early stop would also trip the completeness
+    # guard in ``_untrusted_run_reason``.
+    "--maxfail=0",
     # Block pytest-rerunfailures so a candidate ``@pytest.mark.flaky`` on a
     # changed test can't rerun-and-pass a real failure past this gate — same
     # reason as full_unit (codex #1222 r21). Used by both _run_pytest (the
@@ -281,12 +305,15 @@ _PYTEST_CMD = [
 class _PytestRun(NamedTuple):
     """Result of a targeted pytest run.
 
-    ``failed`` is the scraped ``FAILED`` node-id list (empty => none scraped).
-    ``reran`` / ``errored`` / ``complete`` come from the structured reporter
-    when it was injected; without it (``nodeid_log`` absent / plugin
-    unimportable) they degrade to the trusting defaults ``False`` / ``False``
-    / ``True`` so a legacy no-reporter run behaves as before. ``returncode``
-    is always pytest's real exit code."""
+    ``failed`` is the authoritative FAILED node-id list: read from the
+    structured reporter when it was injected, else scraped from stdout.
+    ``reran`` / ``errored`` / ``complete`` / ``structured`` also come from the
+    reporter; without it (``nodeid_log`` absent / plugin unimportable) they
+    degrade to the trusting defaults ``False`` / ``False`` / ``True`` /
+    ``False`` so a legacy no-reporter run behaves as before. ``returncode`` is
+    always pytest's real exit code; ``structured`` records whether the reporter
+    ran, so the exit-code / completeness / unaccounted-exit checks know when
+    they may trust the reporter-derived fields."""
 
     summary: str
     failed: list[str]
@@ -294,35 +321,45 @@ class _PytestRun(NamedTuple):
     returncode: int
     errored: bool
     complete: bool
+    structured: bool
 
 
-def _untrusted_run_reason(returncode: int, errored: bool, complete: bool) -> str | None:
+def _untrusted_run_reason(run: _PytestRun) -> str | None:
     """Why a targeted run can't be trusted as a clean pass/fail, or ``None``.
 
-    An empty scraped ``FAILED`` list only means "clean" when the run finished
-    as an ordinary pass (exit 0) or fail (exit 1). Any OTHER exit — collection
-    error (2), internal error (3), usage error (4), no tests collected (5) — or
-    a structured ``ERROR`` record (a collection / setup / teardown failure,
-    which NEVER appears as a ``FAILED`` summary line so it can't be
-    negative-control filtered), or a truncated session (an early
-    ``pytest.exit`` / crash before the session-finish record) would otherwise
-    slip through as a false green with an empty FAILED set (codex #1222 r25).
-    ``errored`` / ``complete`` are only meaningful when the structured reporter
-    ran; the caller passes the trusting defaults otherwise."""
-    if returncode not in (0, 1):
+    An empty ``FAILED`` list only means "clean" when the run finished as an
+    ordinary pass (exit 0) or fail (exit 1). Any OTHER exit — collection error
+    (2), internal error (3), usage error (4), no tests collected (5) — or a
+    structured ``ERROR`` record (a collection / setup / teardown failure, which
+    NEVER appears as a ``FAILED`` line so it can't be negative-control
+    filtered), or a truncated session (an early ``pytest.exit`` / crash before
+    the session-finish record) would otherwise slip through as a false green
+    with an empty FAILED set (codex #1222 r25). And an exit of 1 with NO
+    structured FAILED/RERUN record accounting for it means the failure summary
+    was suppressed (``-rN`` / a summary-blanking addopts) — the empty list is
+    not trusted (codex #1222 r26). The reporter-derived checks apply only when
+    ``run.structured`` (the reporter ran); otherwise the caller passed the
+    trusting defaults and only the exit-code check is meaningful."""
+    if run.returncode not in (0, 1):
         return (
-            f"pytest exited {returncode} (not a plain pass=0 / fail=1 — a "
+            f"pytest exited {run.returncode} (not a plain pass=0 / fail=1 — a "
             "collection/usage/internal error, or no tests were collected)"
         )
-    if errored:
+    if run.errored:
         return (
             "the structured log recorded an ERROR (collection or "
             "setup/teardown failure), which never scrapes as a FAILED line"
         )
-    if not complete:
+    if not run.complete:
         return (
             "pytest did not run to completion (an early pytest.exit / crash "
             "before the session-finish record) — a truncated run is not green"
+        )
+    if run.returncode == 1 and run.structured and not run.failed and not run.reran:
+        return (
+            "pytest exited 1 but no structured FAILED/RERUN record accounts "
+            "for it — the failure summary was suppressed; an empty FAILED list "
+            "is not accepted as green"
         )
     return None
 
@@ -363,17 +400,27 @@ def _run_pytest(
     )
     log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
     summary = _last_summary_line(proc.stdout) or f"exit {proc.returncode}"
-    failed = _extract_failed_node_ids(proc.stdout)
     # Reporter-derived signals. Without the reporter we can't prove
     # completeness / distinguish ERROR from a clean run, so degrade to the
-    # trusting defaults (reran=False, errored=False, complete=True) — the
-    # exit-code check in _untrusted_run_reason still applies either way.
-    reran = errored = False
-    complete = True
-    if inject and nodeid_log.exists():
+    # trusting defaults (structured=False, reran/errored=False, complete=True)
+    # and fall back to scraping stdout for FAILED — the exit-code check in
+    # _untrusted_run_reason still applies either way.
+    structured = inject and nodeid_log.exists()
+    if structured:
         reran = rerun_detected(nodeid_log)
         errored = bool(report_log_node_ids(nodeid_log, "ERROR"))
         complete = session_completed(nodeid_log)
+        # Take FAILED from the reporter's records, NOT scraped stdout: a
+        # candidate that suppresses the short summary (``-rN`` / a
+        # summary-blanking addopts, though addopts is already neutralized)
+        # would blank the scrape and false-pass, but the structured FAILED
+        # record is written per failing outcome and can't be turned off from
+        # candidate config (codex #1222 r26).
+        failed = report_log_node_ids(nodeid_log, "FAILED")
+    else:
+        reran = errored = False
+        complete = True
+        failed = _extract_failed_node_ids(proc.stdout)
     return _PytestRun(
         summary=summary,
         failed=failed,
@@ -381,6 +428,7 @@ def _run_pytest(
         returncode=proc.returncode,
         errored=errored,
         complete=complete,
+        structured=structured,
     )
 
 
