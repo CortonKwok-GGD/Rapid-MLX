@@ -202,7 +202,22 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
         seen: set = set()
         for key_node, _value_node in node.value:
             key = self.construct_object(key_node, deep=deep)
-            if key in seen:
+            # A complex (list / mapping) YAML key is unhashable, so ``key in
+            # seen`` would raise a raw ``TypeError`` instead of the documented
+            # ``QuarantineError`` (codex #1222 r22). Convert it to a
+            # ``ConstructorError`` (a ``yaml.YAMLError``) so the caller's
+            # error handling wraps it — the same class of complaint pyyaml
+            # itself raises for an unhashable key, just surfaced here first.
+            try:
+                is_dup = key in seen
+            except TypeError as e:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"unacceptable (unhashable) key: {e}",
+                    key_node.start_mark,
+                ) from e
+            if is_dup:
                 raise yaml.constructor.ConstructorError(
                     "while constructing a mapping",
                     node.start_mark,

@@ -76,10 +76,14 @@ def ctx_factory(tmp_path, monkeypatch):
         # steps' should_run predicate is satisfied.
         ctx.files_changed = files_changed or ["vllm_mlx/scheduler.py"]
         ctx.work_dir = tmp_path / "work"
-        # A truthy immutable base SHA so the quarantine load path runs
-        # (steps read the registry only from base_sha now — codex r10).
-        # Tests exercising the no-SHA fail-closed path clear it explicitly.
+        # Truthy immutable base + head SHAs so the quarantine load path runs
+        # the base ∩ candidate intersection (codex r10/r21). full_unit reads
+        # the base registry from base_sha and the candidate from head_sha;
+        # `_patch_quarantine` returns the same list for both, so the effective
+        # set equals the patched registry. Tests exercising a fail-closed path
+        # (no base/head sha, unreadable candidate) clear / diverge these.
         ctx.base_sha = "basesha0000000000000000000000000000000000"
+        ctx.head_sha = "headsha0000000000000000000000000000000000"
         return ctx
 
     return _make
@@ -383,6 +387,16 @@ class TestLoadQuarantine:
             "    added: 2026-01-01\n"
         )
         with pytest.raises(QuarantineError, match="[Dd]uplicate"):
+            load_quarantine(p)
+
+    def test_unhashable_mapping_key_raises_quarantine_error(self, tmp_path):
+        # codex #1222 r22: a complex YAML key (`? [a, b]` → a list) is
+        # unhashable, so the duplicate-key check's `key in seen` would raise a
+        # raw TypeError instead of the documented QuarantineError. The loader
+        # must convert it to a QuarantineError so the gating caller fails safe.
+        p = tmp_path / "q.yaml"
+        p.write_text("tests:\n  - ? [a, b]\n    : value\n")
+        with pytest.raises(QuarantineError):
             load_quarantine(p)
 
     def test_missing_added_raises(self, tmp_path):
@@ -999,6 +1013,43 @@ class TestFullUnitQuarantineAware:
         assert res.status == "fail"
         assert "tests/a.py::test_flaky" in res.details
 
+    def test_malformed_candidate_registry_fails_closed(self, ctx_factory, monkeypatch):
+        # codex #1222 r22: a candidate CONTROLS its own committed
+        # quarantine.yaml. If it's malformed/unreadable, we must NOT fall back
+        # to the stale base waiver (that would let a PR keep a base-quarantined
+        # but now-failing test green by breaking its own registry). Fail CLOSED
+        # to an empty quarantine → the failure blocks.
+        def fake(ref, *a, **k):
+            if ref == "headsha1111":  # candidate read
+                raise QuarantineError("candidate registry is malformed")
+            return [QuarantineEntry(id="tests/a.py::test_flaky")]  # base
+
+        monkeypatch.setattr(full_unit_mod, "load_quarantine_from_ref", fake)
+        self._patch_pytest(
+            monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        ctx = ctx_factory()
+        ctx.head_sha = "headsha1111"
+        res = FullUnitStep().run(ctx)
+        assert res.status == "fail"
+        assert "failing closed" in res.details
+        assert "tests/a.py::test_flaky" in res.details
+
+    def test_missing_head_sha_fails_closed(self, ctx_factory, monkeypatch):
+        # No pinned head sha → the candidate registry can't be confirmed →
+        # fail closed to empty (every failure blocks), not the base waiver.
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        self._patch_pytest(
+            monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        ctx = ctx_factory()
+        ctx.head_sha = ""  # unavailable
+        res = FullUnitStep().run(ctx)
+        assert res.status == "fail"
+        assert "failing closed" in res.details
+
     def test_abnormal_exit_blocks(self, ctx_factory, monkeypatch):
         # Exit 2 (interrupted) with an otherwise-quarantined failure must
         # still block — the exit code says something the FAILED list
@@ -1031,14 +1082,17 @@ class TestFullUnitQuarantineAware:
         res = FullUnitStep().run(ctx_factory())
         assert res.status == "fail"
 
-    def test_registry_sourced_from_base_revision(self, ctx_factory, monkeypatch):
-        # The gate must read the registry from the PROTECTED base, not the
-        # candidate checkout — assert full_unit passes ctx.base_sha to the
-        # loader (so a PR can't quarantine its own failing tests).
-        captured = {}
+    def test_registry_sourced_from_base_and_head_revisions(
+        self, ctx_factory, monkeypatch
+    ):
+        # The gate reads the BASE registry from the protected base SHA (so a
+        # PR can't quarantine its own failing tests) and the CANDIDATE from
+        # the pinned head SHA (so a de-quarantine removal is honored) — both
+        # from immutable revisions, never the working tree (codex r10/r21).
+        captured = {"refs": []}
 
         def fake_loader(ref, repo_root, *a, **k):
-            captured["ref"] = ref
+            captured["refs"].append(ref)
             return [QuarantineEntry(id="tests/a.py::test_flaky")]
 
         monkeypatch.setattr(full_unit_mod, "load_quarantine_from_ref", fake_loader)
@@ -1047,9 +1101,11 @@ class TestFullUnitQuarantineAware:
         )
         ctx = ctx_factory()
         ctx.base_sha = "deadbeefbase"
+        ctx.head_sha = "deadbeefhead"
         res = FullUnitStep().run(ctx)
-        assert captured["ref"] == "deadbeefbase"
-        assert res.status == "pass"  # quarantined → non-blocking
+        # Base read first (base_sha), then candidate (head_sha) — both pinned.
+        assert captured["refs"] == ["deadbeefbase", "deadbeefhead"]
+        assert res.status == "pass"  # in both → quarantined → non-blocking
 
     def test_downgrade_withheld_without_structured_log(self, ctx_factory, monkeypatch):
         # codex #1222 r13: the quarantine downgrade must rest on the exact
@@ -1854,6 +1910,48 @@ class TestFlakeTrackingContract:
         data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
         assert data["flake_candidates_known"] == ["tests/x.py::flaky"]
         assert data["reproduced_quarantined"] == []
+
+    def test_dequarantined_flake_classified_against_effective_intersection(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r22: the advisory must classify against the SAME
+        # effective quarantine (base ∩ candidate) full_unit enforces. A test
+        # the PR DE-QUARANTINED (in base, removed in candidate) that reproduces
+        # must NOT be mislabeled "known-flaky" / reproduced_quarantined —
+        # full_unit actually BLOCKED it, so the advisory reports it as a real
+        # reproduction, matching the gate instead of contradicting it.
+        ctx = ctx_factory()
+        ctx.head_sha = "headsha1111"
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary("FAILED tests/x.py::flaky - X")
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+
+        def fake_loader(ref, *a, **k):
+            # base still lists it; candidate (head) removed it → de-quarantined.
+            if ref == "headsha1111":
+                return []
+            return [QuarantineEntry(id="tests/x.py::flaky")]
+
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", fake_loader)
+        rerun = (
+            "==================== short test summary info ====================\n"
+            "FAILED tests/x.py::flaky\n"
+            "==== 1 failed in 0.20s ====\n"
+        )
+        monkeypatch.setattr(
+            flake_mod, "_run_session", lambda *a, **k: _completed(1, rerun)
+        )
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"  # advisory never blocks
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        # De-quarantined → NOT known / not reproduced_quarantined; it's a real
+        # reproduction, same as full_unit treated it.
+        assert data["flake_candidates_known"] == []
+        assert data["reproduced_quarantined"] == []
+        assert "tests/x.py::flaky" in data["reproduced_likely_real"]
 
     def test_teardown_error_after_pass_is_reproduced_not_flake(
         self, ctx_factory, monkeypatch

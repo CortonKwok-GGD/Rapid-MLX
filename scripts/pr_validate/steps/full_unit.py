@@ -340,11 +340,22 @@ class FullUnitStep(Step):
                 # registry can only TIGHTEN, never waive more than the base
                 # approved (a PR that DELETES quarantine.yaml → candidate empty
                 # → nothing waived, the correct strict de-quarantine-all).
+                #
+                # If the candidate revision can't be read/validated, fail
+                # CLOSED to an EMPTY effective quarantine — NEVER back to the
+                # base list (codex #1222 r22). A candidate CONTROLS its own
+                # committed quarantine.yaml, so falling back to base on a
+                # malformed/corrupt registry would let a PR keep a
+                # base-quarantined but now-failing test green by simply
+                # breaking its own registry. Empty → every failure blocks,
+                # the same fail-closed posture as a missing base sha /
+                # unreadable base registry.
                 if not ctx.head_sha:
-                    entries = base_entries
+                    entries = []
                     registry_note = (
-                        "\n\n⚠️ no PR head SHA — de-quarantine (removal) "
-                        "detection disabled; using the base registry as-is."
+                        "\n\n⚠️ no PR head SHA — cannot confirm the candidate "
+                        "registry; failing closed to an empty quarantine (every "
+                        "failure blocks)."
                     )
                 else:
                     try:
@@ -352,11 +363,11 @@ class FullUnitStep(Step):
                             ctx.head_sha, ctx.repo_root
                         )
                     except QuarantineError as e:
-                        entries = base_entries
+                        entries = []
                         registry_note = (
                             f"\n\n⚠️ candidate quarantine registry unreadable — "
-                            f"de-quarantine (removal) detection disabled; using "
-                            f"the base registry as-is: {e}"
+                            f"failing closed to an empty quarantine (every "
+                            f"failure blocks): {e}"
                         )
                     else:
                         entries = effective_quarantine(base_entries, cand_entries)

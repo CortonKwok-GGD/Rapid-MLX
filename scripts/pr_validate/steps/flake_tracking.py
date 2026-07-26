@@ -80,7 +80,12 @@ from .. import _nodeid_reporter
 from .._pytest_summary import report_log_node_ids, summary_node_ids
 from ..base import Step, StepResult
 from ..context import Context
-from ..quarantine import QuarantineError, is_quarantined, load_quarantine_from_ref
+from ..quarantine import (
+    QuarantineError,
+    effective_quarantine,
+    is_quarantined,
+    load_quarantine_from_ref,
+)
 
 # Cap on how many failed ids we re-run. If main is broken with hundreds
 # of reds, re-running them all (× reruns) would blow the budget for no
@@ -184,15 +189,21 @@ class FlakeTrackingStep(Step):
                 ),
             )
 
-        # Report against the ACTIVE quarantine, read from the IMMUTABLE base
-        # SHA — same protected source full_unit's downgrade uses, and never
-        # the mutable branch ref a candidate could rewrite (codex #1222 r10).
-        # Fail-safe: no SHA / a broken registry just means "nothing
-        # known-flaky yet" for the advisory report.
+        # Report against the SAME effective quarantine full_unit enforces —
+        # base ∩ candidate (codex #1222 r22). Reading base-only would label a
+        # test the PR just DE-QUARANTINED as "known-flaky" (rode along) when
+        # full_unit actually BLOCKED it, so the advisory would contradict the
+        # gate. Base comes from the immutable base SHA, the candidate from the
+        # pinned head SHA — never the mutable branch ref a candidate could
+        # rewrite (codex r10). Fail-safe for this ADVISORY report: any unread
+        # side → empty ("nothing known-flaky yet"), which conservatively
+        # matches full_unit's fail-closed direction.
         entries = []
-        if ctx.base_sha:
+        if ctx.base_sha and ctx.head_sha:
             try:
-                entries = load_quarantine_from_ref(ctx.base_sha, ctx.repo_root)
+                base_entries = load_quarantine_from_ref(ctx.base_sha, ctx.repo_root)
+                cand_entries = load_quarantine_from_ref(ctx.head_sha, ctx.repo_root)
+                entries = effective_quarantine(base_entries, cand_entries)
             except QuarantineError:
                 entries = []
 
