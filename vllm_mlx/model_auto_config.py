@@ -2179,7 +2179,16 @@ def _local_weight_tensor_names(
         # would falsely confirm the MTP head is absent (codex #1202 round 2).
         if not isinstance(weight_map, dict) or not weight_map:
             return None
-        keys = [k for k in weight_map if isinstance(k, str)]
+        # A real weight_map maps a tensor name to a NON-EMPTY shard filename.
+        # An entry whose value is null / empty / non-string is a malformed
+        # descriptor, not evidence that the tensor is present — count only
+        # well-formed entries so a corrupt index can't fabricate a phantom
+        # MTP-head tensor name (codex #1202 round 4).
+        keys = [
+            k
+            for k, v in weight_map.items()
+            if isinstance(k, str) and isinstance(v, str) and v
+        ]
         return keys or None
 
     def _from_single(path: str) -> "list[str] | None":
@@ -2199,7 +2208,27 @@ def _local_weight_tensor_names(
             header = _json.loads(fh.read(header_len))
         if not isinstance(header, dict):
             return None
-        keys = [k for k in header if isinstance(k, str) and k != "__metadata__"]
+        # Data region the tensor byte-ranges must fall inside.
+        data_region = size - 8 - header_len
+        # A real tensor entry is a dict whose ``data_offsets`` [start, end]
+        # are in-bounds. Reject malformed descriptors so a corrupt header
+        # can't fabricate a phantom MTP-head tensor name from a stray key
+        # (codex #1202 round 4).
+        keys = []
+        for k, desc in header.items():
+            if not isinstance(k, str) or k == "__metadata__":
+                continue
+            if not isinstance(desc, dict):
+                continue
+            offs = desc.get("data_offsets")
+            if (
+                not isinstance(offs, (list, tuple))
+                or len(offs) != 2
+                or not all(isinstance(o, int) and not isinstance(o, bool) for o in offs)
+                or not (0 <= offs[0] <= offs[1] <= data_region)
+            ):
+                continue
+            keys.append(k)
         return keys or None
 
     def _resolve(directory: str, filename: str) -> "str | None":
