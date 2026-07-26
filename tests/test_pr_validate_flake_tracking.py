@@ -3663,6 +3663,40 @@ class TestRunSession:
         assert (out, err) == ("", "")
         assert fake.wait_called  # direct child was reaped, not orphaned
 
+    def test_interrupt_during_communicate_sweeps_group(self, monkeypatch):
+        # codex #1222 r38: a NON-timeout exit from communicate() — most
+        # importantly a KeyboardInterrupt when the operator Ctrl-C's the gate
+        # mid-rerun — must still SIGKILL the process group and bounded-reap
+        # the child, then re-raise, so pytest + its GPU/inference descendants
+        # aren't orphaned. Driven with a stub so it's deterministic and fast.
+        killed = {"pgid": None}
+
+        class _FakeProc:
+            def __init__(self):
+                self.stdout = None
+                self.stderr = None
+                self.pid = 999999
+                self.returncode = None
+                self._calls = 0
+
+            def communicate(self, timeout=None):
+                self._calls += 1
+                if self._calls == 1:
+                    raise KeyboardInterrupt  # the interrupted wait
+                return "", ""  # the post-kill bounded drain succeeds
+
+            def wait(self, timeout=None):
+                return -9
+
+        monkeypatch.setattr(flake_mod.subprocess, "Popen", lambda *a, **k: _FakeProc())
+        monkeypatch.setattr(flake_mod.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            flake_mod.os, "killpg", lambda pgid, sig: killed.__setitem__("pgid", pgid)
+        )
+        with pytest.raises(KeyboardInterrupt):
+            _run_session([sys.executable, "-c", "pass"], cwd=".", timeout=30)
+        assert killed["pgid"] == 999999  # group swept before the re-raise
+
 
 class TestRegistration:
     def test_registered_after_all_gating_steps(self):

@@ -561,6 +561,12 @@ def _run_session(
     pipe open can't hang the drain, and the drain itself is time-bounded
     so even a group-escaping descendant can't wedge the gate (codex
     #1222 r2).
+
+    The SAME sweep must run on ANY non-timeout exit from ``communicate`` —
+    most importantly a ``KeyboardInterrupt`` when the operator Ctrl-C's the
+    gate mid-rerun. Without it, pytest and its GPU/inference descendants
+    would outlive the interrupted gate. So a ``BaseException`` handler kills
+    the group + bounded-reaps, then re-raises the original (codex #1222 r38).
     """
     proc = subprocess.Popen(  # noqa: S603
         cmd,
@@ -577,6 +583,13 @@ def _run_session(
         _kill_group(proc)
         out, err = _drain_bounded(proc)
         raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    except BaseException:
+        # KeyboardInterrupt during cancellation, an OSError from the pipe,
+        # anything — sweep the process group and bounded-reap the child so it
+        # can't be orphaned, then propagate the original exception unchanged.
+        _kill_group(proc)
+        _drain_bounded(proc)
+        raise
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
