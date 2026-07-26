@@ -587,8 +587,18 @@ def _run_session(
         # KeyboardInterrupt during cancellation, an OSError from the pipe,
         # anything — sweep the process group and bounded-reap the child so it
         # can't be orphaned, then propagate the original exception unchanged.
-        _kill_group(proc)
-        _drain_bounded(proc)
+        #
+        # BUT only killpg while the leader is demonstrably UNREAPED
+        # (``returncode is None``): ``communicate()`` may have already waited
+        # and reaped the child while unwinding a KeyboardInterrupt, and once
+        # reaped its pgid can be RECYCLED — a blind ``os.getpgid(proc.pid)`` +
+        # killpg could then SIGKILL an unrelated group (codex #1222 r38→r39;
+        # the same pgid-recycling hazard the timeout path avoids by construction
+        # since a timeout leaves the child unreaped). Reaped → nothing of ours
+        # is left to kill; skip straight to the re-raise.
+        if proc.returncode is None:
+            _kill_group(proc)
+            _drain_bounded(proc)
         raise
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 

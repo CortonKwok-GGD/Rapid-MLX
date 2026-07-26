@@ -711,6 +711,27 @@ class TestLoadQuarantineFromRef:
         assert q._GIT != "git", "git must be pre-resolved, not a bare PATH lookup"
         assert os.path.isabs(q._GIT), f"_GIT must be absolute, got {q._GIT!r}"
 
+    def test_resolve_git_rejects_relative_path(self, monkeypatch):
+        # codex #1222 r39: a relative `which` result (PATH held ".") would
+        # resolve under the subprocess cwd (the candidate checkout), letting a
+        # committed ./git forge the registry — so it must fail closed to None.
+        from scripts.pr_validate import quarantine as q
+
+        monkeypatch.setattr(q.shutil, "which", lambda _n: "some/rel/git")
+        assert q._resolve_git() is None
+
+    def test_resolve_git_keeps_absolute_path(self, monkeypatch):
+        from scripts.pr_validate import quarantine as q
+
+        monkeypatch.setattr(q.shutil, "which", lambda _n: "/usr/bin/git")
+        assert q._resolve_git() == "/usr/bin/git"
+
+    def test_resolve_git_none_when_absent(self, monkeypatch):
+        from scripts.pr_validate import quarantine as q
+
+        monkeypatch.setattr(q.shutil, "which", lambda _n: None)
+        assert q._resolve_git() is None
+
     def test_git_show_invokes_preresolved_binary(self, tmp_path, monkeypatch):
         # The subprocess argv[0] must be the pinned absolute `_GIT`, never a
         # bare "git" a candidate could shadow via a writable leading PATH dir.
@@ -931,6 +952,71 @@ class TestFetchSnapshotWiring:
         # Snapshotted the exact immutable base/head SHAs full_unit later reads.
         assert recorded["refs"] == ["BASESHA", "HEADSHA"]
         assert recorded["repo_root"] == ctx.repo_root
+
+    def _run_fetch(self, tmp_path, monkeypatch, files, head_loader):
+        """Drive FetchStep with a stub gh + snapshot, a given changed-file
+        list, and a head-registry loader — returns the StepResult."""
+        from scripts.pr_validate.context import Context
+        from scripts.pr_validate.steps import fetch as fetch_mod
+
+        monkeypatch.setattr(
+            fetch_mod, "snapshot_quarantine_registries", lambda *a, **k: None
+        )
+        monkeypatch.setattr(fetch_mod, "load_quarantine_from_ref", head_loader)
+        monkeypatch.setattr(fetch_mod.shutil, "which", lambda _n: "/usr/bin/gh")
+        meta = {
+            "number": 1,
+            "title": "t",
+            "body": "b",
+            "author": {"login": "u"},
+            "isCrossRepository": False,
+            "headRefOid": "HEADSHA",
+            "headRefName": "feat",
+            "baseRefOid": "BASESHA",
+            "additions": 1,
+            "deletions": 0,
+            "files": [{"path": p} for p in files],
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+        }
+        monkeypatch.setattr(
+            fetch_mod,
+            "_gh",
+            lambda args: json.dumps(meta) if args.startswith("pr view") else "diff\n",
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'fake'\n")
+        monkeypatch.chdir(tmp_path)
+        ctx = Context(pr_number=1)
+        ctx.work_dir = tmp_path / "work"
+        return fetch_mod.FetchStep().run(ctx)
+
+    def test_fetch_fails_on_malformed_candidate_registry(self, tmp_path, monkeypatch):
+        # codex #1222 r39 NIT: a PR that commits a malformed quarantine.yaml
+        # would merge on a green full_unit (the registry is only read on
+        # failure) and then break every later PR's quarantine. When the PR
+        # MODIFIES the registry, fetch validates the candidate blob and fails.
+        from scripts.pr_validate.quarantine import QUARANTINE_REL_PATH, QuarantineError
+
+        def boom(ref, repo_root, *a, **k):
+            raise QuarantineError("test #0 needs a non-empty 'reason'")
+
+        res = self._run_fetch(
+            tmp_path, monkeypatch, files=[QUARANTINE_REL_PATH, "a.py"], head_loader=boom
+        )
+        assert res.status == "fail"
+        assert "quarantine.yaml" in res.summary
+
+    def test_fetch_ignores_registry_error_when_registry_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        # If the PR does NOT touch quarantine.yaml, a (pre-existing) registry
+        # problem is not this PR's fault — the head-registry validation is
+        # scoped to modifications, so the loader is never consulted here.
+        def boom(ref, repo_root, *a, **k):
+            raise AssertionError("head registry must not be validated when unchanged")
+
+        res = self._run_fetch(tmp_path, monkeypatch, files=["a.py"], head_loader=boom)
+        assert res.status == "pass"
 
 
 # --------------------------------------------------------------------------
@@ -3696,6 +3782,39 @@ class TestRunSession:
         with pytest.raises(KeyboardInterrupt):
             _run_session([sys.executable, "-c", "pass"], cwd=".", timeout=30)
         assert killed["pgid"] == 999999  # group swept before the re-raise
+
+    def test_interrupt_after_reap_skips_killpg(self, monkeypatch):
+        # codex #1222 r39: if communicate() already reaped the child while
+        # unwinding the interrupt (returncode set), its pgid can be RECYCLED —
+        # killpg would then risk SIGKILLing an unrelated group. The handler
+        # must SKIP the group-kill (nothing of ours is left) and still
+        # re-raise. getpgid is booby-trapped to prove it's never consulted.
+        class _FakeProc:
+            def __init__(self):
+                self.stdout = None
+                self.stderr = None
+                self.pid = 999999
+                self.returncode = -2  # already reaped by communicate()
+
+            def communicate(self, timeout=None):
+                raise KeyboardInterrupt
+
+            def wait(self, timeout=None):
+                return -2
+
+        killpg_called = {"v": False}
+        monkeypatch.setattr(flake_mod.subprocess, "Popen", lambda *a, **k: _FakeProc())
+
+        def _no_getpgid(_pid):
+            raise AssertionError("must not getpgid a reaped (recyclable) pid")
+
+        monkeypatch.setattr(flake_mod.os, "getpgid", _no_getpgid)
+        monkeypatch.setattr(
+            flake_mod.os, "killpg", lambda *a: killpg_called.__setitem__("v", True)
+        )
+        with pytest.raises(KeyboardInterrupt):
+            _run_session([sys.executable, "-c", "pass"], cwd=".", timeout=30)
+        assert not killpg_called["v"]  # no group-kill on a reaped child
 
 
 class TestRegistration:

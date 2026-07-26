@@ -20,9 +20,15 @@ import shlex
 import shutil
 import subprocess
 
+from .._pytest_summary import render_fence_safe
 from ..base import Step, StepResult
 from ..context import Context
-from ..quarantine import snapshot_quarantine_registries
+from ..quarantine import (
+    QUARANTINE_REL_PATH,
+    QuarantineError,
+    load_quarantine_from_ref,
+    snapshot_quarantine_registries,
+)
 
 
 class FetchStep(Step):
@@ -138,6 +144,26 @@ class FetchStep(Step):
         # not candidate-controlled); a falsy SHA is skipped and full_unit's own
         # fail-closed branch handles it. Never raises.
         snapshot_quarantine_registries([ctx.base_sha, ctx.head_sha], ctx.repo_root)
+
+        # If THIS PR modifies quarantine.yaml, its committed (head) registry
+        # MUST parse. A green full_unit only READS the registry when a test
+        # fails, so a malformed candidate registry would otherwise merge
+        # undetected on a passing run and then fail-closed EVERY later PR's
+        # quarantine (their base load raises) (codex #1222 r39). The snapshot
+        # above already parsed + cached it; surface a malformed one here.
+        if QUARANTINE_REL_PATH in ctx.files_changed and ctx.head_sha:
+            try:
+                load_quarantine_from_ref(ctx.head_sha, ctx.repo_root)
+            except QuarantineError as e:
+                # The error text is candidate-controlled (it echoes the PR's
+                # own registry) — render it fence-safe (codex #1222 r25).
+                return StepResult(
+                    name=self.name,
+                    status="fail",
+                    summary="this PR's quarantine.yaml does not parse — fix it "
+                    "before merge (a green test run would not catch it)",
+                    details=f"malformed quarantine registry: {render_fence_safe(str(e))}",
+                )
 
         ctx.run_log(
             f"fetched: '{ctx.pr_title[:60]}' by {ctx.pr_author} "

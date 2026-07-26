@@ -43,6 +43,7 @@ DEFAULT_QUARANTINE_PATH = Path(__file__).with_name("quarantine.yaml")
 QUARANTINE_REL_PATH = "scripts/pr_validate/quarantine.yaml"
 _GIT_SHOW_TIMEOUT_S = 30
 
+
 # Resolve the git binary ONCE, at import time — which runs when pr_validate
 # boots, BEFORE any candidate test code executes in a later pipeline step
 # (targeted_tests / full_unit). Resolving lazily at call time would look up
@@ -59,7 +60,24 @@ _GIT_SHOW_TIMEOUT_S = 30
 # when git can't be resolved we keep ``None`` and FAIL CLOSED at call time
 # (a QuarantineError → the gating caller treats every failure as blocking),
 # never a bare "git" re-looked-up through a candidate-tamperable PATH.
-_GIT = shutil.which("git")
+#
+# r39: the result must also be ABSOLUTE. ``shutil.which`` returns a relative
+# path when PATH holds ``.`` (or any relative entry); the subprocess runs with
+# ``cwd=repo_root``, so a relative ``_GIT`` would resolve under the CANDIDATE
+# checkout at call time — a committed ``./git`` could then forge the registry.
+# Only an absolute path is trustworthy; a relative one fails closed like an
+# unresolved git.
+def _resolve_git() -> str | None:
+    """Resolve git to an ABSOLUTE path, or None (→ fail closed). A relative
+    ``which`` result (PATH held ``.``) is rejected — it would resolve under
+    the subprocess ``cwd`` (the candidate checkout) at call time (codex r39)."""
+    g = shutil.which("git")
+    if g is not None and not os.path.isabs(g):
+        return None
+    return g
+
+
+_GIT = _resolve_git()
 
 # Registries are also SNAPSHOTTED at fetch — before any candidate code runs —
 # into this cache (see ``snapshot_quarantine_registries``); ``load_quarantine
