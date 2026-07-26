@@ -154,6 +154,22 @@ class TargetedTestsStep(Step):
         # legitimate reclassification) but make it LOUD so a reviewer is
         # prompted to confirm the deselection is intentional.
         #
+        # MULTI-FILE variant (codex #1222 r41): the ``SESSIONFINISH 0 0`` proof
+        # is AGGREGATE across all changed test targets, so when one changed file
+        # legitimately deselects to zero, a SIBLING changed test file that
+        # contributed ZERO trace — empty, renamed out of ``python_files``, or
+        # a candidate-conftest ``pytest_ignore_collect`` drop — rides along under
+        # the shared "deselected" summary. This is NOT separately closeable: the
+        # sound per-target check codex proposes (require every requested file to
+        # contribute a gate-owned deselection, or collect each target alone)
+        # FALSE-BLOCKS the routine cases — a PR that deletes all tests from a
+        # file, or renames a test module, leaves exactly that zero-trace
+        # signature — while the in-process conftest drop is the SAME r27 surgical
+        # residual reached a different way (a hook that forges per-file
+        # "deselected" defeats a per-file check too). Same defenses apply:
+        # slow-lane CI and diff review, which see the emptied/renamed file and
+        # any added collection hook.
+        #
         # GATE (codex #1222 r34): grant this non-blocking skip ONLY on
         # ``all_deselected_clean`` — the reporter's structured proof of a benign
         # zero-selection run (exactly ``SESSIONFINISH 0 0`` with NO
@@ -608,21 +624,24 @@ def _run_on_main(
             # id wouldn't match the PR id and the pre-existing failure would be
             # misclassified as a PR-only regression (codex #1222 r29).
             #
-            # RESIDUAL (codex #1222 r30, fail-safe): ``summary_node_ids`` is
-            # exact for normal ids but IRREDUCIBLY ambiguous for an id that
-            # itself contains ``" - "`` with unbalanced brackets
-            # (``test_x[a] - b]``) — the same wall that motivated the structured
-            # reporter plugin (see its module docstring; codex r4/r5/r6/r9/r10).
-            # The base predates that plugin, so it cannot get canonical ids here,
-            # and injecting the PR checkout's plugin would drag the PR's library
-            # onto the base run's ``PYTHONPATH`` — contaminating the negative
-            # control (base TEST files run against PR code), a worse and unsound
-            # failure than the one it fixes. So a ``" - "``-laden base id may
-            # truncate and NOT match the PR-side canonical id — which fails
-            # CLOSED: the pre-existing failure is treated as a regression and
-            # BLOCKS (never a false green — a real regression is never masked;
-            # see the fail-safe test). We accept a rare false block of a
-            # pathological pre-existing id over an unsound negative control.
+            # RESIDUAL (codex #1222 r30/r41, fail-safe): ``summary_node_ids``
+            # is exact for normal ids but AMBIGUOUS for an id that itself
+            # contains ``" - "`` next to brackets (``test_x[a] - b]`` unbalanced,
+            # ``test_x[a] - b[c]`` balanced) — the same wall that motivated the
+            # structured reporter plugin (see its module docstring; codex
+            # r4/r5/r6/r9/r40/r41). The base predates that plugin, so it cannot
+            # get canonical ids here, and injecting the PR checkout's plugin
+            # would drag the PR's library onto the base run's ``PYTHONPATH`` —
+            # contaminating the negative control (base TEST files run against PR
+            # code), a worse and unsound failure than the one it fixes. So a
+            # ``" - "``-laden base id may truncate and NOT match the PR-side
+            # canonical id. ``_strip_message`` fails CLOSED on EVERY such
+            # ambiguous shape (r40 unbalanced + r41 balanced): it returns the
+            # WHOLE line, which can't match a shorter PR-side canonical id, so
+            # the pre-existing failure is treated as a regression and BLOCKS —
+            # never a false green (a real regression is never masked; see the
+            # fail-safe tests). We accept a rare false block of a pathological
+            # pre-existing id over an unsound negative control.
             return summary_node_ids(proc.stdout, "FAILED")
         finally:
             # Remove the worktree even if pytest crashed.

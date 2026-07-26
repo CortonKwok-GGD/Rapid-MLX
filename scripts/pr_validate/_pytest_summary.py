@@ -274,7 +274,8 @@ def _strip_message(rest: str) -> str:
     (``test_x - AssertionError: [1]`` → ``test_x``) — the earlier
     ``rfind("]")`` approach got the latter wrong (codex #1222 r5).
 
-    Ambiguity is resolved by failing SAFE, never by guessing. Two cases:
+    Ambiguity is resolved by failing SAFE, never by guessing. Four tells,
+    all making a split return the WHOLE line instead of a truncated id:
 
       * ``r6``: a node id whose EXPLICIT param id holds an *unmatched*
         bracket (``ids=["["]`` → ``test_x[[]``) leaves the depth counter
@@ -284,16 +285,31 @@ def _strip_message(rest: str) -> str:
         prematurely, so the FIRST depth-0 ``" - "`` lands *inside* the
         param sequence. Splitting there would truncate to ``test_x[a]`` —
         which could wrongly match a shorter quarantine entry and DOWNGRADE
-        a real failure. To prevent that, a candidate split is rejected when
-        the message it would produce begins with ``"["`` (the tell-tale of
-        a mid-param split, or a genuine bracket-leading message we equally
-        can't disambiguate). We then return the whole line as the id.
+        a real failure. Rejected when the message begins with ``"["``.
+      * ``r40``: a custom param id like ``ids=["a] - b"]`` yields
+        ``test_x[a] - b]``; the inner ``]`` drops depth to 0 so the first
+        depth-0 ``" - "`` would COLLAPSE it to ``test_x[a]``. Rejected when
+        the message holds an UNMATCHED ``"]"`` (that ``"]"`` closes a real
+        param bracket, so the id extends past the ``"-"``).
+      * ``r41``: the BALANCED variant ``test_x[a] - b[c]`` (param value
+        ``a] - b[c``) — the r40 tell misses it because ``b[c]`` balances,
+        yet it is still indistinguishable from a single node id. Rejected
+        when the id-part ends with ``"]"`` and the message contains ``"["``.
 
-    Both cases return a mangled id that won't match a normal quarantine
-    entry, so the failure BLOCKS rather than being wrongly waived, and a
-    mistargeted advisory re-run just yields an inconclusive result. The
-    r4/r5 common cases are unaffected — their message begins with the
-    exception text (``AssertionError: …``) or a bare word, not ``"["``.
+    After these four guards a split is taken ONLY when the id-part is
+    unparametrized (no ``"]"``, so no ``" - "`` can lie inside it) or the
+    message provably cannot be a bracketed param continuation (no ``"["``,
+    no unmatched ``"]"``). That makes the scrape FAIL-CLOSED SOUND: it never
+    truncates to a shorter id that could false-green the base negative
+    control — at the cost of over-blocking a pre-existing PARAMETRIZED
+    failure whose message contains ``"["`` (safe, and rare: a normal
+    parametrized failure only trips it when it was ALREADY failing at base).
+    A blocked id won't match a normal quarantine entry either, so the
+    failure blocks rather than being wrongly waived, and a mistargeted
+    advisory re-run just yields an inconclusive result. The r4/r5 common
+    cases are unaffected — an UNPARAMETRIZED test's message can hold any
+    brackets (``test_x - AssertionError: [1]`` → ``test_x``); only a
+    parametrized id-part gates on the message's ``"["``.
 
     A structured report (junit-xml) was considered and rejected: its
     ``classname``/``name`` split can't be mapped back to a pytest node id
@@ -310,6 +326,7 @@ def _strip_message(rest: str) -> str:
             if depth > 0:
                 depth -= 1
         elif depth == 0 and rest.startswith(" - ", i):
+            id_part = rest[:i]
             msg = rest[i + 3 :]
             # Fail safe (return the WHOLE line, which won't match a shorter
             # id) whenever the split is unreliable:
@@ -323,9 +340,31 @@ def _strip_message(rest: str) -> str:
             #    COLLAPSE it to a shorter id ("test_x[a]") that could wrongly
             #    match a PR-introduced failure and waive it as pre-existing —
             #    a FALSE GREEN in the base negative control (codex #1222 r40).
-            if msg.startswith("[") or _has_unmatched_close_bracket(msg):
+            #  * the id-part ends with "]" AND the message contains a "[" —
+            #    a BALANCED-bracket variant of the above ("test_x[a] - b[c]",
+            #    from a custom param value that embeds "] ... ["). The r40
+            #    unmatched-"]" tell misses it because "b[c]" is balanced, yet
+            #    the string is still indistinguishable from a single node id
+            #    whose param value is "a] - b[c". Splitting COLLAPSES it to
+            #    "test_x[a]", which could coincide with a DIFFERENT test's
+            #    canonical id and waive a real PR regression as pre-existing —
+            #    the same FALSE GREEN r40 closed for the unbalanced case
+            #    (codex #1222 r41). This is the LAST ambiguous shape: after
+            #    these three guards, a split is only taken when the id-part is
+            #    unparametrized (no "]" → no " - " can be inside it) or the
+            #    message provably can't be a bracketed param continuation (no
+            #    "[", no unmatched "]"), so the scrape is fail-closed sound —
+            #    never a false green, at the cost of blocking a pre-existing
+            #    PARAMETRIZED failure whose message contains "[" (a safe,
+            #    rare over-block that matches this scrape's stated preference:
+            #    a false block over an unsound negative control).
+            if (
+                msg.startswith("[")
+                or _has_unmatched_close_bracket(msg)
+                or (id_part.endswith("]") and "[" in msg)
+            ):
                 return rest.strip()
-            return rest[:i].strip()
+            return id_part.strip()
         i += 1
     return rest.strip()
 

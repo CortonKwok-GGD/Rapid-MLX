@@ -138,11 +138,18 @@ class FlakeTrackingStep(Step):
             )
 
     def _run(self, ctx: Context) -> StepResult:
-        # Clear any stale candidate artifact from a REUSED run dir up front —
-        # ``flake-candidates.json`` is (over)written only on the success path
-        # below, so a skip/error return would otherwise leave an earlier run's
-        # candidates in place and misrepresent this run (codex #1222 r37).
-        ctx.artifact_path("flake-candidates.json").unlink(missing_ok=True)
+        # Clear EVERY artifact this step generates from a REUSED run dir up
+        # front — each is written only on a path that may not be reached this
+        # run (``flake-candidates.json`` on the success path; the rerun log +
+        # nodeid tsv only once a rerun actually launches). A skip/error return
+        # before those points would otherwise leave an earlier run's files in
+        # place and misrepresent THIS run (codex #1222 r37 / r41 NIT).
+        for stale in (
+            "flake-candidates.json",
+            "flake-rerun.log",
+            "flake-rerun-nodeids.tsv",
+        ):
+            ctx.artifact_path(stale).unlink(missing_ok=True)
 
         log_path = ctx.artifact_path("full-unit.log")
         if not log_path.exists():

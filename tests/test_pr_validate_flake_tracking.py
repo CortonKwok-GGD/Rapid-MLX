@@ -153,12 +153,47 @@ class TestSummaryNodeIds:
         )
         assert out == ["tests/a.py::test_x"]
 
-    def test_param_id_and_message_both_bracketed(self):
+    def test_param_id_and_message_both_bracketed_fails_safe(self):
+        # codex #1222 r41: a PARAMETRIZED id-part followed by a message that
+        # contains "[" is IRREDUCIBLY ambiguous — "test_x[a - b] - ValueError:
+        # got [2]" is indistinguishable from a single node id whose custom param
+        # value is "a - b] - ValueError: got [2". Splitting to "test_x[a - b]"
+        # could coincide with a DIFFERENT test's canonical id and waive a real
+        # PR regression as pre-existing (a false green in the base negative
+        # control), so we fail SAFE and return the whole line — it won't match a
+        # shorter id, so the failure BLOCKS. This over-blocks a genuine
+        # parametrized failure whose message holds "[" (safe, and only when it
+        # was ALREADY failing at base); an UNPARAMETRIZED failure with the same
+        # message still splits (see test_message_with_bracket_not_absorbed).
         out = summary_node_ids(
             _summary("FAILED tests/a.py::test_x[a - b] - ValueError: got [2]"),
             "FAILED",
         )
-        assert out == ["tests/a.py::test_x[a - b]"]
+        assert out == ["tests/a.py::test_x[a - b] - ValueError: got [2]"]
+
+    def test_balanced_bracket_param_after_dash_fails_safe(self):
+        # codex #1222 r41: the BALANCED sibling of the r40 unmatched-"]" case.
+        # A custom param id like ids=["a] - b[c"] yields node
+        # "test_x[a] - b[c]". The message "b[c]" balances, so the r40 tell
+        # (unmatched "]") MISSES it, yet splitting still COLLAPSES the id to
+        # "test_x[a]" — which could match a PR-introduced "test_x[a]" and waive
+        # it as pre-existing (a FALSE GREEN). The id-part ends "]" and the
+        # message contains "[", so we now fail safe and return the whole line.
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x[a] - b[c]"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x[a] - b[c]"]
+
+    def test_unparametrized_message_with_balanced_bracket_still_splits(self):
+        # The r41 guard is scoped to a PARAMETRIZED id-part (ends with "]"): an
+        # unparametrized test's "-" is unambiguously the separator because a
+        # function name can't contain " - ", so its message may hold any
+        # brackets and the split is still taken. Guards the common case against
+        # the r41 fail-safe over-firing (would false-block ordinary failures).
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x - ValueError: got [2]"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x"]
 
     def test_nested_balanced_brackets_ok(self):
         # A param id with nested, BALANCED brackets and inner " - " is
@@ -1940,6 +1975,23 @@ class TestFlakeTrackingContract:
         res = FlakeTrackingStep().run(ctx)
         assert res.status == "skip"
         assert not stale.exists()  # the stale candidates were removed
+
+    def test_stale_rerun_artifacts_cleared_on_skip(self, ctx_factory):
+        # codex #1222 r41 NIT: the rerun log + nodeid tsv are written only once a
+        # rerun launches, so a REUSED run dir with stale copies must ALSO be
+        # cleared up front (not just flake-candidates.json) — an early skip must
+        # not leave an earlier run's rerun evidence behind to misrepresent this
+        # run.
+        ctx = ctx_factory()
+        stale_log = ctx.artifact_path("flake-rerun.log")
+        stale_ids = ctx.artifact_path("flake-rerun-nodeids.tsv")
+        stale_log.write_text("old rerun output\n")
+        stale_ids.write_text("RERUN\ttests/old.py::stale\n")
+        ctx.artifact_path("full-unit.log").write_text(_passed())  # no failures
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "skip"
+        assert not stale_log.exists()
+        assert not stale_ids.exists()
 
     def test_reruns_error_nodeids_structured(self, ctx_factory, monkeypatch):
         # codex #1222 r15 NIT: a setup / teardown / collection flake is
@@ -4425,3 +4477,17 @@ class TestTargetedTestsUntrustedRun:
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "fail"  # fail-safe: never a false green
         assert json.dumps(canonical, ensure_ascii=False) in res.details
+
+    def test_balanced_ambiguous_base_id_does_not_waive_short_regression(self):
+        # codex #1222 r41, end-to-end: the base has a real failure whose node id
+        # is the BALANCED-ambiguous "test_x[a] - b[c]" (custom param "a] - b[c").
+        # If summary_node_ids collapsed it to "test_x[a]", a PR that newly breaks
+        # a DIFFERENT test literally named "test_x[a]" would be waived as
+        # pre-existing — a FALSE GREEN. The r41 guard keeps the base id WHOLE, so
+        # the short PR-side id is NOT in the base set and stays a regression.
+        base_line = _summary("FAILED tests/a.py::test_x[a] - b[c]")
+        base_set = set(summary_node_ids(base_line, "FAILED"))
+        # The base failure is kept whole (not truncated to the short id).
+        assert base_set == {"tests/a.py::test_x[a] - b[c]"}
+        # A different PR regression with the short canonical id is NOT masked.
+        assert "tests/a.py::test_x[a]" not in base_set
