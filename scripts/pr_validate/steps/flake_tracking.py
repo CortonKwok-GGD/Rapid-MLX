@@ -212,25 +212,41 @@ class FlakeTrackingStep(Step):
         new_candidates = [i for i in candidates if not is_quarantined(i, entries)]
         known_flakes = [i for i in candidates if is_quarantined(i, entries)]
 
+        # Split reproductions the same way: a NON-quarantined test that
+        # reproduces is a real failure full_unit blocked on. A QUARANTINED
+        # one reproduced deterministically here — full_unit PASSED it as
+        # non-blocking, so it's NOT something the gate blocked on; flag it
+        # separately as "quarantine may be masking a now-deterministic
+        # bug" rather than mislabeling it (codex #1222 r5).
+        reproduced_new = [i for i in reproduced if not is_quarantined(i, entries)]
+        reproduced_known = [i for i in reproduced if is_quarantined(i, entries)]
+
         payload = {
             "original_failed": original_failed,
             "sampled": sample,
             "truncated": truncated,
             "flake_candidates_new": new_candidates,
             "flake_candidates_known": known_flakes,
-            "reproduced_likely_real": reproduced,
+            "reproduced_likely_real": reproduced_new,
+            "reproduced_quarantined": reproduced_known,
             "inconclusive": inconclusive,
         }
         cand_path = ctx.artifact_path("flake-candidates.json")
         cand_path.write_text(json.dumps(payload, indent=2))
 
         details = _render(
-            new_candidates, known_flakes, reproduced, inconclusive, truncated
+            new_candidates,
+            known_flakes,
+            reproduced_new,
+            reproduced_known,
+            inconclusive,
+            truncated,
         )
         summary = (
             f"{len(new_candidates)} new flake candidate(s), "
-            f"{len(reproduced)} reproduced, "
+            f"{len(reproduced_new)} reproduced, "
             f"{len(known_flakes)} known-flaky, "
+            f"{len(reproduced_known)} quarantined-reproduced, "
             f"{len(inconclusive)} inconclusive — advisory"
         )
         return StepResult(
@@ -321,7 +337,8 @@ def _kill_group(proc: subprocess.Popen) -> None:
 def _render(
     new_candidates: list[str],
     known_flakes: list[str],
-    reproduced: list[str],
+    reproduced_new: list[str],
+    reproduced_known: list[str],
     inconclusive: list[str],
     truncated: int,
 ) -> str:
@@ -332,12 +349,20 @@ def _render(
             "isolated re-run — consider promoting to `quarantine.yaml` "
             "after confirming):\n```\n" + "\n".join(new_candidates) + "\n```"
         )
-    if reproduced:
+    if reproduced_new:
         parts.append(
             "**Reproduced on re-run** (failure is deterministic — likely a "
             "real bug, NOT a flake; `full_unit` blocked on these):\n```\n"
-            + "\n".join(reproduced)
+            + "\n".join(reproduced_new)
             + "\n```"
+        )
+    if reproduced_known:
+        parts.append(
+            "**Quarantined but reproduced deterministically** (`full_unit` "
+            "PASSED these as quarantined, but they failed every re-run here "
+            "— the quarantine may be masking a now-deterministic bug; "
+            "re-check whether the entry still belongs in `quarantine.yaml`):"
+            "\n```\n" + "\n".join(reproduced_known) + "\n```"
         )
     if known_flakes:
         parts.append(

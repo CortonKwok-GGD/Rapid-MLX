@@ -68,7 +68,14 @@ def load_quarantine(path: Path | None = None) -> list[QuarantineEntry]:
     path = path or DEFAULT_QUARANTINE_PATH
     if not path.exists():
         return []
-    return _parse_quarantine_text(path.read_text(), source=str(path))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        # A non-UTF-8 registry is malformed, not "absent" — surface it as
+        # QuarantineError so the gating caller fails safe to empty rather
+        # than crashing on an unhandled ValueError (codex #1222 r5).
+        raise QuarantineError(f"{path}: not valid UTF-8: {e}") from e
+    return _parse_quarantine_text(text, source=str(path))
 
 
 def load_quarantine_from_ref(
@@ -92,6 +99,7 @@ def load_quarantine_from_ref(
             ["git", "show", f"{ref}:{rel_path}"],  # noqa: S607
             capture_output=True,
             text=True,
+            encoding="utf-8",
             cwd=str(repo_root),
             timeout=_GIT_SHOW_TIMEOUT_S,
         )
@@ -99,6 +107,11 @@ def load_quarantine_from_ref(
         # git missing / not a repo / timeout → treat as no quarantine
         # (stricter gate). Never let an infra hiccup loosen the gate.
         return []
+    except UnicodeDecodeError as e:
+        # A non-UTF-8 blob at ref is malformed → QuarantineError so the
+        # gating caller fails safe to empty, not an unhandled ValueError
+        # (codex #1222 r5).
+        raise QuarantineError(f"{ref}:{rel_path}: not valid UTF-8: {e}") from e
     if proc.returncode != 0:
         return []
     return _parse_quarantine_text(proc.stdout, source=f"{ref}:{rel_path}")

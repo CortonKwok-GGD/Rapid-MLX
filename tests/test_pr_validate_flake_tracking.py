@@ -113,6 +113,22 @@ class TestSummaryNodeIds:
         out = summary_node_ids(_summary("FAILED tests/a.py::test_x[a - b]"), "FAILED")
         assert out == ["tests/a.py::test_x[a - b]"]
 
+    def test_message_with_bracket_not_absorbed_into_id(self):
+        # A ']' inside the MESSAGE must not be mistaken for the id's
+        # parametrization bracket — the separator is the first " - "
+        # outside brackets (codex #1222 r5 regression guard).
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x - AssertionError: [1]"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x"]
+
+    def test_param_id_and_message_both_bracketed(self):
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x[a - b] - ValueError: got [2]"),
+            "FAILED",
+        )
+        assert out == ["tests/a.py::test_x[a - b]"]
+
     def test_ignores_failed_outside_summary(self):
         text = (
             "tests/a.py::test_x FAILED in call setup\n"  # pre-summary noise
@@ -208,6 +224,15 @@ class TestLoadQuarantine:
         p.write_text("# just a comment\n")
         assert load_quarantine(p) == []
 
+    def test_non_utf8_file_raises(self, tmp_path):
+        # A non-UTF-8 blob is malformed, not absent — must surface as
+        # QuarantineError (not an unhandled UnicodeDecodeError) so the gate
+        # fails safe to empty (codex #1222 r5).
+        p = tmp_path / "q.yaml"
+        p.write_bytes(b"tests:\n  - id: \xff\xfe not utf8\n")
+        with pytest.raises(QuarantineError):
+            load_quarantine(p)
+
     def test_tests_must_be_list(self, tmp_path):
         p = tmp_path / "q.yaml"
         p.write_text("tests: not-a-list\n")
@@ -280,6 +305,17 @@ class TestLoadQuarantineFromRef:
             "scripts.pr_validate.quarantine.subprocess.run",
             lambda *a, **k: _completed(0, "tests: [unclosed\n"),
         )
+        with pytest.raises(QuarantineError):
+            load_quarantine_from_ref("BASE", tmp_path)
+
+    def test_non_utf8_at_ref_raises(self, tmp_path, monkeypatch):
+        # A non-UTF-8 blob at the ref makes `text=True` subprocess.run
+        # raise UnicodeDecodeError — it must be wrapped as QuarantineError,
+        # not escape as an unhandled ValueError (codex #1222 r5).
+        def boom(*a, **k):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", boom)
         with pytest.raises(QuarantineError):
             load_quarantine_from_ref("BASE", tmp_path)
 
@@ -637,6 +673,43 @@ class TestFlakeTrackingContract:
         assert data["flake_candidates_new"] == ["tests/x.py::a"]
         assert data["reproduced_likely_real"] == ["tests/x.py::b"]
         assert data["inconclusive"] == ["tests/x.py::c"]
+
+    def test_quarantined_reproduction_not_labeled_blocked(
+        self, ctx_factory, monkeypatch
+    ):
+        # A quarantined test that reproduces on re-run must land in
+        # `reproduced_quarantined`, NOT `reproduced_likely_real` — full_unit
+        # PASSED it (quarantined), so it isn't a failure the gate blocked
+        # on (codex #1222 r5).
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary(
+                "FAILED tests/x.py::flaky - X",
+                "FAILED tests/x.py::real - X",
+            )
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(
+            flake_mod,
+            "load_quarantine_from_ref",
+            lambda *a, **k: [QuarantineEntry(id="tests/x.py::flaky")],
+        )
+        rerun = (
+            "==================== short test summary info ====================\n"
+            "FAILED tests/x.py::flaky - AssertionError\n"
+            "FAILED tests/x.py::real - AssertionError\n"
+            "==== 2 failed in 0.20s ====\n"
+        )
+        monkeypatch.setattr(
+            flake_mod, "_run_session", lambda *a, **k: _completed(1, rerun)
+        )
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert data["reproduced_likely_real"] == ["tests/x.py::real"]
+        assert data["reproduced_quarantined"] == ["tests/x.py::flaky"]
 
 
 class TestFlakeTrackingClassification:

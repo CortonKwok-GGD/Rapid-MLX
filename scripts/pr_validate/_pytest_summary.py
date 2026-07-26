@@ -76,12 +76,24 @@ def summary_node_ids(text: str, *labels: str) -> list[str]:
 def _strip_message(rest: str) -> str:
     """Return the node id from a ``<nodeid>[ - <message>]`` tail.
 
-    The message separator is the first ``" - "`` that falls *after* the
-    node id's final ``]`` (or the first one at all, for an unparametrized
-    id). This keeps a ``" - "`` inside a parametrization bracket as part
-    of the id instead of truncating it (codex #1222 r4)."""
-    bracket_end = rest.rfind("]")
-    search_from = bracket_end + 1 if bracket_end != -1 else 0
-    sep = rest.find(" - ", search_from)
-    node_id = rest if sep == -1 else rest[:sep]
-    return node_id.strip()
+    The message separator is the FIRST ``" - "`` that falls outside the
+    node id's parametrization brackets. Scanning left-to-right with a
+    bracket-depth counter handles both directions of ambiguity: a
+    ``" - "`` inside ``[...]`` is part of the id (``test_x[a - b]``), and
+    a ``]`` inside the *message* can't be mistaken for the id's bracket
+    (``test_x - AssertionError: [1]`` → ``test_x``) — the earlier
+    ``rfind("]")`` approach got the latter wrong (codex #1222 r5)."""
+    depth = 0
+    i = 0
+    n = len(rest)
+    while i < n:
+        c = rest[i]
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0 and rest.startswith(" - ", i):
+            return rest[:i].strip()
+        i += 1
+    return rest.strip()
