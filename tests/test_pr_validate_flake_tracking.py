@@ -1082,6 +1082,89 @@ class TestNodeidReporter:
         if log_path.exists():
             assert "PASSED" not in log_path.read_text(encoding="utf-8")
 
+    def test_reruns_log_only_terminal_outcome(self, tmp_path):
+        # The reporter is consumed downstream WITH pytest-rerunfailures, so a
+        # flaky test's INTERMEDIATE attempts must never leak into the log: a
+        # fail-then-pass test has to appear ONLY as PASSED (never also FAILED)
+        # and a fail-then-pass-in-SETUP test likewise, else flake_tracking
+        # would classify one node id as flake AND reproduction at once. This
+        # locks that behavior against a future rerunfailures change — pytest
+        # marks retried attempts outcome=="rerun", which the plugin's
+        # failed/passed matchers exclude by construction.
+        pytest.importorskip("pytest_rerunfailures")
+        (tmp_path / "test_flaky.py").write_text(
+            textwrap.dedent(
+                """
+                import pathlib
+
+                _call = pathlib.Path(__file__).with_name('.call')
+                _setup = pathlib.Path(__file__).with_name('.setup')
+
+                def _bump(p):
+                    n = int(p.read_text()) if p.exists() else 0
+                    p.write_text(str(n + 1))
+                    return n
+
+                def test_call_flake():
+                    assert _bump(_call) >= 2          # fails attempts 0,1,2, passes on 3rd
+
+                import pytest
+
+                @pytest.fixture
+                def flaky_setup():
+                    if _bump(_setup) < 1:             # setup fails once, then passes
+                        raise RuntimeError("setup flake")
+
+                def test_setup_flake(flaky_setup):
+                    assert True
+
+                def test_always_bad():
+                    assert False                       # exhausts reruns → terminal FAILED
+                """
+            )
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        repo_root = self._repo_root()
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, repo_root, log_passes=True
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "--reruns=3",
+                *plugin_args,
+                "test_flaky.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        rows = [
+            tuple(ln.split("\t", 1))
+            for ln in log_path.read_text(encoding="utf-8").splitlines()
+            if "\t" in ln
+        ]
+        passed = [nid for label, nid in rows if label == "PASSED"]
+        failed = [nid for label, nid in rows if label == "FAILED"]
+        errored = [nid for label, nid in rows if label == "ERROR"]
+
+        # Eventually-passing flakes: PASSED exactly once, never FAILED/ERROR.
+        for nid in (
+            "test_flaky.py::test_call_flake",
+            "test_flaky.py::test_setup_flake",
+        ):
+            assert passed.count(nid) == 1, (nid, rows)
+            assert nid not in failed
+            assert nid not in errored
+        # The always-failing test: terminal FAILED exactly once, never PASSED.
+        assert failed.count("test_flaky.py::test_always_bad") == 1
+        assert "test_flaky.py::test_always_bad" not in passed
+
 
 # --------------------------------------------------------------------------
 # flake_tracking._run_session — process-group timeout kill

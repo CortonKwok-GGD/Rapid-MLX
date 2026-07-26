@@ -33,7 +33,7 @@ tests:
     issue: ""
   - id: "tests/test_continuous_batching.py::TestContinuousBatchingIntegration::test_batching_improves_throughput"
     reason: >-
-      GPU-contention sensitive. Absolute tok/s varies ~6x run-to-run on
+      GPU-contention sensitive. Absolute tok/s varies ~1.8x run-to-run on
       one machine from suite-wide GPU contention (382-697 tok/s observed
       per the test's own docstring). The relative batched-vs-sequential
       comparison is meant to be robust, but still trips intermittently
