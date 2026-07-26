@@ -2984,7 +2984,14 @@ class TestLocalWeightTensorNames:
             "__metadata__": {"format": "pt"},
         }
         blob = json.dumps(header).encode()
-        self._write(tmp_path, "model.safetensors", struct.pack("<Q", len(blob)) + blob)
+        # Append the 2-byte tensor payload declared by ``data_offsets``
+        # [0, 2] so the descriptor's byte-range is actually in-bounds — the
+        # probe now fails closed on out-of-bounds offsets (codex #1202).
+        self._write(
+            tmp_path,
+            "model.safetensors",
+            struct.pack("<Q", len(blob)) + blob + b"\x00\x00",
+        )
         names = auto_config_mod._local_weight_tensor_names(
             str(tmp_path), self._cfg(tmp_path)
         )
