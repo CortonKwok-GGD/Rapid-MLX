@@ -39,6 +39,82 @@ def _quantize_weight(w, group_size, bits):
     return q_w, q_s, q_b
 
 
+def _norm_type(key: str) -> str:
+    """Norm-type tail used to pair an MTP norm with its backbone counterpart.
+
+    ``mtp.layers.0.input_layernorm.weight`` -> ``input_layernorm.weight``.
+    """
+    return ".".join(key.split(".")[-2:])
+
+
+def _find_backbone_reference(mtp_norm_keys, backbone_keys):
+    """Pick an ``(mtp_key, backbone_key)`` pair that share a 1-D norm type.
+
+    ``backbone_key`` is a non-``mtp.`` norm present in ``backbone_keys`` (the
+    target MLX model's tensor names). That backbone norm is the +1-shifted
+    reference produced by mlx-lm's sanitize. Returns ``(None, None)`` when no
+    shared norm type exists.
+    """
+    non_mtp = [k for k in backbone_keys if not k.startswith("mtp.")]
+    for mtp_key in mtp_norm_keys:
+        ntype = _norm_type(mtp_key)
+        for bk in non_mtp:
+            if bk == ntype or bk.endswith("." + ntype):
+                return mtp_key, bk
+    return None, None
+
+
+def _norms_already_shifted(mtp_mean: float, backbone_mean: float) -> bool:
+    """Return True when the extracted MTP norms are ALREADY +1-shifted.
+
+    The backbone norm (post mlx-lm sanitize) is the shifted reference. An
+    unshifted MTP norm sits ~1.0 below it (HF ``(1 + w)`` convention), so its
+    mean is closer to ``backbone_mean - 1.0``. If instead the MTP mean is
+    closer to ``backbone_mean``, the norms were already shifted at the source
+    and applying +1.0 again would silently double-shift them (w+2), so the
+    shift must be skipped.
+    """
+    return abs(mtp_mean - backbone_mean) < abs(mtp_mean - (backbone_mean - 1.0))
+
+
+def _mlx_backbone_norm_mean(mlx_dir: Path, mtp_norm_keys):
+    """Load a backbone (+1-shifted) norm mean from the local MLX model.
+
+    Finds a non-``mtp.`` 1-D norm in ``mlx_dir`` whose type matches one of the
+    ``mtp_norm_keys``, loads that tensor, and returns
+    ``(mean, mtp_ref_key, backbone_key)``. Returns ``(None, None, None)`` when
+    no suitable reference is found or the shard cannot be read (unusual layout).
+    """
+    try:
+        index_path = mlx_dir / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            mtp_ref_key, backbone_key = _find_backbone_reference(
+                mtp_norm_keys, weight_map.keys()
+            )
+            if backbone_key is None:
+                return None, None, None
+            shard = mx.load(str(mlx_dir / weight_map[backbone_key]))
+        else:
+            single = mlx_dir / "model.safetensors"
+            if not single.exists():
+                return None, None, None
+            shard = mx.load(str(single))
+            mtp_ref_key, backbone_key = _find_backbone_reference(
+                mtp_norm_keys, shard.keys()
+            )
+            if backbone_key is None:
+                return None, None, None
+        tensor = shard.get(backbone_key)
+        if tensor is None:
+            return None, None, None
+        return float(mx.mean(tensor).item()), mtp_ref_key, backbone_key
+    except Exception as e:  # unusual layout / corrupt or unreadable shard
+        logger.warning(f"Double-shift guard: failed to load backbone reference: {e}")
+        return None, None, None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract MTP weights from HF model")
     parser.add_argument(
@@ -58,6 +134,12 @@ def main():
         type=int,
         default=None,
         help="Override group size (default: from MLX model config)",
+    )
+    parser.add_argument(
+        "--force-norm-shift",
+        action="store_true",
+        help="Force the +1.0 norm shift even if the double-shift guard detects "
+        "already-shifted MTP norms (escape hatch).",
     )
     args = parser.parse_args()
 
@@ -119,10 +201,59 @@ def main():
     # (the "norm" is mid-name, so an ``endswith('norm.weight')`` list silently
     # missed them — leaving the MTP head's fc-input normalization inverted and
     # producing ~0% draft acceptance). Match any 1-D norm weight instead.
-    for k in list(all_mtp_weights.keys()):
-        if "norm" in k and k.endswith(".weight") and all_mtp_weights[k].ndim == 1:
-            all_mtp_weights[k] = all_mtp_weights[k] + 1.0
-            logger.info(f"  Shifted norm: {k}")
+    #
+    # DOUBLE-SHIFT GUARD: the +1.0 shift is correct ONLY if the HF source stores
+    # its MTP norms unshifted (HF convention). If a source already stores them in
+    # MLX's shifted convention, applying +1.0 again silently double-shifts (w+2),
+    # with the SAME ~0% acceptance symptom and no error. Detect this by comparing
+    # an MTP norm's mean to the SAME-TYPE backbone norm in the target MLX model
+    # (the +1-shifted reference): if the MTP mean already matches the backbone
+    # rather than sitting ~1.0 below it, the norms are pre-shifted — skip the
+    # shift. ``--force-norm-shift`` overrides; a missing reference falls back to
+    # shifting (current behavior).
+    mtp_norm_keys = [
+        k
+        for k in all_mtp_weights
+        if "norm" in k and k.endswith(".weight") and all_mtp_weights[k].ndim == 1
+    ]
+
+    apply_shift = True
+    if not mtp_norm_keys:
+        apply_shift = False
+    elif args.force_norm_shift:
+        logger.info("--force-norm-shift set: applying +1.0 norm shift unconditionally.")
+    else:
+        backbone_mean, mtp_ref_key, backbone_key = _mlx_backbone_norm_mean(
+            mlx_dir, mtp_norm_keys
+        )
+        if backbone_mean is None:
+            logger.warning(
+                f"Double-shift guard could not find a backbone norm reference in "
+                f"{mlx_dir} (unusual layout?); falling back to applying the +1.0 "
+                "shift."
+            )
+        else:
+            mtp_mean = float(mx.mean(all_mtp_weights[mtp_ref_key]).item())
+            if _norms_already_shifted(mtp_mean, backbone_mean):
+                apply_shift = False
+                logger.warning(
+                    f"MTP norms appear already shifted (mean {mtp_mean:.4f} ~= "
+                    f"backbone '{backbone_key}' mean {backbone_mean:.4f}); skipping "
+                    "+1.0 shift to avoid double-shift. Pass --force-norm-shift to "
+                    "override."
+                )
+            else:
+                logger.info(
+                    f"Double-shift guard: MTP norm '{mtp_ref_key}' mean "
+                    f"{mtp_mean:.4f} matches the unshifted convention (backbone "
+                    f"'{backbone_key}' mean {backbone_mean:.4f}); applying +1.0 shift."
+                )
+
+    if apply_shift:
+        for k in list(all_mtp_weights.keys()):
+            if "norm" in k and k.endswith(".weight") and all_mtp_weights[k].ndim == 1:
+                all_mtp_weights[k] = all_mtp_weights[k] + 1.0
+                logger.info(f"  Shifted norm: {k}")
 
     # Convert fused MoE experts (``experts.gate_up_proj`` / ``experts.down_proj``,
     # 3-D stacked, no ``.weight`` suffix) into the ``switch_mlp.{gate,up,down}_proj``
