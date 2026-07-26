@@ -294,7 +294,7 @@ def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
         # that a ``-p no:<name>`` block can't reach (codex #1222 r23). A
         # gating run disables reruns, so any RERUN record is a tamper signal.
         _append(RERUN_LABEL, report.nodeid)
-    if report.when == "teardown":
+    if report.when == "teardown" and report.outcome != "rerun":
         # One teardown report per item pytest ran to COMPLETION; record the
         # DISTINCT node id so pytest_sessionfinish can prove ran == collected.
         # Teardown (not setup) so a ``pytest.exit()`` mid-call can't leave a
@@ -303,6 +303,14 @@ def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
         # several reports (codex #1222 r16). A run truncated by -x / --maxfail
         # / --stepwise / a mid-call pytest.exit tears down strictly fewer
         # distinct items than it collected.
+        #
+        # ``outcome != "rerun"`` (codex #1222 r32): a TEARDOWN-phase failure
+        # that pytest-rerunfailures retries emits an INTERMEDIATE teardown
+        # report with ``outcome == "rerun"`` (verified — unlike a call-phase
+        # rerun, which emits no intermediate teardown at all). Counting that
+        # provisional teardown would let a later truncated FINAL attempt still
+        # satisfy ``ran == collected``. Only a terminal (non-rerun) teardown
+        # proves the item actually finished, so gate on it.
         _completed_ids.add(report.nodeid)
     if report.when == "call":
         if report.outcome == "failed":

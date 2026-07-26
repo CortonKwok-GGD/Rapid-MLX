@@ -1995,30 +1995,30 @@ class TestFlakeTrackingContract:
         assert "--color=no" in captured["cmd"]
         assert "-rA" in captured["cmd"]
 
-    def test_rerun_loads_rerunfailures_explicitly_when_autoload_disabled(
-        self, ctx_factory, monkeypatch
-    ):
-        # codex #1222 r18: find_spec confirms rerunfailures is installed but
-        # not that it's ACTIVE — under PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 an
-        # installed plugin won't register, so --reruns would be unknown and
-        # the advisory would silently skip. In THAT case only, load it
-        # explicitly with -p so --reruns is recognized.
+    def test_rerun_skips_when_autoload_disabled(self, ctx_factory, monkeypatch):
+        # codex #1222 r32 (supersedes r18): under PYTEST_DISABLE_PLUGIN_AUTOLOAD
+        # the advisory re-run can't faithfully reproduce plugin-dependent tests.
+        # Hand-loading ``-p pytest_rerunfailures`` would revive --reruns but
+        # leave the project's OTHER required plugins (pytest-asyncio, …)
+        # disabled, so a recovered async test would ERROR on re-run and be
+        # misclassified as reproduced/inconclusive rather than a flake. The step
+        # is advisory (never gates), so rather than emit a wrong signal it SKIPS
+        # — and must NOT even launch the re-run subprocess.
         monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
         ctx = ctx_factory()
         self._prime(ctx, monkeypatch)
         monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
-        captured = {}
+        called = {"ran": False}
 
         def fake(cmd, cwd, timeout, env=None):
-            captured["cmd"] = cmd
+            called["ran"] = True
             return _completed(0, _passed())
 
         monkeypatch.setattr(flake_mod, "_run_session", fake)
-        FlakeTrackingStep().run(ctx)
-        cmd = captured["cmd"]
-        # -p pytest_rerunfailures appears as adjacent argv entries.
-        assert "pytest_rerunfailures" in cmd
-        assert cmd[cmd.index("pytest_rerunfailures") - 1] == "-p"
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "skip"
+        assert called["ran"] is False  # no advisory subprocess was launched
+        assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in res.summary
 
     def test_rerun_omits_explicit_rerunfailures_when_autoload_on(
         self, ctx_factory, monkeypatch
@@ -2891,6 +2891,106 @@ class TestNodeidReporter:
         passed = report_log_node_ids(log_path, "PASSED")
         assert "test_fl.py::test_flaky" in passed
         assert "test_fl.py::test_flaky" not in failed
+
+    def test_teardown_phase_rerun_emits_intermediate_teardown(self, tmp_path):
+        # codex #1222 r32 EMPIRICAL ANCHOR (correcting the r31 rebuttal, which
+        # probed only CALL-phase reruns). A TEARDOWN-phase flake — a yield
+        # fixture whose teardown fails once then passes — really DOES emit an
+        # intermediate teardown report carrying outcome=='rerun', UNLIKE a
+        # call-phase rerun which emits no intermediate teardown at all. Proof:
+        # a RERUN record is written for it. Yet the completing test still counts
+        # exactly once (ran==collected==1) — the ``outcome != "rerun"`` guard
+        # drops the PROVISIONAL teardown while keeping the terminal one.
+        pytest.importorskip("pytest_rerunfailures")
+        (tmp_path / "test_td.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+                _n = {'v': 0}
+
+                @pytest.fixture
+                def res():
+                    yield 'r'
+                    _n['v'] += 1
+                    assert _n['v'] >= 2   # TEARDOWN fails attempt 1, passes on 2
+
+                @pytest.mark.flaky(reruns=2)
+                def test_td(res):
+                    assert True           # call always passes; the teardown reruns
+                """
+            )
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root(), log_passes=True
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-o",
+                "addopts=",
+                *plugin_args,
+                "test_td.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # The intermediate teardown really carried outcome=='rerun' → RERUN logged.
+        assert report_log_node_ids(log_path, "RERUN") == ["test_td.py::test_td"]
+        # …but the completing test is counted exactly once, so the completeness
+        # record stays ran==collected==1 (the guard kept only the terminal
+        # teardown, not the provisional rerun one).
+        assert raw_session_records(log_path) == ["1 1"]
+
+    def test_teardown_phase_rerun_does_not_prematurely_complete(
+        self, tmp_path, monkeypatch
+    ):
+        # codex #1222 r32: without the ``outcome != "rerun"`` teardown guard,
+        # the INTERMEDIATE teardown/rerun report would add the id to
+        # _completed_ids, so a FINAL attempt truncated before its terminal
+        # teardown would still satisfy ran==collected — masking an incomplete
+        # rerun. Drive the hooks directly with the exact report sequence a
+        # teardown-phase flake produces (verified real in the test above) and
+        # prove the guard keeps the truncation visible as ran < collected.
+        import types
+
+        log_path = tmp_path / "nodeids.tsv"
+        monkeypatch.setenv(_nodeid_reporter._ENV_LOG, str(log_path))
+        _nodeid_reporter.pytest_sessionstart(object())  # clears _completed_ids
+
+        def _rpt(when, outcome, nodeid):
+            return types.SimpleNamespace(
+                when=when,
+                outcome=outcome,
+                nodeid=nodeid,
+                failed=(outcome == "failed"),
+            )
+
+        nid = "tests/x.py::test_teardown_flaky"
+        # Attempt 1: setup+call pass, TEARDOWN fails → rerunfailures marks the
+        # teardown report outcome=='rerun' and retries.
+        _nodeid_reporter.pytest_runtest_logreport(_rpt("setup", "passed", nid))
+        _nodeid_reporter.pytest_runtest_logreport(_rpt("call", "passed", nid))
+        _nodeid_reporter.pytest_runtest_logreport(_rpt("teardown", "rerun", nid))
+        # Final attempt is TRUNCATED mid-flight (process killed / early-stop
+        # elsewhere): it emits setup+call but its terminal teardown never lands.
+        _nodeid_reporter.pytest_runtest_logreport(_rpt("setup", "passed", nid))
+        _nodeid_reporter.pytest_runtest_logreport(_rpt("call", "passed", nid))
+        # Session still finishes gracefully, having collected 1 item.
+        _nodeid_reporter.pytest_sessionfinish(
+            types.SimpleNamespace(testscollected=1), 0
+        )
+
+        # WITHOUT the guard the provisional teardown/rerun would have completed
+        # the id → "1 1" (falsely complete). WITH it, the item never reached a
+        # terminal teardown → ran(0) < collected(1); the gap stays visible.
+        assert raw_session_records(log_path) == ["0 1"]
 
     def _session_records(self, log_path):
         if not log_path.exists():

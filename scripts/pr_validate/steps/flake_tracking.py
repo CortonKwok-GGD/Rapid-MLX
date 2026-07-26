@@ -278,16 +278,28 @@ class FlakeTrackingStep(Step):
         rerun_env.pop("PYTEST_ADDOPTS", None)
         # pytest-rerunfailures provides ``--reruns``. It autoloads by entry
         # point (registered under the name "rerunfailures") UNLESS
-        # PYTEST_DISABLE_PLUGIN_AUTOLOAD is set. Add an explicit ``-p`` ONLY
-        # when autoload is off: a redundant ``-p`` on an already-autoloaded
-        # plugin is NOT a no-op — pluggy raises "Plugin already registered
-        # under a different name" because the entry-point name (rerunfailures)
-        # differs from the module name (pytest_rerunfailures), which crashes
-        # the whole advisory re-run (codex #1222 r18 regression, fixed r19).
-        # find_spec confirmed it's importable above, so the -p can't
-        # ImportError when we do add it.
+        # PYTEST_DISABLE_PLUGIN_AUTOLOAD is set. When autoload is OFF we do not
+        # try to hand-load it: even a correct ``-p pytest_rerunfailures`` would
+        # revive only --reruns while the project's OTHER required plugins
+        # (pytest-asyncio, …) stay disabled — so an async / plugin-dependent
+        # test would ERROR on re-run and be misclassified as reproduced /
+        # inconclusive instead of a flake (codex #1222 r32). We can't reliably
+        # enumerate every required plugin here (test_env_check owns that, and
+        # not all are ``-p`` loadable), and a redundant ``-p`` on an
+        # already-autoloaded plugin is itself a crash ("Plugin already
+        # registered under a different name", codex #1222 r18/r19). So rather
+        # than emit a wrong advisory signal we SKIP — this step is best-effort
+        # and never gates.
         if rerun_env.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD"):
-            cmd += ["-p", "pytest_rerunfailures"]
+            return StepResult(
+                name=self.name,
+                status="skip",
+                summary=(
+                    "flake re-run skipped — PYTEST_DISABLE_PLUGIN_AUTOLOAD is "
+                    "set, so a faithful re-run of plugin-dependent tests "
+                    "(pytest-asyncio, …) can't be guaranteed (advisory)"
+                ),
+            )
         # Emit the structured node-id log (with PASSED, which the classifier
         # needs) so flake-vs-real is decided on exact ids, not summary text.
         if _nodeid_reporter.available():
