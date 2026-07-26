@@ -82,6 +82,13 @@ def build_invocation(
     env[_ENV_LOG] = str(log_path)
     if log_passes:
         env[_ENV_PASSES] = "1"
+    else:
+        # Set the flag DEFINITIVELY, don't just skip it: an inherited
+        # PR_VALIDATE_NODEID_LOG_PASSES=1 from the parent env would
+        # otherwise make full_unit (log_passes=False) log all ~14k passes
+        # and bloat the artifact (codex #1222 r12). Pop it so False means
+        # off regardless of what was inherited.
+        env.pop(_ENV_PASSES, None)
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     return args, env
 

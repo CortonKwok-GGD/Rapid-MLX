@@ -95,10 +95,22 @@ def load_quarantine_from_ref(
     ``QuarantineError`` so the gating caller falls back to empty *and
     reports it loudly*, instead of a silent empty that's indistinguishable
     from "nothing is quarantined". Never let an infra hiccup pass unseen.
+
+    ``--no-replace-objects`` is REQUIRED, not cosmetic (codex #1222 r12):
+    an immutable base SHA pins the *object*, but ``git show`` otherwise
+    honors local replacement refs, so a candidate test that ran earlier in
+    the pipeline could ``git replace <base_sha> <attacker-commit>`` and make
+    ``git show <base_sha>:…`` serve its own allowlist despite the pinned
+    SHA. With replacement disabled, ``<40-hex-sha>:<path>`` resolves the
+    true content-addressed blob — the only git indirection that could remap
+    it is closed (grafts/alternates can't override an existing object's
+    content; a mutable branch ref is no longer used per r10).
     """
     try:
         proc = subprocess.run(  # noqa: S603
-            ["git", "show", f"{ref}:{rel_path}"],  # noqa: S607
+            # --no-replace-objects: ignore any refs/replace/* a candidate
+            # test may have planted; read the true base blob (codex r12).
+            ["git", "--no-replace-objects", "show", f"{ref}:{rel_path}"],  # noqa: S607
             capture_output=True,
             text=True,
             encoding="utf-8",

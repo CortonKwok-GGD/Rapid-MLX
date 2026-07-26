@@ -446,6 +446,54 @@ class TestLoadQuarantineFromRef:
         (entry,) = load_quarantine_from_ref("HEAD", tmp_path)
         assert entry.id == "x.py::t"
 
+    def test_real_git_show_ignores_replace_ref(self, tmp_path):
+        # codex #1222 r12 (security): pinning to an immutable base SHA is not
+        # enough on its own — `git show` honors local refs/replace/*, so a
+        # candidate test that ran earlier could `git replace <base_sha>
+        # <attacker-commit>` and make `git show <base_sha>:…` serve its own
+        # allowlist. The loader passes --no-replace-objects, so the TRUE
+        # content-addressed base blob wins regardless of any planted replace.
+        import os
+
+        def git(*args):
+            return subprocess.run(
+                ["git", *args],
+                cwd=tmp_path,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t",
+                    "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@t",
+                },
+            )
+
+        git("init", "-q")
+        rel = "scripts/pr_validate/quarantine.yaml"
+        (tmp_path / "scripts" / "pr_validate").mkdir(parents=True)
+        (tmp_path / rel).write_text(
+            "tests:\n  - id: GOOD::t\n    reason: r\n    added: 2026-01-01\n"
+        )
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        base_sha = git("rev-parse", "HEAD").stdout.strip()
+        # An attacker commit carrying a DIFFERENT allowlist.
+        (tmp_path / rel).write_text(
+            "tests:\n  - id: EVIL::t\n    reason: r\n    added: 2026-01-01\n"
+        )
+        git("add", "-A")
+        git("commit", "-q", "-m", "evil")
+        evil_sha = git("rev-parse", "HEAD").stdout.strip()
+        git("replace", base_sha, evil_sha)
+        # Sanity: a naive `git show <base_sha>:…` IS fooled by the replace.
+        assert "EVIL::t" in git("show", f"{base_sha}:{rel}").stdout
+        # The loader must NOT be — it reads the true base blob.
+        (entry,) = load_quarantine_from_ref(base_sha, tmp_path)
+        assert entry.id == "GOOD::t"
+
 
 # --------------------------------------------------------------------------
 # quarantine.py — matcher / partition
@@ -862,6 +910,39 @@ class TestFlakeTrackingContract:
         assert data["flake_candidates_known"] == ["tests/x.py::flaky"]
         assert data["reproduced_quarantined"] == []
 
+    def test_teardown_error_after_pass_is_reproduced_not_flake(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r12 BLOCKING: the structured reporter logs one line per
+        # pytest PHASE, so a test whose call PASSES but whose teardown ERRORs
+        # emits BOTH a PASSED and an ERROR line for the same node id. That run
+        # ended badly — it must classify as a reproduction, never a flake
+        # candidate. FAILED/ERROR takes precedence over PASSED, keeping the
+        # buckets disjoint.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary("FAILED tests/x.py::td - X")
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            # Emulate the plugin writing PASSED (call) + ERROR (teardown) for
+            # the same id — the exact double-log codex flagged.
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/x.py::td\nERROR\ttests/x.py::td\n"
+            )
+            return _completed(1, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/x.py::td" not in data["flake_candidates_new"]
+        assert "tests/x.py::td" in data["reproduced_likely_real"]
+
     def test_quarantined_failure_always_sampled_past_cap(
         self, ctx_factory, monkeypatch
     ):
@@ -1081,6 +1162,22 @@ class TestNodeidReporter:
         # file may be absent or empty; either way, no PASSED rows.
         if log_path.exists():
             assert "PASSED" not in log_path.read_text(encoding="utf-8")
+
+    def test_log_passes_false_clears_inherited_flag(self, tmp_path):
+        # codex #1222 r12 nit: log_passes=False must POP an inherited
+        # PR_VALIDATE_NODEID_LOG_PASSES=1, else full_unit (which passes
+        # False) would log all ~14k passes and bloat the artifact.
+        _, env_off = flake_mod._nodeid_reporter.build_invocation(
+            tmp_path / "n.tsv",
+            tmp_path,
+            base_env={"PR_VALIDATE_NODEID_LOG_PASSES": "1", "PATH": "/usr/bin"},
+        )
+        assert "PR_VALIDATE_NODEID_LOG_PASSES" not in env_off
+        # log_passes=True still turns it on.
+        _, env_on = flake_mod._nodeid_reporter.build_invocation(
+            tmp_path / "n.tsv", tmp_path, log_passes=True, base_env={}
+        )
+        assert env_on["PR_VALIDATE_NODEID_LOG_PASSES"] == "1"
 
     def test_reruns_log_only_terminal_outcome(self, tmp_path):
         # The reporter is consumed downstream WITH pytest-rerunfailures, so a

@@ -270,7 +270,15 @@ class FlakeTrackingStep(Step):
         else:
             passed = set(summary_node_ids(proc.stdout, "PASSED"))
             still_bad = set(summary_node_ids(proc.stdout, "FAILED", "ERROR"))
-        candidates = [i for i in sample if i in passed]
+        # FAILED/ERROR takes PRECEDENCE over PASSED for the same node id
+        # (codex #1222 r12): a test whose call PASSES but whose teardown
+        # ERRORs emits BOTH a PASSED and an ERROR line (they're different
+        # pytest phases), and a test can likewise fail then pass across
+        # phases. Such a run is NOT "green on re-run" — it ended badly — so
+        # it must be a reproduction, never a flake candidate. Subtracting
+        # ``still_bad`` from the passed set makes the three buckets disjoint
+        # and gives badness the last word.
+        candidates = [i for i in sample if i in passed and i not in still_bad]
         reproduced = [i for i in sample if i in still_bad]
         inconclusive = [i for i in sample if i not in passed and i not in still_bad]
 
