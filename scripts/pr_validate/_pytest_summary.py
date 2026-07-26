@@ -310,13 +310,36 @@ def _strip_message(rest: str) -> str:
             if depth > 0:
                 depth -= 1
         elif depth == 0 and rest.startswith(" - ", i):
-            # A message beginning with "[" means we can't tell a genuine
-            # bracket-leading message from a split taken in the MIDDLE of a
-            # bracketed param sequence ("test_x[a] - [b]"). Fail safe:
-            # return the whole line so an ambiguous id can't be wrongly
-            # matched against a shorter quarantine entry (codex #1222 r9).
-            if rest[i + 3 :].startswith("["):
+            msg = rest[i + 3 :]
+            # Fail safe (return the WHOLE line, which won't match a shorter
+            # id) whenever the split is unreliable:
+            #  * message begins with "[" — can't tell a genuine bracket-
+            #    leading message from a split taken in the MIDDLE of a
+            #    bracketed param sequence ("test_x[a] - [b]") (codex r9).
+            #  * message contains an UNMATCHED "]" — that "]" almost
+            #    certainly closes a param bracket in the REAL node id (a
+            #    custom param id like "a] - b" → node "test_x[a] - b]"), so
+            #    the id extends PAST this "-" and splitting here would
+            #    COLLAPSE it to a shorter id ("test_x[a]") that could wrongly
+            #    match a PR-introduced failure and waive it as pre-existing —
+            #    a FALSE GREEN in the base negative control (codex #1222 r40).
+            if msg.startswith("[") or _has_unmatched_close_bracket(msg):
                 return rest.strip()
             return rest[:i].strip()
         i += 1
     return rest.strip()
+
+
+def _has_unmatched_close_bracket(s: str) -> bool:
+    """True if ``s`` holds a ``]`` with no matching earlier ``[`` — the
+    tell-tale that a candidate node-id/message split fell INSIDE the id's
+    parametrization brackets (codex #1222 r40)."""
+    depth = 0
+    for c in s:
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth < 0:
+                return True
+    return False

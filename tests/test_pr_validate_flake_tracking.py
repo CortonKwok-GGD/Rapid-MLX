@@ -210,6 +210,28 @@ class TestSummaryNodeIds:
         )
         assert out == ["tests/a.py::test_x - [Errno 2] no such file"]
 
+    def test_param_id_with_trailing_unmatched_close_fails_safe(self):
+        # codex #1222 r40: a custom param id like ids=["a] - b"] yields node
+        # "test_x[a] - b]". The inner ']' at "a]" drops depth to 0, so the
+        # first depth-0 " - " used to split and COLLAPSE the id to "test_x[a]"
+        # (the r9 guard only caught a message STARTING with "["; here the
+        # message "b]" starts with "b"). That collapse could waive a real,
+        # PR-introduced "test_x[a]" as pre-existing in the base negative
+        # control — a FALSE GREEN. The "]" in the message is now recognized as
+        # UNMATCHED, so we fail safe and return the whole line, which won't
+        # match the shorter id → the failure BLOCKS.
+        out = summary_node_ids(_summary("FAILED tests/a.py::test_x[a] - b]"), "FAILED")
+        assert out == ["tests/a.py::test_x[a] - b]"]
+
+    def test_plain_test_message_with_unmatched_close_fails_safe(self):
+        # A plain test whose MESSAGE happens to hold an unmatched ']' is also
+        # unresolvable, so it fails safe (whole line) — over-blocking, never a
+        # false green. Rare, and the conservative direction (codex #1222 r40).
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x - unexpected ] here"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x - unexpected ] here"]
+
     def test_ignores_failed_outside_summary(self):
         text = (
             "tests/a.py::test_x FAILED in call setup\n"  # pre-summary noise
