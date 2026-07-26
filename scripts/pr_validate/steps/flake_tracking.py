@@ -153,6 +153,9 @@ class FlakeTrackingStep(Step):
             f"--reruns={_RERUNS}",
             "-q",
             "--no-header",
+            # Force color off so ANSI escapes can't break outcome parsing
+            # (codex #1222 r6) — same reason as full_unit.
+            "--color=no",
             # -rA => list every test's final outcome (PASSED/FAILED/…) in
             # the short summary. We classify a flake candidate on a
             # *positive* PASSED, not on mere absence from FAILED — so a

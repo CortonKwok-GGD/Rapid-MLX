@@ -64,6 +64,11 @@ class FullUnitStep(Step):
             "--ignore=tests/test_event_loop.py",
             "-q",
             "--no-header",
+            # Force color OFF so the summary/label parsing can't be broken
+            # by ANSI escapes when color is forced via PY_COLORS=1 or an
+            # inherited --color=yes (codex #1222 r6). --color=no overrides
+            # PY_COLORS on the command line.
+            "--color=no",
             # PIN the short-summary contents: always list FAILED and ERROR
             # node ids regardless of any future default change. The
             # quarantine downgrade's soundness rests on being able to SEE

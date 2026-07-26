@@ -82,7 +82,21 @@ def _strip_message(rest: str) -> str:
     ``" - "`` inside ``[...]`` is part of the id (``test_x[a - b]``), and
     a ``]`` inside the *message* can't be mistaken for the id's bracket
     (``test_x - AssertionError: [1]`` → ``test_x``) — the earlier
-    ``rfind("]")`` approach got the latter wrong (codex #1222 r5)."""
+    ``rfind("]")`` approach got the latter wrong (codex #1222 r5).
+
+    Known limitation (codex #1222 r6): a node id whose EXPLICIT param id
+    contains an *unmatched* bracket (e.g. ``ids=["["]`` → ``test_x[[]``)
+    leaves the depth counter unbalanced, so the message is absorbed into
+    the returned id. This is irreducible in pytest's terminal output —
+    ``nodeid - message`` is genuinely ambiguous when the id may hold
+    ``" - "`` and unbalanced ``[]`` while the message may hold anything.
+    It fails SAFE: a mangled id won't match a (normal) quarantine entry,
+    so the failure BLOCKS rather than being wrongly downgraded, and a
+    mistargeted advisory re-run just yields an inconclusive result. A
+    structured report (junit-xml) was considered and rejected: its
+    ``classname``/``name`` split can't be mapped back to a pytest node id
+    unambiguously for class-based / deep-package tests, trading this rare
+    safe failure for a common-path matching risk."""
     depth = 0
     i = 0
     n = len(rest)

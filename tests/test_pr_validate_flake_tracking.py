@@ -129,6 +129,26 @@ class TestSummaryNodeIds:
         )
         assert out == ["tests/a.py::test_x[a - b]"]
 
+    def test_nested_balanced_brackets_ok(self):
+        # A param id with nested, BALANCED brackets and inner " - " is
+        # parsed whole (depth returns to 0 only at the real separator).
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x[[1, 2] - [3, 4]] - ValueError"),
+            "FAILED",
+        )
+        assert out == ["tests/a.py::test_x[[1, 2] - [3, 4]]"]
+
+    def test_unmatched_bracket_param_id_is_known_safe_limitation(self):
+        # DOCUMENTED r6 limitation: an unmatched '[' in the param id leaves
+        # the depth counter unbalanced, so the message is absorbed. Fails
+        # SAFE — the mangled id won't match a normal quarantine entry, so
+        # the failure BLOCKS. Locked here so it's an intentional trade-off,
+        # not a silent regression.
+        out = summary_node_ids(
+            _summary("FAILED tests/a.py::test_x[[] - AssertionError"), "FAILED"
+        )
+        assert out == ["tests/a.py::test_x[[] - AssertionError"]
+
     def test_ignores_failed_outside_summary(self):
         text = (
             "tests/a.py::test_x FAILED in call setup\n"  # pre-summary noise
@@ -474,10 +494,10 @@ class TestFullUnitQuarantineAware:
         assert res.status == "fail"
         assert "test_boom" in res.details
 
-    def test_gate_pins_error_reporting(self, ctx_factory, monkeypatch):
+    def test_gate_pins_error_reporting_and_no_color(self, ctx_factory, monkeypatch):
         # The quarantine downgrade's soundness rests on ERROR lines always
-        # appearing in the summary. The command must pin -rfE so it never
-        # depends on pytest's implicit default (codex #1222 r3).
+        # appearing (-rfE, codex r3) in ANSI-free text (--color=no, codex
+        # r6) — otherwise forced color would break summary parsing.
         captured = {}
 
         def fake_run(cmd, **kw):
@@ -487,6 +507,7 @@ class TestFullUnitQuarantineAware:
         monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
         FullUnitStep().run(ctx_factory())
         assert "-rfE" in captured["cmd"]
+        assert "--color=no" in captured["cmd"]
 
     def test_abnormal_exit_blocks(self, ctx_factory, monkeypatch):
         # Exit 2 (interrupted) with an otherwise-quarantined failure must
@@ -673,6 +694,23 @@ class TestFlakeTrackingContract:
         assert data["flake_candidates_new"] == ["tests/x.py::a"]
         assert data["reproduced_likely_real"] == ["tests/x.py::b"]
         assert data["inconclusive"] == ["tests/x.py::c"]
+
+    def test_rerun_forces_color_off(self, ctx_factory, monkeypatch):
+        # The advisory re-run must also disable color so ANSI escapes can't
+        # break its outcome parsing (codex #1222 r6).
+        ctx = ctx_factory()
+        self._prime(ctx, monkeypatch)
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+        captured = {}
+
+        def fake(cmd, cwd, timeout):
+            captured["cmd"] = cmd
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        FlakeTrackingStep().run(ctx)
+        assert "--color=no" in captured["cmd"]
+        assert "-rA" in captured["cmd"]
 
     def test_quarantined_reproduction_not_labeled_blocked(
         self, ctx_factory, monkeypatch
