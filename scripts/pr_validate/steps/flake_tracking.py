@@ -152,15 +152,20 @@ class FlakeTrackingStep(Step):
             failed_only = summary_node_ids(text, "FAILED")
             error_only = summary_node_ids(text, "ERROR")
         failed_set = set(failed_only)
-        # Ids that appeared ONLY as ERROR (setup / teardown / collection).
-        # full_unit blocks any run containing an ERROR UNCONDITIONALLY (it
-        # never quarantines what it couldn't even complete), so promoting one
-        # of these to quarantine.yaml would be INEFFECTIVE — a quarantine
-        # entry can't waive an ERROR run. Track their origin so a recovered
-        # ERROR flake is reported in its own "investigate, not quarantinable"
-        # bucket rather than recommended for a promotion that wouldn't work
-        # (codex #1222 r18).
-        error_origin = {i for i in error_only if i not in failed_set}
+        # Ids that logged an ERROR in ANY phase (setup / call / teardown /
+        # collection). full_unit blocks any run containing an ERROR
+        # UNCONDITIONALLY (it never quarantines what it couldn't even
+        # complete), so promoting one of these to quarantine.yaml would be
+        # INEFFECTIVE — a quarantine entry can't waive an ERROR run. This
+        # deliberately includes an id that ALSO logged a FAILED — a call
+        # failure followed by a teardown ERROR: the ERROR still makes the
+        # whole run un-waivable, so it is error-origin regardless of the
+        # FAILED (codex #1222 r19 — excluding failed_set here would mislabel
+        # such an id as a quarantinable flake). Track their origin so a
+        # recovered ERROR flake is reported in its own "investigate, not
+        # quarantinable" bucket rather than recommended for a promotion that
+        # wouldn't work.
+        error_origin = set(error_only)
         original_failed = failed_only + [i for i in error_only if i not in failed_set]
         if not original_failed:
             return StepResult(
@@ -327,7 +332,7 @@ class FlakeTrackingStep(Step):
         # gives badness the last word.
         #
         # Collection-error targets need special handling (codex #1222 r17): a
-        # collection ERROR id is a MODULE / DIR path (no "::"), and on a clean
+        # collection ERROR id is a MODULE or DIR path (no "::"), and on a clean
         # re-run its CONTAINED tests log PASSED under their own "::"-bearing
         # ids — the target id itself never logs a PASSED. So a recovered
         # collection flake would fall through to "inconclusive" forever.
@@ -335,11 +340,21 @@ class FlakeTrackingStep(Step):
         # actually PASSED — not merely on the absence of a re-error (codex
         # #1222 r18): a module that collected nothing or only skipped is
         # inconclusive, not a proven flake, same as any other id.
+        #
+        # A MODULE target (``tests/test_x.py``) contains tests at the ``::``
+        # boundary (``tests/test_x.py::test_y``); a DIRECTORY target
+        # (``tests/subdir``) contains them at the ``/`` boundary
+        # (``tests/subdir/test_x.py::test_y``) and would NEVER satisfy a
+        # ``::`` check, leaving genuine directory-collection flakes forever
+        # inconclusive (codex #1222 r19). Accept a passed descendant at
+        # EITHER boundary — both are true containment, and the required
+        # separator (``::`` or ``/``) prevents a sibling-prefix false match
+        # (``tests/foo.py`` is not a descendant of dir ``tests/foo``).
         def _recovered(i: str) -> bool:
             if i in passed:
                 return True
             return _is_collection_target(i) and any(
-                p.startswith(i + "::") for p in passed
+                p.startswith(i + "::") or p.startswith(i + "/") for p in passed
             )
 
         candidates = [i for i in sample if i not in still_bad and _recovered(i)]

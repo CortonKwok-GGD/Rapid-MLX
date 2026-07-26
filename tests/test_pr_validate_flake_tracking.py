@@ -1251,6 +1251,100 @@ class TestFlakeTrackingContract:
         assert "tests/mod.py" not in data["flake_candidates_new"]
         assert "tests/mod.py" in data["reproduced_likely_real"]
 
+    def test_call_fail_plus_teardown_error_is_not_quarantinable(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r19: an id that logs BOTH a FAILED (call) and an ERROR
+        # (teardown) in the full suite is still un-waivable — full_unit blocks
+        # ANY run containing an ERROR unconditionally. Even though it also
+        # appears under FAILED, it must be treated as error-origin and land in
+        # error_flake_candidates ("investigate"), NOT flake_candidates_new
+        # (which recommends an ineffective quarantine promotion). The r18 code
+        # excluded FAILED ids from error_origin and mislabeled this case.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text(
+            "FAILED\ttests/x.py::test_flaky\nERROR\ttests/x.py::test_flaky\n"
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/x.py::test_flaky\n"
+            )
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert data["error_flake_candidates"] == ["tests/x.py::test_flaky"]
+        assert data["flake_candidates_new"] == []
+
+    def test_recovered_directory_collection_error_is_error_candidate(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r19: a DIRECTORY collection target ("tests/subdir", no
+        # ".py") contains its tests at the "/" boundary
+        # ("tests/subdir/test_x.py::test_y"), which never satisfies a "::"
+        # check — so the r18 code left genuine directory-collection flakes
+        # permanently inconclusive. A passed descendant at the "/" boundary is
+        # positive recovery evidence; as an ERROR-origin id it is not
+        # quarantinable → error_flake_candidates.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text("ERROR\ttests/subdir\n")
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/subdir/test_x.py::test_y\n"
+            )
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/subdir" in data["error_flake_candidates"]
+        assert "tests/subdir" not in data["inconclusive"]
+        assert "tests/subdir" not in data["flake_candidates_new"]
+
+    def test_dir_collection_target_not_recovered_by_sibling_prefix(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r19 boundary guard: a passed id that merely shares a
+        # string prefix with a dir target but sits at NEITHER a "::" nor a "/"
+        # boundary ("tests/foo.py::test" vs dir "tests/foo") is NOT a
+        # descendant and must not count as recovery — the id stays
+        # inconclusive, not a false error-flake.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text("ERROR\ttests/foo\n")
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/foo.py::test_sibling\n"
+            )
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/foo" in data["inconclusive"]
+        assert "tests/foo" not in data["error_flake_candidates"]
+
     def test_reruns_error_nodeids_fallback(self, ctx_factory, monkeypatch):
         # Same NIT via the terminal-summary FALLBACK (no structured log): an
         # ERROR line in full-unit.log must be picked up for the advisory
