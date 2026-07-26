@@ -38,7 +38,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ..base import Step, StepResult
+from ..base import GATING_PYTEST_GUARD, Step, StepResult
 from ..context import Context
 
 
@@ -216,6 +216,11 @@ _PYTEST_CMD = [
     "-q",
     "--no-header",
     "--tb=no",  # we don't render tracebacks here; the artifact has them
+    # Block pytest-rerunfailures so a candidate ``@pytest.mark.flaky`` on a
+    # changed test can't rerun-and-pass a real failure past this gate — same
+    # reason as full_unit (codex #1222 r21). Used by both _run_pytest (the
+    # candidate run) and _run_on_main (the negative control).
+    *GATING_PYTEST_GUARD,
 ]
 
 

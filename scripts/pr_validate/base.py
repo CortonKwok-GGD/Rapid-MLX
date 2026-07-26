@@ -32,6 +32,23 @@ if TYPE_CHECKING:
 StepStatus = Literal["pass", "fail", "skip", "error"]
 
 
+# Args every GATING pytest subprocess must carry so a candidate can't use
+# an autoloaded plugin to fake a green run (codex #1222 r20/r21). This PR
+# installs pytest-rerunfailures (for the advisory flake_tracking step), and
+# it autoloads by entry point — so WITHOUT this block a PR could tag a
+# genuinely failing test ``@pytest.mark.flaky(reruns=N)`` and have ANY gating
+# pytest run (targeted_tests, full_unit) re-run and pass it, bypassing the
+# quarantine registry. ``-o addopts=`` / PYTEST_ADDOPTS-stripping can't stop
+# an autoloaded plugin, and disabling autoload globally would also drop
+# plugins the gates rely on (pytest-asyncio, etc.), so we block this one
+# plugin by its registered name on every gating invocation. It is a harmless
+# no-op when the plugin isn't installed. flake_tracking deliberately does NOT
+# use this — its post-gating advisory re-run WANTS reruns. A shared constant
+# (not per-step literals) so a new gating step can't silently forget it; the
+# invariant is pinned by ``test_every_gating_pytest_cmd_blocks_rerunfailures``.
+GATING_PYTEST_GUARD: tuple[str, ...] = ("-p", "no:rerunfailures")
+
+
 @dataclass
 class StepResult:
     """Per-step output the scorecard renders.

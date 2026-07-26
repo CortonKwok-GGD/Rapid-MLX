@@ -27,10 +27,11 @@ import sys
 
 from .. import _nodeid_reporter
 from .._pytest_summary import report_log_node_ids, summary_node_ids
-from ..base import Step, StepResult
+from ..base import GATING_PYTEST_GUARD, Step, StepResult
 from ..context import Context
 from ..quarantine import (
     QuarantineError,
+    effective_quarantine,
     load_quarantine_from_ref,
     partition_failures,
 )
@@ -103,22 +104,13 @@ class FullUnitStep(Step):
             # quarantined failure and have the partial, regression-hiding run
             # accepted as green (codex #1222 r13).
             "--maxfail=0",
-            # Disable pytest-rerunfailures in the GATING run (codex #1222
-            # r20). This PR adds rerunfailures to the [test] extra so the
-            # advisory flake_tracking step can use it — but it autoloads by
-            # entry point, so without this block a candidate could tag a
-            # genuinely failing test `@pytest.mark.flaky(reruns=N)` (or set
-            # reruns via a conftest) and have full_unit RE-RUN and pass it,
-            # producing exit 0 WITHOUT ever consulting the protected
-            # quarantine registry — defeating the gate and violating the
-            # "advisory never affects the verdict" contract. -o addopts= /
-            # PYTEST_ADDOPTS-strip can't stop an AUTOLOADED plugin, so block
-            # it by its registered name. Verified: `-p no:rerunfailures`
-            # makes the flaky mark inert (the test fails as it should) and is
-            # a harmless no-op when the plugin isn't installed. flake_tracking
-            # re-enables reruns only for its own advisory, post-gating re-run.
-            "-p",
-            "no:rerunfailures",
+            # Block pytest-rerunfailures in this GATING run so a candidate
+            # `@pytest.mark.flaky(reruns=N)` can't rerun-and-pass a real
+            # failure without consulting the quarantine (codex #1222 r20).
+            # Shared with targeted_tests via base.GATING_PYTEST_GUARD so no
+            # gating step can silently forget it (codex #1222 r21). See the
+            # constant's docstring for the full rationale.
+            *GATING_PYTEST_GUARD,
         ]
 
         # Emit a STRUCTURED node-id log via the _nodeid_reporter plugin so
@@ -164,26 +156,60 @@ class FullUnitStep(Step):
         summary_line = _last_summary_line(proc.stdout)
 
         if proc.returncode == 0:
-            # A clean exit is only trustworthy on a COMPLETE run: os._exit(0)
-            # can terminate pytest with code 0 after skipping the rest of the
-            # suite, hiding a regression in the un-run tail (codex #1222 r16
-            # B1). When the reporter ran, require its completion record before
-            # accepting green — an absent record / a ran<collected gap means
-            # the session was truncated. If the plugin couldn't be injected at
-            # all (no structured log), there's no signal to check, so fall
-            # back to the exit code (the degraded, non-candidate path).
-            if structured and not _session_completed(nodeid_log):
-                return StepResult(
-                    name=self.name,
-                    status="fail",
-                    summary=summary_line or "pytest exited 0 but did not complete",
-                    details="⚠️ pytest exited 0 but the session did not run to "
-                    "completion — no session-finish record (os._exit / crash / "
-                    "SIGKILL), or fewer tests ran than were collected. A later "
-                    "regression may not have run, so a truncated run is not "
-                    "accepted as green.",
-                    artifacts=[str(log_path)],
-                )
+            # A clean exit is trustworthy only on a COMPLETE run that recorded
+            # NO failures. When the reporter ran, the STRUCTURED log — not the
+            # exit code — is the source of truth (the exit code is candidate-
+            # influenceable and never trusted over the records):
+            #
+            #   * Completeness: os._exit(0) can terminate pytest with code 0
+            #     after skipping the rest of the suite, hiding a regression in
+            #     the un-run tail (codex #1222 r16 B1). Require the completion
+            #     record — an absent record / a ran<collected gap means the
+            #     session was truncated.
+            #   * No masked failures: a conftest / exit-code plugin can
+            #     normalize a FAILING run to code 0 (e.g. pytest_sessionfinish
+            #     setting session.exitstatus = 0), so a clean exit whose
+            #     structured log carries FAILED / ERROR ids is tampering or a
+            #     bug, not green (codex #1222 r21). Block and surface those
+            #     ids; grant NO quarantine downgrade — a forged clean exit is
+            #     exactly the signal we must not reward. A legitimately green
+            #     run records zero FAILED/ERROR (xfail logs as skipped;
+            #     xfail_strict xpass exits non-zero), so this never fires on a
+            #     real pass.
+            #
+            # If the plugin couldn't be injected at all (no structured log),
+            # there's no signal to check, so fall back to the exit code (the
+            # degraded, non-candidate path; the plugin is always available in
+            # production).
+            if structured:
+                if not _session_completed(nodeid_log):
+                    return StepResult(
+                        name=self.name,
+                        status="fail",
+                        summary=summary_line or "pytest exited 0 but did not complete",
+                        details="⚠️ pytest exited 0 but the session did not run to "
+                        "completion — no session-finish record (os._exit / crash / "
+                        "SIGKILL), or fewer tests ran than were collected. A later "
+                        "regression may not have run, so a truncated run is not "
+                        "accepted as green.",
+                        artifacts=[str(log_path)],
+                    )
+                clean_failed = report_log_node_ids(nodeid_log, "FAILED")
+                clean_errors = report_log_node_ids(nodeid_log, "ERROR")
+                if clean_failed or clean_errors:
+                    return StepResult(
+                        name=self.name,
+                        status="fail",
+                        summary=summary_line or "pytest exited 0 but recorded failures",
+                        details="⚠️ pytest exited 0 but the structured log recorded "
+                        f"{len(clean_failed)} FAILED / {len(clean_errors)} ERROR "
+                        "test(s) — the exit code was normalized away from the real "
+                        "outcome (a conftest / plugin can force exit 0). A forged "
+                        "clean exit is not accepted as green and grants no "
+                        "quarantine downgrade.\n\n"
+                        + _render_details(clean_failed + clean_errors, [], log_path),
+                        artifacts=[str(log_path)],
+                    )
             return StepResult(
                 name=self.name,
                 status="pass",
@@ -295,13 +321,45 @@ class FullUnitStep(Step):
             )
         else:
             try:
-                entries = load_quarantine_from_ref(ctx.base_sha, ctx.repo_root)
+                base_entries = load_quarantine_from_ref(ctx.base_sha, ctx.repo_root)
             except QuarantineError as e:
                 entries = []
                 registry_note = (
                     f"\n\n⚠️ base quarantine registry unreadable — treating "
                     f"every failure as blocking: {e}"
                 )
+            else:
+                # Intersect base with the CANDIDATE registry so a
+                # de-quarantine (removal) in THIS PR is honored: an entry the
+                # PR removed drops out of the effective set, so a still-red
+                # de-quarantined test blocks instead of riding on the stale
+                # base list (codex #1222 r21). Read the candidate from the
+                # pinned PR HEAD sha — symmetric with base, and immune to a
+                # candidate test rewriting the working-tree file at runtime.
+                # The intersection is ALWAYS ⊆ base, so a hostile candidate
+                # registry can only TIGHTEN, never waive more than the base
+                # approved (a PR that DELETES quarantine.yaml → candidate empty
+                # → nothing waived, the correct strict de-quarantine-all).
+                if not ctx.head_sha:
+                    entries = base_entries
+                    registry_note = (
+                        "\n\n⚠️ no PR head SHA — de-quarantine (removal) "
+                        "detection disabled; using the base registry as-is."
+                    )
+                else:
+                    try:
+                        cand_entries = load_quarantine_from_ref(
+                            ctx.head_sha, ctx.repo_root
+                        )
+                    except QuarantineError as e:
+                        entries = base_entries
+                        registry_note = (
+                            f"\n\n⚠️ candidate quarantine registry unreadable — "
+                            f"de-quarantine (removal) detection disabled; using "
+                            f"the base registry as-is: {e}"
+                        )
+                    else:
+                        entries = effective_quarantine(base_entries, cand_entries)
         blocking, quarantined = partition_failures(failed_ids, entries)
 
         details = _render_details(blocking, quarantined, log_path) + registry_note

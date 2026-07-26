@@ -24,10 +24,12 @@ import pytest
 
 from scripts.pr_validate import _nodeid_reporter
 from scripts.pr_validate._pytest_summary import summary_node_ids
+from scripts.pr_validate.base import GATING_PYTEST_GUARD
 from scripts.pr_validate.context import Context
 from scripts.pr_validate.quarantine import (
     QuarantineEntry,
     QuarantineError,
+    effective_quarantine,
     load_quarantine,
     load_quarantine_from_ref,
     node_id_matches,
@@ -35,6 +37,7 @@ from scripts.pr_validate.quarantine import (
 )
 from scripts.pr_validate.steps import flake_tracking as flake_mod
 from scripts.pr_validate.steps import full_unit as full_unit_mod
+from scripts.pr_validate.steps import targeted_tests as targeted_mod
 from scripts.pr_validate.steps.flake_tracking import FlakeTrackingStep, _run_session
 from scripts.pr_validate.steps.full_unit import FullUnitStep
 
@@ -349,6 +352,39 @@ class TestLoadQuarantine:
         with pytest.raises(QuarantineError, match="reason"):
             load_quarantine(p)
 
+    def test_duplicate_entry_key_rejected(self, tmp_path):
+        # codex #1222 r21: yaml.safe_load silently keeps the LAST value for a
+        # duplicated key, so a reviewer could approve `reason: real` while a
+        # duplicate `reason:` invisibly overrides it. The strict loader rejects
+        # duplicate mapping keys.
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n"
+            "  - id: a.py::t\n"
+            "    reason: real\n"
+            "    added: 2026-01-01\n"
+            "    reason: attacker-override\n"
+        )
+        with pytest.raises(QuarantineError, match="[Dd]uplicate"):
+            load_quarantine(p)
+
+    def test_duplicate_top_level_key_rejected(self, tmp_path):
+        # A duplicated top-level `tests:` key would silently replace the whole
+        # reviewed list — also rejected.
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n"
+            "  - id: a.py::t\n"
+            "    reason: r\n"
+            "    added: 2026-01-01\n"
+            "tests:\n"
+            "  - id: b.py::t\n"
+            "    reason: r\n"
+            "    added: 2026-01-01\n"
+        )
+        with pytest.raises(QuarantineError, match="[Dd]uplicate"):
+            load_quarantine(p)
+
     def test_missing_added_raises(self, tmp_path):
         p = tmp_path / "q.yaml"
         p.write_text("tests:\n  - id: a.py::t\n    reason: flaky\n")
@@ -643,6 +679,69 @@ class TestPartition:
         assert quarantined == []
 
 
+class TestEffectiveQuarantine:
+    # codex #1222 r21: effective registry = base ∩ candidate, so a
+    # de-quarantine REMOVAL is honored while a candidate can never widen or
+    # self-add coverage.
+    def _e(self, i, fam=False):
+        return QuarantineEntry(id=i, reason="r", added="2026-07-25", family=fam)
+
+    def test_kept_when_in_both(self):
+        eff = effective_quarantine([self._e("t::a")], [self._e("t::a")])
+        assert [e.id for e in eff] == ["t::a"]
+
+    def test_removal_dropped(self):
+        # base lists it, candidate removed it → not effective.
+        eff = effective_quarantine([self._e("t::a")], [])
+        assert eff == []
+
+    def test_candidate_addition_ignored(self):
+        # candidate lists it, base doesn't → not effective (no self-quarantine).
+        eff = effective_quarantine([], [self._e("t::a")])
+        assert eff == []
+
+    def test_candidate_cannot_widen_family(self):
+        # base exact, candidate widens to family → stays exact (narrower wins).
+        eff = effective_quarantine(
+            [self._e("t::a", fam=False)], [self._e("t::a", fam=True)]
+        )
+        assert eff[0].family is False
+
+    def test_candidate_may_tighten_family(self):
+        # base family, candidate tightens to exact → effective exact (allowed).
+        eff = effective_quarantine(
+            [self._e("t::a", fam=True)], [self._e("t::a", fam=False)]
+        )
+        assert eff[0].family is False
+
+    def test_family_kept_when_both_family(self):
+        eff = effective_quarantine(
+            [self._e("t::a", fam=True)], [self._e("t::a", fam=True)]
+        )
+        assert eff[0].family is True
+
+    def test_result_is_always_subset_of_base(self):
+        base = [self._e("t::a"), self._e("t::b", fam=True)]
+        # A maximally-permissive candidate cannot add ids nor widen breadth.
+        candidate = [
+            self._e("t::a", fam=True),
+            self._e("t::c"),
+            self._e("t::b", fam=True),
+        ]
+        eff = effective_quarantine(base, candidate)
+        assert {e.id for e in eff} <= {b.id for b in base}
+        by_id = {e.id: e.family for e in eff}
+        assert by_id["t::a"] is False  # base was exact → stays exact
+        assert by_id["t::b"] is True
+        assert "t::c" not in by_id  # candidate-added ignored
+
+    def test_base_audit_metadata_preserved(self):
+        base = [QuarantineEntry(id="t::a", reason="base-why", added="2026-01-01")]
+        cand = [QuarantineEntry(id="t::a", reason="cand-why", added="2026-09-09")]
+        (eff,) = effective_quarantine(base, cand)
+        assert eff.reason == "base-why" and eff.added == "2026-01-01"
+
+
 # --------------------------------------------------------------------------
 # full_unit.py — quarantine-aware verdict (subprocess mocked)
 # --------------------------------------------------------------------------
@@ -797,6 +896,108 @@ class TestFullUnitQuarantineAware:
         cmd = captured["cmd"]
         assert "no:rerunfailures" in cmd
         assert cmd[cmd.index("no:rerunfailures") - 1] == "-p"
+
+    def test_every_gating_pytest_cmd_blocks_rerunfailures(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r21: r20 disabled rerunfailures only in full_unit, but
+        # targeted_tests ALSO runs candidate tests — a `@pytest.mark.flaky` on
+        # a changed file could rerun-and-pass there. Both gating pytest
+        # invocations must carry the shared guard so no step can silently
+        # forget it. full_unit is captured live; targeted_tests exposes its
+        # base command as a module constant.
+        guard = list(GATING_PYTEST_GUARD)
+
+        def _contains_subseq(seq, sub):
+            return any(
+                seq[i : i + len(sub)] == sub for i in range(len(seq) - len(sub) + 1)
+            )
+
+        # targeted_tests base cmd
+        assert _contains_subseq(list(targeted_mod._PYTEST_CMD), guard)
+
+        # full_unit cmd (captured)
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, _passed(), "")
+
+        monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
+        FullUnitStep().run(ctx_factory())
+        assert _contains_subseq(list(captured["cmd"]), guard)
+
+    def test_exit_zero_with_recorded_failures_blocks(self, ctx_factory, monkeypatch):
+        # codex #1222 r21: a conftest / exit-code plugin can normalize a
+        # FAILING run to exit 0 (e.g. pytest_sessionfinish setting
+        # session.exitstatus = 0). The exit-0 fast path must NOT trust the
+        # code over the structured records — a clean exit whose log carries
+        # FAILED ids is tampering, not green. Block, and grant no downgrade.
+        self._patch_pytest(monkeypatch, 0, _summary("FAILED tests/a.py::test_real - X"))
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "exited 0" in res.details
+        assert "tests/a.py::test_real" in res.details
+
+    def _patch_quarantine_by_ref(self, monkeypatch, *, base, candidate):
+        # Return DIFFERENT registries for the base_sha vs head_sha reads so
+        # the base ∩ candidate intersection can be exercised (codex #1222 r21).
+        def fake(ref, *a, **k):
+            return candidate if ref == "headsha1111" else base
+
+        monkeypatch.setattr(full_unit_mod, "load_quarantine_from_ref", fake)
+
+    def test_dequarantine_removal_blocks(self, ctx_factory, monkeypatch):
+        # A PR that REMOVES an entry (base lists it, candidate doesn't) while
+        # the test still fails must BLOCK — the removal drops it from the
+        # effective (base ∩ candidate) set, so it's no longer waived.
+        self._patch_quarantine_by_ref(
+            monkeypatch,
+            base=[QuarantineEntry(id="tests/a.py::test_flaky")],
+            candidate=[],  # de-quarantined in this PR
+        )
+        self._patch_pytest(
+            monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        ctx = ctx_factory()
+        ctx.head_sha = "headsha1111"
+        res = FullUnitStep().run(ctx)
+        assert res.status == "fail"
+        assert "tests/a.py::test_flaky" in res.details
+
+    def test_quarantine_in_both_still_waived(self, ctx_factory, monkeypatch):
+        # An entry present in BOTH base and candidate is still effective → the
+        # flaky failure is waived (non-blocking), as before.
+        self._patch_quarantine_by_ref(
+            monkeypatch,
+            base=[QuarantineEntry(id="tests/a.py::test_flaky")],
+            candidate=[QuarantineEntry(id="tests/a.py::test_flaky")],
+        )
+        self._patch_pytest(
+            monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        ctx = ctx_factory()
+        ctx.head_sha = "headsha1111"
+        res = FullUnitStep().run(ctx)
+        assert res.status == "pass"
+        assert "known-flaky" in res.summary
+
+    def test_candidate_added_quarantine_ignored(self, ctx_factory, monkeypatch):
+        # A candidate ADDITION (id in candidate but not base) is ignored — a
+        # PR still can't self-quarantine its own failing test.
+        self._patch_quarantine_by_ref(
+            monkeypatch,
+            base=[],
+            candidate=[QuarantineEntry(id="tests/a.py::test_flaky")],
+        )
+        self._patch_pytest(
+            monkeypatch, 1, _summary("FAILED tests/a.py::test_flaky - X")
+        )
+        ctx = ctx_factory()
+        ctx.head_sha = "headsha1111"
+        res = FullUnitStep().run(ctx)
+        assert res.status == "fail"
+        assert "tests/a.py::test_flaky" in res.details
 
     def test_abnormal_exit_blocks(self, ctx_factory, monkeypatch):
         # Exit 2 (interrupted) with an otherwise-quarantined failure must

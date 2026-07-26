@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 
@@ -183,9 +183,42 @@ def _audit_string(
     return value.strip()
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """A ``SafeLoader`` that REJECTS duplicate mapping keys (codex #1222 r21).
+
+    PyYAML's default silently keeps the LAST value for a duplicated key, so a
+    quarantine entry like ``{id: real, id: attacker}`` — or a duplicated
+    top-level ``tests:`` / a duplicated ``family:`` — would let a reviewer
+    approve one value while another invisibly overrides it, exactly the kind
+    of audit-trail swap the mandatory ``reason``/``added`` fields exist to
+    prevent. Rejecting duplicates keeps the YAML honest BEFORE schema
+    validation runs. Raises ``ConstructorError`` (a ``yaml.YAMLError``), so the
+    caller's existing YAML-error handling wraps it as a ``QuarantineError``.
+    Checks every mapping level (root + each test dict) because the loader
+    routes every mapping node through ``construct_mapping``.
+    """
+
+    def construct_mapping(self, node, deep=False):  # noqa: ANN001, ANN201, FBT002
+        seen: set = set()
+        for key_node, _value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
     try:
-        raw = yaml.safe_load(text)
+        # Strict loader: duplicate keys raise instead of silently last-wins
+        # (codex #1222 r21). Loader is a SafeLoader subclass, so this is not
+        # an unsafe ``yaml.load``.
+        raw = yaml.load(text, Loader=_UniqueKeySafeLoader)  # noqa: S506
     except yaml.YAMLError as e:
         raise QuarantineError(f"{source}: not valid YAML: {e}") from e
 
@@ -303,6 +336,50 @@ def node_id_matches(failed_id: str, entry_id: str, *, family: bool = False) -> b
 def is_quarantined(failed_id: str, entries: Iterable[QuarantineEntry]) -> bool:
     """True iff any entry covers ``failed_id``."""
     return any(node_id_matches(failed_id, e.id, family=e.family) for e in entries)
+
+
+def effective_quarantine(
+    base_entries: Iterable[QuarantineEntry],
+    candidate_entries: Iterable[QuarantineEntry],
+) -> list[QuarantineEntry]:
+    """The registry the gate enforces: base ∩ candidate (codex #1222 r21).
+
+    The gate reads quarantine coverage from the PROTECTED base so a PR cannot
+    quarantine its OWN failing tests. But base-only silently ignored the other
+    direction — a PR that REMOVES an entry (de-quarantine): the removed test's
+    failure would still be waived off the stale base list, so a de-quarantine
+    PR could merge while that test is still red, reintroducing a regression
+    alongside the removal.
+
+    Intersecting base with the candidate registry fixes that while keeping the
+    self-quarantine protection intact:
+      * an id is effective ONLY if BOTH base and candidate list it — a
+        candidate REMOVAL drops it, so a still-red de-quarantined test blocks;
+      * a candidate ADDITION (id absent from base) is ignored — a PR still
+        cannot waive its own failure;
+      * breadth is the NARROWER of the two (``family`` only when BOTH set it),
+        so a candidate may TIGHTEN (family→exact, or drop a param) but can
+        never WIDEN (exact→family) to waive more than the base approved.
+
+    The result is ALWAYS a subset of ``base_entries`` with breadth no wider,
+    so even a maximally-hostile candidate registry can only make the gate
+    STRICTER — never waive anything the protected base didn't already approve.
+    Base audit metadata (reason / added / issue) is preserved; only ``family``
+    is narrowed.
+    """
+    # Narrowest candidate breadth per id — a duplicate candidate id can only
+    # tighten (``family`` stays True only if EVERY candidate copy is family).
+    cand_family: dict[str, bool] = {}
+    for c in candidate_entries:
+        cand_family[c.id] = (
+            c.family if c.id not in cand_family else (cand_family[c.id] and c.family)
+        )
+    effective: list[QuarantineEntry] = []
+    for b in base_entries:
+        if b.id not in cand_family:
+            continue  # removed / never listed by the candidate → drop
+        effective.append(replace(b, family=b.family and cand_family[b.id]))
+    return effective
 
 
 def partition_failures(
