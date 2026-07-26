@@ -38,6 +38,7 @@ from scripts.pr_validate.quarantine import (
     QuarantineError,
     _has_param_suffix,
     effective_quarantine,
+    is_quarantined,
     load_quarantine,
     load_quarantine_from_ref,
     node_id_matches,
@@ -810,6 +811,42 @@ class TestEffectiveQuarantine:
         cand = [QuarantineEntry(id="t::a", reason="cand-why", added="2026-09-09")]
         (eff,) = effective_quarantine(base, cand)
         assert eff.reason == "base-why" and eff.added == "2026-01-01"
+
+    def test_candidate_may_drop_a_param(self):
+        # codex #1222 r33: base ``t::a`` family (covers t::a + every t::a[...]),
+        # candidate NARROWS it to the specific param t::a[p1] (the documented
+        # "drop a param" tighten). The old exact-id-only intersection dropped
+        # the entry entirely (b.id "t::a" != cand id "t::a[p1]") → false-blocked
+        # the retained known flake. Now the covered param is materialized as an
+        # EXACT effective entry carrying the base's audit metadata.
+        base = [
+            QuarantineEntry(
+                id="t::a", reason="base-why", added="2026-01-01", family=True
+            )
+        ]
+        cand = [QuarantineEntry(id="t::a[p1]", reason="cand-why", added="2026-09-09")]
+        (eff,) = effective_quarantine(base, cand)
+        assert eff.id == "t::a[p1]"
+        assert eff.family is False  # a specific param can't carry family upward
+        assert eff.reason == "base-why" and eff.added == "2026-01-01"  # base meta
+
+    def test_dropped_param_still_subset_of_base_and_narrows(self):
+        # The materialized param quarantines ONLY t::a[p1]; a DIFFERENT param
+        # t::a[p2], still covered by the base family entry but not listed by the
+        # candidate, is NO LONGER effective → it blocks (the narrowing took
+        # effect, and the result never waives more than base approved).
+        base = [self._e("t::a", fam=True)]
+        cand = [self._e("t::a[p1]")]
+        eff = effective_quarantine(base, cand)
+        assert is_quarantined("t::a[p1]", eff) is True
+        assert is_quarantined("t::a[p2]", eff) is False
+
+    def test_candidate_param_not_covered_by_exact_base_ignored(self):
+        # base is EXACT (family=False) on t::a, so it does NOT cover t::a[p1];
+        # a candidate listing t::a[p1] is an ADDITION not backed by base →
+        # ignored (a PR still can't quarantine a new failing param on its own).
+        eff = effective_quarantine([self._e("t::a", fam=False)], [self._e("t::a[p1]")])
+        assert eff == []
 
 
 # --------------------------------------------------------------------------
@@ -2962,35 +2999,50 @@ class TestNodeidReporter:
 
         log_path = tmp_path / "nodeids.tsv"
         monkeypatch.setenv(_nodeid_reporter._ENV_LOG, str(log_path))
-        _nodeid_reporter.pytest_sessionstart(object())  # clears _completed_ids
+        # HERMETIC: this module is ALSO loaded as the live ``-p`` reporter for
+        # the CURRENT pytest run, and ``_completed_ids`` is a module global.
+        # Snapshot + restore it around the direct hook calls so this test can't
+        # corrupt the OUTER session's completion set — a bare clear() here (or a
+        # call to pytest_sessionstart, which clears it) would drop every
+        # already-completed item and make the whole run look truncated
+        # (ran < collected), failing full_unit / targeted. The env log is
+        # monkeypatched to a tmp file, so the fake SESSIONFINISH we write below
+        # lands there, never in the live log.
+        saved = set(_nodeid_reporter._completed_ids)
+        _nodeid_reporter._completed_ids.clear()
+        try:
 
-        def _rpt(when, outcome, nodeid):
-            return types.SimpleNamespace(
-                when=when,
-                outcome=outcome,
-                nodeid=nodeid,
-                failed=(outcome == "failed"),
+            def _rpt(when, outcome, nodeid):
+                return types.SimpleNamespace(
+                    when=when,
+                    outcome=outcome,
+                    nodeid=nodeid,
+                    failed=(outcome == "failed"),
+                )
+
+            nid = "tests/x.py::test_teardown_flaky"
+            # Attempt 1: setup+call pass, TEARDOWN fails → rerunfailures marks
+            # the teardown report outcome=='rerun' and retries.
+            _nodeid_reporter.pytest_runtest_logreport(_rpt("setup", "passed", nid))
+            _nodeid_reporter.pytest_runtest_logreport(_rpt("call", "passed", nid))
+            _nodeid_reporter.pytest_runtest_logreport(_rpt("teardown", "rerun", nid))
+            # Final attempt is TRUNCATED mid-flight (process killed / early-stop
+            # elsewhere): setup+call, but its terminal teardown never lands.
+            _nodeid_reporter.pytest_runtest_logreport(_rpt("setup", "passed", nid))
+            _nodeid_reporter.pytest_runtest_logreport(_rpt("call", "passed", nid))
+            # Session still finishes gracefully, having collected 1 item.
+            _nodeid_reporter.pytest_sessionfinish(
+                types.SimpleNamespace(testscollected=1), 0
             )
-
-        nid = "tests/x.py::test_teardown_flaky"
-        # Attempt 1: setup+call pass, TEARDOWN fails → rerunfailures marks the
-        # teardown report outcome=='rerun' and retries.
-        _nodeid_reporter.pytest_runtest_logreport(_rpt("setup", "passed", nid))
-        _nodeid_reporter.pytest_runtest_logreport(_rpt("call", "passed", nid))
-        _nodeid_reporter.pytest_runtest_logreport(_rpt("teardown", "rerun", nid))
-        # Final attempt is TRUNCATED mid-flight (process killed / early-stop
-        # elsewhere): it emits setup+call but its terminal teardown never lands.
-        _nodeid_reporter.pytest_runtest_logreport(_rpt("setup", "passed", nid))
-        _nodeid_reporter.pytest_runtest_logreport(_rpt("call", "passed", nid))
-        # Session still finishes gracefully, having collected 1 item.
-        _nodeid_reporter.pytest_sessionfinish(
-            types.SimpleNamespace(testscollected=1), 0
-        )
+            records = raw_session_records(log_path)
+        finally:
+            _nodeid_reporter._completed_ids.clear()
+            _nodeid_reporter._completed_ids.update(saved)
 
         # WITHOUT the guard the provisional teardown/rerun would have completed
         # the id → "1 1" (falsely complete). WITH it, the item never reached a
         # terminal teardown → ran(0) < collected(1); the gap stays visible.
-        assert raw_session_records(log_path) == ["0 1"]
+        assert records == ["0 1"]
 
     def _session_records(self, log_path):
         if not log_path.exists():
@@ -3473,15 +3525,18 @@ class TestTargetedTestsUntrustedRun:
         )
         assert reason and "exited 1" in reason
 
-    def test_reason_unaccounted_exit_one_only_when_structured(self):
-        # Without the reporter we can't prove the record set, so we don't
-        # second-guess an exit-1 (the degraded, non-candidate path).
-        assert (
-            targeted_mod._untrusted_run_reason(
-                self._run(1, failed=[], structured=False)
-            )
-            is None
+    def test_reason_unaccounted_exit_one_untrusted_in_fallback(self):
+        # codex #1222 r33 (supersedes r26's structured-only guard): even WITHOUT
+        # the reporter, an exit-1 with an empty scraped FAILED list can't be
+        # trusted. A setup/teardown ERROR exits 1 but prints ``ERROR``, not
+        # ``FAILED``, so the scrape is empty and (on the fallback path
+        # ``errored`` is the trusting default False) the run would otherwise
+        # slip through as a false green. An unaccounted exit 1 is untrusted on
+        # the fallback path too.
+        reason = targeted_mod._untrusted_run_reason(
+            self._run(1, failed=[], structured=False)
         )
+        assert reason and "exited 1" in reason
 
     def _patch_run_pytest(self, monkeypatch, ctx_factory, run):
         ctx = ctx_factory(["vllm_mlx/scheduler.py"])

@@ -402,13 +402,15 @@ def effective_quarantine(
 
     Intersecting base with the candidate registry fixes that while keeping the
     self-quarantine protection intact:
-      * an id is effective ONLY if BOTH base and candidate list it — a
-        candidate REMOVAL drops it, so a still-red de-quarantined test blocks;
-      * a candidate ADDITION (id absent from base) is ignored — a PR still
+      * an id is effective ONLY if base COVERS it — a candidate REMOVAL drops
+        it, so a still-red de-quarantined test blocks;
+      * a candidate ADDITION (id not covered by base) is ignored — a PR still
         cannot waive its own failure;
-      * breadth is the NARROWER of the two (``family`` only when BOTH set it),
-        so a candidate may TIGHTEN (family→exact, or drop a param) but can
-        never WIDEN (exact→family) to waive more than the base approved.
+      * breadth is the NARROWER of the two (``family`` survives only when the
+        ids are identical AND both set it), so a candidate may TIGHTEN
+        (family→exact on the same id, or drop a param by narrowing a base
+        ``family`` entry to a specific ``id[param]``) but can never WIDEN
+        (exact→family) to waive more than the base approved.
 
     The result is ALWAYS a subset of ``base_entries`` with breadth no wider,
     so even a maximally-hostile candidate registry can only make the gate
@@ -416,18 +418,40 @@ def effective_quarantine(
     Base audit metadata (reason / added / issue) is preserved; only ``family``
     is narrowed.
     """
-    # Narrowest candidate breadth per id — a duplicate candidate id can only
-    # tighten (``family`` stays True only if EVERY candidate copy is family).
-    cand_family: dict[str, bool] = {}
-    for c in candidate_entries:
-        cand_family[c.id] = (
-            c.family if c.id not in cand_family else (cand_family[c.id] and c.family)
-        )
+    # Iterate the CANDIDATE registry and, for each entry, find a base entry
+    # that COVERS it (``node_id_matches`` with the base entry's breadth). An
+    # entry is effective ONLY if such a covering base entry exists, so:
+    #   * a candidate ADDITION not backed by base → no cover → ignored (a PR
+    #     still can't waive its own failure);
+    #   * a candidate REMOVAL → its id is never iterated → dropped (a still-red
+    #     de-quarantined test blocks);
+    #   * a candidate that NARROWS a base ``family`` entry to a specific
+    #     parametrized id (``test_x`` family → ``test_x[p1]``, the documented
+    #     "drop a param" tighten) IS covered by the base family entry, so it is
+    #     materialized as an EXACT effective entry carrying the base's audit
+    #     metadata (codex #1222 r33) — the old exact-id-only intersection
+    #     dropped it entirely and false-blocked the retained known flake.
+    # Because every effective id is covered by base and its breadth is the
+    # narrower of candidate and cover (``family`` survives only when the ids are
+    # identical AND both set it — a more-specific id can never carry family
+    # coverage upward), the result is ALWAYS a subset of base coverage: a
+    # candidate can only TIGHTEN, never WIDEN to waive more than base approved.
+    base_list = list(base_entries)
     effective: list[QuarantineEntry] = []
-    for b in base_entries:
-        if b.id not in cand_family:
-            continue  # removed / never listed by the candidate → drop
-        effective.append(replace(b, family=b.family and cand_family[b.id]))
+    seen: set[tuple[str, bool]] = set()
+    for c in candidate_entries:
+        cover = next(
+            (b for b in base_list if node_id_matches(c.id, b.id, family=b.family)),
+            None,
+        )
+        if cover is None:
+            continue  # candidate addition not backed by base → ignore
+        family = c.family and cover.family and c.id == cover.id
+        key = (c.id, family)
+        if key in seen:
+            continue  # a duplicate candidate copy adds nothing
+        seen.add(key)
+        effective.append(replace(cover, id=c.id, family=family))
     return effective
 
 

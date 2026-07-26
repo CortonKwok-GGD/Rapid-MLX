@@ -404,7 +404,8 @@ def _untrusted_run_reason(run: _PytestRun) -> str | None:
     was suppressed (``-rN`` / a summary-blanking addopts) — the empty list is
     not trusted (codex #1222 r26). The reporter-derived checks apply only when
     ``run.structured`` (the reporter ran); otherwise the caller passed the
-    trusting defaults and only the exit-code check is meaningful."""
+    trusting defaults and only the exit-code and exit-1-accounting checks are
+    meaningful."""
     if run.returncode not in (0, 1):
         return (
             f"pytest exited {run.returncode} (not a plain pass=0 / fail=1 — a "
@@ -420,11 +421,21 @@ def _untrusted_run_reason(run: _PytestRun) -> str | None:
             "pytest did not run to completion (an early pytest.exit / crash "
             "before the session-finish record) — a truncated run is not green"
         )
-    if run.returncode == 1 and run.structured and not run.failed and not run.reran:
+    if run.returncode == 1 and not run.failed and not run.reran:
+        # Exit 1 means tests were collected and some failed/errored — there is
+        # no green exit-1. An empty failure list therefore can't be trusted:
+        # in the STRUCTURED path a suppressed summary (``-rN`` / a
+        # summary-blanking addopts) blanks the scrape while the reporter's
+        # FAILED record would normally account for it; in the NO-REPORTER
+        # FALLBACK path a setup/teardown ERROR exits 1 yet scrapes NO ``FAILED``
+        # line at all (it prints ``ERROR``), so ``run.errored`` is the trusting
+        # default False and the failure would slip through as a false green
+        # (codex #1222 r33). Either way, an unaccounted exit 1 is untrusted.
         return (
-            "pytest exited 1 but no structured FAILED/RERUN record accounts "
-            "for it — the failure summary was suppressed; an empty FAILED list "
-            "is not accepted as green"
+            "pytest exited 1 but no FAILED/RERUN record (or scraped FAILED "
+            "line) accounts for it — the failure summary was suppressed or a "
+            "setup/teardown ERROR produced no FAILED line; an empty FAILED "
+            "list is not accepted as green"
         )
     return None
 
