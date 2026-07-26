@@ -780,6 +780,24 @@ class TestFullUnitQuarantineAware:
         assert "-rfE" in captured["cmd"]
         assert "--color=no" in captured["cmd"]
 
+    def test_gate_disables_rerunfailures(self, ctx_factory, monkeypatch):
+        # codex #1222 r20: the gating run must block pytest-rerunfailures so a
+        # candidate `@pytest.mark.flaky(reruns=N)` can't re-run and pass a
+        # genuinely failing test to green without consulting the quarantine.
+        # It's an AUTOLOADED plugin, so it must be disabled by its registered
+        # name (`-p no:rerunfailures`); -o addopts= / env-strip can't stop it.
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, _passed(), "")
+
+        monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
+        FullUnitStep().run(ctx_factory())
+        cmd = captured["cmd"]
+        assert "no:rerunfailures" in cmd
+        assert cmd[cmd.index("no:rerunfailures") - 1] == "-p"
+
     def test_abnormal_exit_blocks(self, ctx_factory, monkeypatch):
         # Exit 2 (interrupted) with an otherwise-quarantined failure must
         # still block — the exit code says something the FAILED list
@@ -2089,6 +2107,46 @@ class TestNodeidReporter:
             text=True,
         )
         assert self._session_records(log_path) == ["1 3"]
+
+    def test_session_finish_mid_call_exit_records_gap(self, tmp_path):
+        # codex #1222 r20: the LAST collected item calls pytest.exit(0) from
+        # its CALL body. It emits a setup report but NO teardown, and pytest
+        # ends gracefully with exitstatus 0. Counting on SETUP would record
+        # ran == collected — a phantom "ran" for an item whose body never
+        # finished — and full_unit would accept a truncated run as green.
+        # Counting on TEARDOWN (terminal) records ran < collected, so the gap
+        # is visible and the quarantine downgrade is withheld. This is the
+        # exact hole that setup-counting missed.
+        (tmp_path / "test_midexit.py").write_text(
+            "import pytest\n"
+            "def test_a(): assert True\n"
+            "def test_b(): assert True\n"
+            "def test_c(): pytest.exit('bail', returncode=0)\n"
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root()
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-p",
+                "no:cacheprovider",
+                *plugin_args,
+                "test_midexit.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0  # pytest.exit(returncode=0) → graceful zero
+        # test_c exited mid-call → no teardown for it → ran(2) < collected(3).
+        assert self._session_records(log_path) == ["2 3"]
 
     def test_session_finish_reruns_do_not_inflate(self, tmp_path):
         # codex #1222 r16 B2: under --reruns a flaky test emits SEVERAL setup

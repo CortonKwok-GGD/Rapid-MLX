@@ -103,6 +103,22 @@ class FullUnitStep(Step):
             # quarantined failure and have the partial, regression-hiding run
             # accepted as green (codex #1222 r13).
             "--maxfail=0",
+            # Disable pytest-rerunfailures in the GATING run (codex #1222
+            # r20). This PR adds rerunfailures to the [test] extra so the
+            # advisory flake_tracking step can use it — but it autoloads by
+            # entry point, so without this block a candidate could tag a
+            # genuinely failing test `@pytest.mark.flaky(reruns=N)` (or set
+            # reruns via a conftest) and have full_unit RE-RUN and pass it,
+            # producing exit 0 WITHOUT ever consulting the protected
+            # quarantine registry — defeating the gate and violating the
+            # "advisory never affects the verdict" contract. -o addopts= /
+            # PYTEST_ADDOPTS-strip can't stop an AUTOLOADED plugin, so block
+            # it by its registered name. Verified: `-p no:rerunfailures`
+            # makes the flaky mark inert (the test fails as it should) and is
+            # a harmless no-op when the plugin isn't installed. flake_tracking
+            # re-enables reruns only for its own advisory, post-gating re-run.
+            "-p",
+            "no:rerunfailures",
         ]
 
         # Emit a STRUCTURED node-id log via the _nodeid_reporter plugin so
