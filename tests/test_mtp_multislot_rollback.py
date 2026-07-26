@@ -147,3 +147,45 @@ def test_patched_forward_output_matches_unsplit():
     assert bool(mx.array_equal(out_orig, out_pat)), "single-pass changed the output"
     assert bool(mx.array_equal(c_orig[0], c_pat[0])), "single-pass changed conv state"
     assert bool(mx.array_equal(c_orig[1], c_pat[1])), "single-pass changed ssm state"
+
+
+def test_fast_path_leaves_no_rollback_closure():
+    """A forward that requests NO snapshot (no ``snapshot_offsets``, ``S < 2``,
+    or a tensor-parallel bail) must NOT leave a ``rollback_recompute`` closure
+    on the cache.
+
+    This is the safety precondition behind the generator's ``_rollback_draft``
+    early-abort guard: if a reject — or an early abort that re-enters the
+    rewind path — tries to roll back a cache that never snapshotted, the
+    ``None`` sentinel makes ``_rollback_draft`` raise LOUDLY rather than
+    silently reuse a stale closure and mis-rewind the recurrent state. A
+    fast-path forward that silently left a stale closure behind would let an
+    abort rewind to the wrong boundary and corrupt the SSM state undetected.
+    """
+    mx.random.seed(2)
+    from mlx_lm.models.cache import ArraysCache
+
+    from vllm_mlx.spec_decode.mtp import cache_patch
+
+    cache_patch.patch_gated_delta_net_for_mtp()
+    orig_call = cache_patch._orig_gated_delta_call
+    layer, args = _build_gated_delta_net()
+
+    prefix = mx.random.normal((1, 3, args.hidden_size))
+    verify = mx.random.normal((1, 3, args.hidden_size))
+    mx.eval(prefix, verify)
+
+    c = ArraysCache(size=2)
+    orig_call(layer, prefix, mask=None, cache=c)
+    mx.eval(c[0], c[1])
+    assert c.rollback_recompute is None  # nothing stashed yet
+
+    # No snapshot requested -> the patched call takes the fast single-pass
+    # branch and must leave ``rollback_recompute`` untouched (class default).
+    assert getattr(c, "snapshot_offsets", None) is None
+    layer(verify, mask=None, cache=c)
+    mx.eval(c[0], c[1])
+    assert c.rollback_recompute is None, (
+        "a fast-path (no-snapshot) forward must not stash a rollback closure — "
+        "else an abort/reject could silently reuse a stale rewind"
+    )
