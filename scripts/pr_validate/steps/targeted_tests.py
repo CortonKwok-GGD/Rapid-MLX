@@ -42,6 +42,7 @@ from typing import NamedTuple
 from .. import _nodeid_reporter
 from .._pytest_summary import (
     last_summary_line,
+    render_fence_safe,
     report_log_node_ids,
     rerun_detected,
     session_completed,
@@ -127,13 +128,33 @@ class TargetedTestsStep(Step):
         # ``-m`` filter is gate-owned, so "deselected" can't be candidate-forged
         # (a conftest that deselects everything is the documented collection
         # residual, and full_unit still runs the whole suite regardless).
+        #
+        # BOUNDARY (codex #1222 r30): an author could newly mark a *changed*
+        # test ``slow``/``integration``/``needle`` to move it out of this fast
+        # gate — and on a LOW-blast PR (full_unit skipped) nothing else here
+        # runs it. This fast gate cannot close that: it deliberately does NOT
+        # run those markers (they need real models / a live server — the very
+        # reason they're excluded), so it can't tell a broken new slow test
+        # from a legitimately-slow passing one. And the base-comparison codex
+        # proposed is BACKWARDS — a *new* broken slow test is absent on base
+        # (so a "did base run it?" check misses exactly the dangerous case)
+        # while an existing test legitimately reclassified as slow WOULD trip
+        # it (a false block of routine maintenance). Marking a test slow is a
+        # uniform repo policy (full_unit excludes the same markers), owned by
+        # the separate slow-lane CI that runs ``-m slow`` + diff review that
+        # sees the added marker — NOT this gate. We therefore SKIP (never
+        # false-block legitimate reclassification) but make it LOUD so a
+        # reviewer is prompted to confirm the reclassification is intentional.
         if pr.returncode == 5 and "deselected" in pr.summary and not pr.errored:
             return StepResult(
                 name=self.name,
                 status="skip",
                 summary=(
-                    f"{pr.summary} (all targets deselected by the gate "
-                    f"marker filter — nothing gate-relevant to run)"
+                    f"⚠ REVIEW: {pr.summary} — every targeted test was "
+                    f"deselected by the slow/integration/needle filter. If this "
+                    f"PR newly marked a changed test with one of those markers, "
+                    f"its failures run only in the slow-lane CI, not here; "
+                    f"confirm the reclassification is intentional."
                 ),
                 artifacts=[str(pr_log)],
             )
@@ -223,12 +244,15 @@ class TargetedTestsStep(Step):
                 artifacts=[str(pr_log), str(main_log)],
             )
 
-        details = ["**Regressions (fail on PR, pass on main):**", "```"]
-        details.extend(regressions)
-        details.append("```")
+        details = [
+            "**Regressions (fail on PR, pass on main):**",
+            "```",
+            _failed_block(regressions),
+            "```",
+        ]
         if pre_existing:
             details.append("\n**Pre-existing (also fail on main, not blocking):**\n```")
-            details.extend(pre_existing)
+            details.append(_failed_block(pre_existing))
             details.append("```")
         return StepResult(
             name=self.name,
@@ -508,14 +532,28 @@ def _run_on_main(
                 cwd=str(tmp),
             )
             log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
-            # Space-preserving scrape (NOT a ``\S+`` grab): the PR side now
-            # records canonical ``report.nodeid`` via the reporter, so a
-            # pre-existing failure whose param id contains spaces —
-            # ``test_x[param with spaces]`` — must be parsed whole here too,
-            # or the truncated base id wouldn't match the PR id and the
-            # pre-existing failure would be misclassified as a PR-only
-            # regression (codex #1222 r29). The base predates the reporter,
-            # so we scrape its stdout rather than inject the plugin.
+            # Space-preserving scrape (NOT a ``\S+`` grab): the PR side records
+            # canonical ``report.nodeid`` via the reporter, so a pre-existing
+            # failure whose param id contains spaces — ``test_x[param with
+            # spaces]`` — must be parsed whole here too, or the truncated base
+            # id wouldn't match the PR id and the pre-existing failure would be
+            # misclassified as a PR-only regression (codex #1222 r29).
+            #
+            # RESIDUAL (codex #1222 r30, fail-safe): ``summary_node_ids`` is
+            # exact for normal ids but IRREDUCIBLY ambiguous for an id that
+            # itself contains ``" - "`` with unbalanced brackets
+            # (``test_x[a] - b]``) — the same wall that motivated the structured
+            # reporter plugin (see its module docstring; codex r4/r5/r6/r9/r10).
+            # The base predates that plugin, so it cannot get canonical ids here,
+            # and injecting the PR checkout's plugin would drag the PR's library
+            # onto the base run's ``PYTHONPATH`` — contaminating the negative
+            # control (base TEST files run against PR code), a worse and unsound
+            # failure than the one it fixes. So a ``" - "``-laden base id may
+            # truncate and NOT match the PR-side canonical id — which fails
+            # CLOSED: the pre-existing failure is treated as a regression and
+            # BLOCKS (never a false green — a real regression is never masked;
+            # see the fail-safe test). We accept a rare false block of a
+            # pathological pre-existing id over an unsound negative control.
             return summary_node_ids(proc.stdout, "FAILED")
         finally:
             # Remove the worktree even if pytest crashed.
@@ -532,4 +570,12 @@ def _run_on_main(
 
 
 def _failed_block(items: list[str]) -> str:
-    return "\n".join(items) if items else "(none)"
+    # Node ids reach here from the reporter's structured records (r26), which
+    # capture pytest's exact ``report.nodeid`` — and a hostile
+    # ``pytest_make_parametrize_id`` can embed a newline + triple backticks in
+    # that id (r23). Emitted verbatim into the scorecard's ``` fence, such an id
+    # could close the fence and spoof review content, the same sink r24 hardened
+    # for full_unit/flake_tracking — reachable in targeted only once it switched
+    # to canonical ids. ``render_fence_safe`` renders each id as a single quoted
+    # line so no embedded newline can begin a fence-closer (codex #1222 r30).
+    return "\n".join(render_fence_safe(i) for i in items) if items else "(none)"

@@ -2444,6 +2444,17 @@ class TestRenderFenceSafe:
         assert json.dumps(evil, ensure_ascii=False) in out
         assert "b\n```\n# spoof" not in out
 
+    def test_targeted_failed_block_is_fence_safe(self):
+        # targeted surfaces canonical reporter ids (r26), which a hostile
+        # pytest_make_parametrize_id can load with a newline + triple backticks
+        # (r23); _failed_block must render each fence-safe or the id could close
+        # the scorecard fence and spoof review content (codex #1222 r30).
+        evil = "tests/a.py::test_x[a\n```\n# spoof]"
+        block = targeted_mod._failed_block([evil])
+        assert "\n" not in block  # single physical line → no fence-closer
+        assert json.dumps(evil, ensure_ascii=False) in block
+        assert targeted_mod._failed_block([]) == "(none)"
+
 
 class TestNodeidReporter:
     """Prove the plugin round-trips real ``report.nodeid`` values through a
@@ -3452,6 +3463,13 @@ class TestTargetedTestsUntrustedRun:
         res = targeted_mod.TargetedTestsStep().run(ctx)
         assert res.status == "skip"
         assert "deselected" in res.summary
+        # The skip is LOUD (codex #1222 r30): moving a changed test into
+        # slow/integration/needle to dodge this fast gate can't be caught here
+        # (excluded tests need real models / a live server — they run only in
+        # the slow-lane CI), so the summary prompts a reviewer to confirm the
+        # reclassification is intentional rather than silently skipping.
+        assert "⚠ REVIEW" in res.summary
+        assert "reclassification" in res.summary
 
     def test_last_summary_line_recognizes_plural_errors(self):
         # pytest pluralizes the error outcome ("1 error" vs "2 errors"), so an
@@ -3555,3 +3573,43 @@ class TestTargetedTestsUntrustedRun:
         # Parity: base scrape == PR canonical id → shared failure classified
         # pre-existing, not a false regression.
         assert scraped == canonical
+
+    def test_regression_details_render_fence_safe(self, ctx_factory, monkeypatch):
+        # A hostile canonical id (newline + triple backticks) classified as a
+        # regression must be rendered fence-safe in the scorecard details, or it
+        # could close the ``` fence and spoof review content — the same sink r24
+        # hardened for the sibling steps, newly reachable in targeted once it
+        # switched to canonical reporter ids (codex #1222 r30).
+        hostile = "tests/a.py::test_x[a\n```\n## spoof]"
+        ctx = self._patch_run_pytest(
+            monkeypatch, ctx_factory, self._run(1, failed=[hostile])
+        )
+        # Empty base set → the hostile id is classified a regression and rendered.
+        monkeypatch.setattr(targeted_mod, "_run_on_main", lambda *a, **k: [])
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+        assert json.dumps(hostile, ensure_ascii=False) in res.details
+        # The raw fence-breaking sequence must NOT leak into the details block.
+        assert "a\n```\n## spoof" not in res.details
+
+    def test_ambiguous_preexisting_id_fails_closed(self, ctx_factory, monkeypatch):
+        # A pre-existing failure whose id contains `" - "` with unbalanced
+        # brackets (`test_x[a] - b]`) is IRREDUCIBLY ambiguous to the base
+        # summary scrape (the reporter wall, r4-r10) — verified: it truncates to
+        # `test_x[a]`. The base predates the reporter and can't get canonical ids
+        # without contaminating the negative control, so the truncated base id
+        # won't match the PR-side canonical id. That fails CLOSED — the
+        # pre-existing failure is treated as a regression and BLOCKS — never a
+        # false green (a real regression is never masked; codex #1222 r30).
+        canonical = "tests/a.py::test_x[a] - b]"
+        ctx = self._patch_run_pytest(
+            monkeypatch, ctx_factory, self._run(1, failed=[canonical])
+        )
+        # Base scrape truncates the ambiguous id (empirically what
+        # summary_node_ids returns for its `FAILED <id> - <msg>` line).
+        monkeypatch.setattr(
+            targeted_mod, "_run_on_main", lambda *a, **k: ["tests/a.py::test_x[a]"]
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"  # fail-safe: never a false green
+        assert json.dumps(canonical, ensure_ascii=False) in res.details
