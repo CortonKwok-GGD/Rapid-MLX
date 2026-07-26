@@ -70,19 +70,17 @@ STEPS: list[Step] = [
     TargetedTestsStep(),  # 3 — diff-aware test selection + neg control
     FullUnitStep(),  # 4 — full pytest, gated on blast radius
     StressE2EBenchStep(),  # 5 — stress + e2e + bench (multi-model × agents)
-    # 5.5 — flake classification (dev-flow ③). Mostly advisory: it reads
-    # full-unit.log and re-runs only the tests that failed (a tiny set —
-    # usually zero), classifying flake-vs-real. It has ONE gating case —
-    # a quarantined test that reproduces deterministically on every re-run
-    # blocks (a regression the quarantine would otherwise mask). Placed
-    # AFTER every GATING step (full_unit, stress/e2e) on purpose: its
-    # re-runs can leak a detached descendant on macOS (no cgroup to
-    # contain a setsid escapee — see flake_tracking.py), so no gating step
-    # runs after it and such a leak can't contaminate one (codex #1222
-    # r7). Only the advisory diff_coverage follows — and running the gate
-    # before that 3-min coverage rerun gives fail-fast a cheaper exit.
-    # Still skipped under user-opted --fail-fast if an earlier gate
-    # already blocked (a known slice-1 limitation).
+    # 5.5 — flake classification (dev-flow ③). ADVISORY — never gates
+    # (every path returns pass/skip; the verdict cannot depend on it). It
+    # reads full-unit.log and re-runs only the tests that failed (a tiny
+    # set — usually zero), classifying flake-vs-real and loudly flagging a
+    # quarantined test that reproduced (a human de-quarantines; correlated
+    # in-process re-runs can't prove determinism, so we don't auto-block —
+    # see flake_tracking.py). Placed AFTER every step that spawns model
+    # servers / GPU workers (full_unit, stress/e2e) on purpose: its re-runs
+    # can leak a detached descendant on macOS (no cgroup to contain a
+    # setsid escapee), so nothing but the advisory diff_coverage runs after
+    # it and such a leak can't contaminate a later gate (codex #1222 r7).
     FlakeTrackingStep(),
     # 6 — ADVISORY patch-coverage measurement (never gates). Last on
     # purpose: it re-runs the FULL unit suite under coverage instrumentation

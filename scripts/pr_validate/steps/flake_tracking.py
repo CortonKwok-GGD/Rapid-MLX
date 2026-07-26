@@ -1,19 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 """Flake tracking (dev-flow proposal item ③).
 
-MOSTLY advisory: it surfaces flake *candidates* for the quarantine from
-real PR runs (so a human can promote a confirmed flake instead of
-hand-hunting for it), and it never lets its own crash block a PR — the
-base ``execute`` would turn an uncaught exception into a blocking
-``error``, so ``run`` catches everything and downgrades to ``skip``.
+ADVISORY ONLY — this step never blocks a PR. It surfaces flake
+*candidates* for the quarantine from real PR runs (so a human can promote
+a confirmed flake instead of hand-hunting for it), and it loudly flags the
+inverse — a *quarantined* test that stopped flaking and now reproduces —
+for a human to DE-quarantine. It never turns either signal into an
+automated gate, and it never lets its own crash block a PR: the base
+``execute`` would turn an uncaught exception into a blocking ``error``, so
+``run`` catches everything and downgrades to ``skip``.
 
-It has exactly ONE gating case (codex #1222 r7): a test that is
-*quarantined* — so ``full_unit`` downgraded its failure to non-blocking —
-but then fails EVERY isolated re-run here is not flaky, it's a
-deterministic regression the quarantine would otherwise mask forever.
-That revokes the downgrade and BLOCKS. This closes the "quarantine
-graveyard" hole where an allowlisted test silently rots into a real
-regression. Every other outcome is advisory (``pass`` / ``skip``).
+Why not auto-gate the "quarantine graveyard" case (codex #1222 r7 → r8):
+r7 added a hard block when a quarantined test reproduced on every re-run,
+reasoning it must be a deterministic regression the allowlist masks. r8
+correctly rebutted that: back-to-back, in-process re-runs are
+*correlated*, so this cannot soundly decide the quarantine question in
+EITHER direction. A genuine environmental flake — e.g. the seeded
+GPU-contention case — fails the whole retry batch under sustained
+contention and *looks* deterministic; and an isolated re-run's order /
+fixture scope / resource state differs from the full suite, so a failure
+that is deterministic only under full-suite conditions *passes* here and
+looks flaky. Four correlated re-runs are evidence for a human, not a
+verdict — deciding it needs independent runs / history (slice 2+). So we
+report it LOUDLY (a ``pass`` whose summary leads with a REVIEW flag and a
+populated ``reproduced_quarantined`` bucket) and leave the call to the
+human, exactly like the *adding*-to-quarantine direction. This keeps the
+"never automate the quarantine decision" contract symmetric.
 
 Mechanism: after ``full_unit`` runs, read its log for the tests that
 failed, then re-run exactly those node ids in isolation with
@@ -88,12 +100,12 @@ _CLASSIFIABLE_EXITS = (0, 1)
 class FlakeTrackingStep(Step):
     name = "flake_tracking"
     description = (
-        "classify full_unit failures — blocks a deterministic quarantined regression"
+        "classify full_unit failures — advisory (flake candidates + graveyard review)"
     )
-    # A CRASH here must never sink the PR (advisory heritage): run() also
-    # catches everything itself and downgrades to skip, so this step only
-    # ever emits a *deliberate* fail (the reproduced-quarantined gate) —
-    # never an error. continue_on_error stays True as belt-and-suspenders.
+    # Advisory: this step never emits fail/error — every path returns
+    # pass/skip, and run() catches everything and downgrades to skip so a
+    # crash can't turn into a blocking error. continue_on_error stays True
+    # as belt-and-suspenders; the verdict cannot depend on this step.
     continue_on_error = True
 
     def should_run(self, ctx: Context) -> bool:
@@ -142,8 +154,8 @@ class FlakeTrackingStep(Step):
             )
 
         # Report against the ACTIVE (protected base) quarantine, same
-        # source the gate uses. Fail-safe: a broken/absent registry just
-        # means "nothing known-flaky yet" for the report.
+        # source full_unit's downgrade uses. Fail-safe: a broken/absent
+        # registry just means "nothing known-flaky yet" for the report.
         try:
             entries = load_quarantine_from_ref(
                 ctx.base_sha or ctx.base_branch, ctx.repo_root
@@ -151,7 +163,15 @@ class FlakeTrackingStep(Step):
         except QuarantineError:
             entries = []
 
-        sample = original_failed[:_MAX_RERUN_IDS]
+        # Cap the re-run set, but check EVERY quarantined failure first
+        # (codex #1222 r8 nit): a graveyard candidate — a quarantined test
+        # that may have stopped flaking — is the highest-value review
+        # signal, so it must never be dropped by the cap just because it
+        # sorted past the 25th id. The cap then applies to the advisory
+        # non-quarantined remainder.
+        q_failed = [i for i in original_failed if is_quarantined(i, entries)]
+        other_failed = [i for i in original_failed if not is_quarantined(i, entries)]
+        sample = (q_failed + other_failed)[:_MAX_RERUN_IDS]
         truncated = len(original_failed) - len(sample)
 
         rerun_log = ctx.artifact_path("flake-rerun.log")
@@ -256,27 +276,23 @@ class FlakeTrackingStep(Step):
             truncated,
         )
 
-        # The ONE gating case (codex #1222 r7): a quarantined test that
-        # full_unit downgraded to non-blocking, yet failed EVERY isolated
-        # re-run here, is not flaky — it's a deterministic regression the
-        # quarantine would otherwise mask forever ("quarantine graveyard").
-        # Revoke the downgrade and BLOCK. Everything else stays advisory.
-        if reproduced_known:
-            summary = (
-                f"{len(reproduced_known)} quarantined test(s) failed "
-                f"deterministically on {_RERUNS} re-run(s) — a regression, "
-                f"not a flake; fix the test or remove it from "
-                f"quarantine.yaml (blocking)"
-            )
-            return StepResult(
-                name=self.name,
-                status="fail",
-                summary=summary,
-                details=details,
-                artifacts=[str(cand_path), str(rerun_log)],
-            )
-
+        # The "quarantine graveyard" signal (codex #1222 r7 → r8): a
+        # quarantined test that full_unit downgraded, yet reproduced on
+        # every isolated re-run, MAY be a deterministic regression the
+        # allowlist is masking — but correlated in-process re-runs can't
+        # prove that (a sustained-contention flake looks identical). So we
+        # surface it LOUDLY for a human to de-quarantine rather than
+        # auto-blocking on weak evidence (see module docstring). The
+        # summary leads with the review flag; status stays advisory.
+        review = (
+            f"⚠ REVIEW: {len(reproduced_known)} quarantined test(s) "
+            f"reproduced on all {_RERUNS} re-run(s) — may be a regression, "
+            f"not a flake; a human should re-verify and de-quarantine. "
+            if reproduced_known
+            else ""
+        )
         summary = (
+            f"{review}"
             f"{len(new_candidates)} new flake candidate(s), "
             f"{len(reproduced_new)} reproduced, "
             f"{len(known_flakes)} known-flaky, "

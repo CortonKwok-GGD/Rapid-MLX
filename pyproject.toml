@@ -276,11 +276,13 @@ test = [
     "pytest-cov>=4.0.0",
     "diff-cover>=8.0.0,<9.0.0",
     # Powers pr_validate's ADVISORY flake_tracking step (dev-flow ③,
-    # measure-only, never gates). Used to re-run the handful of tests
-    # that failed the full suite and classify pass-after-rerun as a
-    # flake candidate. Import is OPTIONAL — the step skips cleanly when
-    # the plugin is absent, so it is NOT in the required-plugin set that
-    # test_env_check pins. See scripts/pr_validate/steps/flake_tracking.py.
+    # never gates — the verdict cannot depend on it). Used to re-run the
+    # handful of tests that failed the full suite, classify pass-after-
+    # rerun as a flake candidate, and loudly flag a quarantined test that
+    # reproduced (for a human to de-quarantine). Import is OPTIONAL — the
+    # step skips cleanly when the plugin is absent, so it is NOT in the
+    # required-plugin set that test_env_check pins. See
+    # scripts/pr_validate/steps/flake_tracking.py.
     "pytest-rerunfailures>=14.0",
 ]
 dev = [

@@ -712,14 +712,16 @@ class TestFlakeTrackingContract:
         assert "--color=no" in captured["cmd"]
         assert "-rA" in captured["cmd"]
 
-    def test_quarantined_deterministic_reproduction_blocks(
-        self, ctx_factory, monkeypatch
-    ):
-        # A quarantined test that reproduces its failure on EVERY re-run is
-        # a deterministic regression the quarantine would otherwise mask —
-        # flake_tracking must BLOCK (status=fail), revoking full_unit's
-        # downgrade (codex #1222 r7). Its id lands in `reproduced_quarantined`;
-        # a non-quarantined reproduction lands in `reproduced_likely_real`.
+    def test_quarantined_reproduction_is_advisory_loud(self, ctx_factory, monkeypatch):
+        # A quarantined test that reproduces on EVERY re-run MAY be a
+        # deterministic regression the quarantine is masking — but
+        # correlated in-process re-runs can't prove that (a sustained-
+        # contention flake looks identical), so flake_tracking does NOT
+        # auto-block (codex #1222 r8, reverting r7's hard gate). It surfaces
+        # the case LOUDLY for human de-quarantine: status stays advisory
+        # (pass), the summary leads with a REVIEW flag, and the id lands in
+        # `reproduced_quarantined`. A non-quarantined reproduction still
+        # lands in `reproduced_likely_real` (full_unit already blocked it).
         ctx = ctx_factory()
         ctx.artifact_path("full-unit.log").write_text(
             _summary(
@@ -745,8 +747,9 @@ class TestFlakeTrackingContract:
             flake_mod, "_run_session", lambda *a, **k: _completed(1, rerun)
         )
         res = FlakeTrackingStep().run(ctx)
-        assert res.status == "fail"  # deterministic quarantined regression
-        assert "deterministically" in res.summary
+        assert res.status == "pass"  # advisory — never auto-blocks (r8)
+        assert "REVIEW" in res.summary
+        assert "de-quarantine" in res.summary
         data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
         assert data["reproduced_likely_real"] == ["tests/x.py::real"]
         assert data["reproduced_quarantined"] == ["tests/x.py::flaky"]
@@ -780,6 +783,41 @@ class TestFlakeTrackingContract:
         data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
         assert data["flake_candidates_known"] == ["tests/x.py::flaky"]
         assert data["reproduced_quarantined"] == []
+
+    def test_quarantined_failure_always_sampled_past_cap(
+        self, ctx_factory, monkeypatch
+    ):
+        # A quarantined failure is the highest-value review signal, so it
+        # must be re-run even when it sorts past the _MAX_RERUN_IDS cap —
+        # otherwise the graveyard-review report silently drops it (codex
+        # #1222 r8 nit). Put the quarantined id LAST among 40 failures and
+        # assert it still reaches the re-run command.
+        ids = [f"tests/x.py::t{i}" for i in range(40)]
+        q_id = ids[-1]
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary(*[f"FAILED {i} - X" for i in ids])
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(
+            flake_mod,
+            "load_quarantine_from_ref",
+            lambda *a, **k: [QuarantineEntry(id=q_id)],
+        )
+        captured = {}
+
+        def _capture(cmd, cwd, timeout):
+            captured["cmd"] = cmd
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", _capture)
+        FlakeTrackingStep().run(ctx)
+        assert q_id in captured["cmd"]  # quarantined id survived the cap
+        # ...and the cap still bounds the total re-run set.
+        rerun_ids = [c for c in captured["cmd"] if c.startswith("tests/x.py::")]
+        assert len(rerun_ids) == flake_mod._MAX_RERUN_IDS
 
 
 class TestFlakeTrackingClassification:
@@ -928,8 +966,9 @@ class TestRunSession:
 class TestRegistration:
     def test_registered_after_all_gating_steps(self):
         # Must read full-unit.log (so after full_unit) AND run after every
-        # gating step so its possible descendant leak can't contaminate one
-        # (codex #1222 r7): after full_unit and stress_e2e_bench.
+        # step that spawns model servers / GPU workers, so its possible
+        # descendant leak on macOS can't contaminate a later gate (codex
+        # #1222 r7): after full_unit and stress_e2e_bench.
         from scripts.pr_validate.runner import STEPS
 
         names = [s.name for s in STEPS]
@@ -938,6 +977,7 @@ class TestRegistration:
         assert names.index("flake_tracking") > names.index("stress_e2e_bench")
 
     def test_crash_never_blocks(self):
-        # A crash in this step must never sink the PR (advisory heritage);
-        # its only blocking path is a deliberate reproduced-quarantined fail.
+        # Advisory: this step has NO blocking path — every outcome is
+        # pass/skip, and run() downgrades any crash to skip so an uncaught
+        # exception can't become a blocking error (codex #1222 r8).
         assert FlakeTrackingStep().continue_on_error is True
