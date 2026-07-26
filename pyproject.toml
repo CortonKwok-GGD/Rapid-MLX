@@ -283,7 +283,7 @@ test = [
     # step skips cleanly when the plugin is absent, so it is NOT in the
     # required-plugin set that test_env_check pins. See
     # scripts/pr_validate/steps/flake_tracking.py.
-    "pytest-rerunfailures>=14.0",
+    "pytest-rerunfailures>=14.0,<17",
 ]
 dev = [
     # Test runtime (must mirror the `test` extras above; a unit test in
@@ -309,7 +309,7 @@ dev = [
     "diff-cover>=8.0.0,<9.0.0",
     # Mirror of the [test] entry (dev ⊇ test). Powers the advisory
     # flake_tracking step — see scripts/pr_validate/steps/flake_tracking.py.
-    "pytest-rerunfailures>=14.0",
+    "pytest-rerunfailures>=14.0,<17",
     # Linters / typer — NOT in the `test` extras because pr_validate
     # only needs to *run* the tests; lint is its own pipeline step
     # (ruff) and runs from the host environment.

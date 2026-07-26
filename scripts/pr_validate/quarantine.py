@@ -27,6 +27,7 @@ Design notes:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -41,6 +42,22 @@ DEFAULT_QUARANTINE_PATH = Path(__file__).with_name("quarantine.yaml")
 # git revision (the protected base) rather than the candidate checkout.
 QUARANTINE_REL_PATH = "scripts/pr_validate/quarantine.yaml"
 _GIT_SHOW_TIMEOUT_S = 30
+
+# Resolve the git binary ONCE, at import time — which runs when pr_validate
+# boots, BEFORE any candidate test code executes in a later pipeline step
+# (targeted_tests / full_unit). Resolving lazily at call time would look up
+# ``git`` through the inherited PATH *after* a failing candidate test had a
+# chance to plant a fake ``git`` in a writable leading PATH directory (e.g. the
+# venv's own bin, which is writable and typically first on PATH). That fake git
+# could serve a forged base/head registry from ``git show`` and self-quarantine
+# the candidate's own failure, bypassing the ``--no-replace-objects`` pin.
+# Pinning the absolute path resolved from the operator's clean startup PATH
+# closes that PATH-injection vector (codex #1222 r35). Overwriting the resolved
+# binary *in place* would instead require write access to a system / Homebrew
+# bin and would corrupt the operator's git globally — a far louder, out-of-scope
+# attack, not a silent registry forgery. Fall back to the bare name only when
+# git is absent at import (then the FileNotFoundError path reports infra loudly).
+_GIT = shutil.which("git") or "git"
 
 
 class QuarantineError(Exception):
@@ -135,9 +152,11 @@ def load_quarantine_from_ref(
     """
     try:
         proc = subprocess.run(  # noqa: S603
+            # _GIT is the import-time-resolved absolute git path, NOT a bare
+            # "git" looked up now through a candidate-tamperable PATH (r35).
             # --no-replace-objects: ignore any refs/replace/* a candidate
             # test may have planted; read the true base blob (codex r12).
-            ["git", "--no-replace-objects", "show", f"{ref}:{rel_path}"],  # noqa: S607
+            [_GIT, "--no-replace-objects", "show", f"{ref}:{rel_path}"],  # noqa: S607
             capture_output=True,
             text=True,
             encoding="utf-8",

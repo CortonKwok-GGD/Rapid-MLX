@@ -660,6 +660,85 @@ class TestLoadQuarantineFromRef:
         (entry,) = load_quarantine_from_ref(base_sha, tmp_path)
         assert entry.id == "GOOD::t"
 
+    def test_git_binary_is_preresolved_absolute(self):
+        # codex #1222 r35 (security): the git binary is resolved ONCE at
+        # import — when pr_validate boots, before any candidate test runs —
+        # so the pinned value must be an absolute path, NOT a bare "git"
+        # re-looked-up through a candidate-tamperable PATH at call time.
+        from scripts.pr_validate import quarantine as q
+
+        assert q._GIT != "git", "git must be pre-resolved, not a bare PATH lookup"
+        assert os.path.isabs(q._GIT), f"_GIT must be absolute, got {q._GIT!r}"
+
+    def test_git_show_invokes_preresolved_binary(self, tmp_path, monkeypatch):
+        # The subprocess argv[0] must be the pinned absolute `_GIT`, never a
+        # bare "git" a candidate could shadow via a writable leading PATH dir.
+        from scripts.pr_validate import quarantine as q
+
+        captured: dict[str, object] = {}
+
+        def capture(cmd, *a, **k):
+            captured["argv0"] = cmd[0]
+            return _completed(0, "tests: []\n")
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", capture)
+        load_quarantine_from_ref("BASE", tmp_path)
+        assert captured["argv0"] == q._GIT
+        assert os.path.isabs(captured["argv0"])
+
+    def test_hostile_git_on_path_is_ignored(self, tmp_path, monkeypatch):
+        # codex #1222 r35 (security, end-to-end): a failing candidate test
+        # could drop a fake `git` into a writable leading PATH directory to
+        # make the registry loader serve a forged allowlist and self-
+        # quarantine its own failure. Because the loader invokes the git
+        # binary resolved at import (from the clean startup PATH), a hostile
+        # git planted on PATH *after* import must be ignored entirely.
+        def git(*args):
+            return subprocess.run(
+                ["git", *args],
+                cwd=tmp_path,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t",
+                    "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@t",
+                },
+            )
+
+        git("init", "-q")
+        rel = "scripts/pr_validate/quarantine.yaml"
+        (tmp_path / "scripts" / "pr_validate").mkdir(parents=True)
+        (tmp_path / rel).write_text(
+            "tests:\n  - id: GOOD::t\n    reason: r\n    added: 2026-01-01\n"
+        )
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+
+        # Plant a hostile `git` earlier on PATH: it would serve an attacker
+        # allowlist (and leave a sentinel proving it ran) if ever invoked.
+        fakebin = tmp_path / "fakebin"
+        fakebin.mkdir()
+        sentinel = tmp_path / "fakegit-was-called"
+        fake = fakebin / "git"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"touch '{sentinel}'\n"
+            "echo 'tests:'\n"
+            "echo '  - id: EVIL::t'\n"
+            "echo '    reason: r'\n"
+            "echo '    added: 2026-01-01'\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}")
+
+        (entry,) = load_quarantine_from_ref("HEAD", tmp_path)
+        assert entry.id == "GOOD::t"  # real git served the true base blob
+        assert not sentinel.exists()  # the hostile git was never invoked
+
 
 # --------------------------------------------------------------------------
 # quarantine.py — matcher / partition
