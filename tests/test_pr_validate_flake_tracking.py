@@ -951,6 +951,40 @@ class TestFullUnitQuarantineAware:
         assert res.status == "fail"
         assert "did not run to completion" in res.details
 
+    def test_clean_exit_without_completion_blocks(self, ctx_factory, monkeypatch):
+        # codex #1222 r16 B1: os._exit(0) can exit pytest with code 0 after
+        # skipping the rest of the suite, hiding a regression in the un-run
+        # tail. When the reporter ran, even a GREEN exit requires the
+        # completion record — its absence proves the run was truncated.
+        self._patch_pytest(monkeypatch, 0, _passed(), session=False)
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "did not run to completion" in res.details
+
+    def test_clean_exit_early_stop_record_blocks(self, ctx_factory, monkeypatch):
+        # Exit 0 with a ran<collected record is still a truncated run (a
+        # conftest could stop early yet exit 0) — not accepted as green.
+        self._patch_pytest(monkeypatch, 0, _passed(), ran=1, collected=50)
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "did not run to completion" in res.details
+
+    def test_clean_exit_with_completion_passes(self, ctx_factory, monkeypatch):
+        # Positive control: a green exit WITH a complete record is a clean
+        # pass (the plugin ran and the whole suite completed).
+        self._patch_pytest(monkeypatch, 0, _passed(), ran=50, collected=50)
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "pass"
+
+    def test_clean_exit_without_plugin_trusts_exit_code(self, ctx_factory, monkeypatch):
+        # If the reporter couldn't be injected at all (no structured log),
+        # there's no completeness signal to check — a green exit falls back to
+        # the exit code (the degraded, non-candidate path). structured=False
+        # simulates the plugin not writing a log.
+        self._patch_pytest(monkeypatch, 0, _passed(), structured=False)
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "pass"
+
 
 # --------------------------------------------------------------------------
 # full_unit._session_completed — structured completeness proof (codex r15)
@@ -996,6 +1030,14 @@ class TestSessionCompleted:
         # safe direction.
         assert not full_unit_mod._session_completed(
             self._tsv(tmp_path, "SESSIONFINISH\t50 50\nSESSIONFINISH\t1 50\n")
+        )
+
+    def test_identical_duplicate_records_incomplete(self, tmp_path):
+        # codex #1222 r16: two IDENTICAL completion records must NOT collapse
+        # — report_log_node_ids would dedup them by value and pass the
+        # "exactly one" check; the raw line count rejects the duplicate.
+        assert not full_unit_mod._session_completed(
+            self._tsv(tmp_path, "SESSIONFINISH\t50 50\nSESSIONFINISH\t50 50\n")
         )
 
     def test_malformed_value_is_incomplete(self, tmp_path):
@@ -1205,6 +1247,30 @@ class TestFlakeTrackingContract:
         FlakeTrackingStep().run(ctx)
         assert "--color=no" in captured["cmd"]
         assert "-rA" in captured["cmd"]
+
+    def test_rerun_neutralizes_candidate_addopts_and_env(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r16: the advisory re-run must be hermetic like full_unit
+        # — clear ini addopts (-o addopts=) and strip PYTEST_ADDOPTS so a
+        # candidate can't suppress classification via --collect-only / a
+        # marker filter / -p no:<reporter>.
+        ctx = ctx_factory()
+        self._prime(ctx, monkeypatch)
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+        monkeypatch.setenv("PYTEST_ADDOPTS", "--collect-only")
+        captured = {}
+
+        def fake(cmd, cwd, timeout, env=None):
+            captured["cmd"] = cmd
+            captured["env"] = env
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        FlakeTrackingStep().run(ctx)
+        assert "-o" in captured["cmd"]
+        assert "addopts=" in captured["cmd"]
+        assert "PYTEST_ADDOPTS" not in (captured["env"] or {})
 
     def test_quarantined_reproduction_is_advisory_loud(self, ctx_factory, monkeypatch):
         # A quarantined test that reproduces on EVERY re-run MAY be a
@@ -1731,6 +1797,46 @@ class TestNodeidReporter:
             text=True,
         )
         assert self._session_records(log_path) == ["1 3"]
+
+    def test_session_finish_reruns_do_not_inflate(self, tmp_path):
+        # codex #1222 r16 B2: under --reruns a flaky test emits SEVERAL setup
+        # reports for the same id, so a raw setup COUNT would inflate ran past
+        # collected and mask a truncated run. The record counts DISTINCT node
+        # ids, so a complete run stays ran == collected despite the retries.
+        pytest.importorskip("pytest_rerunfailures")
+        (tmp_path / "test_reruns.py").write_text(
+            "import pathlib\n"
+            "_c = pathlib.Path(__file__).with_name('.n')\n"
+            "def test_flaky():\n"
+            "    n = int(_c.read_text()) if _c.exists() else 0\n"
+            "    _c.write_text(str(n + 1))\n"
+            "    assert n >= 2\n"  # fails attempts 0,1,2 → passes on the 3rd
+            "def test_a(): assert True\n"
+            "def test_b(): assert True\n"
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root(), log_passes=True
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "--reruns=3",
+                *plugin_args,
+                "test_reruns.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # 3 distinct tests all ran to completion → ran == collected == 3,
+        # even though the flaky one produced ~5 setup reports.
+        assert self._session_records(log_path) == ["3 3"]
 
 
 # --------------------------------------------------------------------------

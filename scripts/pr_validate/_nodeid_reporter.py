@@ -25,9 +25,10 @@ back):
     logging them all would bloat the gate's artifact for no benefit.
   * session finished      → ``SESSIONFINISH\t<ran> <collected>`` — one
     line written from ``pytest_sessionfinish``, proving the run reached a
-    GRACEFUL end and recording how many items pytest attempted vs
-    collected. The quarantine downgrade in ``full_unit`` is only sound on a
-    COMPLETE run, and this record is how the consumer proves completeness
+    GRACEFUL end and recording how many DISTINCT items pytest attempted vs
+    collected (distinct so ``--reruns`` retries can't inflate the count —
+    codex #1222 r16). The quarantine downgrade in ``full_unit`` is only
+    sound on a COMPLETE run, and this record is how the consumer proves it
     STRUCTURALLY instead of scraping stdout banners (codex #1222 r15):
       - the hook fires only on a graceful end, so its ABSENCE flags a hard
         truncation — ``os._exit`` / a crash / SIGKILL kills the process
@@ -63,13 +64,15 @@ PLUGIN_MODULE = "scripts.pr_validate._nodeid_reporter"
 # run before granting any quarantine downgrade (codex #1222 r15).
 SESSION_LABEL = "SESSIONFINISH"
 
-# Count of test items pytest ATTEMPTED this session — one ``setup`` report
-# per item, regardless of pass/fail/skip. Compared against
-# ``session.testscollected`` at sessionfinish to detect an early stop
-# (``-x`` / ``--maxfail`` / ``--stepwise`` attempt fewer than they
-# collected). Reset at ``pytest_sessionstart`` so the module can be reused
-# in-process without carrying a stale count.
-_ran_tests = 0
+# The DISTINCT node ids pytest ATTEMPTED this session (each gets a ``setup``
+# report). Compared against ``session.testscollected`` at sessionfinish to
+# detect an early stop (``-x`` / ``--maxfail`` / ``--stepwise`` attempt fewer
+# items than they collected). A SET, not a counter: ``pytest-rerunfailures``
+# retries emit MULTIPLE setup reports for the SAME id, so a raw count would
+# inflate past ``collected`` and mask a truncated run — deduping by node id
+# keeps the comparison item-for-item (codex #1222 r16). Reset at
+# ``pytest_sessionstart`` so a reused module never carries a stale set.
+_attempted_ids: set[str] = set()
 
 
 def available() -> bool:
@@ -131,21 +134,21 @@ def _append(label: str, nodeid: str) -> None:
 
 
 def pytest_sessionstart(session) -> None:  # noqa: ANN001, ARG001 — pytest hook
-    # Reset the attempt counter so a reused module (e.g. a harness running
-    # multiple sessions in one process) never carries a stale count into
-    # the next session's completeness check (codex #1222 r15).
-    global _ran_tests
-    _ran_tests = 0
+    # Reset the attempt set so a reused module (e.g. a harness running
+    # multiple sessions in one process) never carries stale ids into the
+    # next session's completeness check (codex #1222 r15).
+    _attempted_ids.clear()
 
 
 def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
     if report.when == "setup":
-        # One setup report per item pytest ATTEMPTS (pass, fail, or skip) —
-        # count them so pytest_sessionfinish can prove ran == collected. A
-        # run truncated by -x / --maxfail / --stepwise attempts strictly
-        # fewer than it collected (codex #1222 r15).
-        global _ran_tests
-        _ran_tests += 1
+        # One setup report per item pytest ATTEMPTS (pass, fail, or skip);
+        # record the DISTINCT node id so pytest_sessionfinish can prove
+        # ran == collected. Deduping matters under --reruns, where the same
+        # id emits several setups (codex #1222 r16). A run truncated by -x /
+        # --maxfail / --stepwise attempts strictly fewer distinct items than
+        # it collected.
+        _attempted_ids.add(report.nodeid)
     if report.when == "call":
         if report.outcome == "failed":
             _append("FAILED", report.nodeid)
@@ -173,4 +176,4 @@ def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ANN001, ARG001 �
     # old stdout-banner heuristic (codex #1222 r15). ``_append`` no-ops
     # when no log path is configured.
     collected = int(getattr(session, "testscollected", 0) or 0)
-    _append(SESSION_LABEL, f"{_ran_tests} {collected}")
+    _append(SESSION_LABEL, f"{len(_attempted_ids)} {collected}")

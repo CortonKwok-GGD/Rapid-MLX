@@ -135,7 +135,32 @@ class FullUnitStep(Step):
         # "==== 3 failed, 2080 passed, 17 skipped in 25.56s ===="
         summary_line = _last_summary_line(proc.stdout)
 
+        # Did the STRUCTURED reporter run? Its log carries pytest's exact
+        # node ids AND the session-completion record; a downgrade / clean
+        # pass is only trusted on the exact structured source (codex r13).
+        structured = nodeid_log.exists()
+
         if proc.returncode == 0:
+            # A clean exit is only trustworthy on a COMPLETE run: os._exit(0)
+            # can terminate pytest with code 0 after skipping the rest of the
+            # suite, hiding a regression in the un-run tail (codex #1222 r16
+            # B1). When the reporter ran, require its completion record before
+            # accepting green — an absent record / a ran<collected gap means
+            # the session was truncated. If the plugin couldn't be injected at
+            # all (no structured log), there's no signal to check, so fall
+            # back to the exit code (the degraded, non-candidate path).
+            if structured and not _session_completed(nodeid_log):
+                return StepResult(
+                    name=self.name,
+                    status="fail",
+                    summary=summary_line or "pytest exited 0 but did not complete",
+                    details="⚠️ pytest exited 0 but the session did not run to "
+                    "completion — no session-finish record (os._exit / crash / "
+                    "SIGKILL), or fewer tests ran than were collected. A later "
+                    "regression may not have run, so a truncated run is not "
+                    "accepted as green.",
+                    artifacts=[str(log_path)],
+                )
             return StepResult(
                 name=self.name,
                 status="pass",
@@ -147,10 +172,8 @@ class FullUnitStep(Step):
         # ERROR entries (collection / fixture failures) separately. The
         # STRUCTURED plugin log carries pytest's exact node ids; the
         # terminal-summary fallback is ambiguous (its id/message split has
-        # documented edge cases — ``test_x[a] - b]`` …). ``structured``
-        # records which source we got: the quarantine downgrade below is
-        # only granted on the exact source (codex #1222 r13).
-        structured = nodeid_log.exists()
+        # documented edge cases — ``test_x[a] - b]`` …). The quarantine
+        # downgrade below is only granted on the exact source (codex r13).
         if structured:
             failed_ids = report_log_node_ids(nodeid_log, "FAILED")
             error_ids = report_log_node_ids(nodeid_log, "ERROR")
@@ -350,8 +373,13 @@ def _session_completed(nodeid_log) -> bool:
     Requires EXACTLY one well-formed record (``<ran> <collected>``) with a
     positive collected count and ``ran >= collected``. Anything else —
     missing, malformed, duplicated (an unexpected xdist/tamper shape) —
-    withholds the downgrade, the safe direction."""
-    records = report_log_node_ids(nodeid_log, _nodeid_reporter.SESSION_LABEL)
+    withholds the downgrade, the safe direction.
+
+    Reads RAW records, NOT via ``report_log_node_ids`` — that dedups by
+    value, so two IDENTICAL ``SESSIONFINISH\t50 50`` lines would collapse to
+    one and slip past the "exactly one" rule (codex #1222 r16). Counting raw
+    lines rejects any duplicate, identical or not."""
+    records = _raw_session_records(nodeid_log)
     if len(records) != 1:
         return False
     try:
@@ -360,6 +388,20 @@ def _session_completed(nodeid_log) -> bool:
     except (ValueError, TypeError):
         return False
     return collected > 0 and ran >= collected
+
+
+def _raw_session_records(nodeid_log) -> list[str]:
+    """Every ``SESSIONFINISH`` value line in the log, WITHOUT the node-id
+    dedup ``report_log_node_ids`` applies. Two identical completion records
+    must count as two so ``_session_completed`` can reject the duplicate
+    (codex #1222 r16)."""
+    label = _nodeid_reporter.SESSION_LABEL
+    out: list[str] = []
+    for line in nodeid_log.read_text(encoding="utf-8").splitlines():
+        rec_label, tab, value = line.partition("\t")
+        if tab and rec_label == label and value:
+            out.append(value)
+    return out
 
 
 def _last_summary_line(stdout: str) -> str:

@@ -200,6 +200,16 @@ class FlakeTrackingStep(Step):
             sys.executable,
             "-m",
             "pytest",
+            # Neutralize candidate-controlled config for the advisory re-run
+            # too (codex #1222 r16): -o addopts= drops the pytest.ini /
+            # pyproject addopts wholesale so a planted --collect-only / marker
+            # filter / -p no:<reporter> can't suppress classification, and
+            # PYTEST_ADDOPTS is stripped from the env below (it bites through
+            # -o addopts=). We re-run EXPLICIT node ids, so no marker filter
+            # needs re-applying — the sample already comes from full_unit's
+            # filtered run.
+            "-o",
+            "addopts=",
             *sample,
             f"--reruns={_RERUNS}",
             "-q",
@@ -218,12 +228,17 @@ class FlakeTrackingStep(Step):
             "-p",
             "no:cacheprovider",
         ]
+        # Strip PYTEST_ADDOPTS from the subprocess env — it bites THROUGH
+        # ``-o addopts=`` (that only overrides the ini file), so a candidate
+        # env var could still inject options into the advisory re-run
+        # otherwise (codex #1222 r16). Done regardless of plugin availability.
+        rerun_env = dict(os.environ)
+        rerun_env.pop("PYTEST_ADDOPTS", None)
         # Emit the structured node-id log (with PASSED, which the classifier
         # needs) so flake-vs-real is decided on exact ids, not summary text.
-        rerun_env = None
         if _nodeid_reporter.available():
             plugin_args, rerun_env = _nodeid_reporter.build_invocation(
-                rerun_nodeids, ctx.repo_root, log_passes=True
+                rerun_nodeids, ctx.repo_root, log_passes=True, base_env=rerun_env
             )
             cmd += plugin_args
         try:
