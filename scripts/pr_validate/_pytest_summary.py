@@ -22,6 +22,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from ._nodeid_reporter import SESSION_LABEL, unescape_field
+
 # pytest writes the section header as a full-width separator banner:
 # ``==================== short test summary info ====================``.
 # Anchoring on that *padded* banner — not a bare ``"short test summary"``
@@ -59,11 +61,66 @@ def report_log_node_ids(path: Path, *labels: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
-        label, tab, nodeid = line.partition("\t")
-        if tab and label in wanted and nodeid and nodeid not in seen:
+        label, tab, raw = line.partition("\t")
+        if not (tab and label in wanted and raw):
+            continue
+        # Decode the escaped value back to the exact node id. Dedup on the
+        # DECODED id so an escaped and a raw spelling of the same id can't
+        # both slip through (codex #1222 r23).
+        nodeid = unescape_field(raw)
+        if nodeid and nodeid not in seen:
             seen.add(nodeid)
             out.append(nodeid)
     return out
+
+
+def raw_session_records(path: Path) -> list[str]:
+    """Every ``SESSIONFINISH`` value line in the log, decoded but WITHOUT the
+    node-id dedup ``report_log_node_ids`` applies.
+
+    Two identical completion records must count as two so ``session_completed``
+    can reject the duplicate (an unexpected xdist/tamper shape) — deduping
+    would collapse them to one and slip a second record past the "exactly
+    one" rule (codex #1222 r16)."""
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        rec_label, tab, raw = line.partition("\t")
+        if tab and rec_label == SESSION_LABEL and raw:
+            out.append(unescape_field(raw))
+    return out
+
+
+def session_completed(path: Path) -> bool:
+    """True iff the reporter's session-finish record proves pytest ran the
+    WHOLE collected suite — the precondition for a sound quarantine
+    downgrade (``full_unit``) and for trusting a rerun classification
+    (``flake_tracking``) (codex #1222 r15/r23).
+
+    Both truncation modes are caught STRUCTURALLY, replacing an old
+    stdout-banner heuristic that false-positived when a test's own traceback
+    contained ``"stopping after"`` / ``"Interrupted:"`` (r15 B2):
+
+      * ABSENT record → ``pytest_sessionfinish`` never fired, i.e. the
+        process died mid-suite (``os._exit`` / crash / SIGKILL) (r15 B1).
+      * ``ran < collected`` → the session ended early (``-x`` / a hit
+        ``--maxfail`` / ``--stepwise`` / a mid-call ``pytest.exit``), so
+        tests after the stop never ran.
+
+    Requires EXACTLY one well-formed record (``<ran> <collected>``) with a
+    positive collected count and ``ran >= collected``. Anything else —
+    missing, malformed, duplicated — withholds trust, the safe direction.
+
+    Kept here (not in a step) so ``full_unit`` and ``flake_tracking`` share
+    ONE completeness definition and can't drift on it."""
+    records = raw_session_records(path)
+    if len(records) != 1:
+        return False
+    try:
+        ran_s, collected_s = records[0].split()
+        ran, collected = int(ran_s), int(collected_s)
+    except (ValueError, TypeError):
+        return False
+    return collected > 0 and ran >= collected
 
 
 def summary_node_ids(text: str, *labels: str) -> list[str]:

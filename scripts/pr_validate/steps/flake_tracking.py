@@ -77,7 +77,11 @@ import sys
 import traceback
 
 from .. import _nodeid_reporter
-from .._pytest_summary import report_log_node_ids, summary_node_ids
+from .._pytest_summary import (
+    report_log_node_ids,
+    session_completed,
+    summary_node_ids,
+)
 from ..base import Step, StepResult
 from ..context import Context
 from ..quarantine import (
@@ -327,6 +331,29 @@ class FlakeTrackingStep(Step):
         # Prefer the structured node-id log (exact ids); fall back to
         # scraping the summary only if the plugin didn't run (codex r10).
         if rerun_nodeids.exists():
+            # The structured rerun is only trustworthy on a COMPLETE session.
+            # A rerun truncated mid-flight (a sampled test's pytest.exit /
+            # os._exit, a crash) tears down fewer items than it collected, so
+            # its PASSED/FAILED set is partial: an id whose real reproduction
+            # was in the un-run tail could be mislabeled a recovered flake and
+            # wrongly recommended for a quarantine promotion. Prove
+            # completeness structurally from the reporter's session-finish
+            # record — the SAME check full_unit applies to the gate (codex
+            # #1222 r23) — and skip rather than emit a misleading advisory
+            # when the rerun didn't finish. A COMPLETE rerun holds whether the
+            # sampled tests passed (recovered) or failed (reproduced), so this
+            # doesn't suppress either legitimate signal.
+            if not session_completed(rerun_nodeids):
+                return StepResult(
+                    name=self.name,
+                    status="skip",
+                    summary=(
+                        "flake re-run did not run to completion "
+                        "(truncated session) — classification inconclusive, "
+                        "skipped"
+                    ),
+                    artifacts=[str(rerun_log)],
+                )
             passed = set(report_log_node_ids(rerun_nodeids, "PASSED"))
             still_bad = set(report_log_node_ids(rerun_nodeids, "FAILED", "ERROR"))
         else:

@@ -26,7 +26,13 @@ import subprocess
 import sys
 
 from .. import _nodeid_reporter
-from .._pytest_summary import report_log_node_ids, summary_node_ids
+from .._pytest_summary import (
+    report_log_node_ids,
+    summary_node_ids,
+)
+from .._pytest_summary import (
+    session_completed as _session_completed,
+)
 from ..base import GATING_PYTEST_GUARD, Step, StepResult
 from ..context import Context
 from ..quarantine import (
@@ -154,6 +160,28 @@ class FullUnitStep(Step):
         # Pull the summary line: pytest ends with a line like
         # "==== 3 failed, 2080 passed, 17 skipped in 25.56s ===="
         summary_line = _last_summary_line(proc.stdout)
+
+        # A GATING run must NEVER rerun a test. GATING_PYTEST_GUARD disables
+        # pytest-rerunfailures by name, but name-based ``-p no:<name>``
+        # blocking is bypassable — a conftest can re-register the plugin
+        # under an arbitrary name (codex #1222 r23). The reporter's RERUN
+        # record is name-independent: any RERUN means the plugin ran anyway
+        # and a real failure may have been retried into a pass, so the run's
+        # exit code and FAILED set are both untrustworthy. Block regardless
+        # of exit code, before either the clean-exit or the failure path
+        # can trust this run.
+        if structured and _rerun_detected(nodeid_log):
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=summary_line or "gating run reran a test",
+                details="⚠️ the gating pytest run reran at least one test — "
+                "pytest-rerunfailures was active despite the by-name block, so "
+                "it was smuggled in under a different name. A rerun can retry a "
+                "real failure into a pass, so this run is not trusted; reruns "
+                "must be OFF for the gate.",
+                artifacts=[str(log_path)],
+            )
 
         if proc.returncode == 0:
             # A clean exit is trustworthy only on a COMPLETE run that recorded
@@ -448,52 +476,18 @@ def _render_unaccounted(
     return "\n\n".join(parts)
 
 
-def _session_completed(nodeid_log) -> bool:
-    """True iff the reporter's session-finish record proves pytest ran the
-    WHOLE collected suite — the precondition for a sound quarantine
-    downgrade (codex #1222 r15).
+def _rerun_detected(nodeid_log) -> bool:
+    """True iff the reporter logged any RERUN record — pytest-rerunfailures
+    retried a test inside a GATING run that must never rerun.
 
-    Both truncation modes are caught STRUCTURALLY, replacing the old
-    stdout-banner heuristic that false-positived when a test's own traceback
-    contained ``"stopping after"`` / ``"Interrupted:"`` (r15 B2):
-
-      * ABSENT record → ``pytest_sessionfinish`` never fired, i.e. the
-        process died mid-suite (``os._exit`` / crash / SIGKILL) (r15 B1).
-      * ``ran < collected`` → the session ended early (``-x`` / a hit
-        ``--maxfail`` / ``--stepwise``), so tests after the stop never ran.
-
-    Requires EXACTLY one well-formed record (``<ran> <collected>``) with a
-    positive collected count and ``ran >= collected``. Anything else —
-    missing, malformed, duplicated (an unexpected xdist/tamper shape) —
-    withholds the downgrade, the safe direction.
-
-    Reads RAW records, NOT via ``report_log_node_ids`` — that dedups by
-    value, so two IDENTICAL ``SESSIONFINISH\t50 50`` lines would collapse to
-    one and slip past the "exactly one" rule (codex #1222 r16). Counting raw
-    lines rejects any duplicate, identical or not."""
-    records = _raw_session_records(nodeid_log)
-    if len(records) != 1:
-        return False
-    try:
-        ran_s, collected_s = records[0].split()
-        ran, collected = int(ran_s), int(collected_s)
-    except (ValueError, TypeError):
-        return False
-    return collected > 0 and ran >= collected
-
-
-def _raw_session_records(nodeid_log) -> list[str]:
-    """Every ``SESSIONFINISH`` value line in the log, WITHOUT the node-id
-    dedup ``report_log_node_ids`` applies. Two identical completion records
-    must count as two so ``_session_completed`` can reject the duplicate
-    (codex #1222 r16)."""
-    label = _nodeid_reporter.SESSION_LABEL
-    out: list[str] = []
-    for line in nodeid_log.read_text(encoding="utf-8").splitlines():
-        rec_label, tab, value = line.partition("\t")
-        if tab and rec_label == label and value:
-            out.append(value)
-    return out
+    ``GATING_PYTEST_GUARD`` blocks the plugin by its registered NAME, but a
+    hostile conftest can register the same plugin under an ARBITRARY name
+    that ``-p no:<name>`` can't reach (verified — a ``@pytest.mark.flaky``
+    marker plus ``config.pluginmanager.register(mod, name="…")`` still
+    reruns) (codex #1222 r23). The reporter records a rerun OUTCOME
+    independent of the plugin's name, so any RERUN record means a real
+    failure could have been retried into a pass — the run is not trusted."""
+    return bool(report_log_node_ids(nodeid_log, _nodeid_reporter.RERUN_LABEL))
 
 
 def _last_summary_line(stdout: str) -> str:

@@ -38,15 +38,35 @@ back):
     This replaces a fragile ``"stopping after" in stdout`` heuristic that
     false-positived when those words appeared in a test's own traceback.
 
+  * retried attempt        → ``RERUN`` — logged whenever a report's
+    ``outcome`` is ``"rerun"`` (pytest-rerunfailures). A GATING run
+    DISABLES reruns, so any RERUN record proves the plugin was smuggled
+    back in — under an ARBITRARY name that a ``-p no:<name>`` block can't
+    reach (``config.pluginmanager.register(mod, name="…")`` + a
+    ``@pytest.mark.flaky`` marker still reruns, verified). ``full_unit``
+    blocks on this record NAME-INDEPENDENTLY (codex #1222 r23), the
+    backstop the by-name guard alone can't provide.
+
 Reads/skips are never logged: a test absent from the log positively
 "didn't fail (or pass, if passes are logged)", which is exactly the
 "inconclusive, not a flake" signal ``flake_tracking`` wants.
 
+Node ids are NOT trustworthy text. A hostile
+``pytest_make_parametrize_id`` can return a param id containing a literal
+``\t`` or ``\n`` (verified — pytest preserves both), which written raw
+would forge extra log records — a fake ``SESSIONFINISH`` masking a
+truncated run, a fake ``PASSED`` turning a real failure into a
+"recovered" flake in the advisory step. So every value field is
+``escape_field``-encoded on write (backslash, tab, newline, CR) and
+``unescape_field``-decoded on read, guaranteeing one record per physical
+line with no injectable delimiter (codex #1222 r23).
+
 This is NOT tamper-proof against a hostile in-process author (an
-``atexit``/``conftest`` could rewrite the file) — nothing in-process is,
-junit-xml included; that residual is scoped in ``_pytest_summary`` and
-defended by the other gates. What it DOES buy is exact, unambiguous node
-ids for every realistic run, closing the parse-ambiguity class for good.
+``atexit``/``conftest`` could rewrite the file with real newlines) —
+nothing in-process is, junit-xml included; that residual is scoped in
+``_pytest_summary`` and defended by the other gates. What escaping buys
+is closing the node-id INJECTION channel (the realistic vector), on top
+of exact, unambiguous node ids for every realistic run.
 """
 
 from __future__ import annotations
@@ -63,6 +83,14 @@ PLUGIN_MODULE = "scripts.pr_validate._nodeid_reporter"
 # ``pytest_sessionfinish``). The consumer keys on this to prove a COMPLETE
 # run before granting any quarantine downgrade (codex #1222 r15).
 SESSION_LABEL = "SESSIONFINISH"
+
+# Label of a retried-attempt record. Logged on any ``outcome == "rerun"``
+# report so ``full_unit`` can detect a smuggled pytest-rerunfailures
+# NAME-INDEPENDENTLY: a gating run disables reruns, so any RERUN record
+# means the plugin was re-registered under a name the ``-p no:<name>``
+# block can't reach, and a rerun could retry a real failure into a pass
+# (codex #1222 r23).
+RERUN_LABEL = "RERUN"
 
 # The DISTINCT node ids pytest ran to COMPLETION this session — counted on
 # the ``teardown`` report, which fires only AFTER an item's full lifecycle
@@ -137,15 +165,62 @@ def build_invocation(
     return args, env
 
 
+def escape_field(value: str) -> str:
+    """Encode a value field so it round-trips through the one-record-per-line
+    log even when it embeds the tab/newline the format uses as delimiters.
+
+    A node id is untrusted text (a hostile ``pytest_make_parametrize_id``
+    can smuggle a literal ``\\t``/``\\n`` into it), so an unescaped write
+    would let it forge additional log records. Escape the BACKSLASH first,
+    then tab / newline / carriage-return, so the written value occupies
+    exactly one physical line with no injectable delimiter and decodes
+    back losslessly (codex #1222 r23)."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
+def unescape_field(value: str) -> str:
+    """Inverse of ``escape_field``. Scans left-to-right so an escaped
+    backslash (``\\\\``) is consumed as one literal ``\\`` and can't pair
+    with a following ``t``/``n``/``r`` to fabricate a control char
+    (``\\\\t`` decodes to ``\\`` + ``t``, NOT a tab). An unknown escape or a
+    trailing lone backslash is preserved verbatim — the writer never emits
+    those, so this only keeps a hand-written/raw record intact rather than
+    corrupting it."""
+    if "\\" not in value:
+        return value
+    out: list[str] = []
+    i = 0
+    n = len(value)
+    while i < n:
+        c = value[i]
+        if c == "\\" and i + 1 < n:
+            nxt = value[i + 1]
+            decoded = {"\\": "\\", "t": "\t", "n": "\n", "r": "\r"}.get(nxt)
+            if decoded is not None:
+                out.append(decoded)
+                i += 2
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _append(label: str, nodeid: str) -> None:
     path = os.environ.get(_ENV_LOG)
     if not path:
         return
     # Append so setup/call/teardown reports for the same test each add
     # their own line; open per-call to stay robust to xdist workers each
-    # writing (append is atomic for the small line sizes here).
+    # writing (append is atomic for the small line sizes here). The value
+    # is escape_field-encoded so an injected tab/newline in a hostile node
+    # id can't forge a second record (codex #1222 r23).
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(f"{label}\t{nodeid}\n")
+        fh.write(f"{label}\t{escape_field(nodeid)}\n")
 
 
 def pytest_sessionstart(session) -> None:  # noqa: ANN001, ARG001 — pytest hook
@@ -156,6 +231,13 @@ def pytest_sessionstart(session) -> None:  # noqa: ANN001, ARG001 — pytest hoo
 
 
 def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
+    if report.outcome == "rerun":
+        # pytest-rerunfailures emitted a retry. Record it NAME-INDEPENDENTLY
+        # (this fires on the OUTCOME, not the plugin's registered name) so
+        # full_unit can detect a plugin smuggled in under an arbitrary name
+        # that a ``-p no:<name>`` block can't reach (codex #1222 r23). A
+        # gating run disables reruns, so any RERUN record is a tamper signal.
+        _append(RERUN_LABEL, report.nodeid)
     if report.when == "teardown":
         # One teardown report per item pytest ran to COMPLETION; record the
         # DISTINCT node id so pytest_sessionfinish can prove ran == collected.

@@ -40,13 +40,30 @@ StepStatus = Literal["pass", "fail", "skip", "error"]
 # pytest run (targeted_tests, full_unit) re-run and pass it, bypassing the
 # quarantine registry. ``-o addopts=`` / PYTEST_ADDOPTS-stripping can't stop
 # an autoloaded plugin, and disabling autoload globally would also drop
-# plugins the gates rely on (pytest-asyncio, etc.), so we block this one
-# plugin by its registered name on every gating invocation. It is a harmless
-# no-op when the plugin isn't installed. flake_tracking deliberately does NOT
-# use this — its post-gating advisory re-run WANTS reruns. A shared constant
-# (not per-step literals) so a new gating step can't silently forget it; the
-# invariant is pinned by ``test_every_gating_pytest_cmd_blocks_rerunfailures``.
-GATING_PYTEST_GUARD: tuple[str, ...] = ("-p", "no:rerunfailures")
+# plugins the gates rely on (pytest-asyncio, etc.), so we block it by name on
+# every gating invocation. We block BOTH the entry-point name
+# (``rerunfailures``) and the module name (``pytest_rerunfailures``), since a
+# conftest can register it under either.
+#
+# By-name blocking is the cheap first line, NOT the whole defense: a hostile
+# conftest can register the plugin under an ARBITRARY name that no ``-p
+# no:<name>`` can enumerate (``pluginmanager.register(mod, name="x")`` + a
+# ``@pytest.mark.flaky`` marker still reruns — verified, codex #1222 r23).
+# The NAME-INDEPENDENT backstop lives in ``full_unit``: the _nodeid_reporter
+# logs a RERUN record on any rerun OUTCOME, and full_unit blocks if one
+# appears (a gating run must never rerun). This constant just stops the
+# common/accidental autoload path without paying the reporter round-trip.
+#
+# Harmless no-op when the plugin isn't installed. flake_tracking deliberately
+# does NOT use this — its post-gating advisory re-run WANTS reruns. A shared
+# constant (not per-step literals) so a new gating step can't silently forget
+# it; pinned by ``test_every_gating_pytest_cmd_blocks_rerunfailures``.
+GATING_PYTEST_GUARD: tuple[str, ...] = (
+    "-p",
+    "no:rerunfailures",
+    "-p",
+    "no:pytest_rerunfailures",
+)
 
 
 @dataclass

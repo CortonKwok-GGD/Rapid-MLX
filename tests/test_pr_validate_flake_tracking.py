@@ -23,7 +23,11 @@ import time
 import pytest
 
 from scripts.pr_validate import _nodeid_reporter
-from scripts.pr_validate._pytest_summary import summary_node_ids
+from scripts.pr_validate._pytest_summary import (
+    raw_session_records,
+    report_log_node_ids,
+    summary_node_ids,
+)
 from scripts.pr_validate.base import GATING_PYTEST_GUARD
 from scripts.pr_validate.context import Context
 from scripts.pr_validate.quarantine import (
@@ -62,6 +66,15 @@ def _passed(n: int = 10) -> str:
 
 def _completed(returncode: int, stdout: str = "", stderr: str = ""):
     return subprocess.CompletedProcess(["pytest"], returncode, stdout, stderr)
+
+
+# A complete-session marker appended to a simulated rerun node-id log.
+# flake_tracking now requires the advisory rerun to have run to completion
+# before it trusts the structured classification (codex #1222 r23); a real
+# rerun always writes this record, so the fakes must too. The exact counts
+# don't matter to session_completed beyond ``collected > 0 and ran >=
+# collected``.
+_RERUN_DONE = f"{_nodeid_reporter.SESSION_LABEL}\t99 99\n"
 
 
 @pytest.fixture
@@ -774,6 +787,7 @@ class TestFullUnitQuarantineAware:
         collected=100,
         session_value=None,
         write_log=True,
+        rerun_ids=None,
     ):
         def fake_run(cmd, **kw):
             # Simulate the reporter plugin: when structured logging is on,
@@ -791,6 +805,13 @@ class TestFullUnitQuarantineAware:
                     f"{label}\t{nid}"
                     for label in ("FAILED", "ERROR")
                     for nid in summary_node_ids(stdout, label)
+                ]
+                # A RERUN record simulates pytest-rerunfailures having run in a
+                # gating invocation despite the by-name block (smuggled in under
+                # an arbitrary name) — full_unit must block on it name-
+                # independently (codex #1222 r23).
+                rows += [
+                    f"{_nodeid_reporter.RERUN_LABEL}\t{nid}" for nid in rerun_ids or []
                 ]
                 # The reporter's session-finish completion record (codex
                 # #1222 r15). ``ran >= collected`` marks a COMPLETE run — the
@@ -910,6 +931,40 @@ class TestFullUnitQuarantineAware:
         cmd = captured["cmd"]
         assert "no:rerunfailures" in cmd
         assert cmd[cmd.index("no:rerunfailures") - 1] == "-p"
+        # codex #1222 r23: block BOTH the entry-point name (rerunfailures) and
+        # the module name (pytest_rerunfailures) — a conftest can register
+        # under either. (Name-blocking is only the cheap first line; the
+        # name-independent RERUN backstop is asserted separately.)
+        assert "no:pytest_rerunfailures" in cmd
+        assert cmd[cmd.index("no:pytest_rerunfailures") - 1] == "-p"
+
+    def test_gate_blocks_on_rerun_record(self, ctx_factory, monkeypatch):
+        # codex #1222 r23: name-based -p blocking is bypassable — a conftest
+        # can register pytest-rerunfailures under an ARBITRARY name, then a
+        # @pytest.mark.flaky marker reruns a real failure to green. The
+        # reporter logs a RERUN record on any rerun OUTCOME (name-independent),
+        # and full_unit must BLOCK on it regardless of a green exit code, since
+        # a gating run must never rerun. Here the exit code is 0 with a passing
+        # summary, yet a RERUN record is present → block.
+        self._patch_pytest(monkeypatch, 0, _passed(), rerun_ids=["tests/a.py::test_x"])
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "rerun" in res.details.lower()
+
+    def test_nonzero_exit_with_rerun_record_blocks(self, ctx_factory, monkeypatch):
+        # The RERUN backstop fires on the failure path too: a run that reran
+        # (and passed some tests) but still exited non-zero is equally
+        # untrusted — the rerun could have flipped OTHER real failures green.
+        self._patch_quarantine(monkeypatch, [])
+        self._patch_pytest(
+            monkeypatch,
+            1,
+            _summary("FAILED tests/a.py::test_real - X"),
+            rerun_ids=["tests/a.py::test_real"],
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "rerun" in res.details.lower()
 
     def test_every_gating_pytest_cmd_blocks_rerunfailures(
         self, ctx_factory, monkeypatch
@@ -1408,6 +1463,42 @@ class TestFlakeTrackingContract:
         FlakeTrackingStep().run(ctx)
         assert "tests/x.py::errored" in captured["cmd"]
 
+    def test_incomplete_rerun_session_skips_classification(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r23: the structured rerun classification is only trusted
+        # on a COMPLETE rerun. A truncated rerun (a sampled test's pytest.exit
+        # / os._exit / crash) leaves a structured log with NO session-finish
+        # record, so its PASSED/FAILED set is partial — an id whose real
+        # reproduction was in the un-run tail could be mislabeled a recovered
+        # flake and wrongly recommended for a quarantine promotion. When the
+        # rerun didn't run to completion the step SKIPS instead.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text(
+            "FAILED\ttests/x.py::test_real\n"
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            # A truncated rerun: test_real logged a PASSED before a mid-session
+            # exit, but NO session-finish record was written (deliberately no
+            # _RERUN_DONE) — the completeness proof is absent.
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/x.py::test_real\n"
+            )
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "skip"
+        assert "did not run to completion" in res.summary
+        # No misleading candidate artifact is emitted on the truncated path.
+        assert not ctx.artifact_path("flake-candidates.json").exists()
+
     def test_recovered_collection_error_is_error_candidate(
         self, ctx_factory, monkeypatch
     ):
@@ -1431,7 +1522,7 @@ class TestFlakeTrackingContract:
             # Clean re-run: the module collected fine and its test passed; the
             # module id itself logs nothing.
             ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
-                "PASSED\ttests/mod.py::test_a\n"
+                "PASSED\ttests/mod.py::test_a\n" + _RERUN_DONE
             )
             return _completed(0, "")
 
@@ -1459,8 +1550,9 @@ class TestFlakeTrackingContract:
         monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
 
         def fake(cmd, cwd, timeout, env=None):
-            # Re-run collected but nothing passed (all skipped / empty).
-            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text("")
+            # Re-run collected but nothing passed (all skipped) — the session
+            # still completed, so only the completion marker is present.
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(_RERUN_DONE)
             return _completed(0, "")
 
         monkeypatch.setattr(flake_mod, "_run_session", fake)
@@ -1489,7 +1581,7 @@ class TestFlakeTrackingContract:
 
         def fake(cmd, cwd, timeout, env=None):
             ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
-                "PASSED\ttests/x.py::test_boom\n"
+                "PASSED\ttests/x.py::test_boom\n" + _RERUN_DONE
             )
             return _completed(0, "")
 
@@ -1515,7 +1607,7 @@ class TestFlakeTrackingContract:
 
         def fake(cmd, cwd, timeout, env=None):
             ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
-                "ERROR\ttests/mod.py\n"
+                "ERROR\ttests/mod.py\n" + _RERUN_DONE
             )
             return _completed(1, "")
 
@@ -1548,7 +1640,7 @@ class TestFlakeTrackingContract:
 
         def fake(cmd, cwd, timeout, env=None):
             ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
-                "PASSED\ttests/x.py::test_flaky\n"
+                "PASSED\ttests/x.py::test_flaky\n" + _RERUN_DONE
             )
             return _completed(0, "")
 
@@ -1579,7 +1671,7 @@ class TestFlakeTrackingContract:
 
         def fake(cmd, cwd, timeout, env=None):
             ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
-                "PASSED\ttests/subdir/test_x.py::test_y\n"
+                "PASSED\ttests/subdir/test_x.py::test_y\n" + _RERUN_DONE
             )
             return _completed(0, "")
 
@@ -1609,7 +1701,7 @@ class TestFlakeTrackingContract:
 
         def fake(cmd, cwd, timeout, env=None):
             ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
-                "PASSED\ttests/foo.py::test_sibling\n"
+                "PASSED\ttests/foo.py::test_sibling\n" + _RERUN_DONE
             )
             return _completed(0, "")
 
@@ -1975,7 +2067,7 @@ class TestFlakeTrackingContract:
             # Emulate the plugin writing PASSED (call) + ERROR (teardown) for
             # the same id — the exact double-log codex flagged.
             ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
-                "PASSED\ttests/x.py::td\nERROR\ttests/x.py::td\n"
+                "PASSED\ttests/x.py::td\nERROR\ttests/x.py::td\n" + _RERUN_DONE
             )
             return _completed(1, "")
 
@@ -2096,6 +2188,57 @@ class TestFlakeTrackingClassification:
 # --------------------------------------------------------------------------
 
 
+class TestFieldEscaping:
+    """The log's value fields are escape_field-encoded so a hostile node id
+    can't inject a delimiter and forge a record (codex #1222 r23)."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "tests/a.py::test_x",
+            "tests/a.py::test_x[a - b]",
+            "evil\nSESSIONFINISH\t9999 1",
+            "tab\there",
+            "cr\rhere",
+            "back\\slash",
+            "escaped\\tnot_a_tab",
+            "trailing\\",
+            "50 50",
+            "",
+        ],
+    )
+    def test_round_trip(self, value):
+        enc = _nodeid_reporter.escape_field(value)
+        # No raw delimiter survives encoding — the whole point.
+        assert "\n" not in enc and "\t" not in enc
+        assert _nodeid_reporter.unescape_field(enc) == value
+
+    def test_escaped_backslash_does_not_pair_with_following_letter(self):
+        # "\\t" (a literal backslash then a 't') must decode to backslash+'t',
+        # NOT a tab — otherwise a node id containing a literal backslash could
+        # still smuggle a control char through.
+        assert _nodeid_reporter.unescape_field("\\\\t") == "\\t"
+        assert _nodeid_reporter.unescape_field("\\\\n") == "\\n"
+
+    def test_unknown_escape_preserved_verbatim(self):
+        # The writer never emits "\z"; a raw/hand-written record keeps it
+        # intact rather than being corrupted.
+        assert _nodeid_reporter.unescape_field("a\\zb") == "a\\zb"
+
+    def test_no_backslash_is_identity_fast_path(self):
+        assert _nodeid_reporter.unescape_field("plain::id") == "plain::id"
+
+    def test_reader_not_fooled_by_injected_value(self, tmp_path, monkeypatch):
+        # End-to-end at the writer/reader boundary: append a malicious id via
+        # the REAL _append, then prove the readers see one FAILED id and ZERO
+        # session records (the injected SESSIONFINISH is inert).
+        log = tmp_path / "n.tsv"
+        monkeypatch.setenv("PR_VALIDATE_NODEID_LOG", str(log))
+        _nodeid_reporter._append("FAILED", "evil\nSESSIONFINISH\t9999 1")
+        assert raw_session_records(log) == []
+        assert report_log_node_ids(log, "FAILED") == ["evil\nSESSIONFINISH\t9999 1"]
+
+
 class TestNodeidReporter:
     """Prove the plugin round-trips real ``report.nodeid`` values through a
     genuine pytest subprocess, using the ACTUAL repo root on PYTHONPATH so
@@ -2185,6 +2328,68 @@ class TestNodeidReporter:
         assert any("test_uncollectable.py" in nid for nid in errored)
         # A pass is never mis-logged as a failure.
         assert "test_outcomes.py::test_ok" not in failed
+
+    def test_hostile_param_id_cannot_forge_records(self, tmp_path):
+        # codex #1222 r23: a hostile pytest_make_parametrize_id can embed a
+        # literal newline/tab in report.nodeid (verified — pytest preserves
+        # both). Written RAW, the id would forge a second log record — a fake
+        # SESSIONFINISH masking a truncated run, or a fake PASSED faking a
+        # recovery. escape_field keeps the value on ONE physical line, so the
+        # reader sees the exact id and NO injected record.
+        (tmp_path / "conftest.py").write_text(
+            textwrap.dedent(
+                """
+                def pytest_make_parametrize_id(config, val, argname):
+                    return val
+                """
+            )
+        )
+        (tmp_path / "test_inj.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+
+                # A param id carrying a newline + tab that spells a forged
+                # completion record: "SESSIONFINISH\\t9999 1".
+                INJECT = "evil\\nSESSIONFINISH\\t9999 1"
+
+                @pytest.mark.parametrize("x", [INJECT])
+                def test_p(x):
+                    assert False
+                """
+            )
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root(), log_passes=True
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                *plugin_args,
+                "test_inj.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert log_path.exists()
+        # Exactly ONE genuine SESSIONFINISH record — the injected
+        # "SESSIONFINISH\t9999 1" is escaped inside the FAILED value, not a
+        # record of its own, so it can't forge a second completion line.
+        assert len(raw_session_records(log_path)) == 1
+        # The real record (1 item collected, 1 ran) proves completeness; the
+        # injection did NOT fabricate an early-stop/garbage record.
+        assert full_unit_mod._session_completed(log_path)
+        failed = report_log_node_ids(log_path, "FAILED")
+        # The malicious id round-trips EXACTLY — newline + tab intact, as ONE
+        # id, not two records.
+        assert any("evil\nSESSIONFINISH\t9999 1" in nid for nid in failed)
 
     def test_passes_not_logged_without_opt_in(self, tmp_path):
         (tmp_path / "test_only_pass.py").write_text("def test_ok():\n    assert True\n")
@@ -2292,6 +2497,7 @@ class TestNodeidReporter:
         passed = [nid for label, nid in rows if label == "PASSED"]
         failed = [nid for label, nid in rows if label == "FAILED"]
         errored = [nid for label, nid in rows if label == "ERROR"]
+        rerun = [nid for label, nid in rows if label == "RERUN"]
 
         # Eventually-passing flakes: PASSED exactly once, never FAILED/ERROR.
         for nid in (
@@ -2304,6 +2510,13 @@ class TestNodeidReporter:
         # The always-failing test: terminal FAILED exactly once, never PASSED.
         assert failed.count("test_flaky.py::test_always_bad") == 1
         assert "test_flaky.py::test_always_bad" not in passed
+        # codex #1222 r23: every retried attempt logs a RERUN record so
+        # full_unit can detect a smuggled pytest-rerunfailures NAME-
+        # INDEPENDENTLY (a gating run disables reruns, so any RERUN is a
+        # tamper signal). All three tests here are retried, so RERUN records
+        # exist — including the always-bad one that exhausts its reruns.
+        assert rerun, ("expected RERUN records under --reruns", rows)
+        assert "test_flaky.py::test_always_bad" in rerun
 
     def _session_records(self, log_path):
         if not log_path.exists():
