@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the MTP norm double-shift guard.
 
-These exercise the PURE decision helper ``_norms_already_shifted`` with
-synthetic means only -- no network, no model downloads, no MLX tensors.
+These exercise the PURE decision helpers (``_norms_already_shifted`` and
+``_classify_norm``) with synthetic means only -- no network, no model
+downloads, no MLX tensors.
 """
 
-from scripts.extract_mtp_weights import _find_backbone_reference, _norms_already_shifted
+from scripts.extract_mtp_weights import (
+    NORM_AMBIGUITY_BAND,
+    _classify_norm,
+    _norms_already_shifted,
+)
 
 
 def test_unshifted_norms_get_shifted():
@@ -17,7 +22,7 @@ def test_unshifted_norms_get_shifted():
     assert _norms_already_shifted(mtp_mean, backbone_mean) is False
 
 
-def test_already_shifted_norms_are_skipped():
+def test_already_shifted_norms_are_detected():
     # Source already stores MTP norms in MLX's shifted convention: the MTP mean
     # already matches the backbone. Guard must detect this so the shift is
     # skipped (avoids a silent w+2 double-shift).
@@ -41,24 +46,25 @@ def test_boundary_just_past_midpoint_detects_shift():
     assert _norms_already_shifted(mtp_mean, backbone_mean) is True
 
 
-def test_find_backbone_reference_matches_same_norm_type():
-    mtp_norm_keys = [
-        "mtp.pre_fc_norm_embedding.weight",  # MTP-only: no backbone counterpart
-        "mtp.layers.0.input_layernorm.weight",
-    ]
-    backbone_keys = [
-        "model.embed_tokens.weight",
-        "model.layers.0.input_layernorm.weight",
-        "model.layers.0.post_attention_layernorm.weight",
-        "model.norm.weight",
-    ]
-    mtp_key, backbone_key = _find_backbone_reference(mtp_norm_keys, backbone_keys)
-    assert mtp_key == "mtp.layers.0.input_layernorm.weight"
-    assert backbone_key == "model.layers.0.input_layernorm.weight"
+def test_classify_unshifted():
+    # Mean hugging the unshifted reference (backbone - 1.0).
+    assert _classify_norm(0.02, 1.02) == "unshifted"
 
 
-def test_find_backbone_reference_skips_mtp_keys_and_returns_none_when_absent():
-    # Only an MTP-specific norm with no backbone counterpart present.
-    mtp_norm_keys = ["mtp.pre_fc_norm_hidden.weight"]
-    backbone_keys = ["model.layers.0.input_layernorm.weight", "mtp.something.weight"]
-    assert _find_backbone_reference(mtp_norm_keys, backbone_keys) == (None, None)
+def test_classify_already_shifted():
+    # Mean hugging the shifted backbone reference.
+    assert _classify_norm(1.01, 1.02) == "already_shifted"
+
+
+def test_classify_ambiguous_far_from_both():
+    # backbone 1.0 -> references at 1.0 (shifted) and 0.0 (unshifted). A mean of
+    # 0.4 is >0.3 from both, so it must NOT be force-classified: an independently
+    # trained norm is excluded from the consensus vote rather than misread as
+    # unshifted and double-shifted (the codex-flagged failure mode).
+    assert min(abs(0.4 - 1.0), abs(0.4 - 0.0)) > NORM_AMBIGUITY_BAND
+    assert _classify_norm(0.4, 1.0) == "ambiguous"
+
+
+def test_classify_band_edge_is_not_ambiguous():
+    # Exactly at the band edge from the unshifted reference stays classified.
+    assert _classify_norm(0.0 + NORM_AMBIGUITY_BAND, 1.0) == "unshifted"
