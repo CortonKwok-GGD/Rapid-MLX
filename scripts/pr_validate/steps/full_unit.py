@@ -78,9 +78,15 @@ class FullUnitStep(Step):
             # ordinary test failures" — codex #1222 r3). -rfE is explicit
             # so the gate never depends on pytest's implicit default.
             "-rfE",
-            # Don't stop on first failure — we want the full count for
-            # the scorecard ("3 failed, 2080 passed" is more actionable
-            # than "1 failed, ???? passed").
+            # Don't stop on first failure — we want the full count for the
+            # scorecard, and, critically, the quarantine downgrade is only
+            # SOUND on a COMPLETE run. --maxfail=0 (= no limit) overrides any
+            # -x / --maxfail a candidate planted in pytest.ini / pyproject
+            # addopts (a command-line maxfail wins over the prepended ini
+            # one); without it, a candidate could stop the suite after one
+            # quarantined failure and have the partial, regression-hiding run
+            # accepted as green (codex #1222 r13).
+            "--maxfail=0",
         ]
 
         # Emit a STRUCTURED node-id log via the _nodeid_reporter plugin so
@@ -117,10 +123,14 @@ class FullUnitStep(Step):
             )
 
         # Non-zero exit. Extract the per-test node ids (FAILED) and any
-        # ERROR entries (collection / fixture failures) separately —
-        # preferring the structured plugin log (exact node ids) and
-        # falling back to terminal-summary parsing only if it didn't run.
-        if nodeid_log.exists():
+        # ERROR entries (collection / fixture failures) separately. The
+        # STRUCTURED plugin log carries pytest's exact node ids; the
+        # terminal-summary fallback is ambiguous (its id/message split has
+        # documented edge cases — ``test_x[a] - b]`` …). ``structured``
+        # records which source we got: the quarantine downgrade below is
+        # only granted on the exact source (codex #1222 r13).
+        structured = nodeid_log.exists()
+        if structured:
             failed_ids = report_log_node_ids(nodeid_log, "FAILED")
             error_ids = report_log_node_ids(nodeid_log, "ERROR")
         else:
@@ -148,6 +158,29 @@ class FullUnitStep(Step):
                 details=_render_unaccounted(
                     proc.returncode, failed_ids, error_ids, log_path
                 ),
+                artifacts=[str(log_path)],
+            )
+
+        # The quarantine downgrade turns a red green, so it MUST rest on
+        # pytest's exact ``report.nodeid`` — never the ambiguous summary
+        # fallback, whose id/message split could truncate a param id and
+        # wrongly match a family quarantine entry, waiving a real failure.
+        # If the structured log is absent — the plugin couldn't load, or a
+        # candidate disabled it via pytest plugin config — grant NO
+        # downgrade: every failure blocks, with the fallback ids used only
+        # to REPORT which tests failed. This keeps the ambiguous parser out
+        # of the gating path entirely (it survives only in the advisory
+        # flake_tracking step, where a mis-split is a mislabeled advisory,
+        # not a wrongly-waived gate) (codex #1222 r13).
+        if not structured:
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=summary_line or f"pytest exited {proc.returncode}",
+                details=_render_details(failed_ids, [], log_path)
+                + "\n\n⚠️ structured node-id log absent (reporter plugin did "
+                "not run) — quarantine downgrade withheld; every failure "
+                "blocks.",
                 artifacts=[str(log_path)],
             )
 

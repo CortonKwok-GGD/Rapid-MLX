@@ -339,6 +339,27 @@ class TestLoadQuarantine:
         with pytest.raises(QuarantineError, match="added"):
             load_quarantine(p)
 
+    def test_non_date_added_raises(self, tmp_path):
+        # `added` claims YYYY-MM-DD, so a non-empty-but-garbage value is
+        # audit rot and must be rejected, not silently accepted (codex r13).
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            'tests:\n  - id: a.py::t\n    reason: flaky\n    added: "someday"\n'
+        )
+        with pytest.raises(QuarantineError, match="added"):
+            load_quarantine(p)
+
+    def test_noncanonical_added_date_raises(self, tmp_path):
+        # A date that doesn't round-trip to canonical YYYY-MM-DD (non-padded,
+        # out-of-range month/day, a timestamp) is rejected so the audit trail
+        # stays uniform (codex #1222 r13).
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            'tests:\n  - id: a.py::t\n    reason: flaky\n    added: "2026-13-40"\n'
+        )
+        with pytest.raises(QuarantineError, match="added"):
+            load_quarantine(p)
+
 
 # --------------------------------------------------------------------------
 # quarantine.py — git base-ref loader (a PR must not quarantine itself)
@@ -547,8 +568,24 @@ class TestPartition:
 
 
 class TestFullUnitQuarantineAware:
-    def _patch_pytest(self, monkeypatch, returncode, stdout):
+    def _patch_pytest(self, monkeypatch, returncode, stdout, *, structured=True):
         def fake_run(cmd, **kw):
+            # Simulate the reporter plugin: when structured logging is on,
+            # mirror the summary's FAILED/ERROR lines into the node-id TSV
+            # the real plugin would have written. full_unit reads THAT for
+            # the quarantine decision (the summary is only a fallback, and a
+            # downgrade is withheld entirely when the structured log is
+            # absent — codex #1222 r13).
+            env = kw.get("env") or {}
+            log = env.get("PR_VALIDATE_NODEID_LOG")
+            if structured and log:
+                rows = [
+                    f"{label}\t{nid}"
+                    for label in ("FAILED", "ERROR")
+                    for nid in summary_node_ids(stdout, label)
+                ]
+                with open(log, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(rows) + ("\n" if rows else ""))
             return subprocess.CompletedProcess(cmd, returncode, stdout, "")
 
         monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
@@ -686,6 +723,42 @@ class TestFullUnitQuarantineAware:
         res = FullUnitStep().run(ctx)
         assert captured["ref"] == "deadbeefbase"
         assert res.status == "pass"  # quarantined → non-blocking
+
+    def test_downgrade_withheld_without_structured_log(self, ctx_factory, monkeypatch):
+        # codex #1222 r13: the quarantine downgrade must rest on the exact
+        # structured node ids, never the ambiguous summary fallback. If the
+        # reporter log is absent (plugin couldn't load, or a candidate
+        # disabled it via pytest config), grant NO downgrade — a would-be
+        # quarantined failure BLOCKS, so a mis-split fallback id can never
+        # wrongly match a family entry and waive a real red.
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        self._patch_pytest(
+            monkeypatch,
+            1,
+            _summary("FAILED tests/a.py::test_flaky - X"),
+            structured=False,  # plugin produced no log
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"  # withheld → blocks despite being listed
+        assert "structured node-id log absent" in res.details
+
+    def test_cmd_overrides_candidate_maxfail(self, ctx_factory, monkeypatch):
+        # codex #1222 r13: a candidate could plant -x / --maxfail=1 in
+        # pytest.ini addopts to stop the suite after one quarantined failure
+        # and have the partial, regression-hiding run accepted. full_unit
+        # appends --maxfail=0 (no limit) so a trailing command-line maxfail
+        # overrides the prepended ini one and the WHOLE suite always runs.
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, _passed(), "")
+
+        monkeypatch.setattr(full_unit_mod.subprocess, "run", fake_run)
+        FullUnitStep().run(ctx_factory())
+        assert "--maxfail=0" in captured["cmd"]
 
 
 # --------------------------------------------------------------------------

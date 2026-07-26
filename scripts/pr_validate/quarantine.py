@@ -27,6 +27,7 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -196,6 +197,24 @@ def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
             raise QuarantineError(
                 f"{source}: test #{i} ('{node_id}') needs a non-empty 'added' "
                 f"date (YYYY-MM-DD)"
+            )
+        # ``added`` claims to be a YYYY-MM-DD date, so ENFORCE it — a
+        # non-empty-but-garbage value ("soon", "2026-13-40") is exactly the
+        # silent audit rot the mandatory field exists to prevent. Require a
+        # value that round-trips through ``date.fromisoformat`` to canonical
+        # YYYY-MM-DD (rejects "2026-7-5", timestamps, and out-of-range
+        # dates) (codex #1222 r13).
+        try:
+            parsed = date.fromisoformat(added)
+        except ValueError as e:
+            raise QuarantineError(
+                f"{source}: test #{i} ('{node_id}') 'added' must be a "
+                f"YYYY-MM-DD date, got {added!r}: {e}"
+            ) from e
+        if parsed.isoformat() != added:
+            raise QuarantineError(
+                f"{source}: test #{i} ('{node_id}') 'added' must be canonical "
+                f"YYYY-MM-DD, got {added!r} (expected {parsed.isoformat()})"
             )
         entries.append(
             QuarantineEntry(
