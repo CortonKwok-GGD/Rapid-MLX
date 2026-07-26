@@ -138,6 +138,12 @@ class FlakeTrackingStep(Step):
             )
 
     def _run(self, ctx: Context) -> StepResult:
+        # Clear any stale candidate artifact from a REUSED run dir up front —
+        # ``flake-candidates.json`` is (over)written only on the success path
+        # below, so a skip/error return would otherwise leave an earlier run's
+        # candidates in place and misrepresent this run (codex #1222 r37).
+        ctx.artifact_path("flake-candidates.json").unlink(missing_ok=True)
+
         log_path = ctx.artifact_path("full-unit.log")
         if not log_path.exists():
             return StepResult(

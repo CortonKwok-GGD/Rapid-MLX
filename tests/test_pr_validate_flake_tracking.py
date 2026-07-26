@@ -424,6 +424,46 @@ class TestLoadQuarantine:
         with pytest.raises(QuarantineError, match="[Dd]uplicate"):
             load_quarantine(p)
 
+    def test_duplicate_id_across_entries_rejected(self, tmp_path):
+        # codex #1222 r37: the strict loader catches duplicate KEYS within one
+        # mapping, but two separate list entries for the SAME id (e.g. one
+        # family:true, one family:false) would make effective_quarantine's
+        # first-match selection depend on YAML list order. A repeated id is an
+        # authoring mistake — reject it so coverage is order-independent.
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n"
+            "  - id: tests/a.py::t\n"
+            "    reason: r\n"
+            "    added: 2026-01-01\n"
+            "    family: true\n"
+            "  - id: tests/a.py::t\n"
+            "    reason: r2\n"
+            "    added: 2026-01-02\n"
+        )
+        with pytest.raises(QuarantineError, match="[Dd]uplicate"):
+            load_quarantine(p)
+
+    def test_family_base_and_specific_param_not_duplicate(self, tmp_path):
+        # A family-covering base entry (``t``) and a specific parametrization
+        # (``t[p1]``) carry DIFFERENT id strings, so they are NOT duplicates —
+        # the r37 duplicate-id guard must not reject this legitimate pair.
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n"
+            "  - id: tests/a.py::t\n"
+            "    reason: r\n"
+            "    added: 2026-01-01\n"
+            "    family: true\n"
+            "  - id: tests/a.py::t[p1]\n"
+            "    reason: r2\n"
+            "    added: 2026-01-02\n"
+        )
+        assert [e.id for e in load_quarantine(p)] == [
+            "tests/a.py::t",
+            "tests/a.py::t[p1]",
+        ]
+
     def test_unhashable_mapping_key_raises_quarantine_error(self, tmp_path):
         # codex #1222 r22: a complex YAML key (`? [a, b]` → a list) is
         # unhashable, so the duplicate-key check's `key in seen` would raise a
@@ -1779,6 +1819,19 @@ class TestFlakeTrackingContract:
         ctx.artifact_path("full-unit.log").write_text(_passed())
         res = FlakeTrackingStep().run(ctx)
         assert res.status == "skip"
+
+    def test_stale_candidate_artifact_cleared_on_skip(self, ctx_factory):
+        # codex #1222 r37 NIT: flake-candidates.json is written only on the
+        # classify path, so a REUSED run dir with a stale one must be cleared
+        # up front — a skip/error return must not leave an earlier run's
+        # candidates behind to misrepresent this run.
+        ctx = ctx_factory()
+        stale = ctx.artifact_path("flake-candidates.json")
+        stale.write_text('{"flake_candidates_new": ["tests/old.py::stale"]}')
+        ctx.artifact_path("full-unit.log").write_text(_passed())  # no failures
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "skip"
+        assert not stale.exists()  # the stale candidates were removed
 
     def test_reruns_error_nodeids_structured(self, ctx_factory, monkeypatch):
         # codex #1222 r15 NIT: a setup / teardown / collection flake is

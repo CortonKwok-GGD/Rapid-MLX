@@ -440,6 +440,24 @@ def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
                 family=family,
             )
         )
+    # Reject duplicate node ids across ENTRIES — the strict loader above only
+    # catches duplicate KEYS within one mapping (codex #1222 r37). Two list
+    # entries for the same id (e.g. one ``family: true`` and one
+    # ``family: false``) would make ``effective_quarantine``'s first-match
+    # selection depend on YAML list order and could drop valid family
+    # coverage. A registry with a repeated id is always an authoring mistake;
+    # reject it loudly so coverage is order-independent and unambiguous. (A
+    # ``family``-covering entry and a specific parametrization carry DIFFERENT
+    # id strings — ``t`` vs ``t[p1]`` — so this never rejects that legit pair.)
+    seen_ids: set[str] = set()
+    for e in entries:
+        if e.id in seen_ids:
+            raise QuarantineError(
+                f"{source}: duplicate quarantine id {e.id!r} — each test may "
+                f"appear at most once (a repeated id makes effective coverage "
+                f"depend on list order)"
+            )
+        seen_ids.add(e.id)
     return entries
 
 
