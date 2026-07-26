@@ -27,8 +27,12 @@ import sys
 
 from .. import _nodeid_reporter
 from .._pytest_summary import (
+    render_fence_safe,
     report_log_node_ids,
     summary_node_ids,
+)
+from .._pytest_summary import (
+    rerun_detected as _rerun_detected,
 )
 from .._pytest_summary import (
     session_completed as _session_completed,
@@ -437,12 +441,12 @@ def _render_details(blocking: list[str], quarantined: list[str], log_path) -> st
     flagged non-blocking)."""
     parts: list[str] = []
     if blocking:
-        shown = blocking[:30]
+        shown = [render_fence_safe(i) for i in blocking[:30]]
         parts.append("**Failed tests (blocking):**\n```\n" + "\n".join(shown) + "\n```")
         if len(blocking) > 30:
             parts.append(f"…and {len(blocking) - 30} more — see {log_path}")
     if quarantined:
-        shown = quarantined[:30]
+        shown = [render_fence_safe(i) for i in quarantined[:30]]
         parts.append(
             "**Quarantined flakes that failed (non-blocking):**\n```\n"
             + "\n".join(shown)
@@ -468,26 +472,14 @@ def _render_unaccounted(
         f"{_PYTEST_TESTS_FAILED} with no errors)."
     ]
     if failed_ids:
-        parts.append("**FAILED:**\n```\n" + "\n".join(failed_ids[:30]) + "\n```")
+        shown = [render_fence_safe(i) for i in failed_ids[:30]]
+        parts.append("**FAILED:**\n```\n" + "\n".join(shown) + "\n```")
     if error_ids:
-        parts.append("**ERROR:**\n```\n" + "\n".join(error_ids[:30]) + "\n```")
+        shown = [render_fence_safe(i) for i in error_ids[:30]]
+        parts.append("**ERROR:**\n```\n" + "\n".join(shown) + "\n```")
     if not failed_ids and not error_ids:
         parts.append(f"(no parseable FAILED/ERROR node ids — see {log_path})")
     return "\n\n".join(parts)
-
-
-def _rerun_detected(nodeid_log) -> bool:
-    """True iff the reporter logged any RERUN record — pytest-rerunfailures
-    retried a test inside a GATING run that must never rerun.
-
-    ``GATING_PYTEST_GUARD`` blocks the plugin by its registered NAME, but a
-    hostile conftest can register the same plugin under an ARBITRARY name
-    that ``-p no:<name>`` can't reach (verified — a ``@pytest.mark.flaky``
-    marker plus ``config.pluginmanager.register(mod, name="…")`` still
-    reruns) (codex #1222 r23). The reporter records a rerun OUTCOME
-    independent of the plugin's name, so any RERUN record means a real
-    failure could have been retried into a pass — the run is not trusted."""
-    return bool(report_log_node_ids(nodeid_log, _nodeid_reporter.RERUN_LABEL))
 
 
 def _last_summary_line(stdout: str) -> str:

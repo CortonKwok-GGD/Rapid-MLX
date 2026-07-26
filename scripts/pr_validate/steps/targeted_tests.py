@@ -31,6 +31,7 @@ on PR → real regression → BLOCK.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -38,6 +39,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .. import _nodeid_reporter
+from .._pytest_summary import rerun_detected
 from ..base import GATING_PYTEST_GUARD, Step, StepResult
 from ..context import Context
 
@@ -80,7 +83,31 @@ class TargetedTestsStep(Step):
         # ensure it).  TODO if we ever auto-checkout PRs: switch to the
         # PR head here too.
         pr_log = ctx.artifact_path("targeted-pr.log")
-        pr_summary, pr_failed = _run_pytest(targets, pr_log, ctx.repo_root)
+        pr_nodeids = ctx.artifact_path("targeted-pr-nodeids.tsv")
+        pr_summary, pr_failed, pr_reran = _run_pytest(
+            targets, pr_log, ctx.repo_root, pr_nodeids
+        )
+
+        # A GATING run must never rerun. targeted_tests is the FIRST — and,
+        # for a low-blast PR where full_unit is skipped, the ONLY — gating
+        # step that runs candidate tests, so the RERUN backstop has to live
+        # here too: the by-name GATING_PYTEST_GUARD is bypassable by a
+        # conftest registering pytest-rerunfailures under an arbitrary name,
+        # and if full_unit never runs, nothing else would catch the rerun
+        # (codex #1222 r24). Any RERUN record → a real failure may have been
+        # retried to green → block, regardless of the scraped FAILED set.
+        if pr_reran:
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=f"{pr_summary} (gating run reran a test)",
+                details="⚠️ the targeted gating run reran at least one test — "
+                "pytest-rerunfailures was active despite the by-name block, so "
+                "it was smuggled in under a different name. A rerun can retry a "
+                "real failure into a pass, so this run is not trusted; reruns "
+                "must be OFF for the gate.",
+                artifacts=[str(pr_log)],
+            )
 
         if not pr_failed:
             return StepResult(
@@ -224,19 +251,42 @@ _PYTEST_CMD = [
 ]
 
 
-def _run_pytest(targets: list[str], log_path: Path, cwd: Path) -> tuple[str, list[str]]:
-    """Run pytest against ``targets``. Returns (one-line summary,
-    list of FAILED node IDs). Empty failed list => clean run."""
+def _run_pytest(
+    targets: list[str], log_path: Path, cwd: Path, nodeid_log: Path | None = None
+) -> tuple[str, list[str], bool]:
+    """Run pytest against ``targets``. Returns (one-line summary, list of
+    FAILED node IDs, reran) where ``reran`` is True iff the run reran a test
+    (a gating run must never rerun). Empty failed list => clean run.
+
+    When ``nodeid_log`` is given and the reporter plugin is importable, the
+    run emits the structured RERUN record used for the name-independent
+    rerun backstop. ``cwd`` (the PR head worktree) must contain the reporter
+    module — it does, since this PR adds it; the negative-control run on the
+    protected base does NOT inject it (the base predates the plugin)."""
+    cmd = [*_PYTEST_CMD, *targets]
+    env = dict(os.environ)
+    env.pop("PYTEST_ADDOPTS", None)
+    inject = nodeid_log is not None and _nodeid_reporter.available()
+    if inject:
+        plugin_args, env = _nodeid_reporter.build_invocation(
+            nodeid_log, cwd, base_env=env
+        )
+        cmd += plugin_args
+        # Start-sentinel so an empty log is distinguishable from "plugin
+        # never ran" (mirrors full_unit); rerun detection reads it below.
+        nodeid_log.write_text("", encoding="utf-8")
     proc = subprocess.run(  # noqa: S603
-        [*_PYTEST_CMD, *targets],
+        cmd,
         capture_output=True,
         text=True,
         cwd=str(cwd),
+        env=env,
     )
     log_path.write_text((proc.stdout or "") + (proc.stderr or ""))
     summary = _last_summary_line(proc.stdout) or f"exit {proc.returncode}"
     failed = _extract_failed_node_ids(proc.stdout)
-    return summary, failed
+    reran = bool(inject and nodeid_log.exists() and rerun_detected(nodeid_log))
+    return summary, failed, reran
 
 
 def _run_on_main(

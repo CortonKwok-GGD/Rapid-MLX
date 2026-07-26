@@ -92,6 +92,14 @@ SESSION_LABEL = "SESSIONFINISH"
 # (codex #1222 r23).
 RERUN_LABEL = "RERUN"
 
+# SUPPLEMENTARY label for a COLLECTION failure, written ALONGSIDE the ERROR
+# record (never instead of it), so ``full_unit``'s gate — which reads ERROR
+# — is untouched and can't be weakened. The advisory classifier reads this
+# to recognize a collection target whose id CONTAINS ``::`` (a class
+# collector: ``tests/test_x.py::TestClass``), which the "``::``-absence"
+# heuristic alone misses (codex #1222 r24).
+COLLECTERROR_LABEL = "COLLECTERROR"
+
 # The DISTINCT node ids pytest ran to COMPLETION this session — counted on
 # the ``teardown`` report, which fires only AFTER an item's full lifecycle
 # (setup + call + teardown) finishes. Compared against
@@ -260,9 +268,16 @@ def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
 
 def pytest_collectreport(report) -> None:  # noqa: ANN001 — pytest hook
     # A collection failure (import error, bad conftest) — ERROR, and the
-    # node id is the module/dir that failed to collect.
+    # node id is the module/dir/class that failed to collect.
     if report.failed:
         _append("ERROR", report.nodeid)
+        # ALSO tag it as a COLLECTION error (in ADDITION to ERROR, never
+        # instead) so the advisory classifier can recognize a collection
+        # target even when its id contains "::" — a class collector reports
+        # `tests/test_x.py::TestClass`, which the "::"-absence heuristic
+        # misses. full_unit reads ERROR for its gate, so this extra label
+        # cannot weaken it (codex #1222 r24).
+        _append(COLLECTERROR_LABEL, report.nodeid)
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ANN001, ARG001 — pytest hook

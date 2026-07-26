@@ -19,10 +19,11 @@ derived (a divergence would silently mis-gate).
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
-from ._nodeid_reporter import SESSION_LABEL, unescape_field
+from ._nodeid_reporter import RERUN_LABEL, SESSION_LABEL, unescape_field
 
 # pytest writes the section header as a full-width separator banner:
 # ``==================== short test summary info ====================``.
@@ -88,6 +89,36 @@ def raw_session_records(path: Path) -> list[str]:
         if tab and rec_label == SESSION_LABEL and raw:
             out.append(unescape_field(raw))
     return out
+
+
+def rerun_detected(path: Path) -> bool:
+    """True iff the reporter logged any RERUN record — a gating pytest run
+    reran a test, which it must NEVER do.
+
+    Name-based ``-p no:<name>`` blocking is bypassable — a conftest can
+    register pytest-rerunfailures under an arbitrary name (verified, codex
+    #1222 r23) — so this OUTCOME-based signal is the name-independent
+    backstop shared by EVERY gating pytest step (``full_unit``,
+    ``targeted_tests``): a real failure could have been retried into a pass,
+    so any RERUN in a gating run makes it untrustworthy (codex #1222 r24).
+    Kept here so no gating step reimplements the check and drifts."""
+    return bool(report_log_node_ids(path, RERUN_LABEL))
+
+
+def render_fence_safe(node_id: str) -> str:
+    """JSON-encode a node id for safe interpolation into a Markdown ``` code
+    fence in the scorecard.
+
+    ``report.nodeid`` is not trustworthy display text — a hostile
+    ``pytest_make_parametrize_id`` can embed a newline (and backticks) in it
+    (codex #1222 r24). Interpolated raw into a fenced block, a newline could
+    start a fence-closing line and let the rest of the id spoof scorecard
+    Markdown. JSON escaping collapses the value to a single quoted line
+    (newline → ``\\n``, tab → ``\\t``, backslash/quote escaped), so no
+    embedded newline can begin a fence-closer; ``ensure_ascii=False`` keeps
+    a legitimate non-ASCII id readable. A normal id is unchanged except for
+    the surrounding quotes."""
+    return json.dumps(node_id, ensure_ascii=False)
 
 
 def session_completed(path: Path) -> bool:

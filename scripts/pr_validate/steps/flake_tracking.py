@@ -78,6 +78,7 @@ import traceback
 
 from .. import _nodeid_reporter
 from .._pytest_summary import (
+    render_fence_safe,
     report_log_node_ids,
     session_completed,
     summary_node_ids,
@@ -156,10 +157,17 @@ class FlakeTrackingStep(Step):
         if nodeid_log.exists():
             failed_only = report_log_node_ids(nodeid_log, "FAILED")
             error_only = report_log_node_ids(nodeid_log, "ERROR")
+            # Ids the reporter tagged as COLLECTION targets (module / dir /
+            # CLASS collectors). A class collector id contains "::"
+            # (`tests/x.py::TestClass`), which the "::"-absence heuristic
+            # misses, so recovery detection consults this structured set too
+            # (codex #1222 r24). Absent on the summary-fallback path below.
+            collect_targets = set(report_log_node_ids(nodeid_log, "COLLECTERROR"))
         else:
             text = log_path.read_text()
             failed_only = summary_node_ids(text, "FAILED")
             error_only = summary_node_ids(text, "ERROR")
+            collect_targets = set()
         failed_set = set(failed_only)
         # Ids that logged an ERROR in ANY phase (setup / call / teardown /
         # collection). full_unit blocks any run containing an ERROR
@@ -391,7 +399,13 @@ class FlakeTrackingStep(Step):
         def _recovered(i: str) -> bool:
             if i in passed:
                 return True
-            return _is_collection_target(i) and any(
+            # A collection target is recovered on POSITIVE evidence — a
+            # contained test passed. Recognize the target by EITHER the
+            # "::"-absence heuristic (module / dir, works on the fallback
+            # path) OR the structured COLLECTERROR set (also catches a class
+            # collector whose id contains "::" — codex #1222 r24).
+            is_collection = _is_collection_target(i) or i in collect_targets
+            return is_collection and any(
                 p.startswith(i + "::") or p.startswith(i + "/") for p in passed
             )
 
@@ -419,14 +433,25 @@ class FlakeTrackingStep(Step):
             if i not in error_origin and is_quarantined(i, entries)
         ]
 
-        # Split reproductions the same way: a NON-quarantined test that
-        # reproduces is a real failure full_unit blocked on. A QUARANTINED
-        # one reproduced deterministically here — full_unit PASSED it as
-        # non-blocking, so it's NOT something the gate blocked on; flag it
-        # separately as "quarantine may be masking a now-deterministic
-        # bug" rather than mislabeling it (codex #1222 r5).
-        reproduced_new = [i for i in reproduced if not is_quarantined(i, entries)]
-        reproduced_known = [i for i in reproduced if is_quarantined(i, entries)]
+        # Split reproductions the same way, but an ERROR-origin id is NEVER
+        # "reproduced_quarantined" even if it's in the registry: full_unit
+        # blocks ANY run containing an ERROR unconditionally, so the
+        # quarantine never actually waived it — labeling it "full_unit PASSED
+        # this as quarantined" would be false. Route ERROR-origin
+        # reproductions to reproduced_likely_real (the gate DID block them),
+        # matching the r18/r19 error-origin discipline (codex #1222 r24).
+        # A NON-quarantined (or error-origin) reproduction is a real failure
+        # full_unit blocked on; a quarantined, non-error one reproduced
+        # deterministically while full_unit PASSED it as non-blocking — flag
+        # that separately as "quarantine may be masking a now-deterministic
+        # bug" (codex #1222 r5).
+        reproduced_known = [
+            i
+            for i in reproduced
+            if is_quarantined(i, entries) and i not in error_origin
+        ]
+        reproduced_known_set = set(reproduced_known)
+        reproduced_new = [i for i in reproduced if i not in reproduced_known_set]
 
         payload = {
             "original_failed": original_failed,
@@ -592,12 +617,19 @@ def _render(
     sampled: int,
     total: int,
 ) -> str:
+    # Every node id below is interpolated into a Markdown ``` code fence.
+    # report.nodeid can embed a newline/backticks (a hostile
+    # pytest_make_parametrize_id), which raw could break out of the fence and
+    # spoof scorecard content — render each id fence-safe (codex #1222 r24).
+    def _fence(ids: list[str]) -> str:
+        return "\n".join(render_fence_safe(i) for i in ids)
+
     parts: list[str] = []
     if new_candidates:
         parts.append(
             "**New flake candidates** (failed the full suite, passed on "
             "isolated re-run — consider promoting to `quarantine.yaml` "
-            "after confirming):\n```\n" + "\n".join(new_candidates) + "\n```"
+            "after confirming):\n```\n" + _fence(new_candidates) + "\n```"
         )
     if error_candidates:
         parts.append(
@@ -606,13 +638,13 @@ def _render(
             "isolated re-run — so non-deterministic, but `full_unit` blocks "
             "ANY run containing an ERROR unconditionally, so a `quarantine.yaml`"
             " entry would NOT waive these; fix the fixture / collection or the "
-            "code):\n```\n" + "\n".join(error_candidates) + "\n```"
+            "code):\n```\n" + _fence(error_candidates) + "\n```"
         )
     if reproduced_new:
         parts.append(
             "**Reproduced on re-run** (failure is deterministic — likely a "
             "real bug, NOT a flake; `full_unit` blocked on these):\n```\n"
-            + "\n".join(reproduced_new)
+            + _fence(reproduced_new)
             + "\n```"
         )
     if reproduced_known:
@@ -621,19 +653,19 @@ def _render(
             "PASSED these as quarantined, but they failed every re-run here "
             "— the quarantine may be masking a now-deterministic bug; "
             "re-check whether the entry still belongs in `quarantine.yaml`):"
-            "\n```\n" + "\n".join(reproduced_known) + "\n```"
+            "\n```\n" + _fence(reproduced_known) + "\n```"
         )
     if known_flakes:
         parts.append(
             "**Already quarantined** (confirmed still flaky):\n```\n"
-            + "\n".join(known_flakes)
+            + _fence(known_flakes)
             + "\n```"
         )
     if inconclusive:
         parts.append(
             "**Inconclusive** (didn't positively pass or fail on isolated "
             "re-run — skipped, deselected, or not collected; NOT classified "
-            "as a flake):\n```\n" + "\n".join(inconclusive) + "\n```"
+            "as a flake):\n```\n" + _fence(inconclusive) + "\n```"
         )
     if total > sampled:
         parts.append(

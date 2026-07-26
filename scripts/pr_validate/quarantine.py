@@ -76,21 +76,30 @@ def load_quarantine(path: Path | None = None) -> list[QuarantineEntry]:
     file-path form is for tests and for reading the shipped default.
     """
     path = path or DEFAULT_QUARANTINE_PATH
-    if not path.exists():
-        return []
+    # Attempt the read DIRECTLY — never gate on ``path.exists()`` first.
+    # ``Path.exists()`` re-raises a ``PermissionError`` when a parent
+    # directory is inaccessible (it only swallows ENOENT/ENOTDIR/etc.), so
+    # a pre-check outside the handler could escape the documented
+    # QuarantineError fail-safe with a raw OSError (codex #1222 r24). Only a
+    # CONFIRMED-missing file (``FileNotFoundError``) is the legitimate
+    # "absent → empty" case; every other OSError is a present-but-unusable
+    # registry.
     try:
         text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # No registry configured — legitimate empty quarantine.
+        return []
     except UnicodeDecodeError as e:
         # A non-UTF-8 registry is malformed, not "absent" — surface it as
         # QuarantineError so the gating caller fails safe to empty rather
         # than crashing on an unhandled ValueError (codex #1222 r5).
         raise QuarantineError(f"{path}: not valid UTF-8: {e}") from e
     except OSError as e:
-        # A present-but-unreadable file (permissions, an I/O error, a
-        # TOCTOU vanish after the exists() check) is a read failure, not
-        # "absent" — the docstring promises QuarantineError for a present-
-        # but-unusable registry, so a caller catching only that exception
-        # doesn't crash on a raw OSError (codex #1222 r18).
+        # A present-but-unreadable file (permission denied, an inaccessible
+        # parent, an I/O error) is a read failure, not "absent" — the
+        # docstring promises QuarantineError for a present-but-unusable
+        # registry, so a caller catching only that exception doesn't crash on
+        # a raw OSError (codex #1222 r18/r24).
         raise QuarantineError(f"{path}: could not be read: {e}") from e
     return _parse_quarantine_text(text, source=str(path))
 

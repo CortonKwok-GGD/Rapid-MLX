@@ -19,12 +19,14 @@ import subprocess
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 import pytest
 
 from scripts.pr_validate import _nodeid_reporter
 from scripts.pr_validate._pytest_summary import (
     raw_session_records,
+    render_fence_safe,
     report_log_node_ids,
     summary_node_ids,
 )
@@ -270,6 +272,22 @@ class TestLoadQuarantine:
 
     def test_missing_file_is_empty(self, tmp_path):
         assert load_quarantine(tmp_path / "nope.yaml") == []
+
+    def test_permission_error_raises_quarantine_error(self, tmp_path, monkeypatch):
+        # codex #1222 r24: the old `if not path.exists(): return []` pre-check
+        # ran OUTSIDE the try/except, and `Path.exists()` re-raises a
+        # PermissionError (inaccessible parent dir) rather than swallowing it —
+        # so a raw OSError escaped the documented QuarantineError fail-safe.
+        # The read now goes direct; only FileNotFoundError → [], every other
+        # OSError → QuarantineError.
+        p = tmp_path / "q.yaml"
+
+        def boom(*_a, **_k):
+            raise PermissionError("permission denied")
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        with pytest.raises(QuarantineError):
+            load_quarantine(p)
 
     def test_malformed_yaml_raises(self, tmp_path):
         p = tmp_path / "q.yaml"
@@ -1683,6 +1701,74 @@ class TestFlakeTrackingContract:
         assert "tests/subdir" not in data["inconclusive"]
         assert "tests/subdir" not in data["flake_candidates_new"]
 
+    def test_recovered_class_collection_error_is_error_candidate(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r24: a CLASS collection error id CONTAINS "::"
+        # ("tests/x.py::TestC"), so the "::"-absence heuristic misses it and
+        # the r19 code left it permanently inconclusive. The structured
+        # COLLECTERROR label (written alongside ERROR, so the gate is
+        # untouched) lets the classifier recognize it; a passed descendant
+        # ("tests/x.py::TestC::test_m") is positive recovery evidence. As an
+        # ERROR-origin id it is not quarantinable → error_flake_candidates.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text(
+            "ERROR\ttests/x.py::TestC\nCOLLECTERROR\ttests/x.py::TestC\n"
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/x.py::TestC::test_m\n" + _RERUN_DONE
+            )
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/x.py::TestC" in data["error_flake_candidates"]
+        assert "tests/x.py::TestC" not in data["inconclusive"]
+        assert "tests/x.py::TestC" not in data["flake_candidates_new"]
+
+    def test_error_origin_reproduced_is_not_reproduced_quarantined(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r24: an ERROR-origin id that is ALSO quarantined and
+        # reproduces must NOT be labeled reproduced_quarantined ("full_unit
+        # PASSED as quarantined") — full_unit BLOCKS any ERROR run regardless
+        # of the registry, so the quarantine never waived it. Route it to
+        # reproduced_likely_real (the gate DID block it).
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text(
+            "ERROR\ttests/x.py::test_e\n"
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(
+            flake_mod,
+            "load_quarantine_from_ref",
+            lambda *a, **k: [QuarantineEntry(id="tests/x.py::test_e")],
+        )
+
+        def fake(cmd, cwd, timeout, env=None):
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "ERROR\ttests/x.py::test_e\n" + _RERUN_DONE
+            )
+            return _completed(1, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        FlakeTrackingStep().run(ctx)
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/x.py::test_e" in data["reproduced_likely_real"]
+        assert "tests/x.py::test_e" not in data["reproduced_quarantined"]
+
     def test_dir_collection_target_not_recovered_by_sibling_prefix(
         self, ctx_factory, monkeypatch
     ):
@@ -2237,6 +2323,36 @@ class TestFieldEscaping:
         _nodeid_reporter._append("FAILED", "evil\nSESSIONFINISH\t9999 1")
         assert raw_session_records(log) == []
         assert report_log_node_ids(log, "FAILED") == ["evil\nSESSIONFINISH\t9999 1"]
+
+
+class TestRenderFenceSafe:
+    """A node id interpolated into a Markdown ``` code fence must not be able
+    to break out of it and spoof scorecard content (codex #1222 r24)."""
+
+    def test_collapses_newlines_to_single_line(self):
+        evil = "tests/a.py::t[a\n```\n# spoof]"
+        out = render_fence_safe(evil)
+        # No embedded newline survives → no line can start a fence-closer.
+        assert "\n" not in out
+        assert out.startswith('"') and out.endswith('"')
+        # Data fidelity: the original id is recoverable via JSON.
+        assert json.loads(out) == evil
+
+    def test_preserves_unicode(self):
+        assert render_fence_safe("tests/tûv.py::tîme") == '"tests/tûv.py::tîme"'
+
+    def test_full_unit_render_details_is_fence_safe(self):
+        evil = "tests/a.py::test_x[a\n```\n# spoof]"
+        out = full_unit_mod._render_details([evil], [], "/tmp/log")
+        assert json.dumps(evil, ensure_ascii=False) in out
+        # The raw fence-breaking newline sequence must NOT leak into the block.
+        assert "a\n```\n# spoof" not in out
+
+    def test_flake_render_is_fence_safe(self):
+        evil = "tests/a.py::test_y[b\n```\n# spoof]"
+        out = flake_mod._render([evil], [], [], [], [], [], sampled=1, total=1)
+        assert json.dumps(evil, ensure_ascii=False) in out
+        assert "b\n```\n# spoof" not in out
 
 
 class TestNodeidReporter:
@@ -2866,3 +2982,74 @@ class TestRegistration:
         # pass/skip, and run() downgrades any crash to skip so an uncaught
         # exception can't become a blocking error (codex #1222 r8).
         assert FlakeTrackingStep().continue_on_error is True
+
+
+class TestTargetedTestsRerunBackstop:
+    """targeted_tests is a gating run — and, for a low-blast PR where
+    full_unit is skipped, the ONLY gating run of candidate tests — so the
+    name-independent RERUN backstop must live here too (codex #1222 r24)."""
+
+    def test_run_pytest_detects_rerun_record(self, tmp_path, monkeypatch):
+        # _run_pytest injects the reporter and flags reran=True when the
+        # structured log carries a RERUN record (rerunfailures smuggled in
+        # under a non-blocked name).
+        nodeid_log = tmp_path / "n.tsv"
+
+        def fake_run(cmd, **kw):
+            env = kw.get("env") or {}
+            log = env.get("PR_VALIDATE_NODEID_LOG")
+            assert log, "reporter was not injected"
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("RERUN\ttests/a.py::t\nFAILED\ttests/a.py::t\n")
+            return subprocess.CompletedProcess(cmd, 1, "==== 1 failed in 1s ====\n", "")
+
+        monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
+        summary, failed, reran = targeted_mod._run_pytest(
+            ["tests/a.py"], tmp_path / "log.txt", tmp_path, nodeid_log
+        )
+        assert reran is True
+
+    def test_run_pytest_no_rerun_is_false(self, tmp_path, monkeypatch):
+        nodeid_log = tmp_path / "n.tsv"
+
+        def fake_run(cmd, **kw):
+            env = kw.get("env") or {}
+            log = env.get("PR_VALIDATE_NODEID_LOG")
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("FAILED\ttests/a.py::t\nSESSIONFINISH\t1 1\n")
+            return subprocess.CompletedProcess(cmd, 1, "==== 1 failed in 1s ====\n", "")
+
+        monkeypatch.setattr(targeted_mod.subprocess, "run", fake_run)
+        _, _, reran = targeted_mod._run_pytest(
+            ["tests/a.py"], tmp_path / "log.txt", tmp_path, nodeid_log
+        )
+        assert reran is False
+
+    def test_run_blocks_when_pr_run_reran(self, ctx_factory, monkeypatch):
+        ctx = ctx_factory(["vllm_mlx/scheduler.py"])
+        monkeypatch.setattr(
+            targeted_mod, "_select_test_files", lambda c: ["tests/test_scheduler.py"]
+        )
+        monkeypatch.setattr(
+            targeted_mod,
+            "_run_pytest",
+            lambda *a, **k: (
+                "1 failed, 2 passed",
+                ["tests/test_scheduler.py::t"],
+                True,
+            ),
+        )
+        res = targeted_mod.TargetedTestsStep().run(ctx)
+        assert res.status == "fail"
+        assert "rerun" in res.details.lower()
+
+    def test_negative_control_run_does_not_inject_reporter(self):
+        # The base predates this PR's reporter module, so the negative-control
+        # run on main must NOT try to inject `-p …_nodeid_reporter` (it would
+        # be an unloadable plugin → usage error). _run_on_main uses the plain
+        # _PYTEST_CMD, never the reporter.
+        import inspect
+
+        src = inspect.getsource(targeted_mod._run_on_main)
+        assert "build_invocation" not in src
+        assert "_nodeid_reporter" not in src
