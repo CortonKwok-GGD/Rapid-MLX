@@ -105,6 +105,13 @@ def rerun_detected(path: Path) -> bool:
     return bool(report_log_node_ids(path, RERUN_LABEL))
 
 
+# The three ``str.splitlines()`` line boundaries that ``json.dumps`` leaves
+# LITERAL under ``ensure_ascii=False``: it escapes every control char < U+0020
+# (``\n``/``\r``/``\t``/``\v``/``\f``/``\x1c``-``\x1e``) but NOT U+0085 (NEL),
+# U+2028 (LINE SEP), or U+2029 (PARA SEP), which are all ≥ U+0020 (codex r31).
+_JSON_UNESCAPED_LINE_SEPARATORS = ("\x85", "\u2028", "\u2029")
+
+
 def render_fence_safe(node_id: str) -> str:
     """JSON-encode a node id for safe interpolation into a Markdown ``` code
     fence in the scorecard.
@@ -117,8 +124,19 @@ def render_fence_safe(node_id: str) -> str:
     (newline → ``\\n``, tab → ``\\t``, backslash/quote escaped), so no
     embedded newline can begin a fence-closer; ``ensure_ascii=False`` keeps
     a legitimate non-ASCII id readable. A normal id is unchanged except for
-    the surrounding quotes."""
-    return json.dumps(node_id, ensure_ascii=False)
+    the surrounding quotes.
+
+    ``json.dumps`` escapes only control chars < U+0020, so it would leave
+    U+0085/U+2028/U+2029 LITERAL — yet ``str.splitlines()`` (and some Markdown
+    renderers) treat those as line boundaries too, so a hostile id embedding
+    one could still begin a fence-closer on a second physical line. Escape
+    them explicitly as ``\\uXXXX`` (valid JSON, so ``json.loads`` still
+    round-trips the id) to keep the single-line guarantee under splitlines
+    (codex #1222 r31, mirroring the escape_field hardening in r28)."""
+    out = json.dumps(node_id, ensure_ascii=False)
+    for sep in _JSON_UNESCAPED_LINE_SEPARATORS:
+        out = out.replace(sep, f"\\u{ord(sep):04x}")
+    return out
 
 
 # ``errors?`` — pytest pluralizes the error outcome ("1 error" vs "2 errors"),

@@ -2455,6 +2455,20 @@ class TestRenderFenceSafe:
         assert json.dumps(evil, ensure_ascii=False) in block
         assert targeted_mod._failed_block([]) == "(none)"
 
+    def test_unicode_line_separators_escaped(self):
+        # json.dumps(ensure_ascii=False) escapes control chars < U+0020 but
+        # leaves U+0085/U+2028/U+2029 literal — yet str.splitlines() (and some
+        # Markdown renderers) treat those as line boundaries, so a hostile id
+        # embedding one could still begin a fence-closer on a second physical
+        # line. render_fence_safe must escape them (codex #1222 r31).
+        for sep in ("\x85", "\u2028", "\u2029"):
+            evil = f"tests/a.py::t[a{sep}```\n# spoof]"
+            out = render_fence_safe(evil)
+            assert len(out.splitlines()) == 1  # single line under splitlines
+            assert "\n" not in out
+            assert sep not in out  # the literal separator is gone
+            assert json.loads(out) == evil  # valid JSON → still round-trips
+
 
 class TestNodeidReporter:
     """Prove the plugin round-trips real ``report.nodeid`` values through a
@@ -2735,17 +2749,21 @@ class TestNodeidReporter:
         assert rerun, ("expected RERUN records under --reruns", rows)
         assert "test_flaky.py::test_always_bad" in rerun
 
-    def test_strict_xpass_logged_failed_and_carries_no_wasxfail(self, tmp_path):
-        # codex #1222 r27 (finding 2) REBUTTAL, locked as committed evidence.
-        # Claim: a strict-xfail test that unexpectedly PASSES is logged FAILED
-        # and, if quarantined, wrongly waived — "fix: detect report.wasxfail".
-        # EMPIRICALLY a strict XPASS report has outcome=='failed' but NO
-        # wasxfail (only the NON-strict xpass and the as-expected xfail carry
-        # it), so the proposed detection can't fire — the premise is false. The
-        # scenario is also not reachable: the allowlist is base-protected
-        # (candidates can't add), and a flaky (quarantined) test that is ALSO
-        # xfail(strict=True) is self-contradictory. A conftest captures the
-        # report to prove the wasxfail attribute is unset.
+    def test_strict_xpass_logged_error_via_longrepr_signal(self, tmp_path):
+        # codex #1222 r27 (rebuttal) + r31 (fix), locked as committed evidence.
+        # A strict-xfail test that unexpectedly PASSES is pytest's INTENTIONAL
+        # fatal (the xfail marker is now stale). r27 rebutted codex's "detect
+        # via report.wasxfail" — a strict XPASS report has outcome=='failed'
+        # but NO wasxfail (only the NON-strict xpass / as-expected xfail carry
+        # it), so that detection can't fire. r31 then closed the underlying gap
+        # (a FAILED strict-xpass on a — mistakenly — quarantined node would be
+        # downgraded to a non-blocking flake, masking the fatal) using the
+        # CLEAN signal that IS present: the call report's longrepr is the STRING
+        # "[XPASS(strict)] …" (a genuine call failure carries an exception-repr
+        # OBJECT). The reporter now records the strict-xpass as ERROR —
+        # unconditional block, never quarantinable in full_unit, always makes
+        # targeted untrusted — not a downgradeable FAILED. A conftest captures
+        # the report to prove both the missing wasxfail and the string longrepr.
         (tmp_path / "conftest.py").write_text(
             textwrap.dedent(
                 """
@@ -2756,7 +2774,10 @@ class TestNodeidReporter:
                     if (report.when == 'call'
                             and report.nodeid.endswith('::test_strict_xpass')):
                         wx = getattr(report, 'wasxfail', '<UNSET>')
-                        _obs.write_text(f'{report.outcome}|{wx!r}')
+                        lr = getattr(report, 'longrepr', None)
+                        _obs.write_text(
+                            f'{report.outcome}|{wx!r}|{isinstance(lr, str)}|{str(lr)[:16]}'
+                        )
                 """
             )
         )
@@ -2799,13 +2820,77 @@ class TestNodeidReporter:
             if "\t" in ln
         ]
         failed = [nid for label, nid in rows if label == "FAILED"]
-        # (a) The strict XPASS is recorded as a plain FAILED …
-        assert "test_xp.py::test_strict_xpass" in failed
-        # (b) … and the report carried NO wasxfail, so codex's wasxfail-based
-        # detection is inapplicable — the finding's premise is empirically false.
-        outcome, wasxfail = (tmp_path / ".obs").read_text().split("|", 1)
+        errored = [nid for label, nid in rows if label == "ERROR"]
+        # (a) r31: the strict XPASS is recorded as ERROR (unconditional block),
+        #     NOT a quarantinable FAILED.
+        assert "test_xp.py::test_strict_xpass" in errored
+        assert "test_xp.py::test_strict_xpass" not in failed
+        # (b) The report carried NO wasxfail (r27 rebuttal stands) but DID carry
+        #     the "[XPASS(strict)]" string longrepr the r31 detection keys on.
+        outcome, wasxfail, lr_is_str, lr_head = (
+            (tmp_path / ".obs").read_text().split("|", 3)
+        )
         assert outcome == "failed"
         assert wasxfail == "'<UNSET>'"
+        assert lr_is_str == "True"
+        assert lr_head.startswith("[XPASS(strict)]")
+
+    def test_rerun_completion_reflects_only_final_attempt(self, tmp_path):
+        # codex #1222 r31 REBUTTAL, locked as committed evidence. Claim:
+        # _completed_ids retains an id "after any completed retry attempt", so a
+        # later retry that terminates before teardown still shows ran==collected.
+        # EMPIRICALLY FALSE: pytest-rerunfailures emits NO teardown report for a
+        # non-final attempt (verified — a rerun attempt is setup+call(rerun)
+        # only, even with a yield fixture whose teardown would emit), so the id
+        # is added to the completion set ONLY on the FINAL attempt's teardown.
+        # The SESSIONFINISH ran count therefore reflects the final attempt: a
+        # flaky-then-pass test is counted once (ran==collected==1), and a
+        # hard-truncated final attempt writes no teardown → ran<collected (or,
+        # if the process dies, no SESSIONFINISH → the absent-record check fires).
+        (tmp_path / "test_fl.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+                _n = {'v': 0}
+
+                @pytest.mark.flaky(reruns=2)
+                def test_flaky():
+                    _n['v'] += 1
+                    assert _n['v'] >= 2  # fail attempt 1, pass attempt 2
+                """
+            )
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        repo_root = self._repo_root()
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, repo_root, log_passes=True
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-o",
+                "addopts=",
+                *plugin_args,
+                "test_fl.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # Exactly ONE SESSIONFINISH, ran==collected==1 — the single test counted
+        # once despite two attempts (no premature/duplicate completion).
+        assert raw_session_records(log_path) == ["1 1"]
+        # The final attempt's terminal outcome (PASSED) is recorded; the
+        # intermediate failure is a 'rerun' outcome, never logged FAILED.
+        failed = report_log_node_ids(log_path, "FAILED")
+        passed = report_log_node_ids(log_path, "PASSED")
+        assert "test_fl.py::test_flaky" in passed
+        assert "test_fl.py::test_flaky" not in failed
 
     def _session_records(self, log_path):
         if not log_path.exists():

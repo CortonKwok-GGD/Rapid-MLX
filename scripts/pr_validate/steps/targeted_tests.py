@@ -123,28 +123,35 @@ class TargetedTestsStep(Step):
         # no-collection run WITHOUT a deselection (an empty/renamed file, or a
         # candidate ``python_files`` matching nothing) has no "deselected" in
         # pytest's summary and no structured ERROR, so it stays BLOCKED by
-        # ``_untrusted_run_reason`` below. The summary is pytest's own output;
-        # candidate addopts is already neutralized (``-o addopts=``), and the
-        # ``-m`` filter is gate-owned, so "deselected" can't be candidate-forged
-        # (a conftest that deselects everything is the documented collection
-        # residual, and full_unit still runs the whole suite regardless).
+        # ``_untrusted_run_reason`` below. Candidate ``addopts`` is neutralized
+        # (``-o addopts=``) and the ``-m`` filter is gate-owned.
         #
-        # BOUNDARY (codex #1222 r30): an author could newly mark a *changed*
-        # test ``slow``/``integration``/``needle`` to move it out of this fast
-        # gate — and on a LOW-blast PR (full_unit skipped) nothing else here
-        # runs it. This fast gate cannot close that: it deliberately does NOT
-        # run those markers (they need real models / a live server — the very
-        # reason they're excluded), so it can't tell a broken new slow test
-        # from a legitimately-slow passing one. And the base-comparison codex
-        # proposed is BACKWARDS — a *new* broken slow test is absent on base
-        # (so a "did base run it?" check misses exactly the dangerous case)
-        # while an existing test legitimately reclassified as slow WOULD trip
-        # it (a false block of routine maintenance). Marking a test slow is a
-        # uniform repo policy (full_unit excludes the same markers), owned by
-        # the separate slow-lane CI that runs ``-m slow`` + diff review that
-        # sees the added marker — NOT this gate. We therefore SKIP (never
-        # false-block legitimate reclassification) but make it LOUD so a
-        # reviewer is prompted to confirm the reclassification is intentional.
+        # BOUNDARY (codex #1222 r30/r31) — this SKIP is the in-process
+        # collection-control residual (r27), NOT a closed hole, and the earlier
+        # "full_unit runs the whole suite regardless" reassurance was WRONG on a
+        # low-blast PR (full_unit is skipped, so targeted is the only
+        # candidate-test gate). Two routes reach an all-deselected exit 5:
+        #   (a) an author newly marks a *changed* test slow/integration/needle
+        #       to move it out of this fast gate; and
+        #   (b) a candidate ``conftest.py`` deselects from
+        #       ``pytest_collection_modifyitems`` (``-o addopts=`` doesn't stop
+        #       conftest loading), forging the "deselected" summary.
+        # Neither is soundly closeable here. This gate DELIBERATELY cannot run
+        # slow/integration/needle tests (they need real models / a live server —
+        # the reason they're excluded), so it can't tell a broken new slow test
+        # from a legitimately-slow passing one. codex's "block unless the base
+        # proves the exclusion pre-existing" is BACKWARDS AND incomplete: a
+        # *new* broken slow test is absent on base (so a "did base run it?"
+        # check misses exactly the dangerous case) while an existing test
+        # legitimately reclassified WOULD trip it (a false block of routine
+        # maintenance) — and either attacker can instead deselect JUST the one
+        # failing test (exit 0, not 5), sailing past any exit-5 rule. That
+        # surgical exit-0 deselection is the fundamental r27 residual: no
+        # in-process count/manifest floor closes it. The real defenses are the
+        # separate slow-lane CI (``-m slow``) and diff review (which sees the
+        # added marker or conftest hook). We therefore SKIP (never false-block
+        # legitimate reclassification) but make it LOUD so a reviewer is
+        # prompted to confirm the deselection is intentional.
         if pr.returncode == 5 and "deselected" in pr.summary and not pr.errored:
             return StepResult(
                 name=self.name,

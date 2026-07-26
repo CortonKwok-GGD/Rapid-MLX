@@ -17,6 +17,10 @@ It writes tab-separated ``<LABEL>\t<nodeid>`` lines to the file named by
 back):
 
   * call-phase failure  → ``FAILED``
+  * strict-xfail XPASS   → ``ERROR`` — a call-phase "failed" that pytest makes
+    FATAL because the xfail marker is stale; recorded as ERROR (unconditional
+    block, never a quarantinable flake) rather than a downgradeable FAILED
+    (codex #1222 r31). Detected by its string ``"[XPASS(strict)]"`` longrepr.
   * setup/teardown fail  → ``ERROR``  (mirrors pytest's own -rfE split)
   * collection failure   → ``ERROR``
   * call-phase pass      → ``PASSED`` — ONLY when
@@ -268,6 +272,20 @@ def pytest_sessionstart(session) -> None:  # noqa: ANN001, ARG001 — pytest hoo
     _completed_ids.clear()
 
 
+def _is_strict_xpass(report) -> bool:  # noqa: ANN001
+    """True iff ``report`` is a strict-xfail test that XPASSED.
+
+    pytest makes a ``@pytest.mark.xfail(strict=True)`` that unexpectedly
+    passes FATAL (``outcome == "failed"``) — the xfail marker is now stale.
+    Its call report carries a STRING ``longrepr`` of the form
+    ``"[XPASS(strict)] <reason>"``, whereas a genuine call failure carries an
+    ``ExceptionRepr`` OBJECT — the only clean, attribute-stable discriminator
+    (``report.wasxfail`` is UNSET for a strict xpass; verified codex
+    #1222 r27/r31)."""
+    longrepr = getattr(report, "longrepr", None)
+    return isinstance(longrepr, str) and longrepr.startswith("[XPASS(strict)]")
+
+
 def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
     if report.outcome == "rerun":
         # pytest-rerunfailures emitted a retry. Record it NAME-INDEPENDENTLY
@@ -288,7 +306,17 @@ def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
         _completed_ids.add(report.nodeid)
     if report.when == "call":
         if report.outcome == "failed":
-            _append("FAILED", report.nodeid)
+            if _is_strict_xpass(report):
+                # A strict-xfail XPASS is pytest's INTENTIONAL fatal signal
+                # (the xfail marker is stale). Record it as ERROR, not FAILED,
+                # so it BLOCKS unconditionally in every gate: ERROR is never a
+                # quarantinable flake in full_unit and always makes targeted
+                # untrusted — a FAILED strict-xpass on a (mistakenly)
+                # quarantined node would otherwise be downgraded to a
+                # non-blocking flake, masking the fatal (codex #1222 r31).
+                _append("ERROR", report.nodeid)
+            else:
+                _append("FAILED", report.nodeid)
         elif report.outcome == "passed" and os.environ.get(_ENV_PASSES) == "1":
             _append("PASSED", report.nodeid)
     elif report.failed:
