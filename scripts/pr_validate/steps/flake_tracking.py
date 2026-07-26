@@ -138,16 +138,21 @@ class FlakeTrackingStep(Step):
 
         # Prefer full_unit's STRUCTURED node-id log (exact ids); fall back
         # to scraping its text log only if the plugin didn't run there.
+        # Read BOTH FAILED and ERROR: a setup / teardown / collection flake
+        # is recorded as ERROR, not FAILED, and it's just as much a flake
+        # candidate as a call-phase failure — reading only FAILED reported
+        # "no failures" and never re-ran those errored tests (codex #1222
+        # r15 NIT).
         nodeid_log = ctx.artifact_path("full-unit-nodeids.tsv")
         if nodeid_log.exists():
-            original_failed = report_log_node_ids(nodeid_log, "FAILED")
+            original_failed = report_log_node_ids(nodeid_log, "FAILED", "ERROR")
         else:
-            original_failed = summary_node_ids(log_path.read_text(), "FAILED")
+            original_failed = summary_node_ids(log_path.read_text(), "FAILED", "ERROR")
         if not original_failed:
             return StepResult(
                 name=self.name,
                 status="skip",
-                summary="full_unit had no failures — nothing to classify",
+                summary="full_unit had no failures or errors — nothing to classify",
             )
 
         if importlib.util.find_spec("pytest_rerunfailures") is None:

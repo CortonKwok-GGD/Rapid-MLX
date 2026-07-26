@@ -155,6 +155,27 @@ def load_quarantine_from_ref(
     return _parse_quarantine_text(proc.stdout, source=f"{ref}:{rel_path}")
 
 
+def _audit_string(
+    value: object, *, source: str, index: int, node_id: str, field: str
+) -> str:
+    """Validate a free-text audit field (``reason`` / ``issue``).
+
+    A MISSING field (``None``) is the empty string. A present but non-string
+    value — e.g. ``reason: [foo, bar]`` — is a schema violation, NOT
+    something to silently ``str(...)``-coerce into a bogus ``"['foo', …]"``
+    rationale that then satisfies the mandatory-field check (codex #1222
+    r15). Returns the stripped string; the caller enforces non-emptiness for
+    a mandatory field."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise QuarantineError(
+            f"{source}: test #{index} ('{node_id}') '{field}' must be a "
+            f"string, got {type(value).__name__}"
+        )
+    return value.strip()
+
+
 def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
     try:
         raw = yaml.safe_load(text)
@@ -194,8 +215,12 @@ def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
         # date) is how a permanent silent waiver creeps in. Enforce them so
         # a bare ``{id: …}`` can't slip a test onto the allowlist without a
         # paper trail (codex #1222 r10). ``issue`` stays optional (not every
-        # flake has a tracker link yet).
-        reason = str(item.get("reason", "") or "").strip()
+        # flake has a tracker link yet). ``reason``/``issue`` must be actual
+        # strings, not ``str(...)``-coerced from a list/mapping (codex #1222
+        # r15); ``added`` is checked below by strict date parsing.
+        reason = _audit_string(
+            item.get("reason"), source=source, index=i, node_id=node_id, field="reason"
+        )
         added = str(item.get("added", "") or "").strip()
         if not reason:
             raise QuarantineError(
@@ -239,7 +264,13 @@ def _parse_quarantine_text(text: str, source: str) -> list[QuarantineEntry]:
                 id=node_id,
                 reason=reason,
                 added=added,
-                issue=str(item.get("issue", "") or "").strip(),
+                issue=_audit_string(
+                    item.get("issue"),
+                    source=source,
+                    index=i,
+                    node_id=node_id,
+                    field="issue",
+                ),
                 family=family,
             )
         )

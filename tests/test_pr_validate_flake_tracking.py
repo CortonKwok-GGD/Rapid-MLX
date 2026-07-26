@@ -22,6 +22,7 @@ import time
 
 import pytest
 
+from scripts.pr_validate import _nodeid_reporter
 from scripts.pr_validate._pytest_summary import summary_node_ids
 from scripts.pr_validate.context import Context
 from scripts.pr_validate.quarantine import (
@@ -339,6 +340,27 @@ class TestLoadQuarantine:
         with pytest.raises(QuarantineError, match="added"):
             load_quarantine(p)
 
+    def test_non_string_reason_raises(self, tmp_path):
+        # codex #1222 r15: a non-string reason (e.g. a YAML list) must raise,
+        # not be str()-coerced into a bogus "['foo', 'bar']" rationale that
+        # then satisfies the mandatory non-empty check.
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n  - id: a.py::t\n    reason: [foo, bar]\n    added: 2026-01-01\n"
+        )
+        with pytest.raises(QuarantineError, match="reason"):
+            load_quarantine(p)
+
+    def test_non_string_issue_raises(self, tmp_path):
+        # Same guard on the optional ``issue`` audit field (codex #1222 r15).
+        p = tmp_path / "q.yaml"
+        p.write_text(
+            "tests:\n  - id: a.py::t\n    reason: flaky\n    added: 2026-01-01\n"
+            "    issue: [123]\n"
+        )
+        with pytest.raises(QuarantineError, match="issue"):
+            load_quarantine(p)
+
     def test_non_date_added_raises(self, tmp_path):
         # `added` claims YYYY-MM-DD, so a non-empty-but-garbage value is
         # audit rot and must be rejected, not silently accepted (codex r13).
@@ -612,7 +634,18 @@ class TestPartition:
 
 
 class TestFullUnitQuarantineAware:
-    def _patch_pytest(self, monkeypatch, returncode, stdout, *, structured=True):
+    def _patch_pytest(
+        self,
+        monkeypatch,
+        returncode,
+        stdout,
+        *,
+        structured=True,
+        session=True,
+        ran=100,
+        collected=100,
+        session_value=None,
+    ):
         def fake_run(cmd, **kw):
             # Simulate the reporter plugin: when structured logging is on,
             # mirror the summary's FAILED/ERROR lines into the node-id TSV
@@ -628,6 +661,19 @@ class TestFullUnitQuarantineAware:
                     for label in ("FAILED", "ERROR")
                     for nid in summary_node_ids(stdout, label)
                 ]
+                # The reporter's session-finish completion record (codex
+                # #1222 r15). ``ran >= collected`` marks a COMPLETE run — the
+                # precondition for a downgrade. Truncation tests pass
+                # ``session=False`` (hard exit / crash → the hook never fires,
+                # no record) or ``ran < collected`` (early stop); a malformed
+                # record is driven via ``session_value``.
+                if session:
+                    value = (
+                        session_value
+                        if session_value is not None
+                        else f"{ran} {collected}"
+                    )
+                    rows.append(f"{_nodeid_reporter.SESSION_LABEL}\t{value}")
                 with open(log, "w", encoding="utf-8") as fh:
                     fh.write("\n".join(rows) + ("\n" if rows else ""))
             return subprocess.CompletedProcess(cmd, returncode, stdout, "")
@@ -825,23 +871,142 @@ class TestFullUnitQuarantineAware:
         assert "PYTEST_ADDOPTS" not in (captured["env"] or {})
 
     def test_early_stop_withholds_downgrade(self, ctx_factory, monkeypatch):
-        # codex #1222 r14: a conftest can set --stepwise programmatically even
-        # with addopts cleared. If pytest terminated the session early, the
-        # suite is incomplete — a later real regression may not have run — so
-        # the quarantine downgrade is withheld and every failure blocks.
+        # codex #1222 r15: completeness is proven STRUCTURALLY from the
+        # reporter's session-finish record, not a stdout banner (which
+        # false-positived when "Interrupted:" appeared in a test's own
+        # traceback — r15 B2). An early stop (-x / --maxfail / --stepwise,
+        # which a conftest can set even with addopts cleared) attempts fewer
+        # items than it collected: ran < collected → the suite is incomplete,
+        # a later regression may not have run, so the downgrade is withheld
+        # and every failure blocks.
         self._patch_quarantine(
             monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
         )
-        stdout = (
-            "==== short test summary info ====\n"
-            "FAILED tests/a.py::test_flaky - X\n"
-            "!!!!!!!! Interrupted: Test failed, continuing next run. !!!!!!!!\n"
-            "==== 1 failed in 0.20s ====\n"
+        self._patch_pytest(
+            monkeypatch,
+            1,
+            _summary("FAILED tests/a.py::test_flaky - X"),
+            ran=1,
+            collected=50,  # 49 collected tests never ran → truncated
         )
-        self._patch_pytest(monkeypatch, 1, stdout)
         res = FullUnitStep().run(ctx_factory())
         assert res.status == "fail"  # withheld despite being listed
-        assert "terminated the session early" in res.details
+        assert "did not run to completion" in res.details
+
+    def test_hard_truncation_withholds_downgrade(self, ctx_factory, monkeypatch):
+        # codex #1222 r15 B1: a test calling os._exit(1) (or a crash /
+        # SIGKILL) kills the process mid-suite, so pytest_sessionfinish never
+        # fires and NO completion record is written — even though the exit
+        # code is 1 and the only logged failure is quarantined. The record's
+        # absence proves the run was truncated, so the downgrade is withheld
+        # and the failure blocks. This is the case the old stdout heuristic
+        # could not see (os._exit prints no banner).
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        self._patch_pytest(
+            monkeypatch,
+            1,
+            _summary("FAILED tests/a.py::test_flaky - X"),
+            session=False,  # process died before sessionfinish → no record
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"  # withheld → blocks despite being listed
+        assert "did not run to completion" in res.details
+
+    def test_complete_run_allows_downgrade(self, ctx_factory, monkeypatch):
+        # The positive control for r15: a well-formed completion record with
+        # ran >= collected proves the whole suite ran, so a solely-quarantined
+        # red is correctly downgraded to a (loud) pass.
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        self._patch_pytest(
+            monkeypatch,
+            1,
+            _summary("FAILED tests/a.py::test_flaky - X"),
+            ran=50,
+            collected=50,
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "pass"
+        assert "known-flaky" in res.summary
+
+    def test_malformed_session_record_withholds_downgrade(
+        self, ctx_factory, monkeypatch
+    ):
+        # A present-but-unparseable completion record (a tampered / unexpected
+        # shape) is not proof of completeness — withhold the downgrade, the
+        # safe direction (codex #1222 r15).
+        self._patch_quarantine(
+            monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
+        )
+        self._patch_pytest(
+            monkeypatch,
+            1,
+            _summary("FAILED tests/a.py::test_flaky - X"),
+            session_value="garbage-not-two-ints",
+        )
+        res = FullUnitStep().run(ctx_factory())
+        assert res.status == "fail"
+        assert "did not run to completion" in res.details
+
+
+# --------------------------------------------------------------------------
+# full_unit._session_completed — structured completeness proof (codex r15)
+# --------------------------------------------------------------------------
+
+
+class TestSessionCompleted:
+    """The quarantine downgrade's completeness precondition is proven from
+    the reporter's SESSIONFINISH record, replacing the fragile stdout-banner
+    heuristic (codex #1222 r15)."""
+
+    def _tsv(self, tmp_path, text):
+        p = tmp_path / "nodeids.tsv"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_complete_run(self, tmp_path):
+        assert full_unit_mod._session_completed(
+            self._tsv(tmp_path, "SESSIONFINISH\t50 50\n")
+        )
+
+    def test_ran_exceeds_collected_is_complete(self, tmp_path):
+        # A benign over-count (e.g. a reran item logs an extra setup) still
+        # ran the whole suite — completeness is ran >= collected, not ==.
+        assert full_unit_mod._session_completed(
+            self._tsv(tmp_path, "SESSIONFINISH\t51 50\n")
+        )
+
+    def test_early_stop_is_incomplete(self, tmp_path):
+        # ran < collected → -x / --maxfail / --stepwise truncated the suite.
+        assert not full_unit_mod._session_completed(
+            self._tsv(tmp_path, "SESSIONFINISH\t1 50\n")
+        )
+
+    def test_absent_record_is_incomplete(self, tmp_path):
+        # os._exit / crash / SIGKILL → sessionfinish never fired → no record.
+        assert not full_unit_mod._session_completed(
+            self._tsv(tmp_path, "FAILED\ttests/a.py::t\n")
+        )
+
+    def test_duplicate_record_is_incomplete(self, tmp_path):
+        # An unexpected multi-record shape (xdist / tamper) → withhold, the
+        # safe direction.
+        assert not full_unit_mod._session_completed(
+            self._tsv(tmp_path, "SESSIONFINISH\t50 50\nSESSIONFINISH\t1 50\n")
+        )
+
+    def test_malformed_value_is_incomplete(self, tmp_path):
+        assert not full_unit_mod._session_completed(
+            self._tsv(tmp_path, "SESSIONFINISH\tgarbage\n")
+        )
+
+    def test_zero_collected_is_incomplete(self, tmp_path):
+        assert not full_unit_mod._session_completed(
+            self._tsv(tmp_path, "SESSIONFINISH\t0 0\n")
+        )
 
 
 # --------------------------------------------------------------------------
@@ -868,6 +1033,53 @@ class TestFlakeTrackingContract:
         ctx.artifact_path("full-unit.log").write_text(_passed())
         res = FlakeTrackingStep().run(ctx)
         assert res.status == "skip"
+
+    def test_reruns_error_nodeids_structured(self, ctx_factory, monkeypatch):
+        # codex #1222 r15 NIT: a setup / teardown / collection flake is
+        # recorded as ERROR, not FAILED. The advisory tracker must re-run
+        # those too (reading only FAILED reported "nothing to classify" and
+        # skipped them). Structured-log path: an ERROR id must reach the
+        # re-run command.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text(
+            "ERROR\ttests/x.py::errored\n"
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+        captured = {}
+
+        def _capture(cmd, cwd, timeout, env=None):
+            captured["cmd"] = cmd
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", _capture)
+        FlakeTrackingStep().run(ctx)
+        assert "tests/x.py::errored" in captured["cmd"]
+
+    def test_reruns_error_nodeids_fallback(self, ctx_factory, monkeypatch):
+        # Same NIT via the terminal-summary FALLBACK (no structured log): an
+        # ERROR line in full-unit.log must be picked up for the advisory
+        # re-run, not dropped.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary("ERROR tests/x.py::errored - fixture boom")
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+        captured = {}
+
+        def _capture(cmd, cwd, timeout, env=None):
+            captured["cmd"] = cmd
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", _capture)
+        FlakeTrackingStep().run(ctx)
+        assert "tests/x.py::errored" in captured["cmd"]
 
     def test_skip_when_plugin_absent(self, ctx_factory, monkeypatch):
         ctx = ctx_factory()
@@ -1417,6 +1629,108 @@ class TestNodeidReporter:
         # The always-failing test: terminal FAILED exactly once, never PASSED.
         assert failed.count("test_flaky.py::test_always_bad") == 1
         assert "test_flaky.py::test_always_bad" not in passed
+
+    def _session_records(self, log_path):
+        if not log_path.exists():
+            return []
+        return [
+            ln.split("\t", 1)[1]
+            for ln in log_path.read_text(encoding="utf-8").splitlines()
+            if ln.startswith(_nodeid_reporter.SESSION_LABEL + "\t")
+        ]
+
+    def test_session_finish_record_on_complete_run(self, tmp_path):
+        # codex #1222 r15: a graceful, complete run writes exactly ONE
+        # SESSIONFINISH record with ran == collected — the structural proof
+        # full_unit requires before granting a quarantine downgrade.
+        (tmp_path / "test_three.py").write_text(
+            "def test_a(): assert True\n"
+            "def test_b(): assert True\n"
+            "def test_c(): assert True\n"
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root()
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                *plugin_args,
+                "test_three.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert self._session_records(log_path) == ["3 3"]
+
+    def test_session_finish_absent_on_hard_exit(self, tmp_path):
+        # codex #1222 r15 B1: a test calling os._exit kills the process
+        # before pytest_sessionfinish, so the record is never written — this
+        # ABSENCE is how full_unit detects a truncated run.
+        (tmp_path / "test_hardexit.py").write_text(
+            "import os\n"
+            "def test_a(): assert True\n"
+            "def test_boom(): os._exit(1)\n"
+            "def test_c(): assert True\n"
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root()
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-p",
+                "no:cacheprovider",
+                *plugin_args,
+                "test_hardexit.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert self._session_records(log_path) == []  # hook never fired
+
+    def test_session_finish_early_stop_records_gap(self, tmp_path):
+        # codex #1222 r15: -x stops after the first failure, so the record
+        # carries ran < collected — full_unit reads that gap as incomplete.
+        (tmp_path / "test_earlystop.py").write_text(
+            "def test_a(): assert False\n"
+            "def test_b(): assert True\n"
+            "def test_c(): assert True\n"
+        )
+        log_path = tmp_path / "nodeids.tsv"
+        plugin_args, env = flake_mod._nodeid_reporter.build_invocation(
+            log_path, self._repo_root()
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:randomly",
+                "-x",
+                *plugin_args,
+                "test_earlystop.py",
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert self._session_records(log_path) == ["1 3"]
 
 
 # --------------------------------------------------------------------------

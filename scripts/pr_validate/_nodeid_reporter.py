@@ -23,6 +23,19 @@ back):
     ``$PR_VALIDATE_NODEID_LOG_PASSES=1``. The rerun classifier needs
     positive PASSED signals; the full suite (14k passes) does not, and
     logging them all would bloat the gate's artifact for no benefit.
+  * session finished      → ``SESSIONFINISH\t<ran> <collected>`` — one
+    line written from ``pytest_sessionfinish``, proving the run reached a
+    GRACEFUL end and recording how many items pytest attempted vs
+    collected. The quarantine downgrade in ``full_unit`` is only sound on a
+    COMPLETE run, and this record is how the consumer proves completeness
+    STRUCTURALLY instead of scraping stdout banners (codex #1222 r15):
+      - the hook fires only on a graceful end, so its ABSENCE flags a hard
+        truncation — ``os._exit`` / a crash / SIGKILL kills the process
+        mid-suite and this line is simply never written;
+      - ``ran < collected`` flags an EARLY stop — ``-x`` / a hit
+        ``--maxfail`` / ``--stepwise`` run fewer items than they collected.
+    This replaces a fragile ``"stopping after" in stdout`` heuristic that
+    false-positived when those words appeared in a test's own traceback.
 
 Reads/skips are never logged: a test absent from the log positively
 "didn't fail (or pass, if passes are logged)", which is exactly the
@@ -44,6 +57,19 @@ _ENV_LOG = "PR_VALIDATE_NODEID_LOG"
 _ENV_PASSES = "PR_VALIDATE_NODEID_LOG_PASSES"
 
 PLUGIN_MODULE = "scripts.pr_validate._nodeid_reporter"
+
+# Label of the one-per-session completion record (see module docstring and
+# ``pytest_sessionfinish``). The consumer keys on this to prove a COMPLETE
+# run before granting any quarantine downgrade (codex #1222 r15).
+SESSION_LABEL = "SESSIONFINISH"
+
+# Count of test items pytest ATTEMPTED this session — one ``setup`` report
+# per item, regardless of pass/fail/skip. Compared against
+# ``session.testscollected`` at sessionfinish to detect an early stop
+# (``-x`` / ``--maxfail`` / ``--stepwise`` attempt fewer than they
+# collected). Reset at ``pytest_sessionstart`` so the module can be reused
+# in-process without carrying a stale count.
+_ran_tests = 0
 
 
 def available() -> bool:
@@ -104,7 +130,22 @@ def _append(label: str, nodeid: str) -> None:
         fh.write(f"{label}\t{nodeid}\n")
 
 
+def pytest_sessionstart(session) -> None:  # noqa: ANN001, ARG001 — pytest hook
+    # Reset the attempt counter so a reused module (e.g. a harness running
+    # multiple sessions in one process) never carries a stale count into
+    # the next session's completeness check (codex #1222 r15).
+    global _ran_tests
+    _ran_tests = 0
+
+
 def pytest_runtest_logreport(report) -> None:  # noqa: ANN001 — pytest hook
+    if report.when == "setup":
+        # One setup report per item pytest ATTEMPTS (pass, fail, or skip) —
+        # count them so pytest_sessionfinish can prove ran == collected. A
+        # run truncated by -x / --maxfail / --stepwise attempts strictly
+        # fewer than it collected (codex #1222 r15).
+        global _ran_tests
+        _ran_tests += 1
     if report.when == "call":
         if report.outcome == "failed":
             _append("FAILED", report.nodeid)
@@ -120,3 +161,16 @@ def pytest_collectreport(report) -> None:  # noqa: ANN001 — pytest hook
     # node id is the module/dir that failed to collect.
     if report.failed:
         _append("ERROR", report.nodeid)
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ANN001, ARG001 — pytest hook
+    # Write the STRUCTURED completion record. This hook fires only on a
+    # graceful session end, so the record's mere presence proves the
+    # process did not die mid-suite (os._exit / crash / SIGKILL), and the
+    # ran-vs-collected counts prove no early stop (-x / --maxfail /
+    # --stepwise). The consumer requires this record with ran >= collected
+    # before any quarantine downgrade — a structural replacement for the
+    # old stdout-banner heuristic (codex #1222 r15). ``_append`` no-ops
+    # when no log path is configured.
+    collected = int(getattr(session, "testscollected", 0) or 0)
+    _append(SESSION_LABEL, f"{_ran_tests} {collected}")

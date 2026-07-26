@@ -205,22 +205,29 @@ class FullUnitStep(Step):
                 artifacts=[str(log_path)],
             )
 
-        # A quarantine downgrade is only sound on a COMPLETE run. If pytest
-        # terminated the session early — --stepwise / -x / --maxfail (a
-        # conftest can still set these programmatically even with addopts
-        # cleared) or any interrupt — a later real regression may simply not
-        # have run yet, so the FAILED set doesn't account for the whole
-        # suite. Withhold the downgrade and block (codex #1222 r14). The
-        # banners pytest prints for these are unambiguous.
-        if _stopped_early(proc.stdout):
+        # A quarantine downgrade is only sound on a COMPLETE run. Prove
+        # completeness STRUCTURALLY from the reporter's session-finish
+        # record (codex #1222 r15), not by scraping stdout: the record is
+        # ABSENT when the process died mid-suite (os._exit / crash / SIGKILL
+        # — pytest_sessionfinish never fired), and shows ran < collected
+        # when the session stopped early (-x / --maxfail / --stepwise, which
+        # a conftest can still set programmatically even with addopts
+        # cleared). Either way a later real regression may not have run, so
+        # the FAILED set can't account for the whole suite — withhold the
+        # downgrade and block. This replaces a fragile stdout heuristic that
+        # false-positived when "stopping after" / "Interrupted:" appeared in
+        # a quarantined test's own traceback (codex #1222 r15 B2).
+        if not _session_completed(nodeid_log):
             return StepResult(
                 name=self.name,
                 status="fail",
-                summary=summary_line or "pytest stopped early",
+                summary=summary_line or "pytest did not run to completion",
                 details=_render_details(failed_ids, [], log_path)
-                + "\n\n⚠️ pytest terminated the session early (--stepwise / "
-                "-x / --maxfail / interrupt) — the suite did not complete, so "
-                "the quarantine downgrade is withheld; every failure blocks.",
+                + "\n\n⚠️ the pytest session did not run to completion — no "
+                "session-finish record (os._exit / crash / SIGKILL), or fewer "
+                "tests ran than were collected (--stepwise / -x / --maxfail). "
+                "A later regression may not have run, so the quarantine "
+                "downgrade is withheld; every failure blocks.",
                 artifacts=[str(log_path)],
             )
 
@@ -326,18 +333,33 @@ def _render_unaccounted(
     return "\n\n".join(parts)
 
 
-def _stopped_early(stdout: str) -> bool:
-    """True iff pytest terminated the session EARLY (—x / --maxfail /
-    --stepwise / an interrupt) instead of running the whole suite.
+def _session_completed(nodeid_log) -> bool:
+    """True iff the reporter's session-finish record proves pytest ran the
+    WHOLE collected suite — the precondition for a sound quarantine
+    downgrade (codex #1222 r15).
 
-    Its interruption banners are unambiguous and stable: ``-x`` / maxfail
-    print ``… stopping after N failures …`` and --stepwise / keyboard /
-    collection interrupts print ``Interrupted: …``. Both land at the left
-    margin (captured test output is indented under its test), so a false
-    positive is unlikely; if one did occur it would only WITHHOLD a
-    downgrade (block), which is the safe direction."""
-    text = stdout or ""
-    return "stopping after" in text or "Interrupted:" in text
+    Both truncation modes are caught STRUCTURALLY, replacing the old
+    stdout-banner heuristic that false-positived when a test's own traceback
+    contained ``"stopping after"`` / ``"Interrupted:"`` (r15 B2):
+
+      * ABSENT record → ``pytest_sessionfinish`` never fired, i.e. the
+        process died mid-suite (``os._exit`` / crash / SIGKILL) (r15 B1).
+      * ``ran < collected`` → the session ended early (``-x`` / a hit
+        ``--maxfail`` / ``--stepwise``), so tests after the stop never ran.
+
+    Requires EXACTLY one well-formed record (``<ran> <collected>``) with a
+    positive collected count and ``ran >= collected``. Anything else —
+    missing, malformed, duplicated (an unexpected xdist/tamper shape) —
+    withholds the downgrade, the safe direction."""
+    records = report_log_node_ids(nodeid_log, _nodeid_reporter.SESSION_LABEL)
+    if len(records) != 1:
+        return False
+    try:
+        ran_s, collected_s = records[0].split()
+        ran, collected = int(ran_s), int(collected_s)
+    except (ValueError, TypeError):
+        return False
+    return collected > 0 and ran >= collected
 
 
 def _last_summary_line(stdout: str) -> str:
