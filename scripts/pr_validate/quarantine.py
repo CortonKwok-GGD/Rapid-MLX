@@ -85,6 +85,13 @@ def load_quarantine(path: Path | None = None) -> list[QuarantineEntry]:
         # QuarantineError so the gating caller fails safe to empty rather
         # than crashing on an unhandled ValueError (codex #1222 r5).
         raise QuarantineError(f"{path}: not valid UTF-8: {e}") from e
+    except OSError as e:
+        # A present-but-unreadable file (permissions, an I/O error, a
+        # TOCTOU vanish after the exists() check) is a read failure, not
+        # "absent" — the docstring promises QuarantineError for a present-
+        # but-unusable registry, so a caller catching only that exception
+        # doesn't crash on a raw OSError (codex #1222 r18).
+        raise QuarantineError(f"{path}: could not be read: {e}") from e
     return _parse_quarantine_text(text, source=str(path))
 
 

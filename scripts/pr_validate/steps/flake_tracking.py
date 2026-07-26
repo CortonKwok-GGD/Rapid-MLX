@@ -145,9 +145,23 @@ class FlakeTrackingStep(Step):
         # r15 NIT).
         nodeid_log = ctx.artifact_path("full-unit-nodeids.tsv")
         if nodeid_log.exists():
-            original_failed = report_log_node_ids(nodeid_log, "FAILED", "ERROR")
+            failed_only = report_log_node_ids(nodeid_log, "FAILED")
+            error_only = report_log_node_ids(nodeid_log, "ERROR")
         else:
-            original_failed = summary_node_ids(log_path.read_text(), "FAILED", "ERROR")
+            text = log_path.read_text()
+            failed_only = summary_node_ids(text, "FAILED")
+            error_only = summary_node_ids(text, "ERROR")
+        failed_set = set(failed_only)
+        # Ids that appeared ONLY as ERROR (setup / teardown / collection).
+        # full_unit blocks any run containing an ERROR UNCONDITIONALLY (it
+        # never quarantines what it couldn't even complete), so promoting one
+        # of these to quarantine.yaml would be INEFFECTIVE — a quarantine
+        # entry can't waive an ERROR run. Track their origin so a recovered
+        # ERROR flake is reported in its own "investigate, not quarantinable"
+        # bucket rather than recommended for a promotion that wouldn't work
+        # (codex #1222 r18).
+        error_origin = {i for i in error_only if i not in failed_set}
+        original_failed = failed_only + [i for i in error_only if i not in failed_set]
         if not original_failed:
             return StepResult(
                 name=self.name,
@@ -234,6 +248,18 @@ class FlakeTrackingStep(Step):
         # otherwise (codex #1222 r16). Done regardless of plugin availability.
         rerun_env = dict(os.environ)
         rerun_env.pop("PYTEST_ADDOPTS", None)
+        # pytest-rerunfailures provides ``--reruns``. It autoloads by entry
+        # point (registered under the name "rerunfailures") UNLESS
+        # PYTEST_DISABLE_PLUGIN_AUTOLOAD is set. Add an explicit ``-p`` ONLY
+        # when autoload is off: a redundant ``-p`` on an already-autoloaded
+        # plugin is NOT a no-op — pluggy raises "Plugin already registered
+        # under a different name" because the entry-point name (rerunfailures)
+        # differs from the module name (pytest_rerunfailures), which crashes
+        # the whole advisory re-run (codex #1222 r18 regression, fixed r19).
+        # find_spec confirmed it's importable above, so the -p can't
+        # ImportError when we do add it.
+        if rerun_env.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD"):
+            cmd += ["-p", "pytest_rerunfailures"]
         # Emit the structured node-id log (with PASSED, which the classifier
         # needs) so flake-vs-real is decided on exact ids, not summary text.
         if _nodeid_reporter.available():
@@ -290,38 +316,55 @@ class FlakeTrackingStep(Step):
         else:
             passed = set(summary_node_ids(proc.stdout, "PASSED"))
             still_bad = set(summary_node_ids(proc.stdout, "FAILED", "ERROR"))
+
         # FAILED/ERROR takes PRECEDENCE over PASSED for the same node id
         # (codex #1222 r12): a test whose call PASSES but whose teardown
         # ERRORs emits BOTH a PASSED and an ERROR line (they're different
         # pytest phases), and a test can likewise fail then pass across
         # phases. Such a run is NOT "green on re-run" — it ended badly — so
         # it must be a reproduction, never a flake candidate. Subtracting
-        # ``still_bad`` from the passed set makes the three buckets disjoint
-        # and gives badness the last word.
+        # ``still_bad`` from the passed set makes the buckets disjoint and
+        # gives badness the last word.
         #
         # Collection-error targets need special handling (codex #1222 r17): a
         # collection ERROR id is a MODULE / DIR path (no "::"), and on a clean
         # re-run its CONTAINED tests log PASSED under their own "::"-bearing
-        # ids — the target id itself never logs a PASSED. So a collection
-        # flake that recovered would fall through to "inconclusive" forever.
-        # Treat a collection target that did NOT re-error (absent from
-        # still_bad) as a recovered flake candidate: it errored in the suite,
-        # collected cleanly in isolation → non-deterministic collection.
-        candidates = [
-            i
-            for i in sample
-            if i not in still_bad and (i in passed or _is_collection_target(i))
-        ]
-        reproduced = [i for i in sample if i in still_bad]
-        inconclusive = [
-            i
-            for i in sample
-            if i not in still_bad and i not in passed and not _is_collection_target(i)
-        ]
+        # ids — the target id itself never logs a PASSED. So a recovered
+        # collection flake would fall through to "inconclusive" forever.
+        # Treat it as recovered ONLY on POSITIVE evidence — a contained test
+        # actually PASSED — not merely on the absence of a re-error (codex
+        # #1222 r18): a module that collected nothing or only skipped is
+        # inconclusive, not a proven flake, same as any other id.
+        def _recovered(i: str) -> bool:
+            if i in passed:
+                return True
+            return _is_collection_target(i) and any(
+                p.startswith(i + "::") for p in passed
+            )
 
-        # Split candidates by whether they're already covered.
-        new_candidates = [i for i in candidates if not is_quarantined(i, entries)]
-        known_flakes = [i for i in candidates if is_quarantined(i, entries)]
+        candidates = [i for i in sample if i not in still_bad and _recovered(i)]
+        reproduced = [i for i in sample if i in still_bad]
+        cand_set = set(candidates)
+        inconclusive = [i for i in sample if i not in still_bad and i not in cand_set]
+
+        # Split candidates three ways (codex #1222 r18): an ERROR-origin flake
+        # can NOT be quarantined — full_unit blocks any run containing an
+        # ERROR unconditionally, so a quarantine entry would never waive it.
+        # Report those separately as "investigate / fix the root cause"
+        # instead of recommending an ineffective promotion. The remaining
+        # (call-phase FAILED) candidates split by whether they're already
+        # covered, as before.
+        error_candidates = [i for i in candidates if i in error_origin]
+        new_candidates = [
+            i
+            for i in candidates
+            if i not in error_origin and not is_quarantined(i, entries)
+        ]
+        known_flakes = [
+            i
+            for i in candidates
+            if i not in error_origin and is_quarantined(i, entries)
+        ]
 
         # Split reproductions the same way: a NON-quarantined test that
         # reproduces is a real failure full_unit blocked on. A QUARANTINED
@@ -338,6 +381,7 @@ class FlakeTrackingStep(Step):
             "truncated": truncated,
             "flake_candidates_new": new_candidates,
             "flake_candidates_known": known_flakes,
+            "error_flake_candidates": error_candidates,
             "reproduced_likely_real": reproduced_new,
             "reproduced_quarantined": reproduced_known,
             "inconclusive": inconclusive,
@@ -348,6 +392,7 @@ class FlakeTrackingStep(Step):
         details = _render(
             new_candidates,
             known_flakes,
+            error_candidates,
             reproduced_new,
             reproduced_known,
             inconclusive,
@@ -370,9 +415,15 @@ class FlakeTrackingStep(Step):
             if reproduced_known
             else ""
         )
+        error_note = (
+            f"{len(error_candidates)} error-flake(s) [not quarantinable], "
+            if error_candidates
+            else ""
+        )
         summary = (
             f"{review}"
             f"{len(new_candidates)} new flake candidate(s), "
+            f"{error_note}"
             f"{len(reproduced_new)} reproduced, "
             f"{len(known_flakes)} known-flaky, "
             f"{len(inconclusive)} inconclusive — advisory"
@@ -480,6 +531,7 @@ def _kill_group(proc: subprocess.Popen) -> None:
 def _render(
     new_candidates: list[str],
     known_flakes: list[str],
+    error_candidates: list[str],
     reproduced_new: list[str],
     reproduced_known: list[str],
     inconclusive: list[str],
@@ -493,6 +545,15 @@ def _render(
             "**New flake candidates** (failed the full suite, passed on "
             "isolated re-run — consider promoting to `quarantine.yaml` "
             "after confirming):\n```\n" + "\n".join(new_candidates) + "\n```"
+        )
+    if error_candidates:
+        parts.append(
+            "**Error flakes — investigate, NOT quarantinable** (errored "
+            "(setup / teardown / collection) in the full suite, recovered on "
+            "isolated re-run — so non-deterministic, but `full_unit` blocks "
+            "ANY run containing an ERROR unconditionally, so a `quarantine.yaml`"
+            " entry would NOT waive these; fix the fixture / collection or the "
+            "code):\n```\n" + "\n".join(error_candidates) + "\n```"
         )
     if reproduced_new:
         parts.append(

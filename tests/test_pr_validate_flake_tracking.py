@@ -288,6 +288,21 @@ class TestLoadQuarantine:
         with pytest.raises(QuarantineError):
             load_quarantine(p)
 
+    def test_unreadable_file_raises_quarantine_error(self, tmp_path, monkeypatch):
+        # A present-but-unreadable registry (permissions / I/O error) is a
+        # read failure, not "absent" — the loader must re-raise it as the
+        # documented QuarantineError so a caller catching only that exception
+        # doesn't crash on a raw OSError (codex #1222 r18).
+        p = tmp_path / "q.yaml"
+        p.write_text("tests: []\n")
+
+        def boom(*a, **k):
+            raise PermissionError("permission denied")
+
+        monkeypatch.setattr(type(p), "read_text", boom)
+        with pytest.raises(QuarantineError, match="could not be read"):
+            load_quarantine(p)
+
     def test_tests_must_be_list(self, tmp_path):
         p = tmp_path / "q.yaml"
         p.write_text("tests: not-a-list\n")
@@ -1118,13 +1133,17 @@ class TestFlakeTrackingContract:
         FlakeTrackingStep().run(ctx)
         assert "tests/x.py::errored" in captured["cmd"]
 
-    def test_recovered_collection_error_is_candidate(self, ctx_factory, monkeypatch):
-        # codex #1222 r17 NIT: a collection ERROR id is a MODULE / DIR path
-        # (no "::"); on a clean re-run its CONTAINED tests log PASSED under
-        # their own "::" ids, but the module id itself never logs a PASSED —
-        # so a recovered collection flake would wrongly land in `inconclusive`
-        # forever. A collection target that did NOT re-error is a recovered
-        # flake candidate instead.
+    def test_recovered_collection_error_is_error_candidate(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r17: a collection ERROR id is a MODULE / DIR path (no
+        # "::"); on a clean re-run its CONTAINED tests log PASSED under their
+        # own "::" ids, but the module id itself never logs a PASSED — so a
+        # recovered collection flake would wrongly land in `inconclusive`
+        # forever. With POSITIVE evidence (a contained test passed) it is a
+        # recovered flake — but as an ERROR-origin one it is NOT quarantinable
+        # (full_unit blocks any ERROR run), so it lands in
+        # `error_flake_candidates`, not `flake_candidates_new` (codex r18).
         ctx = ctx_factory()
         ctx.artifact_path("full-unit.log").write_text("boom")
         ctx.artifact_path("full-unit-nodeids.tsv").write_text("ERROR\ttests/mod.py\n")
@@ -1145,8 +1164,67 @@ class TestFlakeTrackingContract:
         res = FlakeTrackingStep().run(ctx)
         assert res.status == "pass"
         data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
-        assert "tests/mod.py" in data["flake_candidates_new"]
+        assert "tests/mod.py" in data["error_flake_candidates"]
+        assert "tests/mod.py" not in data["flake_candidates_new"]
         assert "tests/mod.py" not in data["inconclusive"]
+
+    def test_collection_target_no_positive_outcome_is_inconclusive(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r18: a collection target that stopped erroring but
+        # produced NO positive outcome on re-run (collected nothing, or only
+        # skipped) is NOT a proven flake — same positive-outcome rule as any
+        # other id. It must land in `inconclusive`, not be falsely recovered.
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text("ERROR\ttests/mod.py\n")
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            # Re-run collected but nothing passed (all skipped / empty).
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text("")
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert "tests/mod.py" in data["inconclusive"]
+        assert "tests/mod.py" not in data["error_flake_candidates"]
+        assert "tests/mod.py" not in data["flake_candidates_new"]
+
+    def test_recovered_setup_error_is_not_quarantinable(self, ctx_factory, monkeypatch):
+        # codex #1222 r18: a setup/teardown ERROR flake that recovers is real
+        # (non-deterministic) but NOT quarantinable — full_unit blocks any
+        # ERROR run unconditionally, so a quarantine entry would never waive
+        # it. It lands in error_flake_candidates ("investigate"), never in
+        # flake_candidates_new (which recommends quarantine promotion).
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text("boom")
+        ctx.artifact_path("full-unit-nodeids.tsv").write_text(
+            "ERROR\ttests/x.py::test_boom\n"
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+
+        def fake(cmd, cwd, timeout, env=None):
+            ctx.artifact_path("flake-rerun-nodeids.tsv").write_text(
+                "PASSED\ttests/x.py::test_boom\n"
+            )
+            return _completed(0, "")
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"
+        assert "not quarantinable" in res.summary
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert data["error_flake_candidates"] == ["tests/x.py::test_boom"]
+        assert data["flake_candidates_new"] == []
 
     def test_reproduced_collection_error_not_candidate(self, ctx_factory, monkeypatch):
         # The inverse: a collection target that RE-ERRORS on re-run reproduces
@@ -1319,6 +1397,54 @@ class TestFlakeTrackingContract:
         FlakeTrackingStep().run(ctx)
         assert "--color=no" in captured["cmd"]
         assert "-rA" in captured["cmd"]
+
+    def test_rerun_loads_rerunfailures_explicitly_when_autoload_disabled(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r18: find_spec confirms rerunfailures is installed but
+        # not that it's ACTIVE — under PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 an
+        # installed plugin won't register, so --reruns would be unknown and
+        # the advisory would silently skip. In THAT case only, load it
+        # explicitly with -p so --reruns is recognized.
+        monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+        ctx = ctx_factory()
+        self._prime(ctx, monkeypatch)
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+        captured = {}
+
+        def fake(cmd, cwd, timeout, env=None):
+            captured["cmd"] = cmd
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        FlakeTrackingStep().run(ctx)
+        cmd = captured["cmd"]
+        # -p pytest_rerunfailures appears as adjacent argv entries.
+        assert "pytest_rerunfailures" in cmd
+        assert cmd[cmd.index("pytest_rerunfailures") - 1] == "-p"
+
+    def test_rerun_omits_explicit_rerunfailures_when_autoload_on(
+        self, ctx_factory, monkeypatch
+    ):
+        # codex #1222 r18 REGRESSION (fixed r19): with autoload ON,
+        # rerunfailures self-registers under the entry-point name
+        # "rerunfailures". Passing an extra ``-p pytest_rerunfailures`` then
+        # makes pluggy raise "Plugin already registered under a different
+        # name" and crashes the advisory re-run entirely. So the explicit
+        # ``-p`` MUST be absent unless autoload is disabled.
+        monkeypatch.delenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", raising=False)
+        ctx = ctx_factory()
+        self._prime(ctx, monkeypatch)
+        monkeypatch.setattr(flake_mod, "load_quarantine_from_ref", lambda *a, **k: [])
+        captured = {}
+
+        def fake(cmd, cwd, timeout, env=None):
+            captured["cmd"] = cmd
+            return _completed(0, _passed())
+
+        monkeypatch.setattr(flake_mod, "_run_session", fake)
+        FlakeTrackingStep().run(ctx)
+        assert "pytest_rerunfailures" not in captured["cmd"]
 
     def test_rerun_neutralizes_candidate_addopts_and_env(
         self, ctx_factory, monkeypatch
