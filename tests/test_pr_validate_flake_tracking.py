@@ -712,13 +712,14 @@ class TestFlakeTrackingContract:
         assert "--color=no" in captured["cmd"]
         assert "-rA" in captured["cmd"]
 
-    def test_quarantined_reproduction_not_labeled_blocked(
+    def test_quarantined_deterministic_reproduction_blocks(
         self, ctx_factory, monkeypatch
     ):
-        # A quarantined test that reproduces on re-run must land in
-        # `reproduced_quarantined`, NOT `reproduced_likely_real` — full_unit
-        # PASSED it (quarantined), so it isn't a failure the gate blocked
-        # on (codex #1222 r5).
+        # A quarantined test that reproduces its failure on EVERY re-run is
+        # a deterministic regression the quarantine would otherwise mask —
+        # flake_tracking must BLOCK (status=fail), revoking full_unit's
+        # downgrade (codex #1222 r7). Its id lands in `reproduced_quarantined`;
+        # a non-quarantined reproduction lands in `reproduced_likely_real`.
         ctx = ctx_factory()
         ctx.artifact_path("full-unit.log").write_text(
             _summary(
@@ -744,10 +745,41 @@ class TestFlakeTrackingContract:
             flake_mod, "_run_session", lambda *a, **k: _completed(1, rerun)
         )
         res = FlakeTrackingStep().run(ctx)
-        assert res.status == "pass"
+        assert res.status == "fail"  # deterministic quarantined regression
+        assert "deterministically" in res.summary
         data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
         assert data["reproduced_likely_real"] == ["tests/x.py::real"]
         assert data["reproduced_quarantined"] == ["tests/x.py::flaky"]
+
+    def test_quarantined_flake_confirmed_does_not_block(self, ctx_factory, monkeypatch):
+        # The inverse: a quarantined test that PASSES on re-run is a genuine
+        # flake — the quarantine downgrade was correct, so we do NOT block;
+        # it's reported as a confirmed known-flake (advisory pass).
+        ctx = ctx_factory()
+        ctx.artifact_path("full-unit.log").write_text(
+            _summary("FAILED tests/x.py::flaky - X")
+        )
+        monkeypatch.setattr(
+            flake_mod.importlib.util, "find_spec", lambda name: object()
+        )
+        monkeypatch.setattr(
+            flake_mod,
+            "load_quarantine_from_ref",
+            lambda *a, **k: [QuarantineEntry(id="tests/x.py::flaky")],
+        )
+        rerun = (
+            "==================== short test summary info ====================\n"
+            "PASSED tests/x.py::flaky\n"
+            "==== 1 passed in 0.20s ====\n"
+        )
+        monkeypatch.setattr(
+            flake_mod, "_run_session", lambda *a, **k: _completed(0, rerun)
+        )
+        res = FlakeTrackingStep().run(ctx)
+        assert res.status == "pass"  # confirmed flake → downgrade was right
+        data = json.loads(ctx.artifact_path("flake-candidates.json").read_text())
+        assert data["flake_candidates_known"] == ["tests/x.py::flaky"]
+        assert data["reproduced_quarantined"] == []
 
 
 class TestFlakeTrackingClassification:
@@ -807,17 +839,33 @@ class TestRunSession:
 
     def test_timeout_kills_grandchild_in_group(self, tmp_path):
         # Prove it's a process-GROUP kill, not just proc.kill(): the child
-        # spawns a long-lived grandchild in the SAME group (no setsid) and
-        # records its pid. On timeout, killpg must reap the grandchild too —
-        # a bare proc.kill() on the direct child would leave it alive
-        # (codex #1222 r2).
+        # spawns a long-lived grandchild in the SAME group (no setsid). On
+        # timeout, killpg must kill the grandchild too — a bare proc.kill()
+        # on the direct child would leave it running (codex #1222 r2).
+        #
+        # Liveness is checked via a HEARTBEAT, not os.kill(pid, 0): a
+        # SIGKILLed-but-not-yet-reaped ZOMBIE still answers signal 0, so a
+        # PID-disappearance poll can flake when the reaper is slow (codex
+        # #1222 r7). A killed process — zombie or not — cannot tick the
+        # heartbeat file, so a frozen counter is unambiguous proof of death.
         pidfile = tmp_path / "grandchild.pid"
+        heartbeat = tmp_path / "heartbeat"
+        grandchild_prog = textwrap.dedent(
+            f"""
+            import time
+            n = 0
+            while True:
+                with open({str(heartbeat)!r}, "w") as f:
+                    f.write(str(n))
+                    f.flush()
+                n += 1
+                time.sleep(0.05)
+            """
+        )
         child_prog = textwrap.dedent(
             f"""
             import subprocess, sys, time
-            gc = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(120)"]
-            )
+            gc = subprocess.Popen([sys.executable, "-c", {grandchild_prog!r}])
             with open({str(pidfile)!r}, "w") as f:
                 f.write(str(gc.pid))
                 f.flush()
@@ -832,23 +880,23 @@ class TestRunSession:
         assert time.monotonic() - t0 < 20.0
 
         gc_pid = int(pidfile.read_text().strip())
-        # killpg SIGKILL is async; poll briefly for the grandchild to die.
-        deadline = time.monotonic() + 5.0
-        alive = True
-        while time.monotonic() < deadline:
-            try:
-                os.kill(gc_pid, 0)
-            except ProcessLookupError:
-                alive = False
-                break
-            time.sleep(0.1)
-        if alive:
-            # Clean up before failing so we don't leak a 120s sleeper.
+        try:
+            # Let the SIGKILL settle, then confirm the heartbeat froze.
+            time.sleep(0.3)
+            assert heartbeat.exists(), "grandchild never started"
+            beat1 = heartbeat.read_text()
+            time.sleep(1.0)  # >> 0.05s tick — an ALIVE grandchild ticks ~20×
+            beat2 = heartbeat.read_text()
+            assert beat1 == beat2, (
+                f"grandchild heartbeat advanced {beat1!r}->{beat2!r} — it "
+                f"survived the process-group kill"
+            )
+        finally:
+            # best-effort cleanup so a survivor (on failure) doesn't leak.
             try:
                 os.kill(gc_pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, OSError):
                 pass
-            pytest.fail(f"grandchild {gc_pid} survived the process-group kill")
 
     def test_double_timeout_reaps_direct_child(self, monkeypatch):
         # If the post-kill drain ALSO times out (a group-escaping
@@ -878,12 +926,18 @@ class TestRunSession:
 
 
 class TestRegistration:
-    def test_registered_after_full_unit(self):
+    def test_registered_after_all_gating_steps(self):
+        # Must read full-unit.log (so after full_unit) AND run after every
+        # gating step so its possible descendant leak can't contaminate one
+        # (codex #1222 r7): after full_unit and stress_e2e_bench.
         from scripts.pr_validate.runner import STEPS
 
         names = [s.name for s in STEPS]
         assert "flake_tracking" in names
         assert names.index("flake_tracking") > names.index("full_unit")
+        assert names.index("flake_tracking") > names.index("stress_e2e_bench")
 
-    def test_is_advisory(self):
+    def test_crash_never_blocks(self):
+        # A crash in this step must never sink the PR (advisory heritage);
+        # its only blocking path is a deliberate reproduced-quarantined fail.
         assert FlakeTrackingStep().continue_on_error is True

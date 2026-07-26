@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Advisory step — flake tracking (dev-flow proposal item ③).
+"""Flake tracking (dev-flow proposal item ③).
 
-MEASURE-ONLY. This step never blocks a PR: every path returns ``pass``
-or ``skip`` (the base ``execute`` would turn an uncaught exception into a
-blocking ``error``, so ``run`` catches everything and downgrades to
-``skip``). It is the reporting half of the flake system whose gating half
-lives in ``full_unit`` (quarantine-aware) — here we surface *candidates*
-for that quarantine from real PR runs, so a human can promote a confirmed
-flake instead of hand-hunting for it.
+MOSTLY advisory: it surfaces flake *candidates* for the quarantine from
+real PR runs (so a human can promote a confirmed flake instead of
+hand-hunting for it), and it never lets its own crash block a PR — the
+base ``execute`` would turn an uncaught exception into a blocking
+``error``, so ``run`` catches everything and downgrades to ``skip``.
+
+It has exactly ONE gating case (codex #1222 r7): a test that is
+*quarantined* — so ``full_unit`` downgraded its failure to non-blocking —
+but then fails EVERY isolated re-run here is not flaky, it's a
+deterministic regression the quarantine would otherwise mask forever.
+That revokes the downgrade and BLOCKS. This closes the "quarantine
+graveyard" hole where an allowlisted test silently rots into a real
+regression. Every other outcome is advisory (``pass`` / ``skip``).
 
 Mechanism: after ``full_unit`` runs, read its log for the tests that
 failed, then re-run exactly those node ids in isolation with
@@ -81,9 +87,13 @@ _CLASSIFIABLE_EXITS = (0, 1)
 
 class FlakeTrackingStep(Step):
     name = "flake_tracking"
-    description = "advisory — classify full_unit failures as flake vs real"
-    # Advisory: an error here must not sink the PR. run() also catches
-    # everything itself; this is belt-and-suspenders with the runner.
+    description = (
+        "classify full_unit failures — blocks a deterministic quarantined regression"
+    )
+    # A CRASH here must never sink the PR (advisory heritage): run() also
+    # catches everything itself and downgrades to skip, so this step only
+    # ever emits a *deliberate* fail (the reproduced-quarantined gate) —
+    # never an error. continue_on_error stays True as belt-and-suspenders.
     continue_on_error = True
 
     def should_run(self, ctx: Context) -> bool:
@@ -245,11 +255,31 @@ class FlakeTrackingStep(Step):
             inconclusive,
             truncated,
         )
+
+        # The ONE gating case (codex #1222 r7): a quarantined test that
+        # full_unit downgraded to non-blocking, yet failed EVERY isolated
+        # re-run here, is not flaky — it's a deterministic regression the
+        # quarantine would otherwise mask forever ("quarantine graveyard").
+        # Revoke the downgrade and BLOCK. Everything else stays advisory.
+        if reproduced_known:
+            summary = (
+                f"{len(reproduced_known)} quarantined test(s) failed "
+                f"deterministically on {_RERUNS} re-run(s) — a regression, "
+                f"not a flake; fix the test or remove it from "
+                f"quarantine.yaml (blocking)"
+            )
+            return StepResult(
+                name=self.name,
+                status="fail",
+                summary=summary,
+                details=details,
+                artifacts=[str(cand_path), str(rerun_log)],
+            )
+
         summary = (
             f"{len(new_candidates)} new flake candidate(s), "
             f"{len(reproduced_new)} reproduced, "
             f"{len(known_flakes)} known-flaky, "
-            f"{len(reproduced_known)} quarantined-reproduced, "
             f"{len(inconclusive)} inconclusive — advisory"
         )
         return StepResult(
