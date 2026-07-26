@@ -43,6 +43,7 @@ from scripts.pr_validate.quarantine import (
     load_quarantine_from_ref,
     node_id_matches,
     partition_failures,
+    snapshot_quarantine_registries,
 )
 from scripts.pr_validate.steps import flake_tracking as flake_mod
 from scripts.pr_validate.steps import full_unit as full_unit_mod
@@ -77,8 +78,8 @@ def _completed(returncode: int, stdout: str = "", stderr: str = ""):
 # flake_tracking now requires the advisory rerun to have run to completion
 # before it trusts the structured classification (codex #1222 r23); a real
 # rerun always writes this record, so the fakes must too. The exact counts
-# don't matter to session_completed beyond ``collected > 0 and ran >=
-# collected``.
+# don't matter to session_completed beyond ``collected > 0 and ran ==
+# collected`` (codex #1222 r36 tightened `>=` to `==`), so use equal counts.
 _RERUN_DONE = f"{_nodeid_reporter.SESSION_LABEL}\t99 99\n"
 
 
@@ -740,6 +741,158 @@ class TestLoadQuarantineFromRef:
         assert not sentinel.exists()  # the hostile git was never invoked
 
 
+class TestQuarantineSnapshot:
+    """r36: registries are snapshotted at fetch (before candidate code), so
+    ``load_quarantine_from_ref`` serves the cached blob without re-invoking
+    git — closing the residual r35 left open (a candidate that can WRITE the
+    resolved git binary, e.g. a user-owned Homebrew git, and overwrite it
+    in place)."""
+
+    def setup_method(self):
+        from scripts.pr_validate import quarantine as q
+
+        q._REGISTRY_SNAPSHOT.clear()
+
+    def teardown_method(self):
+        from scripts.pr_validate import quarantine as q
+
+        q._REGISTRY_SNAPSHOT.clear()
+
+    def test_snapshot_serves_cache_without_reinvoking_git(self, tmp_path, monkeypatch):
+        good = "tests:\n  - id: GOOD::t\n    reason: r\n    added: 2026-01-01\n"
+        calls = {"n": 0}
+
+        def fake_run(*a, **k):
+            calls["n"] += 1
+            return _completed(0, good)
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", fake_run)
+        snapshot_quarantine_registries(["BASE"], tmp_path)  # one git call, at fetch
+        assert calls["n"] == 1
+
+        # Now a candidate has "overwritten" git: any further invocation is a
+        # test failure. The snapshot must satisfy the later load with NO git.
+        def poison(*a, **k):
+            raise AssertionError("git must not be invoked after the snapshot")
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", poison)
+        (entry,) = load_quarantine_from_ref("BASE", tmp_path)
+        assert entry.id == "GOOD::t"  # served from the pre-candidate snapshot
+
+    def test_snapshot_caches_error_and_load_reraises(self, tmp_path, monkeypatch):
+        # A malformed blob at snapshot time is cached as its QuarantineError;
+        # the later load must RE-RAISE it, never silently re-read live (which
+        # a poisoned git could turn into a forged clean allowlist).
+        monkeypatch.setattr(
+            "scripts.pr_validate.quarantine.subprocess.run",
+            lambda *a, **k: _completed(0, "tests: [unclosed\n"),
+        )
+        snapshot_quarantine_registries(["BASE"], tmp_path)
+        monkeypatch.setattr(
+            "scripts.pr_validate.quarantine.subprocess.run",
+            lambda *a, **k: _completed(0, "tests: []\n"),  # would-be forged clean
+        )
+        with pytest.raises(QuarantineError):
+            load_quarantine_from_ref("BASE", tmp_path)
+
+    def test_cache_miss_falls_through_to_live(self, tmp_path, monkeypatch):
+        # An un-snapshotted ref (isolated unit tests) reads live — production
+        # always snapshots the exact base/head SHAs full_unit later reads.
+        monkeypatch.setattr(
+            "scripts.pr_validate.quarantine.subprocess.run",
+            lambda *a, **k: _completed(
+                0, "tests:\n  - id: L::t\n    reason: r\n    added: 2026-01-01\n"
+            ),
+        )
+        (entry,) = load_quarantine_from_ref("UNSNAPSHOTTED", tmp_path)
+        assert entry.id == "L::t"
+
+    def test_snapshot_skips_falsy_refs_and_is_idempotent(self, tmp_path, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_run(*a, **k):
+            calls["n"] += 1
+            return _completed(0, "tests: []\n")
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", fake_run)
+        # "" and None are unset base/head SHAs → skipped (full_unit fails
+        # closed on those); only BASE is loaded.
+        snapshot_quarantine_registries(["", "BASE", None], tmp_path)
+        assert calls["n"] == 1
+        # Re-snapshotting the same ref does not re-invoke git.
+        snapshot_quarantine_registries(["BASE"], tmp_path)
+        assert calls["n"] == 1
+
+    def test_git_unresolved_at_import_fails_closed(self, tmp_path, monkeypatch):
+        # r36: no bare-name fallback. If git wasn't resolvable at import
+        # (`_GIT is None`), the live loader raises QuarantineError and NEVER
+        # spawns a subprocess that a candidate-tamperable PATH could resolve.
+        from scripts.pr_validate import quarantine as q
+
+        monkeypatch.setattr(q, "_GIT", None)
+
+        def no_git(*a, **k):
+            raise AssertionError("must not spawn git when _GIT is unresolved")
+
+        monkeypatch.setattr("scripts.pr_validate.quarantine.subprocess.run", no_git)
+        with pytest.raises(QuarantineError, match="could not be resolved"):
+            load_quarantine_from_ref("BASE", tmp_path)
+
+
+class TestFetchSnapshotWiring:
+    """r36: the fetch step MUST snapshot the registries before any candidate
+    code runs. If this wiring is ever dropped, full_unit falls back to a live
+    git read after candidate tests and the binary-overwrite vector reopens —
+    so pin it behaviorally, not just by comment."""
+
+    def test_fetch_snapshots_base_and_head_registries(self, tmp_path, monkeypatch):
+        from scripts.pr_validate.context import Context
+        from scripts.pr_validate.steps import fetch as fetch_mod
+
+        recorded = {}
+
+        def rec(refs, repo_root, *a, **k):
+            recorded["refs"] = list(refs)
+            recorded["repo_root"] = repo_root
+
+        monkeypatch.setattr(fetch_mod, "snapshot_quarantine_registries", rec)
+        monkeypatch.setattr(fetch_mod.shutil, "which", lambda _n: "/usr/bin/gh")
+
+        meta = {
+            "number": 1,
+            "title": "t",
+            "body": "b",
+            "author": {"login": "u"},
+            "isCrossRepository": False,
+            "headRefOid": "HEADSHA",
+            "headRefName": "feat",
+            "baseRefOid": "BASESHA",
+            "additions": 1,
+            "deletions": 0,
+            "files": [{"path": "a.py"}],
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+        }
+
+        def fake_gh(args):
+            if args.startswith("pr view"):
+                return json.dumps(meta)
+            return "diff --git a/a.py b/a.py\n"  # pr diff
+
+        monkeypatch.setattr(fetch_mod, "_gh", fake_gh)
+
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'fake'\n")
+        monkeypatch.chdir(tmp_path)
+        ctx = Context(pr_number=1)
+        ctx.work_dir = tmp_path / "work"
+
+        res = fetch_mod.FetchStep().run(ctx)
+        assert res.status == "pass"
+        # Snapshotted the exact immutable base/head SHAs full_unit later reads.
+        assert recorded["refs"] == ["BASESHA", "HEADSHA"]
+        assert recorded["repo_root"] == ctx.repo_root
+
+
 # --------------------------------------------------------------------------
 # quarantine.py — matcher / partition
 # --------------------------------------------------------------------------
@@ -973,8 +1126,9 @@ class TestFullUnitQuarantineAware:
                     f"{_nodeid_reporter.RERUN_LABEL}\t{nid}" for nid in rerun_ids or []
                 ]
                 # The reporter's session-finish completion record (codex
-                # #1222 r15). ``ran >= collected`` marks a COMPLETE run — the
-                # precondition for a downgrade. Truncation tests pass
+                # #1222 r15). ``ran == collected`` marks a COMPLETE run — the
+                # precondition for a downgrade (r36 tightened `>=` to `==`).
+                # Truncation tests pass
                 # ``session=False`` (hard exit / crash → the hook never fires,
                 # no record) or ``ran < collected`` (early stop); a malformed
                 # record is driven via ``session_value``.
@@ -1450,7 +1604,7 @@ class TestFullUnitQuarantineAware:
 
     def test_complete_run_allows_downgrade(self, ctx_factory, monkeypatch):
         # The positive control for r15: a well-formed completion record with
-        # ran >= collected proves the whole suite ran, so a solely-quarantined
+        # ran == collected proves the whole suite ran, so a solely-quarantined
         # red is correctly downgraded to a (loud) pass.
         self._patch_quarantine(
             monkeypatch, [QuarantineEntry(id="tests/a.py::test_flaky")]
@@ -1552,10 +1706,14 @@ class TestSessionCompleted:
             self._tsv(tmp_path, "SESSIONFINISH\t50 50\n")
         )
 
-    def test_ran_exceeds_collected_is_complete(self, tmp_path):
-        # A benign over-count (e.g. a reran item logs an extra setup) still
-        # ran the whole suite — completeness is ran >= collected, not ==.
-        assert full_unit_mod._session_completed(
+    def test_ran_exceeds_collected_is_malformed(self, tmp_path):
+        # codex #1222 r36: ran > collected is IMPOSSIBLE for a faithful
+        # reporter — it counts DISTINCT terminal-teardown ids, so it can never
+        # complete more distinct tests than it collected. An over-count is an
+        # inconsistent/forged record and is rejected as malformed (not accepted
+        # as a "benign over-count"), so an inflated `ran` can't paper over
+        # unexecuted collected tests.
+        assert not full_unit_mod._session_completed(
             self._tsv(tmp_path, "SESSIONFINISH\t51 50\n")
         )
 

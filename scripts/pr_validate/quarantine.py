@@ -52,12 +52,29 @@ _GIT_SHOW_TIMEOUT_S = 30
 # could serve a forged base/head registry from ``git show`` and self-quarantine
 # the candidate's own failure, bypassing the ``--no-replace-objects`` pin.
 # Pinning the absolute path resolved from the operator's clean startup PATH
-# closes that PATH-injection vector (codex #1222 r35). Overwriting the resolved
-# binary *in place* would instead require write access to a system / Homebrew
-# bin and would corrupt the operator's git globally — a far louder, out-of-scope
-# attack, not a silent registry forgery. Fall back to the bare name only when
-# git is absent at import (then the FileNotFoundError path reports infra loudly).
-_GIT = shutil.which("git") or "git"
+# closes that PATH-injection vector (codex #1222 r35).
+#
+# r36: NO bare-name fallback. ``shutil.which("git") or "git"`` re-opened the
+# very PATH-lookup hole this pins away whenever git was absent at import — so
+# when git can't be resolved we keep ``None`` and FAIL CLOSED at call time
+# (a QuarantineError → the gating caller treats every failure as blocking),
+# never a bare "git" re-looked-up through a candidate-tamperable PATH.
+_GIT = shutil.which("git")
+
+# Registries are also SNAPSHOTTED at fetch — before any candidate code runs —
+# into this cache (see ``snapshot_quarantine_registries``); ``load_quarantine
+# _from_ref`` then serves the cached blob WITHOUT re-invoking git. That closes
+# the residual r35 left open (codex #1222 r36): pinning the git *path* doesn't
+# stop a candidate that can WRITE the resolved binary — e.g. a Homebrew git at
+# ``/opt/homebrew/bin/git`` is owned by the operator's user, so a candidate
+# subprocess could overwrite it in place, let ``git show`` serve a forged
+# allowlist, then restore it. Loading every registry blob at fetch (git clean,
+# no candidate has run) and caching pure data removes the post-candidate git
+# invocation entirely. Keyed by ``(ref, str(repo_root), rel_path)``; a value is
+# either the parsed ``list[QuarantineEntry]`` or the ``QuarantineError`` to
+# re-raise. Lives in the pr_validate PARENT process — candidate tests run in a
+# separate pytest subprocess and cannot reach it.
+_REGISTRY_SNAPSHOT: dict[tuple[str, str, str], list | QuarantineError] = {}
 
 
 class QuarantineError(Exception):
@@ -149,7 +166,65 @@ def load_quarantine_from_ref(
     true content-addressed blob — the only git indirection that could remap
     it is closed (grafts/alternates can't override an existing object's
     content; a mutable branch ref is no longer used per r10).
+
+    r36: prefer the fetch-time SNAPSHOT. If this ``(ref, repo_root, rel_path)``
+    was pre-loaded by ``snapshot_quarantine_registries`` (at fetch, before any
+    candidate code ran), return the cached blob and never invoke git here — so
+    a candidate that overwrote the git binary after fetch cannot forge the
+    result. A cache MISS (isolated unit tests; production always hits since
+    fetch snapshots the exact base/head SHAs full_unit later reads) falls
+    through to a live read.
     """
+    key = (ref, str(repo_root), rel_path)
+    cached = _REGISTRY_SNAPSHOT.get(key)
+    if cached is not None:
+        if isinstance(cached, QuarantineError):
+            raise cached
+        return list(cached)
+    return _load_quarantine_from_ref_live(ref, repo_root, rel_path)
+
+
+def snapshot_quarantine_registries(
+    refs: Iterable[str],
+    repo_root: Path,
+    rel_path: str = QUARANTINE_REL_PATH,
+) -> None:
+    """Load each ref's registry NOW — called at fetch, BEFORE any candidate
+    test code runs — and cache the result (parsed entries or the
+    ``QuarantineError`` to re-raise) so a later ``load_quarantine_from_ref``
+    for the same key serves the snapshot without re-invoking git (codex #1222
+    r36). Idempotent; skips falsy refs (an unset base/head SHA → full_unit's
+    own fail-closed branch handles it). Never raises: every failure mode is
+    already normalized to ``QuarantineError`` by the live loader and cached."""
+    for ref in refs:
+        if not ref:
+            continue
+        key = (ref, str(repo_root), rel_path)
+        if key in _REGISTRY_SNAPSHOT:
+            continue
+        try:
+            _REGISTRY_SNAPSHOT[key] = _load_quarantine_from_ref_live(
+                ref, repo_root, rel_path
+            )
+        except QuarantineError as e:
+            _REGISTRY_SNAPSHOT[key] = e
+
+
+def _load_quarantine_from_ref_live(
+    ref: str,
+    repo_root: Path,
+    rel_path: str = QUARANTINE_REL_PATH,
+) -> list[QuarantineEntry]:
+    """Uncached ``git show`` read — used by the fetch-time snapshot and as the
+    cache-miss fallback. This is the ONLY place that invokes git; callers in a
+    post-candidate context must go through ``load_quarantine_from_ref`` so the
+    snapshot short-circuits before any git process is spawned."""
+    if _GIT is None:
+        # git wasn't resolvable at import → fail CLOSED (r36). Never fall back
+        # to a bare "git" re-looked-up through a candidate-tamperable PATH.
+        raise QuarantineError(
+            f"git could not be resolved at startup — cannot read {ref}:{rel_path}"
+        )
     try:
         proc = subprocess.run(  # noqa: S603
             # _GIT is the import-time-resolved absolute git path, NOT a bare

@@ -22,6 +22,7 @@ import subprocess
 
 from ..base import Step, StepResult
 from ..context import Context
+from ..quarantine import snapshot_quarantine_registries
 
 
 class FetchStep(Step):
@@ -127,6 +128,16 @@ class FetchStep(Step):
                 summary="PR has merge conflicts (mergeStateStatus=DIRTY) — "
                 "rebase before validating",
             )
+
+        # Snapshot the quarantine registries HERE — fetch is the first step,
+        # git is clean, and NO candidate code has run yet. full_unit later
+        # reads the base/head registry from these cached blobs instead of
+        # re-invoking git after candidate tests, so a candidate that overwrites
+        # the git binary in place can't forge the allowlist (codex #1222 r36).
+        # base_sha/head_sha come from gh's baseRefOid/headRefOid (immutable,
+        # not candidate-controlled); a falsy SHA is skipped and full_unit's own
+        # fail-closed branch handles it. Never raises.
+        snapshot_quarantine_registries([ctx.base_sha, ctx.head_sha], ctx.repo_root)
 
         ctx.run_log(
             f"fetched: '{ctx.pr_title[:60]}' by {ctx.pr_author} "

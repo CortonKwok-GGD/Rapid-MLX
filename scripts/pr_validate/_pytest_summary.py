@@ -182,8 +182,15 @@ def session_completed(path: Path) -> bool:
         tests after the stop never ran.
 
     Requires EXACTLY one well-formed record (``<ran> <collected>``) with a
-    positive collected count and ``ran >= collected``. Anything else —
-    missing, malformed, duplicated — withholds trust, the safe direction.
+    positive collected count and ``ran == collected``. Anything else —
+    missing, malformed, duplicated, or ``ran != collected`` — withholds trust,
+    the safe direction. ``ran > collected`` is rejected as MALFORMED, not
+    accepted as a benign over-count (codex #1222 r36): the reporter counts
+    DISTINCT terminal-teardown ids (``--reruns`` retries can't inflate it), so
+    a faithful record can never complete more distinct tests than it collected
+    — an over-count is an inconsistent/forged record, and treating it as
+    "complete" would let an inflated ``ran`` paper over unexecuted collected
+    tests.
 
     SCOPE (codex #1222 r27): this proves every SELECTED item finished; it does
     NOT prove the selection itself was the whole real suite. ``collected`` is
@@ -214,7 +221,7 @@ def session_completed(path: Path) -> bool:
         ran, collected = int(ran_s), int(collected_s)
     except (ValueError, TypeError):
         return False
-    return collected > 0 and ran >= collected
+    return collected > 0 and ran == collected
 
 
 def summary_node_ids(text: str, *labels: str) -> list[str]:

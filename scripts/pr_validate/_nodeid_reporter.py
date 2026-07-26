@@ -351,9 +351,12 @@ def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ANN001, ARG001 â
     # graceful session end, so the record's mere presence proves the
     # process did not die mid-suite (os._exit / crash / SIGKILL), and the
     # ran-vs-collected counts prove no early stop (-x / --maxfail /
-    # --stepwise). The consumer requires this record with ran >= collected
+    # --stepwise). The consumer requires this record with ran == collected
     # before any quarantine downgrade â€” a structural replacement for the
-    # old stdout-banner heuristic (codex #1222 r15). ``_append`` no-ops
-    # when no log path is configured.
+    # old stdout-banner heuristic (codex #1222 r15). ``ran`` counts DISTINCT
+    # terminal teardowns, so a faithful record has ran == collected exactly;
+    # ran > collected is impossible-except-forged and the consumer rejects it
+    # as malformed (codex #1222 r36). ``_append`` no-ops when no log path is
+    # configured.
     collected = int(getattr(session, "testscollected", 0) or 0)
     _append(SESSION_LABEL, f"{len(_completed_ids)} {collected}")
