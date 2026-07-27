@@ -154,11 +154,11 @@ This is the rule. No exceptions. CI doesn't fake-inference with a tiny model on 
 
 | # | Gate | Side | Where it runs | Catches |
 |---|---|---|---|---|
+| G0 | Output-coherence gate — deterministic golden answers (blocking) + garbage detector (advisory), run FIRST | **M3** | `make release-check-m3` + `scripts/coherence_sweep.sh` | garbage / coherent-but-wrong generation the perf/import/unit gates all miss (#1234 / #1247) |
 | G1 | Build wheel + sdist, then clean-room install + import both | CI | `release-preflight.yml` (macOS-14) | dev mlx symbol drift (#408), incomplete source distribution |
 | G2 | Codex review × 2 rounds | local | maintainer machine | every PR-author bug class |
 | G3 | CLI ↔ Config fidelity audit | CI | `ci.yml` lint (ubuntu) | silent CLI flag drop (#400) |
 | G4 | unit suite (≈4500 tests) | CI | `ci.yml` test-matrix (linux) + test-apple-silicon (macOS-14) | parser/router regressions |
-| G0 | Output-coherence gate — deterministic golden answers (blocking) + garbage detector (advisory), run FIRST | **M3** | `make release-check-m3` + `scripts/coherence_sweep.sh` | garbage / coherent-but-wrong generation the perf/import/unit gates all miss (#1234 / #1247) |
 | G5 | `make stress` — 8 scenarios | **M3** | `make release-check-m3` | concurrent-batching regressions |
 | G6 | Live-server fix-path repro | **M3** | `make release-check-m3` | fix doesn't ship to user-visible path |
 | G7 | SDK integration (anthropic / pydantic_ai / smolagents) | **M3** | `make release-check-m3` | router-level breakage unit tests miss |

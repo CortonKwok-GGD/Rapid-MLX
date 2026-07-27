@@ -26,22 +26,26 @@ set -euo pipefail
 PY="${PY:-python3.12}"
 PORT="${PORT:-8402}"
 MODELS="${*:-${MODELS:-qwen3.5-4b-4bit}}"
-LOG=/tmp/coherence-sweep.log
-PIDFILE=/tmp/coherence-sweep.pid
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rapid-mlx-coherence-sweep.XXXXXX")"
+LOG="$WORK_DIR/server.log"
+PIDFILE="$WORK_DIR/server.pid"
 
 line() { printf '%s\n' "============================================================"; }
+
+CURRENT_PID=""
+cleanup() {
+  if [ -n "$CURRENT_PID" ]; then
+    kill "$CURRENT_PID" 2>/dev/null || true
+    wait "$CURRENT_PID" 2>/dev/null || true
+  fi
+  rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT INT TERM
 
 if lsof -i ":$PORT" >/dev/null 2>&1; then
   echo "ERROR: port $PORT already in use — pick another with PORT=... or free it." >&2
   exit 2
 fi
-
-CURRENT_PID=""
-cleanup() {
-  if [ -n "$CURRENT_PID" ]; then kill "$CURRENT_PID" 2>/dev/null || true; fi
-  if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; rm -f "$PIDFILE"; fi
-}
-trap cleanup EXIT INT TERM
 
 export RAPID_MLX_BASE_URL="http://127.0.0.1:${PORT}/v1"
 
@@ -52,6 +56,7 @@ echo "  port:   $PORT"
 line
 
 failed=""
+infra_failed=""
 for MODEL in $MODELS; do
   line
   echo "  → $MODEL"
@@ -71,13 +76,19 @@ for MODEL in $MODELS; do
   if [ "$up" != 1 ]; then
     echo "ERROR: $MODEL server did not come up. Last log lines:" >&2
     tail -20 "$LOG" >&2
-    failed="$failed $MODEL(boot)"
+    infra_failed="$infra_failed $MODEL(boot)"
   else
     if "$PY" evals/coherence_gate.py; then
       echo "  ✓ $MODEL coherent"
     else
-      echo "  ✗ $MODEL FAILED coherence gate" >&2
-      failed="$failed $MODEL"
+      gate_status=$?
+      if [ "$gate_status" -eq 2 ]; then
+        echo "  ✗ $MODEL coherence gate infrastructure failure" >&2
+        infra_failed="$infra_failed $MODEL(gate-infra)"
+      else
+        echo "  ✗ $MODEL FAILED coherence gate" >&2
+        failed="$failed $MODEL"
+      fi
     fi
   fi
 
@@ -88,6 +99,12 @@ for MODEL in $MODELS; do
 done
 
 line
+if [ -n "$infra_failed" ]; then
+  echo "  SWEEP INFRASTRUCTURE FAILURE —$infra_failed"
+  if [ -n "$failed" ]; then echo "  MODEL FAILURES —$failed"; fi
+  line
+  exit 2
+fi
 if [ -n "$failed" ]; then
   echo "  SWEEP FAILED —$failed"
   line
