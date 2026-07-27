@@ -40,38 +40,52 @@ def test_legacy_servers_key_still_loads():
 
 
 def test_mcpservers_preferred_when_both_present(caplog):
-    # Standard key wins; the legacy key is ignored (and a warning explains it).
-    with caplog.at_level(logging.WARNING, logger="vllm_mlx.mcp.config"):
+    # Standard key wins; the legacy key is ignored (and a warning explains it)
+    # consistently on BOTH load paths (shared select_server_map).
+    with caplog.at_level(logging.WARNING):
         cfg = validate_config(
-            {
-                "mcpServers": {"std": _SERVER},
-                "servers": {"legacy": _SERVER},
-            }
+            {"mcpServers": {"std": dict(_SERVER)}, "servers": {"legacy": dict(_SERVER)}}
+        )
+        MCPConfig.from_dict(
+            {"mcpServers": {"std": dict(_SERVER)}, "servers": {"legacy": dict(_SERVER)}}
         )
     assert list(cfg.servers) == ["std"]
     assert "legacy" not in cfg.servers
-    assert any("both 'mcpServers' and 'servers'" in r.message for r in caplog.records)
+    both_warnings = [
+        r for r in caplog.records if "both 'mcpServers' and 'servers'" in r.getMessage()
+    ]
+    # One warning per path — from_dict no longer diverges from validate_config.
+    assert len(both_warnings) == 2
 
 
-def test_neither_key_nonempty_config_warns(caplog):
-    # A non-empty config with a wrong/missing server key must NOT silently
-    # yield an empty server set — warn so the misconfig is visible.
-    with caplog.at_level(logging.WARNING, logger="vllm_mlx.mcp.config"):
+def test_typoed_server_key_warns(caplog):
+    # A config whose server map is under a mistyped key ("mcp_server") must
+    # NOT silently load nothing — warn, naming the unrecognized key.
+    with caplog.at_level(logging.WARNING):
+        cfg = validate_config({"mcp_server": {"filesystem": dict(_SERVER)}})
+    assert cfg.servers == {}
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "neither 'mcpServers' nor 'servers'" in msgs
+    assert "mcp_server" in msgs
+
+
+def test_globals_only_config_does_not_warn(caplog):
+    # A config with only recognized global settings and no server map is an
+    # intentional "no servers yet" config — not a typo. It must NOT warn.
+    with caplog.at_level(logging.WARNING):
         cfg = validate_config({"default_timeout": 45.0})
     assert cfg.servers == {}
-    assert any(
-        "neither 'mcpServers' nor 'servers'" in r.message for r in caplog.records
-    )
+    assert not any("neither" in r.getMessage() for r in caplog.records)
 
 
 def test_empty_mcpservers_does_not_warn(caplog):
     # ``{"mcpServers": {}}`` is a legitimate "no servers yet" config (the
     # discovery-test fixture writes exactly this) — it must not trip the
     # neither-key warning.
-    with caplog.at_level(logging.WARNING, logger="vllm_mlx.mcp.config"):
+    with caplog.at_level(logging.WARNING):
         cfg = validate_config({"mcpServers": {}})
     assert cfg.servers == {}
-    assert not any("neither" in r.message for r in caplog.records)
+    assert not any("neither" in r.getMessage() for r in caplog.records)
 
 
 def test_standard_stdio_schema_omits_transport():
