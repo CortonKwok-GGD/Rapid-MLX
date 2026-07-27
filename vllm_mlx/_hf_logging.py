@@ -25,11 +25,13 @@ is deliberately biased toward *showing* a record, never toward hiding one:
   a genuine failure — even one whose text happens to mention tokens or
   rate limits (e.g. a hypothetical ``Unauthenticated request: rate limit
   exceeded`` error).
-* **Matched on the advisory's distinctive phrase**, not loose token
-  substrings, so an unrelated warning that merely mentions
-  "unauthenticated" and "rate limit" is not swept up. If the Hub rewords
-  the header past that phrase the (reworded) line simply reappears — we
-  err toward the papercut returning, never toward silence.
+* **Matched on the full advisory text** (its subject *and* its distinctive
+  "set a HF_TOKEN … higher rate limits … faster downloads" advice), not a
+  subject phrase alone — so a *different* actionable warning that merely
+  shares the subject (e.g. "Unauthenticated requests to the HF Hub are
+  temporarily blocked") is not swept up. If the Hub rewords the header
+  past this text the (reworded) line simply reappears — we err toward the
+  papercut returning, never toward silence.
 * **Attached to the exact emitting logger.** A filter on a *parent* logger
   is not consulted for a child logger's records during propagation
   (verified empirically), so filtering ``huggingface_hub`` would not work
@@ -51,11 +53,23 @@ import threading
 # ``logging.get_logger(__name__)`` where ``__name__`` is this module.
 _HF_HTTP_LOGGER = "huggingface_hub.utils._http"
 
-# The distinctive subject line of the server advisory (lower-cased). We
-# anchor on this specific phrase rather than loose "unauthenticated" +
-# "rate limit" substrings so a real error that happens to combine those
-# words is never suppressed.
-_ADVISORY_PHRASE = "unauthenticated requests to the hf hub"
+# The full advisory text, whitespace-normalised and lower-cased, with the
+# leading "You are sending " and the trailing period intentionally dropped
+# so a server variant that adds/removes either still matches. We require
+# this whole string — subject AND the "set a HF_TOKEN … faster downloads"
+# advice — so a *different* actionable warning sharing only the subject is
+# never suppressed. A reword past this text is fail-open (advisory returns).
+_KNOWN_ADVISORY = (
+    "unauthenticated requests to the hf hub. please set a hf_token to "
+    "enable higher rate limits and faster downloads"
+)
+
+
+def _normalize(text: str) -> str:
+    """Lower-case and collapse runs of whitespace, so incidental spacing or
+    a wrapped line in the header can't defeat the match."""
+    return " ".join(text.lower().split())
+
 
 # Marker attribute so a re-install can spot our own filter and not add a
 # duplicate (the filter class name alone isn't a reliable identity across
@@ -82,11 +96,11 @@ class _DropUnauthenticatedAdvisory(logging.Filter):
         if record.levelno != logging.WARNING:
             return True
         try:
-            message = record.getMessage().lower()
+            message = _normalize(record.getMessage())
         except Exception:
             # A record we can't even render is not ours to suppress.
             return True
-        return _ADVISORY_PHRASE not in message
+        return _KNOWN_ADVISORY not in message
 
 
 def silence_hf_unauthenticated_warning() -> None:

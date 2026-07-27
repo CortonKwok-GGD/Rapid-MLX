@@ -77,6 +77,18 @@ def test_filter_drops_the_real_advisory():
     assert filt.filter(_record(_REAL_ADVISORY)) is False
 
 
+def test_filter_drops_advisory_despite_whitespace_and_case():
+    """Incidental spacing / a wrapped header line / casing must not defeat
+    the full-text match — the message is whitespace-normalised first."""
+    filt = _DropUnauthenticatedAdvisory()
+    noisy = (
+        "  You are sending   UNAUTHENTICATED requests to the HF Hub.\n"
+        "Please set a HF_TOKEN to enable higher rate limits and faster "
+        "downloads.  "
+    )
+    assert filt.filter(_record(noisy)) is False
+
+
 @pytest.mark.parametrize(
     "msg",
     [
@@ -109,9 +121,18 @@ def test_filter_is_fail_open_on_unrenderable_record():
     [
         # Near-matches at WARNING: they combine the *words* the old loose
         # predicate keyed on ("unauthenticated" + "rate limit" / "HF_TOKEN")
-        # but not the advisory's distinctive phrase → must NOT be dropped.
+        # but not the advisory's full text → must NOT be dropped.
         ("Unauthenticated request: rate limit exceeded", logging.WARNING),
         ("Your HF_TOKEN is invalid; requests are unauthenticated", logging.WARNING),
+        # Same *subject* as the advisory but a different, actionable
+        # message (codex r2): shares "unauthenticated requests to the HF
+        # Hub" yet lacks the "set a HF_TOKEN … faster downloads" advice →
+        # must NOT be dropped.
+        (
+            "Unauthenticated requests to the HF Hub are temporarily blocked "
+            "due to abuse; contact support.",
+            logging.WARNING,
+        ),
         # The advisory's own wording, but escalated to ERROR / CRITICAL — a
         # real failure, never ours to hide, even though the phrase matches.
         (_REAL_ADVISORY, logging.ERROR),
