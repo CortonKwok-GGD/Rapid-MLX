@@ -19,10 +19,16 @@ Usage
     # or point it explicitly:
     python evals/coherence_gate.py --base-url http://127.0.0.1:8000/v1
 
+Two tiers:
+    * BLOCKING — the deterministic golden-answer cases decide the exit code.
+    * ADVISORY — the heuristic garbage detector (:func:`looks_like_garbage`) is
+      printed as a diagnostic warning but NEVER changes the exit code, because a
+      frequency heuristic cannot reliably tell diverse token soup from prose.
+
 Exit codes:
-    0 — every golden case coherent + correct
-    1 — one or more cases failed (garbage, wrong answer, or think-leak)
-    2 — no server reachable at the base URL
+    0 — every BLOCKING golden case passed (advisory warnings may still print)
+    1 — one or more BLOCKING golden cases failed (wrong answer or think-leak)
+    2 — no server reachable at the base URL, or it became unreachable mid-run
 """
 
 from __future__ import annotations
@@ -43,7 +49,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from vllm_mlx.coherence import GOLDEN, GoldenCase, evaluate_case  # noqa: E402
+from vllm_mlx.coherence import (  # noqa: E402
+    GOLDEN,
+    GoldenCase,
+    evaluate_case,
+    looks_like_garbage,
+)
 
 _DEFAULT_BASE_URL = os.environ.get("RAPID_MLX_BASE_URL", "http://127.0.0.1:8000/v1")
 
@@ -96,7 +107,7 @@ def main() -> int:
     print("=" * 60)
     print("  output-coherence gate (#1247)")
     print(f"  base_url: {base_url}")
-    print(f"  cases:    {len(GOLDEN)}")
+    print(f"  golden cases (blocking): {len(GOLDEN)}")
     print("=" * 60)
 
     if not _server_reachable(base_url):
@@ -107,7 +118,8 @@ def main() -> int:
         )
         return 2
 
-    failures: list[tuple[str, str, str]] = []  # (id, reason, snippet)
+    failures: list[tuple[str, str, str]] = []  # BLOCKING: (id, reason, snippet)
+    advisories: list[tuple[str, str, str]] = []  # ADVISORY: (id, why, snippet)
     passed_n = 0
     transport_failed = False
     for case in GOLDEN:
@@ -130,11 +142,23 @@ def main() -> int:
         else:
             print(f"           output: {snippet!r}")
             failures.append((case.id, reason, snippet))
+
         if transport_failed:
             break
 
+        # Advisory-only: surface obvious degeneracy as a diagnostic. Never
+        # affects the exit code — the heuristic can miss diverse token soup, so
+        # it must not gate (or falsely gate) a release.
+        is_garbage, why = looks_like_garbage(text)
+        if is_garbage:
+            advisories.append((case.id, why, snippet))
+
     print("=" * 60)
-    print(f"  {passed_n}/{len(GOLDEN)} coherent")
+    print(f"  BLOCKING: {passed_n}/{len(GOLDEN)} golden cases passed")
+    if advisories:
+        print(f"  ADVISORY: garbage detector flagged {len(advisories)} output(s):")
+        for cid, why, snippet in advisories:
+            print(f"    - {cid}: {why}  |  {snippet!r}")
     print("=" * 60)
 
     if transport_failed:
@@ -147,9 +171,9 @@ def main() -> int:
 
     if failures:
         print(
-            "COHERENCE GATE FAILED — the served model produced incoherent or "
-            "incorrect output. This is the class that shipped as garbage in "
-            "#1234; do NOT release.",
+            "COHERENCE GATE FAILED — the served model gave a wrong or incoherent "
+            "answer to a golden prompt. This is the class that shipped as garbage "
+            "in #1234; do NOT release.",
             file=sys.stderr,
         )
         return 1

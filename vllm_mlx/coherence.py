@@ -6,23 +6,27 @@ Motivation (#1247). Qwen3.6-35B-A3B and Qwen3.5-35B-A3B-8bit shipped producing
 ``+1.0`` norm-shift misfire; fixed in #1234). The garbage passed *every*
 automated gate — 278 delta tests, lint, install/import smoke, perf thresholds —
 because **no gate ever generates a token and checks whether the output is
-coherent**. This module supplies the two pieces that close that hole:
+coherent**. This module supplies two pieces with deliberately different roles:
 
-  * :func:`looks_like_garbage` — a cheap, deterministic detector for the two
-    collapse classes we have actually shipped (``!!!!!!`` prefix-cache poison
-    and doubled-norm token soup). Conservative by design: it only fires on
-    unambiguous degeneracy, so coherent prose never trips it and the precise
-    correctness work is left to the golden predicates below.
-  * :data:`GOLDEN` + :func:`evaluate_case` — fixed prompts with *checkable*
-    properties (``capital of Japan`` → ``Tokyo``, ``17 × 23`` → ``391``), so a
-    coherent-but-wrong regression fails deterministically at ``temperature=0``.
+  * :data:`GOLDEN` + :func:`evaluate_case` — the **BLOCKING** layer. Fixed
+    prompts with a strict, normalized, *checkable* answer (``capital of Japan``
+    → ``Tokyo``, ``17 × 23`` → ``391``). A coherent-but-wrong regression fails
+    (not an exact match), and garbage fails too (also not a match), so the
+    blocking layer needs no heuristic help and cannot false-green on
+    plausible-looking token soup.
+  * :func:`looks_like_garbage` — an **ADVISORY / diagnostic** detector for the
+    obvious collapse classes we have actually shipped (``!!!!!!`` prefix-cache
+    poison, doubled-norm single-token soup, exact loops). It is *not* a reliable
+    classifier — a frequency heuristic cannot separate diverse token soup
+    (``"Ocean qzxv blorp fnarg glip."``) from prose without trading false
+    negatives for false positives — so the runner surfaces it as a warning and
+    it **never blocks a release**. Also intended for reuse by the telemetry
+    garbage-rate alert (#1250), where an aggregate advisory signal is useful.
 
 Everything here is pure (no network, no MLX, no server) so it can be unit-tested
 in ordinary CI on a GitHub-hosted runner. The serve-path runner that feeds real
 generations through these predicates lives in ``evals/coherence_gate.py`` and
 runs on the Apple-Silicon release gauntlet (``scripts/release_check_m3.sh``).
-The detector is also intended for reuse by the telemetry garbage-rate alert
-(#1250).
 """
 
 from __future__ import annotations
@@ -130,12 +134,16 @@ def looks_like_garbage(text: str, *, min_words: int = 10) -> tuple[bool, str]:
 
 @dataclass(frozen=True)
 class GoldenCase:
-    """A fixed prompt plus a checkable predicate over its completion.
+    """A fixed prompt plus a *deterministic* checkable predicate. Every golden
+    case is BLOCKING and has a known-right answer — there are no heuristic
+    (open-ended / prose) cases in the blocking set, because a structural check
+    on free-form text still false-greens on diverse token soup that happens to
+    include the required words (``"Ocean qzxv blorp. Water wug traz."``). Only
+    exact-answer checks belong here.
 
     ``kind`` selects the predicate applied by :func:`evaluate_case`:
 
     * ``exact``         — normalized completion exactly matches one of ``expect``
-    * ``two_sentence``  — two distinct sentences containing every expected term
     * ``no_think_leak`` — exact match AND no raw reasoning tag
     """
 
@@ -190,22 +198,6 @@ GOLDEN: tuple[GoldenCase, ...] = (
         max_tokens=32,
     ),
     GoldenCase(
-        "open-ocean",
-        "Write a short two-sentence description of the ocean. "
-        "Include the exact words ocean and water.",
-        "two_sentence",
-        ("ocean", "water"),
-        max_tokens=200,
-    ),
-    GoldenCase(
-        "open-cpu",
-        "In two sentences, explain what a computer CPU does. "
-        "Include the exact words CPU and instructions.",
-        "two_sentence",
-        ("cpu", "instructions"),
-        max_tokens=200,
-    ),
-    GoldenCase(
         "no-think-leak",
         "What is the capital of France? Answer in one word.",
         "no_think_leak",
@@ -229,36 +221,17 @@ def _matches_exact(text: str, expected: tuple[str, ...]) -> bool:
 
 
 def evaluate_case(case: GoldenCase, text: str) -> tuple[bool, str]:
-    """Apply ``case``'s predicate to a completion ``text``.
+    """Apply ``case``'s deterministic golden predicate to a completion ``text``.
 
-    Returns ``(passed, reason)``. Every case is first screened by
-    :func:`looks_like_garbage` — a golden answer buried in ``!!!!`` still fails
-    — and then the kind-specific predicate is applied.
+    Returns ``(passed, reason)``. This is the BLOCKING layer: a strict,
+    normalized golden-answer check with NO heuristic garbage screen. Garbage or
+    a fluent-but-wrong answer fails naturally — it is simply not an exact match
+    for the expected token — so the blocking layer cannot false-green on
+    plausible-looking token soup. Garbage *detection*
+    (:func:`looks_like_garbage`) is a separate ADVISORY signal the runner prints
+    but never blocks on, because a frequency heuristic cannot reliably separate
+    diverse token soup (``"Ocean qzxv blorp fnarg glip."``) from prose.
     """
-    garbage, why = looks_like_garbage(text)
-    if garbage:
-        return False, f"garbage output ({why})"
-
-    if case.kind == "two_sentence":
-        words = _WORD_RE.findall(text)
-        sentence_ends = re.findall(r"[.!?。！？](?:\s|$)", text)
-        sentences = [
-            sentence.strip().casefold()
-            for sentence in re.split(r"[.!?。！？]+", text)
-            if sentence.strip()
-        ]
-        if len(words) < 8:
-            return False, f"too short ({len(words)} words; expected at least 8)"
-        if len(sentence_ends) < 2:
-            return False, "expected at least two complete sentences"
-        if len(set(sentences)) < 2:
-            return False, "repeated the same sentence"
-        output_words = {word.casefold() for word in words}
-        missing = [term for term in case.expect if term.casefold() not in output_words]
-        if missing:
-            return False, f"missing required term(s) {tuple(missing)!r}"
-        return True, "coherent two-sentence response with required terms"
-
     if case.kind == "exact":
         if _matches_exact(text, case.expect):
             return True, f"exactly matches {case.expect!r}"

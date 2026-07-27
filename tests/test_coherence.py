@@ -88,11 +88,28 @@ def test_evaluate_case_rejects_coherent_but_wrong() -> None:
 
 
 def test_evaluate_case_rejects_garbage_for_golden_prompt() -> None:
-    """The exact #1234 failure: the model emits garbage for a golden prompt."""
+    """The exact #1234 failure: the model emits garbage for a golden prompt. The
+    BLOCKING layer rejects it deterministically — it is simply not an exact
+    match for the expected token — with NO reliance on the heuristic garbage
+    detector (which is advisory-only)."""
     case = next(c for c in GOLDEN if c.id == "arithmetic")
     passed, reason = evaluate_case(case, "!!!!!!!!!!!!!!!!!!!!")
     assert not passed
-    assert "garbage" in reason
+    assert "exact match" in reason
+
+
+def test_blocking_layer_catches_what_the_detector_cannot() -> None:
+    """The review's core point: a frequency heuristic cannot separate diverse
+    token soup from prose, so the advisory detector FALSE-GREENS on it — but the
+    deterministic golden check rejects it anyway (not an exact match). This is
+    exactly why the golden answers are the blocking layer and the detector is
+    advisory-only."""
+    token_soup = "Ocean qzxv blorp fnarg glip. Water wug zibble plonk traz."
+    # The advisory detector honestly cannot tell this from prose:
+    assert looks_like_garbage(token_soup)[0] is False
+    # But the blocking golden check rejects it — not an exact "Tokyo":
+    case = next(c for c in GOLDEN if c.id == "capital-japan")
+    assert not evaluate_case(case, token_soup)[0]
 
 
 def test_evaluate_case_arithmetic_wrong_number_fails() -> None:
@@ -115,19 +132,6 @@ def test_no_think_leak_case_rejects_raw_reasoning_tag() -> None:
     assert "think" in reason.lower() or "reasoning" in reason.lower()
     # Clean answer passes.
     assert evaluate_case(case, "Paris")[0]
-
-
-def test_not_garbage_case_is_open_ended() -> None:
-    case = next(c for c in GOLDEN if c.id == "open-ocean")
-    assert case.kind == "two_sentence"
-    assert evaluate_case(
-        case, "The ocean is deep and full of life. Its water covers most of Earth."
-    )[0]
-    assert not evaluate_case(case, "ocean ocean ocean ocean ocean ocean ocean ocean")[0]
-    assert not evaluate_case(case, "foo bar baz qux. foo bar baz qux.")[0]
-    assert not evaluate_case(case, "qzxv blorp fnarg glip. wug zibble plonk traz.")[0]
-    assert not evaluate_case(case, "x")[0]
-    assert not evaluate_case(case, "asdfghjkl")[0]
 
 
 def test_gate_returns_infrastructure_code_for_midrun_transport_failure(
@@ -154,15 +158,16 @@ def test_gate_turns_invalid_response_content_into_failure(
     assert coherence_gate.main() == 1
 
 
-def test_golden_set_is_wellformed() -> None:
+def test_golden_set_is_all_deterministic_blocking() -> None:
+    """Every golden case must be a deterministic, exact-answer predicate — no
+    heuristic / open-ended cases in the blocking set (review convergence)."""
     assert len(GOLDEN) >= 5
-    valid_kinds = {"exact", "two_sentence", "no_think_leak"}
+    valid_kinds = {"exact", "no_think_leak"}  # deterministic only
     ids = set()
     for c in GOLDEN:
         assert isinstance(c, GoldenCase)
-        assert c.kind in valid_kinds, f"{c.id}: bad kind {c.kind!r}"
+        assert c.kind in valid_kinds, f"{c.id}: non-deterministic kind {c.kind!r}"
         assert c.id not in ids, f"duplicate case id {c.id!r}"
         ids.add(c.id)
-        if c.kind in {"exact", "two_sentence", "no_think_leak"}:
-            assert c.expect, f"{c.id}: {c.kind} needs a non-empty expect"
+        assert c.expect, f"{c.id}: a deterministic case needs a non-empty expect"
         assert c.max_tokens > 0
