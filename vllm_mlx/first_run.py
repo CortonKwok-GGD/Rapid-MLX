@@ -194,9 +194,12 @@ def build_nameplate(version: str) -> str:
     lines.append("Get started:")
 
     # The bare-command chat suggestion always points at the known-good starter
-    # (FIRST_RUN_MODEL) — never an arbitrary cached alias, which could be a
-    # non-chat (embedding / transcription) checkpoint. Cached models are
-    # listed above so a returning user can pick one explicitly.
+    # (FIRST_RUN_MODEL), never whichever alias happens to be cached: the
+    # starter is the one model we promise reliable chat + tool-calls, and
+    # auto-picking a cached alias would run something the user never named
+    # (e.g. a text-diffusion checkpoint, which chats but with very different
+    # REPL behavior). Cached models are still listed above so a returning user
+    # can name one explicitly.
     starter_cached = any(alias == FIRST_RUN_MODEL for alias, _ in cached)
     rows: list[tuple[str, str]] = []
     if starter_cached:
@@ -209,7 +212,7 @@ def build_nameplate(version: str) -> str:
             )
         )
     if cached:
-        rows.append(("rapid-mlx chat <model>", "or run any model listed above"))
+        rows.append(("rapid-mlx chat <model>", "or name a cached model above"))
     rows.append(
         (f"rapid-mlx serve {FIRST_RUN_MODEL}", "OpenAI-compatible API on :8000")
     )

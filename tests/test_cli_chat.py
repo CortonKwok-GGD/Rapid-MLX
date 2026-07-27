@@ -102,8 +102,10 @@ def test_chat_no_model_defaults_to_qwen35_4b():
     captured: list = []
     with (
         patch.object(sys, "argv", ["rapid-mlx", "chat"]),
-        # Interactive: exercise the intended cold-cache auto-select path (a
-        # non-TTY cold cache deliberately refuses rather than silently pull).
+        # Interactive: exercise the intended cold-cache auto-select path,
+        # which prints the "one-time download" notice before the gate. (A
+        # non-TTY cold cache prints no notice and falls through to the same
+        # download gate silently — that path is covered by the non-TTY tests.)
         patch.object(sys.stdin, "isatty", return_value=True),
         # Cold cache → select_chat_default() falls back to FIRST_RUN_MODEL.
         patch("vllm_mlx.first_run.cached_known_aliases", return_value=[]),
