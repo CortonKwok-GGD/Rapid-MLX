@@ -56,6 +56,7 @@ GARBAGE = [
     "the the the the the the the the the the the the the",  # bigram loop
     "cat cat cat cat cat cat cat cat cat cat cat cat",  # word loop
     "Sure! " + "!" * 40,  # long single-char run embedded in otherwise-ok text
+    "11111111111111111111",  # long numeric single-token collapse
 ]
 
 
@@ -120,10 +121,11 @@ def test_not_garbage_case_is_open_ended() -> None:
     case = next(c for c in GOLDEN if c.id == "open-ocean")
     assert case.kind == "two_sentence"
     assert evaluate_case(
-        case, "The ocean is deep and full of life. It covers most of Earth."
+        case, "The ocean is deep and full of life. Its water covers most of Earth."
     )[0]
     assert not evaluate_case(case, "ocean ocean ocean ocean ocean ocean ocean ocean")[0]
     assert not evaluate_case(case, "foo bar baz qux. foo bar baz qux.")[0]
+    assert not evaluate_case(case, "qzxv blorp fnarg glip. wug zibble plonk traz.")[0]
     assert not evaluate_case(case, "x")[0]
     assert not evaluate_case(case, "asdfghjkl")[0]
 
@@ -161,6 +163,6 @@ def test_golden_set_is_wellformed() -> None:
         assert c.kind in valid_kinds, f"{c.id}: bad kind {c.kind!r}"
         assert c.id not in ids, f"duplicate case id {c.id!r}"
         ids.add(c.id)
-        if c.kind in {"exact", "no_think_leak"}:
+        if c.kind in {"exact", "two_sentence", "no_think_leak"}:
             assert c.expect, f"{c.id}: {c.kind} needs a non-empty expect"
         assert c.max_tokens > 0

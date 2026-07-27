@@ -100,7 +100,8 @@ def looks_like_garbage(text: str, *, min_words: int = 10) -> tuple[bool, str]:
     # (c) character-repetition heuristics. Guarded by a length floor so short
     # legitimate answers ("7", "42", "OK") are never flagged: a doubled-norm /
     # cache-poison collapse that carries word characters ("aaaaa…") is long.
-    if len(non_space) >= 5 and not s.isdecimal():
+    short_numeric_answer = s.isdecimal() and len(non_space) < 20
+    if len(non_space) >= 5 and not short_numeric_answer:
         top_char, top_n = Counter(non_space).most_common(1)[0]
         if top_n >= 5 and top_n / len(non_space) > 0.5:
             return True, (
@@ -134,7 +135,7 @@ class GoldenCase:
     ``kind`` selects the predicate applied by :func:`evaluate_case`:
 
     * ``exact``         — normalized completion exactly matches one of ``expect``
-    * ``two_sentence``  — non-degenerate response with two sentences
+    * ``two_sentence``  — two distinct sentences containing every expected term
     * ``no_think_leak`` — exact match AND no raw reasoning tag
     """
 
@@ -190,14 +191,18 @@ GOLDEN: tuple[GoldenCase, ...] = (
     ),
     GoldenCase(
         "open-ocean",
-        "Write a short two-sentence description of the ocean.",
+        "Write a short two-sentence description of the ocean. "
+        "Include the exact words ocean and water.",
         "two_sentence",
+        ("ocean", "water"),
         max_tokens=200,
     ),
     GoldenCase(
         "open-cpu",
-        "In two sentences, explain what a computer CPU does.",
+        "In two sentences, explain what a computer CPU does. "
+        "Include the exact words CPU and instructions.",
         "two_sentence",
+        ("cpu", "instructions"),
         max_tokens=200,
     ),
     GoldenCase(
@@ -248,7 +253,11 @@ def evaluate_case(case: GoldenCase, text: str) -> tuple[bool, str]:
             return False, "expected at least two complete sentences"
         if len(set(sentences)) < 2:
             return False, "repeated the same sentence"
-        return True, "coherent two-sentence response"
+        output_words = {word.casefold() for word in words}
+        missing = [term for term in case.expect if term.casefold() not in output_words]
+        if missing:
+            return False, f"missing required term(s) {tuple(missing)!r}"
+        return True, "coherent two-sentence response with required terms"
 
     if case.kind == "exact":
         if _matches_exact(text, case.expect):
