@@ -41,8 +41,20 @@ dependencies = [
     # default_stream / new_stream / new_thread_local_stream) are materialised
     # on T2 via np.array(arr). The shim adopts the worker's process-wide
     # default — the only path that round-trips cleanly across threads.
-    "mlx>=0.31.2",
-    "mlx-lm>=0.31.3",  # 0.31.1+ required for presence_penalty/frequency_penalty kwargs on make_logits_processors (#512); 0.31.3 added thread-local generation_stream but cross-thread eval is still broken (see shim sites).
+    # Upper caps <0.32 (mlx, mlx-lm) added for #1248. Floor-only pins let a
+    # plain ``pip install rapid-mlx`` silently resolve a NEWER, untested
+    # mlx-lm whose model-loading heuristics can corrupt generation — exactly
+    # how Qwen3.6-35B shipped pure garbage (#1234: mlx-lm 0.31.3's ``qwen3_5``
+    # ``sanitize`` added a spurious +1.0 to already-standard-form RMSNorm
+    # gains, doubling the scale). The cap pins to the 0.31.x line the release
+    # was validated against; moving to 0.32 must be a DELIBERATE bump PR that
+    # re-runs the full-family output-coherence sweep (#1247), not an ambient
+    # resolver upgrade under an existing user. Mirrors the existing
+    # ``mlx-audio<0.4.4`` and ``transformers<5.13`` ceilings. The vendored
+    # DeepSeek V4 note (``[tool.ruff]`` below) already treats mlx-lm 0.32 as a
+    # future, gated upstream-sync migration — this cap makes that explicit.
+    "mlx>=0.31.2,<0.32",
+    "mlx-lm>=0.31.3,<0.32",  # 0.31.1+ required for presence_penalty/frequency_penalty kwargs on make_logits_processors (#512); 0.31.3 added thread-local generation_stream but cross-thread eval is still broken (see shim sites). <0.32 cap: see #1248 note above.
     # mlx-vlm is opt-in via [vision] extras (saves ~322 MB for text-only users)
     #
     # Upper cap <5.13 (release-blocker): mlx-lm and mlx-vlm both float
@@ -141,7 +153,14 @@ vision = [
     # resolves a fresh install straight to the broken build. All five extras
     # that pull mlx-vlm carry this exclusion — enforced by
     # tests/test_vision_extra_install.py so a new extra can't silently regress.
-    "mlx-vlm>=0.6.3,!=0.6.4",
+    #
+    # Upper cap <0.7 (#1248): same rationale as the mlx / mlx-lm caps above —
+    # a floor-only range silently pulls an untested newer mlx-vlm whose model
+    # forwards can regress generation (0.6.4's broken qwen3_5 GatedDeltaNet is
+    # the cautionary case). Bumping to 0.7 is a deliberate, coherence-swept
+    # migration (#1247), not an ambient upgrade. Mirrored across all five
+    # extras that pull mlx-vlm.
+    "mlx-vlm>=0.6.3,!=0.6.4,<0.7",
     "opencv-python>=4.8.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
@@ -155,7 +174,7 @@ vision = [
 # the vision extras do. Only enable if you serve a DFlash-eligible alias
 # (e.g. qwen3.5-27b-8bit) with --speculative-config '{"method":"dflash"}'.
 dflash = [
-    "mlx-vlm>=0.6.3,!=0.6.4",
+    "mlx-vlm>=0.6.3,!=0.6.4,<0.7",
 ]
 # MTP (Multi-Token Prediction) speculative decoding — Gemma 4 external
 # assistant path via ``--speculative-config '{"method":"mtp","model":"<path>"}'``.
@@ -205,7 +224,7 @@ chat = [
 # pip install .[all] and editable installs.
 all = [
     # vision
-    "mlx-vlm>=0.6.3,!=0.6.4",
+    "mlx-vlm>=0.6.3,!=0.6.4,<0.7",
     "opencv-python>=4.8.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
@@ -258,7 +277,7 @@ test = [
     # ``pytest tests/`` without hand-installed local extras.
     "aiohttp>=3.9.0",
     "pillow>=10.0.0",
-    "mlx-vlm>=0.6.3,!=0.6.4; platform_system == 'Darwin'",
+    "mlx-vlm>=0.6.3,!=0.6.4,<0.7; platform_system == 'Darwin'",
     "mlx-audio>=0.2.9,<0.4.4; platform_system == 'Darwin'",
     # Powers the property-based invariant suite in tests/property/ — encodes
     # numeric/validation invariants over the whole input space (e.g. the
@@ -288,7 +307,7 @@ dev = [
     'tomli>=2.0.1; python_version < "3.11"',
     "aiohttp>=3.9.0",
     "pillow>=10.0.0",
-    "mlx-vlm>=0.6.3,!=0.6.4; platform_system == 'Darwin'",
+    "mlx-vlm>=0.6.3,!=0.6.4,<0.7; platform_system == 'Darwin'",
     "mlx-audio>=0.2.9,<0.4.4; platform_system == 'Darwin'",
     # Mirror of the [test] entry — keep `dev` a strict superset of `test`
     # (enforced by tests/test_pr_validate_test_env.py).
