@@ -103,6 +103,18 @@ if ! curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
   exit 2
 fi
 
+#-------------------- G4 output coherence -------------------------
+# The most fundamental gate: does the served model produce coherent,
+# correct text at all? Qwen3.6/3.5-35B shipped garbage from the first
+# token (#1234) and passed every perf / import / unit gate because
+# nothing checked generation coherence (#1247). Run this FIRST — if it
+# fails, the stress / SDK gates below would just re-test the same broken
+# inference path. Reads RAPID_MLX_BASE_URL (exported above).
+line
+echo "  G4 — output coherence gate (golden answers + garbage detector)"
+line
+"$PY" evals/coherence_gate.py
+
 #-------------------- G5 stress -----------------------------------
 line
 echo "  G5 — make stress (8 scenarios incl. tool storm)"
