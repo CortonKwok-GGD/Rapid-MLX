@@ -65,10 +65,8 @@ def hf_http_logger():
         )
 
 
-def _record(msg, *args):
-    return logging.LogRecord(
-        _HF_HTTP_LOGGER, logging.WARNING, __file__, 1, msg, args, None
-    )
+def _record(msg, *args, level=logging.WARNING):
+    return logging.LogRecord(_HF_HTTP_LOGGER, level, __file__, 1, msg, args, None)
 
 
 # --- the filter predicate, tested directly -------------------------------
@@ -104,6 +102,33 @@ def test_filter_is_fail_open_on_unrenderable_record():
     filt = _DropUnauthenticatedAdvisory()
     # "%d" % ("abc",) raises TypeError inside getMessage().
     assert filt.filter(_record("%d", "abc")) is True
+
+
+@pytest.mark.parametrize(
+    "msg, level",
+    [
+        # Near-matches at WARNING: they combine the *words* the old loose
+        # predicate keyed on ("unauthenticated" + "rate limit" / "HF_TOKEN")
+        # but not the advisory's distinctive phrase → must NOT be dropped.
+        ("Unauthenticated request: rate limit exceeded", logging.WARNING),
+        ("Your HF_TOKEN is invalid; requests are unauthenticated", logging.WARNING),
+        # The advisory's own wording, but escalated to ERROR / CRITICAL — a
+        # real failure, never ours to hide, even though the phrase matches.
+        (_REAL_ADVISORY, logging.ERROR),
+        (_REAL_ADVISORY, logging.CRITICAL),
+        (
+            "unauthenticated requests to the HF Hub caused a rate-limit "
+            "error and an HF_TOKEN is required",
+            logging.ERROR,
+        ),
+    ],
+)
+def test_filter_never_hides_real_failures(msg, level):
+    """The filter is fail-safe: it only drops the WARNING-level advisory,
+    never a higher-severity record and never a near-match that merely
+    shares vocabulary with it (the collision codex flagged)."""
+    filt = _DropUnauthenticatedAdvisory()
+    assert filt.filter(_record(msg, level=level)) is True
 
 
 # --- the installer, end-to-end through the logging machinery -------------
