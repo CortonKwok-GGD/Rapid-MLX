@@ -110,9 +110,13 @@ class MCPConfig:
         mirroring :func:`vllm_mlx.mcp.config.validate_config`.
         """
         servers = {}
-        servers_data = data.get("mcpServers")
-        if servers_data is None:
-            servers_data = data.get("servers", {})
+        # Key on PRESENCE (not truthiness) so a present-but-invalid standard
+        # key doesn't silently fall back to ``servers`` — that would diverge
+        # from validate_config, which rejects e.g. ``{"mcpServers": null}``.
+        servers_key = "mcpServers" if "mcpServers" in data else "servers"
+        servers_data = data.get(servers_key, {})
+        if not isinstance(servers_data, dict):
+            raise ValueError(f"'{servers_key}' must be a dictionary")
         for name, server_data in servers_data.items():
             server_data["name"] = name
             servers[name] = MCPServerConfig(**server_data)

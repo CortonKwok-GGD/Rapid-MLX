@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import logging
 
+import pytest
+
 from vllm_mlx.mcp.config import create_example_config, validate_config
 from vllm_mlx.mcp.types import MCPConfig, MCPTransport
 
@@ -92,6 +94,17 @@ def test_from_dict_accepts_mcpservers():
     # The secondary MCPConfig.from_dict path mirrors validate_config.
     cfg = MCPConfig.from_dict({"mcpServers": {"filesystem": dict(_SERVER)}})
     assert list(cfg.servers) == ["filesystem"]
+
+
+def test_present_but_null_mcpservers_rejected_consistently():
+    # A present-but-invalid standard key (JSON ``null``) must RAISE on BOTH
+    # paths — never silently fall back to a legacy ``servers`` value. Keying
+    # on presence keeps from_dict and validate_config consistent.
+    bad = {"mcpServers": None, "servers": {"legacy": dict(_SERVER)}}
+    with pytest.raises(ValueError, match="mcpServers"):
+        validate_config(dict(bad))
+    with pytest.raises(ValueError, match="mcpServers"):
+        MCPConfig.from_dict(dict(bad))
 
 
 def test_example_config_uses_mcpservers_and_roundtrips():
