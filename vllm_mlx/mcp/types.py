@@ -103,9 +103,17 @@ class MCPConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MCPConfig":
-        """Create config from dictionary."""
+        """Create config from dictionary.
+
+        Accepts the ecosystem-standard ``mcpServers`` key as well as the
+        historical ``servers`` key (``mcpServers`` wins when both present),
+        mirroring :func:`vllm_mlx.mcp.config.validate_config`.
+        """
         servers = {}
-        for name, server_data in data.get("servers", {}).items():
+        servers_data = data.get("mcpServers")
+        if servers_data is None:
+            servers_data = data.get("servers", {})
+        for name, server_data in servers_data.items():
             server_data["name"] = name
             servers[name] = MCPServerConfig(**server_data)
 

@@ -135,10 +135,31 @@ def validate_config(data: dict[str, Any]) -> MCPConfig:
     if not isinstance(data, dict):
         raise ValueError("MCP config must be a dictionary")
 
-    # Validate servers section
-    servers_data = data.get("servers", {})
+    # Accept BOTH the ecosystem-standard "mcpServers" key (Claude Desktop,
+    # .mcp.json, VS Code — and our own docs/guides/mcp-tools.md) and the
+    # historical "servers" key. Prefer "mcpServers" when present; fall back
+    # to "servers" for back-compat. Reading only "servers" silently loaded
+    # ZERO servers for anyone who pasted a standard config or followed our
+    # own MCP guide (which uses "mcpServers") — no error, just a mysteriously
+    # tool-less agent.
+    has_standard = "mcpServers" in data
+    has_legacy = "servers" in data
+    servers_key = "mcpServers" if has_standard else "servers"
+    servers_data = data.get(servers_key, {})
     if not isinstance(servers_data, dict):
-        raise ValueError("'servers' must be a dictionary")
+        raise ValueError(f"'{servers_key}' must be a dictionary")
+    if has_standard and has_legacy:
+        logger.warning(
+            "MCP config has both 'mcpServers' and 'servers'; using the "
+            "standard 'mcpServers' key and ignoring 'servers'."
+        )
+    elif not has_standard and not has_legacy and data:
+        # A non-empty config with neither key is almost always a wrong-key
+        # typo that would otherwise silently yield an empty server set.
+        logger.warning(
+            "MCP config has neither 'mcpServers' nor 'servers' — no MCP "
+            "servers will be loaded. The standard key is 'mcpServers'."
+        )
 
     servers = {}
     for name, server_data in servers_data.items():
@@ -178,7 +199,7 @@ def create_example_config() -> str:
         JSON string with example configuration
     """
     example = {
-        "servers": {
+        "mcpServers": {
             "filesystem": {
                 "transport": "stdio",
                 "command": "npx",
