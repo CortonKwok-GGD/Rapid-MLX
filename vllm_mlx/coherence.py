@@ -133,10 +133,9 @@ class GoldenCase:
 
     ``kind`` selects the predicate applied by :func:`evaluate_case`:
 
-    * ``contains``      — completion contains any of ``expect`` (case-insensitive)
-    * ``contains_all``  — completion contains every string in ``expect``
+    * ``exact``         — normalized completion exactly matches one of ``expect``
     * ``not_garbage``   — open-ended prompt; only requirement is non-degeneracy
-    * ``no_think_leak`` — contains any of ``expect`` AND no raw reasoning tag
+    * ``no_think_leak`` — exact match AND no raw reasoning tag
     """
 
     id: str
@@ -153,28 +152,28 @@ GOLDEN: tuple[GoldenCase, ...] = (
     GoldenCase(
         "capital-japan",
         "What is the capital of Japan? Answer in one word.",
-        "contains",
+        "exact",
         ("Tokyo",),
         max_tokens=32,
     ),
     GoldenCase(
         "arithmetic",
         "What is 17 multiplied by 23? Reply with just the number.",
-        "contains",
+        "exact",
         ("391",),
         max_tokens=32,
     ),
     GoldenCase(
         "sky-color",
         "What color is a clear daytime sky? Answer in one word.",
-        "contains",
+        "exact",
         ("blue",),
         max_tokens=32,
     ),
     GoldenCase(
         "days-in-week",
         "How many days are in a week? Reply with just the number.",
-        "contains",
+        "exact",
         ("7", "seven"),
         max_tokens=32,
     ),
@@ -185,7 +184,7 @@ GOLDEN: tuple[GoldenCase, ...] = (
         # a case-insensitive single-letter check.
         "echo-word",
         "Repeat exactly this word back to me, nothing else: banana",
-        "contains",
+        "exact",
         ("banana",),
         max_tokens=32,
     ),
@@ -211,14 +210,17 @@ GOLDEN: tuple[GoldenCase, ...] = (
 )
 
 
-def _contains(text: str, needles: tuple[str, ...]) -> bool:
-    t = text.lower()
-    return any(n.lower() in t for n in needles)
+_ANSWER_WRAPPER = " \t\r\n`*_~\"'“”‘’.,!?;:。！？；："
 
 
-def _contains_all(text: str, needles: tuple[str, ...]) -> bool:
-    t = text.lower()
-    return all(n.lower() in t for n in needles)
+def _normalize_exact_answer(text: str) -> str:
+    """Normalize harmless presentation around a requested one-token answer."""
+    return " ".join(text.casefold().strip(_ANSWER_WRAPPER).split())
+
+
+def _matches_exact(text: str, expected: tuple[str, ...]) -> bool:
+    answer = _normalize_exact_answer(text)
+    return any(answer == _normalize_exact_answer(item) for item in expected)
 
 
 def evaluate_case(case: GoldenCase, text: str) -> tuple[bool, str]:
@@ -236,23 +238,18 @@ def evaluate_case(case: GoldenCase, text: str) -> tuple[bool, str]:
         # The garbage screen above IS the predicate for open-ended prompts.
         return True, "coherent (non-degenerate)"
 
-    if case.kind == "contains":
-        if _contains(text, case.expect):
-            return True, f"contains {case.expect!r}"
-        return False, f"missing expected {case.expect!r}"
-
-    if case.kind == "contains_all":
-        if _contains_all(text, case.expect):
-            return True, f"contains all of {case.expect!r}"
-        return False, f"missing one of {case.expect!r}"
+    if case.kind == "exact":
+        if _matches_exact(text, case.expect):
+            return True, f"exactly matches {case.expect!r}"
+        return False, f"not an exact match for {case.expect!r}"
 
     if case.kind == "no_think_leak":
         low = text.lower()
         leaked = [m for m in _THINK_MARKERS if m in low]
         if leaked:
             return False, f"leaked reasoning marker(s) {leaked!r} into visible output"
-        if _contains(text, case.expect):
-            return True, f"contains {case.expect!r}, no think-leak"
-        return False, f"missing expected {case.expect!r}"
+        if _matches_exact(text, case.expect):
+            return True, f"exactly matches {case.expect!r}, no think-leak"
+        return False, f"not an exact match for {case.expect!r}"
 
     return False, f"unknown case kind {case.kind!r}"

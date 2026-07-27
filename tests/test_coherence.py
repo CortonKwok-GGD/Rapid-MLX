@@ -66,7 +66,7 @@ def test_garbage_text_flagged(text: str) -> None:
 
 def test_evaluate_case_accepts_correct_answer() -> None:
     case = next(c for c in GOLDEN if c.id == "capital-japan")
-    passed, _ = evaluate_case(case, "The capital of Japan is Tokyo.")
+    passed, _ = evaluate_case(case, "**Tokyo.**")
     assert passed
 
 
@@ -74,9 +74,9 @@ def test_evaluate_case_rejects_coherent_but_wrong() -> None:
     """A fluent, non-garbage, but WRONG answer must fail — this is the class no
     perf/import gate catches."""
     case = next(c for c in GOLDEN if c.id == "capital-japan")
-    passed, reason = evaluate_case(case, "The capital of Japan is Osaka.")
+    passed, reason = evaluate_case(case, "Tokyo is incorrect; Osaka is the capital.")
     assert not passed
-    assert "missing" in reason
+    assert "exact match" in reason
 
 
 def test_evaluate_case_rejects_garbage_for_golden_prompt() -> None:
@@ -89,8 +89,13 @@ def test_evaluate_case_rejects_garbage_for_golden_prompt() -> None:
 
 def test_evaluate_case_arithmetic_wrong_number_fails() -> None:
     case = next(c for c in GOLDEN if c.id == "arithmetic")
-    assert evaluate_case(case, "17 times 23 is 391.")[0]
-    assert not evaluate_case(case, "17 times 23 is 400.")[0]
+    assert evaluate_case(case, "391.")[0]
+    assert not evaluate_case(case, "1391")[0]
+
+
+def test_evaluate_case_days_rejects_number_containing_answer() -> None:
+    case = next(c for c in GOLDEN if c.id == "days-in-week")
+    assert not evaluate_case(case, "17")[0]
 
 
 def test_no_think_leak_case_rejects_raw_reasoning_tag() -> None:
@@ -114,13 +119,13 @@ def test_not_garbage_case_is_open_ended() -> None:
 
 def test_golden_set_is_wellformed() -> None:
     assert len(GOLDEN) >= 5
-    valid_kinds = {"contains", "contains_all", "not_garbage", "no_think_leak"}
+    valid_kinds = {"exact", "not_garbage", "no_think_leak"}
     ids = set()
     for c in GOLDEN:
         assert isinstance(c, GoldenCase)
         assert c.kind in valid_kinds, f"{c.id}: bad kind {c.kind!r}"
         assert c.id not in ids, f"duplicate case id {c.id!r}"
         ids.add(c.id)
-        if c.kind in {"contains", "contains_all", "no_think_leak"}:
+        if c.kind in {"exact", "no_think_leak"}:
             assert c.expect, f"{c.id}: {c.kind} needs a non-empty expect"
         assert c.max_tokens > 0
