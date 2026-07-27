@@ -21,10 +21,22 @@ import pytest
 from vllm_mlx.mcp.config import create_example_config, validate_config
 from vllm_mlx.mcp.types import MCPConfig, MCPTransport
 
-# ``python3`` is on the security allowlist AND always on PATH (it's the
-# interpreter running pytest), so config validation never flakes on a missing
-# binary — matching the house style in test_chat_mcp.py.
 _SERVER = {"command": "python3", "args": ["-m", "some_mcp_server"]}
+
+
+@pytest.fixture(autouse=True)
+def _stub_command_path_lookup(monkeypatch):
+    """Make config validation independent of what's installed on PATH.
+
+    These tests exercise server-KEY handling, not the security PATH-presence
+    check. Stub ``shutil.which`` so an allowlisted command (python3 / npx /
+    uvx) always resolves — otherwise a runner exposing only ``python`` (not
+    ``python3``), or one without Node/uv, would fail validation for reasons
+    unrelated to what's under test.
+    """
+    monkeypatch.setattr(
+        "vllm_mlx.mcp.security.shutil.which", lambda cmd: f"/usr/bin/{cmd}"
+    )
 
 
 def test_mcpservers_standard_key_loads_servers():
@@ -116,17 +128,12 @@ def test_present_but_null_mcpservers_rejected_consistently():
         MCPConfig.from_dict(dict(bad))
 
 
-def test_example_config_uses_mcpservers_and_roundtrips(monkeypatch):
+def test_example_config_uses_mcpservers_and_roundtrips():
     data = json.loads(create_example_config())
     # The emitted example must key under the standard name...
     assert "mcpServers" in data
     assert "servers" not in data
-    # ...and must itself be a valid config the loader accepts. The example
-    # uses real server commands (npx / uvx) that need not be installed on the
-    # runner, so stub the command-in-PATH check — it's orthogonal to the key
-    # handling this test covers.
-    monkeypatch.setattr(
-        "vllm_mlx.mcp.security.shutil.which", lambda cmd: f"/usr/bin/{cmd}"
-    )
+    # ...and must itself be a valid config the loader accepts. (The example's
+    # npx/uvx commands need not be installed — see the autouse PATH stub.)
     cfg = validate_config(data)
     assert set(cfg.servers) == set(data["mcpServers"])
