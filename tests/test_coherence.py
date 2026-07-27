@@ -32,6 +32,8 @@ COHERENT = [
     # token answer must never be judged garbage.
     "7",
     "42",
+    "10000",
+    "100000",
     "9",
     "Yes",
     "No",

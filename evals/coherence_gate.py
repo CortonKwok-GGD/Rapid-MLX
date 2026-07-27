@@ -128,6 +128,8 @@ def main() -> int:
         if not passed:
             print(f"           output: {snippet!r}")
             failures.append((case.id, reason, snippet))
+        if transport_failed:
+            break
 
     print("=" * 60)
     passed_n = len(GOLDEN) - len(failures)

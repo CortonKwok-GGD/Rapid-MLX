@@ -100,7 +100,7 @@ def looks_like_garbage(text: str, *, min_words: int = 10) -> tuple[bool, str]:
     # (c) character-repetition heuristics. Guarded by a length floor so short
     # legitimate answers ("7", "42", "OK") are never flagged: a doubled-norm /
     # cache-poison collapse that carries word characters ("aaaaa…") is long.
-    if len(non_space) >= 5:
+    if len(non_space) >= 5 and not s.isdecimal():
         top_char, top_n = Counter(non_space).most_common(1)[0]
         if top_n / len(non_space) > 0.5:
             return True, (
