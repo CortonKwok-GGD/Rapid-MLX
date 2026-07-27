@@ -113,7 +113,9 @@ class _ProgressTracker:
       in-place bar with ``\\r`` so a multi-GB cold pull shows one live line
       instead of scrolling hundreds of raw ``[bytes]`` lines (0.11 dogfood
       papercut). Discrete status lines route through :meth:`write_line` so
-      they don't shred the bar.
+      they don't shred the bar. ``isatty()`` alone selects this mode;
+      ``NO_COLOR`` keeps the bar but drops ANSI (``\\r`` + space-pad erase)
+      rather than falling back to the machine flood.
 
     Two robustness properties, both from codex review on PR #1259:
 
@@ -136,15 +138,19 @@ class _ProgressTracker:
         self._total = max(0, int(total))
         self._last_emit = 0.0
         # Capture the stream once so the isatty() decision and every write
-        # target the same object even if sys.stdout is later swapped. A
-        # human terminal gets the in-place bar; anything piped keeps the
-        # machine ``[bytes] D/T`` contract. Same predicate as the puller's
-        # own ``is_tty`` banner styling so the two agree.
+        # target the same object even if sys.stdout is later swapped.
         self._out = sys.stdout
-        self._is_tty = (
-            bool(self._out) and self._out.isatty() and "NO_COLOR" not in os.environ
-        )
+        # A human terminal gets the in-place bar; anything piped keeps the
+        # machine ``[bytes] D/T`` contract. The TTY-vs-machine choice is
+        # ``isatty()`` ALONE — ``NO_COLOR`` must NOT push an interactive user
+        # back to the byte flood this change removes (codex #1259). NO_COLOR
+        # only downgrades *styling*: an escape-free ``\r`` + space-pad bar
+        # instead of the ``\x1b[2K`` erase (``\r`` is a carriage return, not
+        # color, so a colorless progress bar is still fine under NO_COLOR).
+        self._is_tty = bool(self._out) and self._out.isatty()
+        self._ansi = self._is_tty and "NO_COLOR" not in os.environ
         self._bar_live = False  # a bar is currently drawn on the TTY row
+        self._last_line_len = 0  # width of the current row (no-ANSI erase)
 
     def add(self, delta: int) -> None:
         if delta <= 0:
@@ -176,23 +182,29 @@ class _ProgressTracker:
         else:
             print(f"  [bytes] {done}/{total}", file=self._out, flush=True)
 
-    def _draw_bar(self, done: int, total: int) -> None:
-        """Redraw the single in-place progress bar (TTY only, no newline).
-        Caller holds ``self._lock``.
+    def _inplace(self, text: str, newline: bool) -> None:
+        """Redraw ``text`` on the current terminal row (caller holds the
+        lock). With styling allowed, uses the ANSI erase-line; under
+        ``NO_COLOR`` falls back to a carriage return + trailing-space pad so
+        a shorter line still overwrites a longer predecessor without emitting
+        any escape sequence."""
+        if self._ansi:
+            body = f"\r\x1b[2K{text}"
+        else:
+            pad = " " * max(0, self._last_line_len - len(text))
+            body = f"\r{text}{pad}"
+        self._last_line_len = 0 if newline else len(text)
+        print(body, end=("\n" if newline else ""), file=self._out, flush=True)
 
-        Leads with ``\\r\\x1b[2K`` (carriage-return + erase-line) so a
-        shorter redraw can't leave stale tail characters from a longer one.
-        """
+    def _draw_bar(self, done: int, total: int, newline: bool = False) -> None:
+        """Redraw the single in-place progress bar (TTY only). Caller holds
+        ``self._lock``. ``newline=True`` finalizes the row (used by flush)."""
         pct = int(done * 100 / total) if total else 0
         width = 24
         filled = int(width * done / total) if total else 0
         bar = "█" * filled + "░" * (width - filled)
-        print(
-            f"\r\x1b[2K  ↓ {pct:3d}%  [{bar}]  {done / 1e6:.0f}/{total / 1e6:.0f} MB",
-            end="",
-            file=self._out,
-            flush=True,
-        )
+        text = f"  ↓ {pct:3d}%  [{bar}]  {done / 1e6:.0f}/{total / 1e6:.0f} MB"
+        self._inplace(text, newline)
 
     def write_line(self, text: str) -> None:
         """Print a discrete status line without corrupting the live bar.
@@ -204,10 +216,13 @@ class _ProgressTracker:
         """
         with self._lock:
             if self._is_tty and self._bar_live:
-                print(f"\r\x1b[2K{text}", file=self._out, flush=True)
+                # Erase the live bar and print the line on its own row (ANSI
+                # erase, or \r + pad under NO_COLOR); next heartbeat redraws.
+                self._inplace(text, newline=True)
                 self._bar_live = False
             else:
                 print(text, file=self._out)
+                self._last_line_len = 0
 
     def subtract(self, delta: int) -> None:
         """Roll back optimistic R2-chunk credits when the file fails
@@ -234,8 +249,9 @@ class _ProgressTracker:
             done = min(self._done, self._total)
             if self._is_tty:
                 if self._bar_live or done > 0:
-                    self._draw_bar(done, self._total)
-                    print(file=self._out, flush=True)  # newline finalizes
+                    # Finalize the bar with a trailing newline so the next
+                    # banner starts on a clean row.
+                    self._draw_bar(done, self._total, newline=True)
                     self._bar_live = False
             else:
                 print(f"  [bytes] {done}/{self._total}", file=self._out, flush=True)

@@ -129,3 +129,28 @@ def test_tty_stays_silent_when_total_unknown(monkeypatch):
     t.add(500)
     t.flush()
     assert fake.getvalue() == ""
+
+
+def test_no_color_tty_keeps_bar_without_ansi(monkeypatch):
+    """NO_COLOR must NOT re-trigger the machine ``[bytes]`` flood on a
+    terminal — that's the exact regression this feature removes, and the
+    NO_COLOR user is precisely who wants clean output. NO_COLOR only drops
+    ANSI: the bar still redraws in place via ``\\r`` + space-pad, emitting
+    zero escape sequences.
+    """
+    monkeypatch.setenv("NO_COLOR", "1")  # re-set (autouse fixture cleared it)
+    fake = _FakeTTY()
+    monkeypatch.setattr(sys, "stdout", fake)
+    t = _ProgressTracker(total=1000)
+    t.add(250)
+    t.add(250)  # 50%
+    t.write_line("  [1/3] config.json")  # erases the bar without ANSI
+    t.add(500)  # 100%
+    t.flush()
+    out = fake.getvalue()
+    assert "[bytes]" not in out  # no machine flood for a NO_COLOR terminal
+    assert "\x1b" not in out  # zero ANSI escapes
+    assert "\r" in out  # still an in-place bar
+    assert "↓" in out and "100%" in out
+    assert "[1/3] config.json" in out
+    assert out.endswith("\n")  # flush finalized the row
