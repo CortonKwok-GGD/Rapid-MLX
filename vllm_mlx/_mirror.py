@@ -117,15 +117,18 @@ class _ProgressTracker:
       ``NO_COLOR`` keeps the bar but drops ANSI (``\\r`` + space-pad erase)
       rather than falling back to the machine flood.
 
-    Two robustness properties, both from codex review on PR #1259:
+    Three robustness properties, all from codex review on PR #1259:
 
-    * **Single lock guards counters AND rendering.** A render happens while
-      the lock is held, immediately after the byte-count update — so
-      renders fire in lock-acquisition (== byte-count) order and the bar
-      can never regress to a stale value when two workers heartbeat close
-      together. The lock is held across the tiny, throttled (≤2/s) terminal
-      write; contention is negligible (a decode-loop's chunk accounting was
-      already serialized on this lock).
+    * **Two locks: counters (``_lock``) vs rendering (``_io_lock``).** Chunk
+      accounting stays on the fast ``_lock``; the potentially-blocking
+      terminal/pipe write happens with only ``_io_lock`` held, so a slow or
+      backpressured stdout can never stall a worker updating its byte count.
+    * **Renders read the freshest count, and can't regress.** ``_emit``
+      re-reads ``_done`` under a brief ``_lock`` nested inside ``_io_lock``,
+      so serialized renders are monotonic (each reads a ``_done`` ≥ the
+      previous render's) — no out-of-order/stale bar even when two workers
+      heartbeat close together. Lock order is always ``_io_lock`` → ``_lock``
+      (never the reverse while held), so there is no deadlock.
     * **The output stream is captured once** (``self._out``) and used for
       both the ``isatty()`` decision and every write, so swapping or
       redirecting ``sys.stdout`` after construction can't send ANSI to a
@@ -133,7 +136,8 @@ class _ProgressTracker:
     """
 
     def __init__(self, total: int = 0) -> None:
-        self._lock = threading.Lock()  # guards the counters AND rendering
+        self._lock = threading.Lock()  # guards the byte counters (fast)
+        self._io_lock = threading.Lock()  # serializes rendering + bar state
         self._done = 0
         self._total = max(0, int(total))
         self._last_emit = 0.0
@@ -149,12 +153,14 @@ class _ProgressTracker:
         # color, so a colorless progress bar is still fine under NO_COLOR).
         self._is_tty = bool(self._out) and self._out.isatty()
         self._ansi = self._is_tty and "NO_COLOR" not in os.environ
+        # Render state — guarded by ``_io_lock`` (never ``_lock``).
         self._bar_live = False  # a bar is currently drawn on the TTY row
         self._last_line_len = 0  # width of the current row (no-ANSI erase)
 
     def add(self, delta: int) -> None:
         if delta <= 0:
             return
+        do_emit = False
         with self._lock:
             self._done += int(delta)
             if self._total <= 0:
@@ -162,29 +168,43 @@ class _ProgressTracker:
             now = time.monotonic()
             if now - self._last_emit >= _PROGRESS_HEARTBEAT_SECONDS:
                 self._last_emit = now
-                # Codex R3 BLOCKING on PR #682: clamp DISPLAY at total so
-                # an oversized/corrupt R2 stream (Content-Length lies,
-                # proxy injects extra bytes) can't render ``1200/1000``
-                # before the final-size-mismatch rollback runs. Internal
-                # ``_done`` stays raw so ``subtract`` continues to balance
-                # against the actual credit (rollback of raw 1200 from
-                # raw 1200 leaves _done=0 → next ``add(1000)`` from HF
-                # lands at clean 1000/1000). Render under the lock so
-                # concurrent workers emit in byte-count order and the bar
-                # never regresses (codex #1259 BLOCKING).
-                self._render(min(self._done, self._total), self._total)
+                do_emit = True
+        # Render OUTSIDE the counter lock (codex #1259): a slow / backpressured
+        # stdout must not stall every worker's chunk accounting. ``_emit``
+        # re-reads the freshest byte count under a brief counter-lock nested
+        # inside ``_io_lock``, so serialized renders stay monotonic (each
+        # reads a ``_done`` ≥ the previous render's) and never regress.
+        if do_emit:
+            self._emit()
 
-    def _render(self, done: int, total: int) -> None:
-        """Render one observation. Caller MUST hold ``self._lock``."""
-        if self._is_tty:
-            self._draw_bar(done, total)
-            self._bar_live = True
-        else:
-            print(f"  [bytes] {done}/{total}", file=self._out, flush=True)
+    def _emit(self) -> None:
+        """Render the current progress under ``_io_lock``.
+
+        The byte snapshot is read under a brief ``_lock`` nested inside
+        ``_io_lock``; the potentially-blocking terminal/pipe write then runs
+        with only ``_io_lock`` held, so it never stalls a worker updating
+        counters. Lock order ``_io_lock`` → ``_lock`` matches :meth:`flush`.
+        """
+        with self._io_lock:
+            with self._lock:
+                if self._total <= 0:
+                    return
+                # Clamp DISPLAY at total (codex R3 on PR #682): an oversized
+                # / corrupt R2 stream (Content-Length lies, proxy injects
+                # extra bytes) must not render ``1200/1000`` before the
+                # final-size-mismatch rollback runs. ``_done`` stays raw so
+                # ``subtract`` still balances against the actual credit.
+                done = min(self._done, self._total)
+                total = self._total
+            if self._is_tty:
+                self._draw_bar(done, total)
+                self._bar_live = True
+            else:
+                print(f"  [bytes] {done}/{total}", file=self._out, flush=True)
 
     def _inplace(self, text: str, newline: bool) -> None:
-        """Redraw ``text`` on the current terminal row (caller holds the
-        lock). With styling allowed, uses the ANSI erase-line; under
+        """Redraw ``text`` on the current terminal row (caller holds
+        ``_io_lock``). With styling allowed, uses the ANSI erase-line; under
         ``NO_COLOR`` falls back to a carriage return + trailing-space pad so
         a shorter line still overwrites a longer predecessor without emitting
         any escape sequence."""
@@ -198,7 +218,7 @@ class _ProgressTracker:
 
     def _draw_bar(self, done: int, total: int, newline: bool = False) -> None:
         """Redraw the single in-place progress bar (TTY only). Caller holds
-        ``self._lock``. ``newline=True`` finalizes the row (used by flush)."""
+        ``self._io_lock``. ``newline=True`` finalizes the row (used by flush)."""
         pct = int(done * 100 / total) if total else 0
         width = 24
         filled = int(width * done / total) if total else 0
@@ -214,7 +234,7 @@ class _ProgressTracker:
         stream this is a plain ``print`` — byte-identical to the old
         ``_print_dim`` path the desktop parser and tests observe.
         """
-        with self._lock:
+        with self._io_lock:
             if self._is_tty and self._bar_live:
                 # Erase the live bar and print the line on its own row (ANSI
                 # erase, or \r + pad under NO_COLOR); next heartbeat redraws.
@@ -242,19 +262,21 @@ class _ProgressTracker:
         throttle window — the last 500 ms of bytes would otherwise be
         invisible. On a TTY this finalizes the in-place bar with a trailing
         newline so the next banner starts on a clean row."""
-        with self._lock:
-            if self._total <= 0:
-                return
-            # Clamp display at total — same rationale as ``add()``.
-            done = min(self._done, self._total)
+        with self._io_lock:
+            with self._lock:
+                if self._total <= 0:
+                    return
+                # Clamp display at total — same rationale as ``_emit``.
+                done = min(self._done, self._total)
+                total = self._total
             if self._is_tty:
                 if self._bar_live or done > 0:
                     # Finalize the bar with a trailing newline so the next
                     # banner starts on a clean row.
-                    self._draw_bar(done, self._total, newline=True)
+                    self._draw_bar(done, total, newline=True)
                     self._bar_live = False
             else:
-                print(f"  [bytes] {done}/{self._total}", file=self._out, flush=True)
+                print(f"  [bytes] {done}/{total}", file=self._out, flush=True)
 
 
 def _rollback_credits(
