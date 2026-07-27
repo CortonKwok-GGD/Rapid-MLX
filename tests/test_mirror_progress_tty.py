@@ -77,14 +77,19 @@ def test_tty_draws_single_inplace_bar(monkeypatch):
     t.add(250)  # 50%
     mid = fake.getvalue()
     assert "[bytes]" not in mid  # machine format never shown to a human
-    assert "\r" in mid and "↓" in mid  # in-place bar
-    assert "50%" in mid
-    assert not mid.endswith("\n")  # mid-stream redraw carries no newline
+    assert "50%" in mid and "↓" in mid
+    # ONE line, redrawn in place: NO newline anywhere mid-stream (a scroll
+    # would insert one), and every redraw is a carriage-return + erase-line.
+    assert "\n" not in mid
+    assert mid.count("\r\x1b[2K") == 2  # exactly the two add() redraws
     t.add(500)  # 100%
     t.flush()
     final = fake.getvalue()
     assert "100%" in final
     assert final.endswith("\n")  # flush finalizes the bar's row
+    # The finalizing newline is the ONLY newline in the whole TTY session —
+    # proof the bar never scrolled.
+    assert final.count("\n") == 1
 
 
 def test_tty_bar_clamps_display_at_100_percent(monkeypatch):
