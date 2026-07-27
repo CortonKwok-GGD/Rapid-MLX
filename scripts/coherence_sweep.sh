@@ -40,7 +40,15 @@ cleanup() {
   fi
   rm -rf "$WORK_DIR"
 }
-trap cleanup EXIT INT TERM
+handle_signal() {
+  signal_status=$1
+  trap - EXIT
+  cleanup
+  exit "$signal_status"
+}
+trap cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 if lsof -i ":$PORT" >/dev/null 2>&1; then
   echo "ERROR: port $PORT already in use — pick another with PORT=... or free it." >&2

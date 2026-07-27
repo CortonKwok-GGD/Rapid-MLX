@@ -158,6 +158,19 @@ def test_gate_turns_invalid_response_content_into_failure(
     assert coherence_gate.main() == 1
 
 
+def test_gate_returns_infrastructure_code_for_invalid_server_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(coherence_gate, "_server_reachable", lambda _url: True)
+
+    def fail_protocol(*_args: object, **_kwargs: object) -> str:
+        raise coherence_gate.InvalidServerResponseError("malformed response")
+
+    monkeypatch.setattr(coherence_gate, "_generate", fail_protocol)
+    monkeypatch.setattr(sys, "argv", ["coherence_gate.py"])
+    assert coherence_gate.main() == 2
+
+
 def test_golden_set_is_all_deterministic_blocking() -> None:
     """Every golden case must be a deterministic, exact-answer predicate — no
     heuristic / open-ended cases in the blocking set (review convergence)."""

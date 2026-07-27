@@ -232,6 +232,9 @@ def evaluate_case(case: GoldenCase, text: str) -> tuple[bool, str]:
     but never blocks on, because a frequency heuristic cannot reliably separate
     diverse token soup (``"Ocean qzxv blorp fnarg glip."``) from prose.
     """
+    if not isinstance(text, str):
+        return False, f"invalid response content type {type(text).__name__}"
+
     if case.kind == "exact":
         if _matches_exact(text, case.expect):
             return True, f"exactly matches {case.expect!r}"

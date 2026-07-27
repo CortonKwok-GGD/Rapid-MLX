@@ -59,6 +59,10 @@ from vllm_mlx.coherence import (  # noqa: E402
 _DEFAULT_BASE_URL = os.environ.get("RAPID_MLX_BASE_URL", "http://127.0.0.1:8000/v1")
 
 
+class InvalidServerResponseError(RuntimeError):
+    """The server replied, but not with a valid chat-completion payload."""
+
+
 def _generate(base_url: str, case: GoldenCase, *, timeout: float) -> str:
     """Non-streaming completion for ``case`` at temperature 0. Returns the
     visible assistant text (empty string if the model returned no content)."""
@@ -77,9 +81,18 @@ def _generate(base_url: str, case: GoldenCase, *, timeout: float) -> str:
         f"{base_url.rstrip('/')}/chat/completions", json=body, timeout=timeout
     )
     resp.raise_for_status()
-    data = resp.json()
-    content = data["choices"][0]["message"].get("content")
-    return content or ""
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"].get("content")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise InvalidServerResponseError("malformed chat-completion response") from exc
+    if content is None:
+        return ""
+    if not isinstance(content, str):
+        raise InvalidServerResponseError(
+            f"assistant content must be a string or null, got {type(content).__name__}"
+        )
+    return content
 
 
 def _server_reachable(base_url: str) -> bool:
@@ -121,21 +134,23 @@ def main() -> int:
     failures: list[tuple[str, str, str]] = []  # BLOCKING: (id, reason, snippet)
     advisories: list[tuple[str, str, str]] = []  # ADVISORY: (id, why, snippet)
     passed_n = 0
-    transport_failed = False
+    infrastructure_failed = False
     for case in GOLDEN:
         try:
             text = _generate(base_url, case, timeout=args.timeout)
             passed, reason = evaluate_case(case, text)
-        except httpx.TransportError as exc:
-            passed, reason = False, f"server transport error: {exc}"
-            transport_failed = True
+        except (httpx.HTTPError, InvalidServerResponseError) as exc:
+            passed, reason = False, f"server/protocol error: {exc}"
+            infrastructure_failed = True
             text = ""
         except Exception as exc:  # server/protocol error mid-run -> a gate failure
             passed, reason = False, f"request error: {exc}"
             text = ""
 
         status = "PASS" if passed else "FAIL"
-        snippet = " ".join(text.split())[:80]
+        snippet = (
+            " ".join(text.split())[:80] if isinstance(text, str) else repr(text)[:80]
+        )
         print(f"  [{status}] {case.id:<16} {reason}")
         if passed:
             passed_n += 1
@@ -143,15 +158,16 @@ def main() -> int:
             print(f"           output: {snippet!r}")
             failures.append((case.id, reason, snippet))
 
-        if transport_failed:
+        if infrastructure_failed:
             break
 
         # Advisory-only: surface obvious degeneracy as a diagnostic. Never
         # affects the exit code — the heuristic can miss diverse token soup, so
         # it must not gate (or falsely gate) a release.
-        is_garbage, why = looks_like_garbage(text)
-        if is_garbage:
-            advisories.append((case.id, why, snippet))
+        if isinstance(text, str):
+            is_garbage, why = looks_like_garbage(text)
+            if is_garbage:
+                advisories.append((case.id, why, snippet))
 
     print("=" * 60)
     print(f"  BLOCKING: {passed_n}/{len(GOLDEN)} golden cases passed")
@@ -161,10 +177,10 @@ def main() -> int:
             print(f"    - {cid}: {why}  |  {snippet!r}")
     print("=" * 60)
 
-    if transport_failed:
+    if infrastructure_failed:
         print(
-            "ERROR: the rapid-mlx server became unreachable while the "
-            "coherence gate was running.",
+            "ERROR: the rapid-mlx server became unreachable or returned an "
+            "invalid response while the coherence gate was running.",
             file=sys.stderr,
         )
         return 2
