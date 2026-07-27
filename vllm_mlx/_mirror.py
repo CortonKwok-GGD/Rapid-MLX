@@ -229,18 +229,22 @@ class _ProgressTracker:
         process's default controlling terminal — which can differ from
         ``self._out`` when stdout is redirected to a different-width PTY; the
         bar would then wrap despite the single-line guarantee (codex #1259).
-        So measure ``self._out`` directly. Precedence: an explicit
-        ``COLUMNS`` override (documented convention) wins; otherwise the
-        stream's own ``TIOCGWINSZ``; a stream with no real terminal
-        (``StringIO``, a pipe) falls back to 80.
+        So measure ``self._out`` directly.
+
+        Precedence: the stream's OWN live ``TIOCGWINSZ`` wins — it is the
+        true source of truth for wrapping, so a stale/oversized inherited
+        ``COLUMNS`` can't wrap the bar. ``COLUMNS`` is only a fallback for
+        streams with no queryable terminal (``StringIO``, a pipe); failing
+        that, 80.
         """
-        cols_env = os.environ.get("COLUMNS")
-        if cols_env and cols_env.isdigit():
-            return int(cols_env)
         try:
             return os.get_terminal_size(self._out.fileno()).columns
         except (OSError, ValueError, AttributeError):
-            return 80
+            pass
+        cols_env = os.environ.get("COLUMNS")
+        if cols_env and cols_env.isdigit():
+            return int(cols_env)
+        return 80
 
     def _draw_bar(self, done: int, total: int, newline: bool = False) -> None:
         """Redraw the single in-place progress bar (TTY only). Caller holds
