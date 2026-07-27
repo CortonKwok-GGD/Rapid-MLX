@@ -89,17 +89,12 @@ def test_empty_mcpservers_does_not_warn(caplog):
 
 
 def test_standard_stdio_schema_omits_transport():
-    # The exact shape our mcp-tools.md guide documents: command + args, no
-    # explicit "transport". It must parse as stdio via the field default.
+    # The shape our mcp-tools.md guide documents: command + args, no explicit
+    # "transport". It must parse as stdio via the field default. Uses python3
+    # (PATH-guaranteed) — a real npx/uvx command would trip the loader's
+    # command-in-PATH check on a Node/uv-less runner.
     cfg = validate_config(
-        {
-            "mcpServers": {
-                "filesystem": {
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-                }
-            }
-        }
+        {"mcpServers": {"filesystem": {"command": "python3", "args": ["-m", "srv"]}}}
     )
     assert cfg.servers["filesystem"].transport is MCPTransport.STDIO
 
@@ -121,11 +116,17 @@ def test_present_but_null_mcpservers_rejected_consistently():
         MCPConfig.from_dict(dict(bad))
 
 
-def test_example_config_uses_mcpservers_and_roundtrips():
+def test_example_config_uses_mcpservers_and_roundtrips(monkeypatch):
     data = json.loads(create_example_config())
     # The emitted example must key under the standard name...
     assert "mcpServers" in data
     assert "servers" not in data
-    # ...and must itself be a valid config the loader accepts.
+    # ...and must itself be a valid config the loader accepts. The example
+    # uses real server commands (npx / uvx) that need not be installed on the
+    # runner, so stub the command-in-PATH check — it's orthogonal to the key
+    # handling this test covers.
+    monkeypatch.setattr(
+        "vllm_mlx.mcp.security.shutil.which", lambda cmd: f"/usr/bin/{cmd}"
+    )
     cfg = validate_config(data)
     assert set(cfg.servers) == set(data["mcpServers"])
