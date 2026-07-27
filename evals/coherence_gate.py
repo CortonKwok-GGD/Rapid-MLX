@@ -108,10 +108,12 @@ def main() -> int:
         return 2
 
     failures: list[tuple[str, str, str]] = []  # (id, reason, snippet)
+    passed_n = 0
     transport_failed = False
     for case in GOLDEN:
         try:
             text = _generate(base_url, case, timeout=args.timeout)
+            passed, reason = evaluate_case(case, text)
         except httpx.TransportError as exc:
             passed, reason = False, f"server transport error: {exc}"
             transport_failed = True
@@ -119,20 +121,19 @@ def main() -> int:
         except Exception as exc:  # server/protocol error mid-run -> a gate failure
             passed, reason = False, f"request error: {exc}"
             text = ""
-        else:
-            passed, reason = evaluate_case(case, text)
 
         status = "PASS" if passed else "FAIL"
         snippet = " ".join(text.split())[:80]
         print(f"  [{status}] {case.id:<16} {reason}")
-        if not passed:
+        if passed:
+            passed_n += 1
+        else:
             print(f"           output: {snippet!r}")
             failures.append((case.id, reason, snippet))
         if transport_failed:
             break
 
     print("=" * 60)
-    passed_n = len(GOLDEN) - len(failures)
     print(f"  {passed_n}/{len(GOLDEN)} coherent")
     print("=" * 60)
 

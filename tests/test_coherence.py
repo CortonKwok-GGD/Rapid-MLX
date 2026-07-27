@@ -34,6 +34,7 @@ COHERENT = [
     "42",
     "10000",
     "100000",
+    "Alabama",
     "9",
     "Yes",
     "No",
@@ -137,6 +138,17 @@ def test_gate_returns_infrastructure_code_for_midrun_transport_failure(
     monkeypatch.setattr(coherence_gate, "_generate", fail_transport)
     monkeypatch.setattr(sys, "argv", ["coherence_gate.py"])
     assert coherence_gate.main() == 2
+
+
+def test_gate_turns_invalid_response_content_into_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(coherence_gate, "_server_reachable", lambda _url: True)
+    monkeypatch.setattr(
+        coherence_gate, "_generate", lambda *_args, **_kwargs: ["not", "text"]
+    )
+    monkeypatch.setattr(sys, "argv", ["coherence_gate.py"])
+    assert coherence_gate.main() == 1
 
 
 def test_golden_set_is_wellformed() -> None:

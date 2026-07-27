@@ -102,7 +102,7 @@ def looks_like_garbage(text: str, *, min_words: int = 10) -> tuple[bool, str]:
     # cache-poison collapse that carries word characters ("aaaaa…") is long.
     if len(non_space) >= 5 and not s.isdecimal():
         top_char, top_n = Counter(non_space).most_common(1)[0]
-        if top_n / len(non_space) > 0.5:
+        if top_n >= 5 and top_n / len(non_space) > 0.5:
             return True, (
                 f"char {top_char!r} is {top_n}/{len(non_space)} of non-space output"
             )
