@@ -20,6 +20,7 @@ These are direct unit tests of the tracker: fast and hermetic, no network.
 from __future__ import annotations
 
 import io
+import os
 import sys
 
 import pytest
@@ -164,6 +165,75 @@ def test_narrow_tty_never_wraps(monkeypatch):
         row = seg.split("\n")[0]
         if "↓" in row:
             assert len(row) <= 20, f"bar row exceeds width: {row!r} ({len(row)})"
+
+
+def _render_bar_under_pty(cols, total, adds, monkeypatch):
+    """Run a real ``_ProgressTracker`` with stdout wired to a PTY sized to
+    ``cols`` columns, and return the captured output. Exercises the true
+    ``os.get_terminal_size(self._out.fileno())`` width path — no ``COLUMNS``,
+    no ``_FakeTTY``."""
+    import fcntl
+    import pty
+    import struct
+    import termios
+    import threading
+
+    master, slave = pty.openpty()
+    # Size the PTY to `cols` columns (rows irrelevant to the bar).
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, cols, 0, 0))
+
+    # Drain the master concurrently: on macOS, closing the slave can discard
+    # buffered data before a serial read gets to it, so read as it's written.
+    captured = bytearray()
+
+    def _reader():
+        while True:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            captured.extend(chunk)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    slave_f = os.fdopen(slave, "w", buffering=1)
+    monkeypatch.setattr(sys, "stdout", slave_f)
+    try:
+        t = _ProgressTracker(total=total)
+        for a in adds:
+            t.add(a)
+        t.flush()
+    finally:
+        slave_f.flush()
+        slave_f.close()  # slave EOF → the reader thread exits
+        monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+    reader.join(timeout=2)
+    os.close(master)
+    return bytes(captured).decode("utf-8", "replace")
+
+
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="PTY unavailable")
+def test_pty_width_measures_output_stream_not_default(monkeypatch):
+    """The bar sizes to ITS OWN output PTY, not the process's default
+    terminal (codex #1259 BLOCKING). Two PTYs of differing widths, COLUMNS
+    unset: every bar row must fit its own PTY's width. If width detection
+    fell back to a constant (e.g. 80), the 34-col PTY's rows would overflow
+    and this fails.
+    """
+    monkeypatch.delenv("COLUMNS", raising=False)  # force the fileno path
+    for cols in (34, 72):
+        out = _render_bar_under_pty(
+            cols, 500_000_000, [250_000_000, 250_000_000], monkeypatch
+        )
+        assert "[bytes]" not in out
+        assert "↓" in out
+        for seg in out.replace("\x1b[2K", "").split("\r"):
+            row = seg.split("\n")[0]
+            if "↓" in row:
+                assert len(row) <= cols, f"cols={cols}: row {row!r} len={len(row)}"
 
 
 def test_no_color_tty_keeps_bar_without_ansi(monkeypatch):

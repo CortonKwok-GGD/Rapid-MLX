@@ -36,7 +36,6 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import shutil
 import sys
 import threading
 import time
@@ -223,6 +222,26 @@ class _ProgressTracker:
         self._last_line_len = 0 if newline else len(text)
         print(body, end=("\n" if newline else ""), file=self._out, flush=True)
 
+    def _terminal_width(self) -> int:
+        """Column count of THIS output stream's terminal.
+
+        ``shutil.get_terminal_size`` measures ``sys.__stdout__`` — the
+        process's default controlling terminal — which can differ from
+        ``self._out`` when stdout is redirected to a different-width PTY; the
+        bar would then wrap despite the single-line guarantee (codex #1259).
+        So measure ``self._out`` directly. Precedence: an explicit
+        ``COLUMNS`` override (documented convention) wins; otherwise the
+        stream's own ``TIOCGWINSZ``; a stream with no real terminal
+        (``StringIO``, a pipe) falls back to 80.
+        """
+        cols_env = os.environ.get("COLUMNS")
+        if cols_env and cols_env.isdigit():
+            return int(cols_env)
+        try:
+            return os.get_terminal_size(self._out.fileno()).columns
+        except (OSError, ValueError, AttributeError):
+            return 80
+
     def _draw_bar(self, done: int, total: int, newline: bool = False) -> None:
         """Redraw the single in-place progress bar (TTY only). Caller holds
         ``self._io_lock``. ``newline=True`` finalizes the row (used by flush).
@@ -236,10 +255,7 @@ class _ProgressTracker:
         pct = int(done * 100 / total) if total else 0
         head = f"  ↓ {pct:3d}%  "
         tail = f"  {done / 1e6:.0f}/{total / 1e6:.0f} MB"
-        try:
-            cols = shutil.get_terminal_size().columns
-        except (ValueError, OSError):
-            cols = 80
+        cols = self._terminal_width()
         # Cells left for the bar after the head, the ``[]`` brackets, and tail.
         bar_cells = min(_BAR_MAX_CELLS, cols - len(head) - len(tail) - 2)
         if bar_cells >= _BAR_MIN_CELLS:
