@@ -100,16 +100,36 @@ class _ProgressTracker:
 
     Workers call ``add(delta)`` for each chunk they write; the call is
     cheap (atomic int add under a lock) and at most one in every
-    ``_PROGRESS_HEARTBEAT_SECONDS`` window emits a ``[bytes] D/T``
-    line to stdout. Print is flushed eagerly so a non-TTY stdout
-    (desktop pipe) sees the line as soon as it's emitted.
+    ``_PROGRESS_HEARTBEAT_SECONDS`` window renders a progress observation.
+
+    Two render modes, chosen once at construction from ``stdout``:
+
+    * **non-TTY** (the desktop app's captured pipe, a redirected log, or
+      pytest capture) — emit the machine-readable ``[bytes] D/T`` line the
+      desktop's ``DownloadProgress`` parser and the mirror regression tests
+      depend on. Unchanged from the original heartbeat.
+    * **TTY** (a human running bare ``rapid-mlx chat``) — redraw a single
+      in-place bar with ``\\r`` so a multi-GB cold pull shows one live line
+      instead of scrolling hundreds of raw ``[bytes]`` lines (0.11 dogfood
+      papercut). Discrete status lines route through :meth:`write_line` so
+      they don't shred the bar.
+
+    Prints are flushed eagerly and serialized on ``_io_lock`` so a redraw
+    fired from a worker thread and a completion line printed from the main
+    dispatcher thread can't interleave mid-escape-sequence.
     """
 
     def __init__(self, total: int = 0) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards the byte counters
+        self._io_lock = threading.Lock()  # serializes terminal writes
         self._done = 0
         self._total = max(0, int(total))
         self._last_emit = 0.0
+        # A human terminal gets the in-place bar; anything piped keeps the
+        # machine ``[bytes] D/T`` contract. Same predicate as the puller's
+        # own ``is_tty`` banner styling so the two agree.
+        self._is_tty = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+        self._bar_live = False  # a bar is currently drawn on the TTY row
 
     def add(self, delta: int) -> None:
         if delta <= 0:
@@ -132,8 +152,48 @@ class _ProgressTracker:
                 # lands at clean 1000/1000).
                 emit = (min(self._done, self._total), self._total)
         if emit is not None:
-            done, total = emit
-            print(f"  [bytes] {done}/{total}", flush=True)
+            self._emit(*emit)
+
+    def _emit(self, done: int, total: int) -> None:
+        """Render one progress observation in the mode picked at init."""
+        with self._io_lock:
+            if self._is_tty:
+                self._draw_bar(done, total)
+                self._bar_live = True
+            else:
+                print(f"  [bytes] {done}/{total}", flush=True)
+
+    @staticmethod
+    def _draw_bar(done: int, total: int) -> None:
+        """Redraw the single in-place progress bar (TTY only, no newline).
+
+        Leads with ``\\r\\x1b[2K`` (carriage-return + erase-line) so a
+        shorter redraw can't leave stale tail characters from a longer one.
+        """
+        pct = int(done * 100 / total) if total else 0
+        width = 24
+        filled = int(width * done / total) if total else 0
+        bar = "█" * filled + "░" * (width - filled)
+        print(
+            f"\r\x1b[2K  ↓ {pct:3d}%  [{bar}]  {done / 1e6:.0f}/{total / 1e6:.0f} MB",
+            end="",
+            flush=True,
+        )
+
+    def write_line(self, text: str) -> None:
+        """Print a discrete status line without corrupting the live bar.
+
+        On a TTY, erase the in-place bar first and print ``text`` on its own
+        row; the next heartbeat redraws the bar below it. On a non-TTY
+        stdout this is a plain ``print`` — byte-identical to the old
+        ``_print_dim`` path the desktop parser and tests observe.
+        """
+        with self._io_lock:
+            if self._is_tty and self._bar_live:
+                print(f"\r\x1b[2K{text}", flush=True)
+                self._bar_live = False
+            else:
+                print(text)
 
     def subtract(self, delta: int) -> None:
         """Roll back optimistic R2-chunk credits when the file fails
@@ -149,17 +209,23 @@ class _ProgressTracker:
             self._done = max(0, self._done - int(delta))
 
     def flush(self) -> None:
-        """Emit a final heartbeat at the end of a pull regardless of
+        """Emit a final observation at the end of a pull regardless of the
         throttle window — the last 500 ms of bytes would otherwise be
-        invisible to the UI."""
-        emit: tuple[int, int] | None = None
+        invisible. On a TTY this finalizes the in-place bar with a trailing
+        newline so the next banner starts on a clean row."""
         with self._lock:
-            if self._total > 0:
-                # Clamp display at total — same rationale as ``add()``.
-                emit = (min(self._done, self._total), self._total)
-        if emit is not None:
-            done, total = emit
-            print(f"  [bytes] {done}/{total}", flush=True)
+            if self._total <= 0:
+                return
+            # Clamp display at total — same rationale as ``add()``.
+            done = min(self._done, self._total)
+        with self._io_lock:
+            if self._is_tty:
+                if self._bar_live or done > 0:
+                    self._draw_bar(done, self._total)
+                    print(flush=True)  # newline finalizes the bar row
+                    self._bar_live = False
+            else:
+                print(f"  [bytes] {done}/{self._total}", flush=True)
 
 
 def _rollback_credits(
@@ -1547,7 +1613,12 @@ def download_with_mirror_fallback(
                     # users aren't surprised when the outer caller falls
                     # back to ``snapshot_download``.
                     tag = f"{DIM}miss (will retry via HF snapshot_download){RESET}"
-                _print_dim(
+                # Route through the tracker (not ``_print_dim``): on a TTY it
+                # erases the in-place byte bar before printing this line and
+                # lets the next heartbeat redraw it below, so the completion
+                # lines and the live bar don't clobber each other. On a
+                # non-TTY stdout this is a plain print — unchanged output.
+                progress_tracker.write_line(
                     f"  {DIM}[{completed}/{total_files_planned}]{RESET} "
                     f"{_safe_display_name(fname)} {tag}"
                 )
