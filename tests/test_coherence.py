@@ -123,6 +123,7 @@ def test_not_garbage_case_is_open_ended() -> None:
         case, "The ocean is deep and full of life. It covers most of Earth."
     )[0]
     assert not evaluate_case(case, "ocean ocean ocean ocean ocean ocean ocean ocean")[0]
+    assert not evaluate_case(case, "foo bar baz qux. foo bar baz qux.")[0]
     assert not evaluate_case(case, "x")[0]
     assert not evaluate_case(case, "asdfghjkl")[0]
 

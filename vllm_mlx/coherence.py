@@ -237,10 +237,17 @@ def evaluate_case(case: GoldenCase, text: str) -> tuple[bool, str]:
     if case.kind == "two_sentence":
         words = _WORD_RE.findall(text)
         sentence_ends = re.findall(r"[.!?。！？](?:\s|$)", text)
+        sentences = [
+            sentence.strip().casefold()
+            for sentence in re.split(r"[.!?。！？]+", text)
+            if sentence.strip()
+        ]
         if len(words) < 8:
             return False, f"too short ({len(words)} words; expected at least 8)"
         if len(sentence_ends) < 2:
             return False, "expected at least two complete sentences"
+        if len(set(sentences)) < 2:
+            return False, "repeated the same sentence"
         return True, "coherent two-sentence response"
 
     if case.kind == "exact":
