@@ -46,9 +46,14 @@ class _FakePipe(io.StringIO):
 def _every_add_emits(monkeypatch):
     # No throttle — every add() renders, so a single add is observable.
     monkeypatch.setattr(_mirror, "_PROGRESS_HEARTBEAT_SECONDS", 0.0)
-    # NO_COLOR forces the non-TTY branch regardless of isatty() — clear it so
-    # the _FakeTTY tests actually exercise the human bar.
+    # Clear NO_COLOR so the _FakeTTY tests exercise the ANSI bar. NO_COLOR
+    # does NOT switch to the non-TTY [bytes] protocol — isatty() alone selects
+    # the bar; NO_COLOR only drops ANSI styling (covered by
+    # test_no_color_tty_keeps_bar_without_ansi).
     monkeypatch.delenv("NO_COLOR", raising=False)
+    # Pin a wide terminal so the width-adaptive bar renders a full 24-cell bar
+    # deterministically, independent of the CI runner's real COLUMNS.
+    monkeypatch.setenv("COLUMNS", "100")
 
 
 def test_non_tty_keeps_machine_bytes_heartbeat(monkeypatch):
@@ -134,6 +139,31 @@ def test_tty_stays_silent_when_total_unknown(monkeypatch):
     t.add(500)
     t.flush()
     assert fake.getvalue() == ""
+
+
+def test_narrow_tty_never_wraps(monkeypatch):
+    """A narrow terminal must not wrap a redraw onto a second row: the bar
+    shrinks (or drops to a compact percentage + bytes readout) and no single
+    redrawn row exceeds the column count (codex #1259).
+    """
+    monkeypatch.setenv("COLUMNS", "20")  # overrides the fixture's wide default
+    fake = _FakeTTY()
+    monkeypatch.setattr(sys, "stdout", fake)
+    t = _ProgressTracker(total=500_000_000)
+    t.add(250_000_000)  # 50%
+    t.write_line("  [1/2] model.safetensors")
+    t.add(250_000_000)  # 100%
+    t.flush()
+    out = fake.getvalue()
+    assert "[bytes]" not in out  # still the human path, not the machine flood
+    assert "↓" in out  # a bar (compact or full) is present
+    # Every redrawn bar row (split on \r, escapes + trailing newline removed)
+    # must fit within the 20-column terminal. write_line status lines are
+    # one-shot (not redrawn), so exempt them from the width check.
+    for seg in out.replace("\x1b[2K", "").split("\r"):
+        row = seg.split("\n")[0]
+        if "↓" in row:
+            assert len(row) <= 20, f"bar row exceeds width: {row!r} ({len(row)})"
 
 
 def test_no_color_tty_keeps_bar_without_ansi(monkeypatch):

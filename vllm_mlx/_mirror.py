@@ -36,6 +36,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -93,6 +94,12 @@ _CHUNK_BYTES = 8 * 1024 * 1024
 # concurrent pulls in the same process don't trample each other's totals
 # (codex R1 BLOCKING on PR #682).
 _PROGRESS_HEARTBEAT_SECONDS = 0.5
+
+# In-place TTY bar sizing. The bar shrinks to the terminal width; below the
+# minimum it's dropped for a compact percentage + bytes readout so a narrow
+# terminal never wraps a redraw onto a second row (codex #1259).
+_BAR_MAX_CELLS = 24
+_BAR_MIN_CELLS = 8
 
 
 class _ProgressTracker:
@@ -218,12 +225,31 @@ class _ProgressTracker:
 
     def _draw_bar(self, done: int, total: int, newline: bool = False) -> None:
         """Redraw the single in-place progress bar (TTY only). Caller holds
-        ``self._io_lock``. ``newline=True`` finalizes the row (used by flush)."""
+        ``self._io_lock``. ``newline=True`` finalizes the row (used by flush).
+
+        Width-adaptive: the whole line is kept within the terminal so a
+        narrow TTY doesn't wrap a redraw onto a second row and defeat the
+        single-line guarantee (codex #1259). The bar shrinks to fit; below a
+        minimum it's dropped for a compact percentage + bytes readout; and the
+        line is hard-capped at the column count as a final backstop.
+        """
         pct = int(done * 100 / total) if total else 0
-        width = 24
-        filled = int(width * done / total) if total else 0
-        bar = "█" * filled + "░" * (width - filled)
-        text = f"  ↓ {pct:3d}%  [{bar}]  {done / 1e6:.0f}/{total / 1e6:.0f} MB"
+        head = f"  ↓ {pct:3d}%  "
+        tail = f"  {done / 1e6:.0f}/{total / 1e6:.0f} MB"
+        try:
+            cols = shutil.get_terminal_size().columns
+        except (ValueError, OSError):
+            cols = 80
+        # Cells left for the bar after the head, the ``[]`` brackets, and tail.
+        bar_cells = min(_BAR_MAX_CELLS, cols - len(head) - len(tail) - 2)
+        if bar_cells >= _BAR_MIN_CELLS:
+            filled = int(bar_cells * done / total) if total else 0
+            text = f"{head}[{'█' * filled}{'░' * (bar_cells - filled)}]{tail}"
+        else:
+            # Too narrow for a legible bar — percentage + bytes only.
+            text = f"  ↓ {pct:3d}%{tail}"
+        if cols > 0 and len(text) > cols:
+            text = text[:cols]  # backstop: a redraw never exceeds one row
         self._inplace(text, newline)
 
     def write_line(self, text: str) -> None:
