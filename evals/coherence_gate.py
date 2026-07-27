@@ -108,10 +108,15 @@ def main() -> int:
         return 2
 
     failures: list[tuple[str, str, str]] = []  # (id, reason, snippet)
+    transport_failed = False
     for case in GOLDEN:
         try:
             text = _generate(base_url, case, timeout=args.timeout)
-        except Exception as exc:  # network / server error mid-run -> a failure
+        except httpx.TransportError as exc:
+            passed, reason = False, f"server transport error: {exc}"
+            transport_failed = True
+            text = ""
+        except Exception as exc:  # server/protocol error mid-run -> a gate failure
             passed, reason = False, f"request error: {exc}"
             text = ""
         else:
@@ -128,6 +133,14 @@ def main() -> int:
     passed_n = len(GOLDEN) - len(failures)
     print(f"  {passed_n}/{len(GOLDEN)} coherent")
     print("=" * 60)
+
+    if transport_failed:
+        print(
+            "ERROR: the rapid-mlx server became unreachable while the "
+            "coherence gate was running.",
+            file=sys.stderr,
+        )
+        return 2
 
     if failures:
         print(

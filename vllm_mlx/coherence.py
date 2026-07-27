@@ -134,7 +134,7 @@ class GoldenCase:
     ``kind`` selects the predicate applied by :func:`evaluate_case`:
 
     * ``exact``         — normalized completion exactly matches one of ``expect``
-    * ``not_garbage``   — open-ended prompt; only requirement is non-degeneracy
+    * ``two_sentence``  — non-degenerate response with two sentences
     * ``no_think_leak`` — exact match AND no raw reasoning tag
     """
 
@@ -191,13 +191,13 @@ GOLDEN: tuple[GoldenCase, ...] = (
     GoldenCase(
         "open-ocean",
         "Write a short two-sentence description of the ocean.",
-        "not_garbage",
+        "two_sentence",
         max_tokens=200,
     ),
     GoldenCase(
         "open-cpu",
         "In two sentences, explain what a computer CPU does.",
-        "not_garbage",
+        "two_sentence",
         max_tokens=200,
     ),
     GoldenCase(
@@ -234,9 +234,14 @@ def evaluate_case(case: GoldenCase, text: str) -> tuple[bool, str]:
     if garbage:
         return False, f"garbage output ({why})"
 
-    if case.kind == "not_garbage":
-        # The garbage screen above IS the predicate for open-ended prompts.
-        return True, "coherent (non-degenerate)"
+    if case.kind == "two_sentence":
+        words = _WORD_RE.findall(text)
+        sentence_ends = re.findall(r"[.!?。！？](?:\s|$)", text)
+        if len(words) < 8:
+            return False, f"too short ({len(words)} words; expected at least 8)"
+        if len(sentence_ends) < 2:
+            return False, "expected at least two complete sentences"
+        return True, "coherent two-sentence response"
 
     if case.kind == "exact":
         if _matches_exact(text, case.expect):

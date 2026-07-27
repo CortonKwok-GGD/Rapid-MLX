@@ -13,8 +13,12 @@ Acceptance for #1247 is "test the gate": the exact class that shipped in #1234
 
 from __future__ import annotations
 
+import sys
+
+import httpx
 import pytest
 
+from evals import coherence_gate
 from vllm_mlx.coherence import GOLDEN, GoldenCase, evaluate_case, looks_like_garbage
 
 # ── real, coherent outputs that must NOT be flagged as garbage ──────────────
@@ -111,15 +115,31 @@ def test_no_think_leak_case_rejects_raw_reasoning_tag() -> None:
 
 def test_not_garbage_case_is_open_ended() -> None:
     case = next(c for c in GOLDEN if c.id == "open-ocean")
-    assert case.kind == "not_garbage"
-    # Any coherent prose passes; degenerate output fails.
-    assert evaluate_case(case, "The ocean is deep and full of life. It is blue.")[0]
+    assert case.kind == "two_sentence"
+    assert evaluate_case(
+        case, "The ocean is deep and full of life. It covers most of Earth."
+    )[0]
     assert not evaluate_case(case, "ocean ocean ocean ocean ocean ocean ocean ocean")[0]
+    assert not evaluate_case(case, "x")[0]
+    assert not evaluate_case(case, "asdfghjkl")[0]
+
+
+def test_gate_returns_infrastructure_code_for_midrun_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(coherence_gate, "_server_reachable", lambda _url: True)
+
+    def fail_transport(*_args: object, **_kwargs: object) -> str:
+        raise httpx.ConnectError("server stopped")
+
+    monkeypatch.setattr(coherence_gate, "_generate", fail_transport)
+    monkeypatch.setattr(sys, "argv", ["coherence_gate.py"])
+    assert coherence_gate.main() == 2
 
 
 def test_golden_set_is_wellformed() -> None:
     assert len(GOLDEN) >= 5
-    valid_kinds = {"exact", "not_garbage", "no_think_leak"}
+    valid_kinds = {"exact", "two_sentence", "no_think_leak"}
     ids = set()
     for c in GOLDEN:
         assert isinstance(c, GoldenCase)
