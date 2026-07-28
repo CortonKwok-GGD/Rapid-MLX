@@ -39,7 +39,10 @@ from ._sampler_fast_path import (  # noqa: E402
     make_fused_top_p_temp_sampler,
 )
 from ._seeded_sampler import make_seeded_sampler  # noqa: E402
-from .kv_estimation import estimate_kv_footprint  # noqa: E402
+from .kv_estimation import (  # noqa: E402
+    _valid_layer_types,
+    estimate_kv_footprint,
+)
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig  # noqa: E402
 from .paged_cache import PagedCacheManager
 from .pflash import PFlashConfig, compress_request_tokens
@@ -3407,20 +3410,34 @@ class Scheduler:
             if model_config is not None:
                 # Multimodal architectures nest the text-tower dims
                 # (num_hidden_layers, num_key_value_heads, head_dim, layer_types)
-                # under ``text_config``. Read the base dims from whichever config
-                # actually carries ``num_hidden_layers`` so ``base_num_layers``
+                # under ``text_config``. Read the base dims from the config that
+                # actually carries the text-layer structure so ``base_num_layers``
                 # matches the ``layer_types`` map the estimator inspects —
-                # otherwise a nested hybrid structure is silently rejected by
+                # otherwise a nested hybrid is silently rejected by
                 # ``estimate_kv_footprint`` and the reduction never engages
-                # (codex round 8 BLOCKING). The estimator independently
-                # re-validates the layer_types length, so an inconsistent outer
-                # count still falls back to the safe uniform estimate.
+                # (codex round 8 BLOCKING).
+                #
+                # BYTE-IDENTICAL guard: only adopt ``text_config`` when the outer
+                # config has no ``num_hidden_layers`` of its own AND the nested
+                # config exposes a VALID ``layer_types`` list (a genuine nested
+                # hybrid — the exact condition ``_pick_structural_config`` uses,
+                # reused here so the two can't drift). A text-lane model (dims on
+                # the outer config) and a multimodal model whose text_config has
+                # no valid layer_types both keep the outer dims unchanged, so
+                # dense/text behavior stays exactly as before.
                 struct_config = model_config
                 if not isinstance(
                     getattr(model_config, "num_hidden_layers", None), int
                 ):
                     text_config = getattr(model_config, "text_config", None)
-                    if text_config is not None:
+                    tc_layers = getattr(text_config, "num_hidden_layers", None)
+                    if (
+                        text_config is not None
+                        and isinstance(tc_layers, int)
+                        and _valid_layer_types(
+                            getattr(text_config, "layer_types", None), tc_layers
+                        )
+                    ):
                         struct_config = text_config
 
                 def _read_int(name: str, fallback: int = 0) -> int:

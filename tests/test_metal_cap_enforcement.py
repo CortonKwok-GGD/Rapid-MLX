@@ -912,6 +912,27 @@ class TestArchitectureAwareKVEstimate:
         assert sched._kv_sliding_per_token_bytes == 2 * (n // 2) * kv * hd * 2
         assert sched._kv_sliding_window_tokens == window
 
+    def test_nested_config_without_layer_types_stays_byte_identical(self):
+        # BYTE-IDENTICAL guard: a multimodal config whose text_config carries NO
+        # valid layer_types (a non-hybrid nested model) must NOT adopt the nested
+        # dims — the outer config has no num_hidden_layers, so admission
+        # accounting stays exactly as before (0, no phantom estimate). Only a
+        # genuine nested hybrid (valid layer_types) flips to the nested dims.
+        cfg = SimpleNamespace(
+            vision_config=SimpleNamespace(num_hidden_layers=27),
+            text_config=SimpleNamespace(
+                num_hidden_layers=32,
+                num_key_value_heads=8,
+                head_dim=128,
+                # no layer_types → not a recognized nested hybrid
+            ),
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        assert sched._resolve_kv_bytes_per_token() == 0
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert sched._kv_sliding_per_token_bytes == 0
+
     def test_operator_override_wins_and_zeroes_baseline(self):
         # Explicit knob short-circuits the estimator; no baseline is charged.
         cfg = SimpleNamespace(
