@@ -8,13 +8,15 @@ These pin the contract that the D-METAL-CAP admission gate depends on
   spurious change to a codex-hardened, over-estimate-safe admission path).
 * Recognized hybrids (sliding-window, KV-sharing, recurrent) get the smaller,
   accurate per-token growth: only full-attention layers grow unbounded per
-  token; sliding-window layers reserve their WHOLE window buffer once per
+  token; sliding-window layers reserve their WHOLE rotating-cache buffer once per
   sequence, and recurrent layers reserve a token-independent fixed state — both
   in the fixed baseline.
 * The estimate is over-count-safe throughout — it never under-counts the counted
   layers. A sliding layer with no readable window (or an unknown layer type) is
   charged as full unbounded growth; a sliding layer WITH a window reserves the
-  whole window (an upper bound on a block-rounded rotating cache).
+  step-rounded, sink-inclusive rotating-cache capacity
+  (``ceil((window + keep) / step) * step`` slots), an upper bound on the real
+  ``RotatingKVCache`` allocation.
 
 Hermetic: pure config dataclasses (``SimpleNamespace``) and dicts — no model
 load, no network.
@@ -31,6 +33,20 @@ from vllm_mlx.kv_estimation import KVFootprintEstimate, estimate_kv_footprint
 
 def _uniform(num_layers: int, kv_heads: int, head_dim: int, dtype_bytes: int) -> int:
     return 2 * num_layers * kv_heads * head_dim * dtype_bytes
+
+
+# Rotating-cache capacity granularity — mirrors kv_estimation's
+# ``_ROTATING_CACHE_STEP`` / ``_ROTATING_CACHE_KEEP`` (sourced from mlx_lm's
+# ``RotatingKVCache.step = 256`` and ``make_prompt_cache(... keep=4)``). A
+# sliding-window layer reserves ``ceil((window + keep) / step) * step`` slots —
+# the step-rounded, sink-inclusive capacity — NOT the raw window.
+_STEP = 256
+_KEEP = 4
+
+
+def _slots(window: int) -> int:
+    """Step-rounded, sink-inclusive rotating-cache capacity for ``window``."""
+    return ((window + _KEEP + _STEP - 1) // _STEP) * _STEP
 
 
 def _est(cfg, *, num_layers, kv_heads, head_dim, dtype_bytes=2) -> KVFootprintEstimate:
@@ -157,9 +173,9 @@ class TestKVSharing:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         # Nothing zeroed: 3 full layers grow unbounded, 7 sliding layers reserve
-        # their whole window buffer (all 10 layers counted, none borrowed).
+        # their whole rotating-cache buffer (all 10 layers counted, none borrowed).
         assert est.per_token_growth_bytes == 2 * 3 * kv * hd * 2
-        assert est.fixed_baseline_bytes == 2 * 7 * 128 * kv * hd * 2
+        assert est.fixed_baseline_bytes == 2 * 7 * _slots(128) * kv * hd * 2
 
     def test_zero_shared_is_not_a_hybrid_signal(self):
         # num_kv_shared_layers=0 (dense Gemma-4 12B/26B/31B) → no reduction,
@@ -194,9 +210,10 @@ class TestSlidingWindow:
         # Only the full layers grow unbounded per token — halved vs uniform.
         assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2) // 2  # halved
-        # Sliding layers reserve their WHOLE window buffer once per sequence —
-        # the over-count-safe upper bound (codex round 9 BLOCKING).
-        assert est.fixed_baseline_bytes == 2 * n_sliding * window * kv * hd * 2
+        # Sliding layers reserve their WHOLE rotating-cache buffer once per
+        # sequence — the step-rounded, sink-inclusive capacity, an over-count-safe
+        # upper bound on the real RotatingKVCache (codex round 10 BLOCKING).
+        assert est.fixed_baseline_bytes == 2 * n_sliding * _slots(window) * kv * hd * 2
 
     def test_projection_below_uniform_for_long_generation(self):
         # The reduction: for a long generation the arch-aware projection (halved
@@ -231,6 +248,55 @@ class TestSlidingWindow:
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+
+    def test_non_step_aligned_window_rounds_up_to_capacity(self):
+        # The real RotatingKVCache does NOT allocate exactly ``window`` slots: it
+        # grows the buffer in step=256 increments and retains keep=4 sinks above
+        # the window, so a window of 500 charges ceil((500+4)/256)*256 = 512
+        # slots — STRICTLY MORE than the raw 500 (codex round 10 BLOCKING: the
+        # whole-window figure still under-counts the block-rounded, sink-retaining
+        # allocation).
+        n, kv, hd, window = 8, 4, 64, 500
+        layer_types = ["sliding_attention"] * n
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        slots = _slots(window)
+        assert slots == 512
+        # Capacity property: at least window+keep, and a whole multiple of step.
+        assert slots >= window + _KEEP
+        assert slots % _STEP == 0
+        # Charged at the rounded-up capacity, strictly greater than the raw window.
+        assert est.per_token_growth_bytes == 0
+        assert est.fixed_baseline_bytes == 2 * n * slots * kv * hd * 2
+        assert est.fixed_baseline_bytes > 2 * n * window * kv * hd * 2
+
+    def test_step_aligned_multi_block_window_rounds_to_768(self):
+        # A window whose (window + keep) crosses into the THIRD step block rounds
+        # up to 768 slots: ceil((513 + 4) / 256) * 256 = ceil(517/256)*256 =
+        # 3*256 = 768. Confirms the round-up spans multiple step blocks, not just
+        # a single-block nudge.
+        n, kv, hd, window = 8, 4, 64, 513
+        layer_types = ["sliding_attention"] * n
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        slots = _slots(window)
+        assert slots == 768
+        assert slots >= window + _KEEP
+        assert slots % _STEP == 0
+        assert est.fixed_baseline_bytes == 2 * n * slots * kv * hd * 2
+        assert est.fixed_baseline_bytes > 2 * n * window * kv * hd * 2
 
 
 class TestRecurrent:
@@ -430,8 +496,8 @@ class TestHybridDimsAndNesting:
         # Producers = first 15 layers. Full at indices 4, 9, 14 → 3 full,
         # 12 sliding. Borrowers (last 20) contribute nothing.
         assert est.per_token_growth_bytes == 2 * 3 * global_kv * global_hd * 2
-        # Sliding layers use local dims; whole window reserved in the baseline.
-        assert est.fixed_baseline_bytes == 12 * 2 * window * kv * hd * 2
+        # Sliding layers use local dims; whole rotating-cache capacity reserved.
+        assert est.fixed_baseline_bytes == 12 * 2 * _slots(window) * kv * hd * 2
 
     def test_layer_structure_read_from_text_config(self):
         # Multimodal configs nest the language layer structure under
@@ -448,7 +514,7 @@ class TestHybridDimsAndNesting:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.fixed_baseline_bytes == 2 * (n // 2) * window * kv * hd * 2
+        assert est.fixed_baseline_bytes == 2 * (n // 2) * _slots(window) * kv * hd * 2
 
     def test_dict_config_supported(self):
         # The offline hybrid probe reads parsed config.json dicts.
@@ -463,7 +529,7 @@ class TestHybridDimsAndNesting:
         }
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.fixed_baseline_bytes == 2 * (n // 2) * window * kv * hd * 2
+        assert est.fixed_baseline_bytes == 2 * (n // 2) * _slots(window) * kv * hd * 2
 
     def test_unknown_layer_type_charged_as_full_growth(self):
         # An unrecognized attention-type string must never under-count → full.
@@ -488,8 +554,9 @@ class TestNeverUnderCounts:
         # must be >= the true footprint of the counted layers for ANY token
         # count, since that is the D-METAL-CAP never-under-count guarantee:
         #   full layers: exact tokens*per-layer
-        #   sliding layers: min(tokens, window)*per-layer  (<= window*per-layer,
-        #                   the whole-window buffer reserved in the baseline)
+        #   sliding layers: min(tokens, window)*per-layer  (<= slots*per-layer,
+        #                   the step-rounded rotating-cache capacity reserved in
+        #                   the baseline, where slots >= window)
         n, kv, hd, window, db = 24, 8, 64, 128, 2
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -546,9 +613,9 @@ class TestNeverUnderCounts:
             sliding_window=window,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
-        # Whole-window baseline at the clamped base per-layer rate, not the tiny
-        # local dims (which would under-count).
-        assert est.fixed_baseline_bytes == n * window * 2 * kv * hd * db
+        # Whole-capacity baseline at the clamped base per-layer rate, not the tiny
+        # local dims (which would under-count). Capacity = step-rounded slots.
+        assert est.fixed_baseline_bytes == n * _slots(window) * 2 * kv * hd * db
         assert est.per_token_growth_bytes == 0
 
     def test_projection_covers_recurrent_fixed_state(self):

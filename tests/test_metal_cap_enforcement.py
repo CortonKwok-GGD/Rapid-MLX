@@ -34,6 +34,18 @@ import pytest
 from vllm_mlx.request import Request, SamplingParams
 from vllm_mlx.scheduler import BackpressureError, Scheduler, SchedulerConfig
 
+# Rotating-cache capacity granularity — mirrors kv_estimation's
+# ``_ROTATING_CACHE_STEP`` / ``_ROTATING_CACHE_KEEP`` (mlx_lm's
+# ``RotatingKVCache.step = 256`` and ``make_prompt_cache(... keep=4)``). A
+# sliding-window layer reserves ``ceil((window + keep) / step) * step`` slots.
+_STEP = 256
+_KEEP = 4
+
+
+def _slots(window: int) -> int:
+    """Step-rounded, sink-inclusive rotating-cache capacity for ``window``."""
+    return ((window + _KEEP + _STEP - 1) // _STEP) * _STEP
+
 
 def _make_request(rid: str = "req-1", tokens: int = 16) -> Request:
     """Tiny synthetic request — only ``request_id`` and
@@ -849,8 +861,9 @@ class TestArchitectureAwareKVEstimate:
 
     def test_gpt_oss_hybrid_reduces_per_token_and_reserves_window(self):
         # ~50% sliding-window layers → unbounded per-token growth halved vs
-        # uniform, and the sliding layers reserve their WHOLE window buffer once
-        # per sequence in the fixed baseline (over-count-safe — codex round 9).
+        # uniform, and the sliding layers reserve their WHOLE rotating-cache
+        # buffer once per sequence in the fixed baseline — the step-rounded,
+        # sink-inclusive capacity (over-count-safe — codex round 10).
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -866,7 +879,7 @@ class TestArchitectureAwareKVEstimate:
         assert sched._resolve_kv_bytes_per_token() == uniform // 2
         assert (
             sched._resolve_kv_fixed_baseline_bytes()
-            == 2 * (n // 2) * window * kv * hd * 2
+            == 2 * (n // 2) * _slots(window) * kv * hd * 2
         )
 
     def test_gemma4_sharing_reduces_per_token(self):
@@ -910,12 +923,12 @@ class TestArchitectureAwareKVEstimate:
         )
         sched = self._sched(cfg)
         uniform = 2 * n * kv * hd * 2  # text dims (n=24), NOT the decoy 27
-        # Reduction engaged off the nested text dims: growth halved, whole window
-        # reserved in the baseline.
+        # Reduction engaged off the nested text dims: growth halved, whole
+        # rotating-cache capacity reserved in the baseline.
         assert sched._resolve_kv_bytes_per_token() == uniform // 2
         assert (
             sched._resolve_kv_fixed_baseline_bytes()
-            == 2 * (n // 2) * window * kv * hd * 2
+            == 2 * (n // 2) * _slots(window) * kv * hd * 2
         )
 
     def test_nested_config_without_layer_types_stays_byte_identical(self):
@@ -1016,9 +1029,10 @@ class TestArchitectureAwareKVEstimate:
     def test_estimate_request_charges_whole_window_baseline(self):
         # A GPT-OSS-style hybrid: the request projection is
         # ``fixed_baseline + growth * tokens`` where the fixed baseline holds the
-        # WHOLE sliding-window buffer (once per sequence, token-independent) —
-        # the over-count-safe upper bound (codex round 9 BLOCKING). Charged
-        # identically regardless of prompt/decode split for the same token total.
+        # WHOLE rotating-cache buffer (once per sequence, token-independent) — the
+        # step-rounded, sink-inclusive capacity, an over-count-safe upper bound
+        # (codex round 10 BLOCKING). Charged identically regardless of
+        # prompt/decode split for the same token total.
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -1032,7 +1046,7 @@ class TestArchitectureAwareKVEstimate:
         sched = self._sched(cfg)
         growth = sched._resolve_kv_bytes_per_token()
         baseline = sched._resolve_kv_fixed_baseline_bytes()
-        assert baseline == 2 * (n // 2) * window * kv * hd * 2
+        assert baseline == 2 * (n // 2) * _slots(window) * kv * hd * 2
         per_layer = 2 * kv * hd * 2
         n_full = n // 2
         n_sliding = n // 2

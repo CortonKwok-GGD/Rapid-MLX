@@ -36,14 +36,17 @@ This module computes an accurate footprint by classifying each layer:
 
 ``fixed_baseline_bytes``
     Charged once per sequence, independent of the token budget:
-    ``2 * dtype_bytes * Σ_sliding (window * kv_heads_L * head_dim_L)`` — the
-    WHOLE rotating-window buffer of each sliding-window layer (an over-count-safe
-    upper bound: a rotating/paged cache allocates in block increments and may
-    retain sink positions, so the buffer can reach — but never exceed — the full
-    window) — plus the conservative fixed recurrent state of each sizeable
-    recurrent layer. Even at the whole window this is a massive reduction vs
-    unbounded per-token growth, because the window is bounded (e.g. 512-4096)
-    while generation is not.
+    ``2 * dtype_bytes * Σ_sliding (slots * kv_heads_L * head_dim_L)`` — the WHOLE
+    rotating-cache buffer of each sliding-window layer, where ``slots`` is the
+    real ``mlx_lm`` ``RotatingKVCache`` capacity: ``window`` plus its retained
+    sink positions, rounded UP to the buffer's step granularity
+    (``ceil((window + keep) / step) * step`` with ``step=256``, ``keep=4``). That
+    step-rounded, sink-inclusive capacity is an over-count-safe upper bound on the
+    actual buffer (the cache grows in block increments and keeps sinks above the
+    window, so it can exceed the raw window) — plus the conservative fixed
+    recurrent state of each sizeable recurrent layer. Even at whole capacity this
+    is a massive reduction vs unbounded per-token growth, because the window is
+    bounded (e.g. 512-4096) while generation is not.
 
 Borrower (KV-sharing) layers contribute 0 to both terms. Sliding-window and
 recurrent layers contribute 0 to per-token growth; their worst-case allocation
@@ -68,10 +71,13 @@ path — see ``scheduler._resolve_kv_bytes_per_token``):
    with no readable window is charged as full unbounded growth; an unrecognized
    layer-type string is charged as full growth (exact-match allowlists, no
    substring guessing). A sliding-window layer WITH a readable window reserves
-   its WHOLE window buffer once per sequence (``2·dtype·window·kv·head_dim``) —
-   an upper bound on a rotating/paged cache that rounds up to block increments
-   and may keep sink positions, so a request is never charged less than its true
-   sliding allocation regardless of token budget or prefill length. Recurrent
+   its WHOLE rotating-cache buffer once per sequence
+   (``2·dtype·slots·kv·head_dim`` where ``slots = ceil((window + keep) / step) *
+   step`` is the real ``RotatingKVCache`` capacity — the window rounded up to the
+   buffer's step granularity plus its retained sink positions) — an upper bound
+   on a cache that grows in block increments and keeps sinks above the window, so
+   a request is never charged less than its true sliding allocation regardless of
+   token budget or prefill length. Recurrent
    layers genuinely have zero per-token growth; a GatedDeltaNet layer's fixed
    state is sized from its real config fields (linear head dims + conv kernel)
    and charged at fp32/element to stay conservative. Every other recurrent family
@@ -138,6 +144,26 @@ _SLIDING_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Rotating-window cache allocation granularity, sourced from the shipped
+# ``mlx_lm.models.cache.RotatingKVCache`` implementation:
+#
+#   * ``RotatingKVCache.step = 256`` — the class attribute that sizes buffer
+#     growth: the cache grows its KV buffer in ``step``-token increments
+#     (``_update_in_place``: ``new_size = min(self.step, self.max_size - prev)``).
+#   * ``keep=4`` — ``mlx_lm.models.cache.make_prompt_cache`` constructs every
+#     rotating layer as ``RotatingKVCache(max_size=max_kv_size, keep=4)``, so the
+#     cache retains 4 sink positions in ADDITION to the rotating window.
+#
+# The real per-layer capacity is therefore the ``step``-rounded size of the
+# window PLUS its sink positions, which can exceed the raw ``sliding_window``
+# figure. Grounding the sliding baseline in this capacity (rather than the raw
+# window) keeps the estimate an over-count-safe upper bound on the actual buffer
+# (codex round 10 BLOCKING: the whole-window baseline still under-counts the
+# block-rounded, sink-retaining allocation). These are the shipped defaults; if a
+# future mlx-lm changes them, update here to match the impl.
+_ROTATING_CACHE_STEP = 256
+_ROTATING_CACHE_KEEP = 4
+
 
 @dataclass(frozen=True)
 class KVFootprintEstimate:
@@ -158,12 +184,14 @@ class KVFootprintEstimate:
             only. This is the value the projection multiplies by
             ``(prompt_tokens + max_tokens)``.
         fixed_baseline_bytes: Bytes allocated once per sequence, independent of
-            the token budget — the WHOLE rotating-window buffer of each
-            sliding-window layer (``2·dtype·window·kv_heads·head_dim``, an upper
-            bound on a rotating/paged cache that allocates in block increments
-            and may retain sink positions) plus the conservative fixed recurrent
-            state of each sizeable recurrent layer. Zero for a dense model and
-            for a hybrid with neither.
+            the token budget — the WHOLE rotating-cache buffer of each
+            sliding-window layer (``2·dtype·slots·kv_heads·head_dim`` where
+            ``slots = ceil((window + keep) / step) * step`` is the real
+            ``RotatingKVCache`` capacity: the window rounded up to the buffer's
+            step granularity plus its retained sink positions, an upper bound on a
+            cache that grows in block increments and keeps sinks above the window)
+            plus the conservative fixed recurrent state of each sizeable recurrent
+            layer. Zero for a dense model and for a hybrid with neither.
     """
 
     per_token_growth_bytes: int
@@ -451,15 +479,22 @@ def estimate_kv_footprint(
     sliding_per_layer = max(
         2 * dtype_bytes * local_kv_heads * local_head_dim, uniform_per_layer
     )
-    # WHOLE-window buffer of ONE sliding-window layer, charged once per sequence.
-    # A rotating/paged KV cache allocates in block increments and may retain sink
-    # positions, so the buffer can be as large as (and never larger than) the
-    # full window — charging the whole window is the over-count-SAFE upper bound
-    # that can never trip the D-METAL-CAP OOM cliff, regardless of the token
-    # budget (codex round 9 BLOCKING: min(tokens, window) under-counts the real
-    # block-rounded allocation). Still a massive reduction vs unbounded per-token
-    # growth: the window is bounded (e.g. 512-4096) while generation is not.
-    sliding_window_bytes = window * sliding_per_layer
+    # WHOLE-capacity buffer of ONE sliding-window layer, charged once per
+    # sequence. The real ``RotatingKVCache`` does NOT allocate exactly ``window``
+    # slots: it grows the buffer in ``_ROTATING_CACHE_STEP``-token increments and
+    # retains ``_ROTATING_CACHE_KEEP`` sink positions ABOVE the rotating window,
+    # so its true capacity is ``window + keep`` rounded UP to the next ``step``
+    # multiple — which can exceed the raw window (codex round 10 BLOCKING: the
+    # whole-window figure still under-counts the block-rounded, sink-retaining
+    # allocation). Reserving that step-rounded capacity is the over-count-SAFE
+    # upper bound that can never trip the D-METAL-CAP OOM cliff, regardless of the
+    # token budget. Still a massive reduction vs unbounded per-token growth: the
+    # window is bounded (e.g. 512-4096) while generation is not.
+    sliding_slots = (
+        (window + _ROTATING_CACHE_KEEP + _ROTATING_CACHE_STEP - 1)
+        // _ROTATING_CACHE_STEP
+    ) * _ROTATING_CACHE_STEP
+    sliding_window_bytes = sliding_slots * sliding_per_layer
 
     per_token_growth = 0
     fixed_baseline = 0
