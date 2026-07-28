@@ -99,11 +99,22 @@ from typing import Any
 # strings the engine actually ships (Gemma-4 / GPT-OSS ``sliding_attention`` +
 # ``full_attention``; Qwen3.5/3.6 GatedDeltaNet ``linear_attention``; Mamba
 # stacks) plus their common upstream aliases.
-_RECURRENT_TYPES: frozenset[str] = frozenset(
+# GatedDeltaNet (Qwen3-Next / Qwen3.5 / Qwen3.6) ships its linear-attention
+# layers under the canonical ``linear_attention`` type plus these upstream
+# aliases. ALL of them must route to ``_gateddeltanet_state_bytes`` — a name
+# that classifies as recurrent (zero per-token growth) but whose state we cannot
+# size would fall back to full-growth and lose the reduction this module exists
+# to deliver (codex round 5 BLOCKING). Keeping the sizer's dispatch keyed on the
+# same set the classifier uses prevents that drift.
+_GATEDDELTANET_TYPES: frozenset[str] = frozenset(
     {
         "linear_attention",
         "gated_delta_net",
         "gated_deltanet",
+    }
+)
+_RECURRENT_TYPES: frozenset[str] = _GATEDDELTANET_TYPES | frozenset(
+    {
         "mamba",
         "mamba2",
         "recurrent",
@@ -299,11 +310,17 @@ def _recurrent_state_bytes(struct: Any, layer_type: str) -> int | None:
     BLOCKING #2). Returns ``None`` (→ caller charges full per-token growth) for
     any family we cannot size exactly.
 
+    Every GatedDeltaNet alias the classifier treats as recurrent
+    (``_GATEDDELTANET_TYPES``: ``linear_attention`` + the ``gated_delta_net`` /
+    ``gated_deltanet`` upstream spellings) routes to the same sizer, so a config
+    that names its linear layers with an alias still gets the reduction rather
+    than silently reverting to full per-token growth (codex round 5 BLOCKING).
+
     The returned term is a per-sequence constant (it does not grow with
     generated tokens), so it lands in the fixed baseline, never in per-token
     growth.
     """
-    if layer_type == "linear_attention":
+    if layer_type in _GATEDDELTANET_TYPES:
         return _gateddeltanet_state_bytes(struct)
     if layer_type in ("mamba", "mamba2"):
         return _mamba_state_bytes(struct)

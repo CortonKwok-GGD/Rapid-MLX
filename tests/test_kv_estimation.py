@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_mlx.kv_estimation import KVFootprintEstimate, estimate_kv_footprint
 
 
@@ -254,6 +256,32 @@ class TestRecurrent:
         n_recurrent = n - n_full
         assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
         assert est.fixed_baseline_bytes == n_recurrent * self._gdn_state_bytes()
+
+    @pytest.mark.parametrize(
+        "gdn_type",
+        ["linear_attention", "gated_delta_net", "gated_deltanet"],
+    )
+    def test_gateddeltanet_aliases_all_sized(self, gdn_type):
+        # Every GatedDeltaNet alias the classifier treats as recurrent must ALSO
+        # route to the GatedDeltaNet sizer — otherwise the alias classifies as
+        # zero-growth but its state cannot be sized, reverting to full per-token
+        # growth and losing the reduction this module exists to deliver (codex
+        # round 5 BLOCKING). All three spellings must yield the identical zero
+        # per-token growth + baseline-reserved fixed state.
+        n, kv, hd = 8, 4, 64
+        layer_types = [gdn_type] * (n - 1) + ["full_attention"]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            **self._GDN_FIELDS,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        # Only the single full layer grows per token; the recurrent layers reserve
+        # their fixed state in the baseline (never full per-token growth).
+        assert est.per_token_growth_bytes == 2 * 1 * kv * hd * 2
+        assert est.fixed_baseline_bytes == (n - 1) * self._gdn_state_bytes()
 
     def test_unsizeable_recurrent_falls_back_to_full_growth(self):
         # linear_attention layers WITHOUT any GatedDeltaNet/Mamba sizing fields
