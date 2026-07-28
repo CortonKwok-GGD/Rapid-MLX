@@ -895,6 +895,25 @@ class TestArchitectureAwareKVEstimate:
         assert sched._resolve_kv_bytes_per_token() == 42
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
 
+    def test_estimator_failure_preserves_uniform_estimate(self):
+        # If the architecture-aware estimator raises, the scheduler must keep
+        # the already-computed uniform per-token value (zero baseline), NOT
+        # reset admission accounting to 0 (codex round 3 BLOCKING #3).
+        cfg = SimpleNamespace(
+            num_hidden_layers=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        with patch(
+            "vllm_mlx.scheduler.estimate_kv_footprint",
+            side_effect=RuntimeError("boom"),
+        ):
+            per_tok = sched._resolve_kv_bytes_per_token()
+        assert per_tok == 2 * 32 * 8 * 128 * 2  # uniform, not 0
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
     def test_magicmock_config_yields_zero_and_no_baseline(self):
         # Bare MagicMock model — int(MagicMock()) path must still yield 0 with
         # no phantom baseline (back-compat for the stub-model unit tests).

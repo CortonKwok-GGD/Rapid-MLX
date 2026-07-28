@@ -249,39 +249,44 @@ def _recurrent_state_bytes(struct: Any) -> int | None:
     Every term is a per-sequence constant (it does not grow with generated
     tokens), so it lands in the fixed baseline, never in per-token growth.
     """
-    # GatedDeltaNet.
+    # GatedDeltaNet. ALL of the state + conv dimensions must be present and
+    # positive — including the conv kernel. If any is missing we cannot size
+    # the full state, so we return None (the caller charges full growth) rather
+    # than silently omitting the conv buffer and under-reserving (codex round 3
+    # BLOCKING #1).
     num_v = _pos_int(_cfg_get(struct, "linear_num_value_heads"))
     num_k = _pos_int(_cfg_get(struct, "linear_num_key_heads"))
     head_k = _pos_int(_cfg_get(struct, "linear_key_head_dim"))
     head_v = _pos_int(_cfg_get(struct, "linear_value_head_dim"))
-    if num_v and num_k and head_k and head_v:
-        conv_kernel = _pos_int(_cfg_get(struct, "linear_conv_kernel_dim"))
+    conv_kernel = _pos_int(_cfg_get(struct, "linear_conv_kernel_dim"))
+    if num_v and num_k and head_k and head_v and conv_kernel:
         key_dim = num_k * head_k
         value_dim = num_v * head_v
         recurrent_elems = num_v * head_k * head_v
         conv_dim = 2 * key_dim + value_dim
-        conv_elems = max(conv_kernel - 1, 0) * conv_dim
+        conv_elems = (conv_kernel - 1) * conv_dim
         return _RECURRENT_STATE_BYTES_PER_ELEM * (recurrent_elems + conv_elems)
 
-    # Mamba / Mamba2.
+    # Mamba / Mamba2 — same all-or-nothing rule: the SSM state, the inner
+    # dimension AND the conv kernel must all be readable, else return None so
+    # the conv buffer is never silently dropped (codex round 3 BLOCKING #2).
     d_state = _pos_int(_cfg_get(struct, "mamba_d_state")) or _pos_int(
         _cfg_get(struct, "state_size")
     )
-    if d_state:
-        n_heads = _pos_int(_cfg_get(struct, "mamba_n_heads"))
-        d_head = _pos_int(_cfg_get(struct, "mamba_d_head"))
-        d_inner = (n_heads * d_head) if (n_heads and d_head) else 0
-        if d_inner == 0:
-            d_inner = _pos_int(_cfg_get(struct, "mamba_intermediate_size")) or _pos_int(
-                _cfg_get(struct, "intermediate_size")
-            )
-        if d_inner:
-            d_conv = _pos_int(_cfg_get(struct, "mamba_d_conv")) or _pos_int(
-                _cfg_get(struct, "conv_kernel_size")
-            )
-            ssm_elems = d_inner * d_state
-            conv_elems = d_inner * max(d_conv - 1, 0)
-            return _RECURRENT_STATE_BYTES_PER_ELEM * (ssm_elems + conv_elems)
+    n_heads = _pos_int(_cfg_get(struct, "mamba_n_heads"))
+    d_head = _pos_int(_cfg_get(struct, "mamba_d_head"))
+    d_inner = (n_heads * d_head) if (n_heads and d_head) else 0
+    if d_inner == 0:
+        d_inner = _pos_int(_cfg_get(struct, "mamba_intermediate_size")) or _pos_int(
+            _cfg_get(struct, "intermediate_size")
+        )
+    d_conv = _pos_int(_cfg_get(struct, "mamba_d_conv")) or _pos_int(
+        _cfg_get(struct, "conv_kernel_size")
+    )
+    if d_state and d_inner and d_conv:
+        ssm_elems = d_inner * d_state
+        conv_elems = d_inner * (d_conv - 1)
+        return _RECURRENT_STATE_BYTES_PER_ELEM * (ssm_elems + conv_elems)
 
     return None
 

@@ -3427,17 +3427,32 @@ class Scheduler:
                     # recognized hybrid (sliding-window / KV-sharing /
                     # recurrent layers) reduces the per-token growth and moves
                     # the window + recurrent-state footprint into the
-                    # per-sequence fixed baseline.
-                    estimate = estimate_kv_footprint(
-                        model_config,
-                        dtype_bytes=dtype_bytes,
-                        uniform_per_token_bytes=per_tok,
-                        base_num_layers=num_layers,
-                        base_kv_heads=num_kv_heads,
-                        base_head_dim=head_dim,
-                    )
-                    per_tok = estimate.per_token_growth_bytes
-                    fixed_baseline = estimate.fixed_baseline_bytes
+                    # per-sequence fixed baseline. Wrapped in its OWN
+                    # try/except so a failure inspecting the newer hybrid
+                    # fields degrades to the SAFE uniform ``per_tok`` (zero
+                    # baseline) instead of the outer handler resetting to 0 —
+                    # which would disable admission accounting entirely (codex
+                    # round 3 BLOCKING #3).
+                    try:
+                        estimate = estimate_kv_footprint(
+                            model_config,
+                            dtype_bytes=dtype_bytes,
+                            uniform_per_token_bytes=per_tok,
+                            base_num_layers=num_layers,
+                            base_kv_heads=num_kv_heads,
+                            base_head_dim=head_dim,
+                        )
+                        per_tok = estimate.per_token_growth_bytes
+                        fixed_baseline = estimate.fixed_baseline_bytes
+                    except Exception as est_err:
+                        logger.debug(
+                            "[D-METAL-CAP] architecture-aware KV estimate "
+                            "failed (%s); keeping the uniform per-token "
+                            "estimate with no fixed baseline",
+                            est_err,
+                        )
+                        # ``per_tok`` already holds the uniform value; keep it.
+                        fixed_baseline = 0
         except Exception as e:
             logger.debug(
                 "[D-METAL-CAP] failed to auto-derive kv_bytes_per_token "

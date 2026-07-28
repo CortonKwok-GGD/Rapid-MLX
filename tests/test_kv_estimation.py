@@ -292,6 +292,47 @@ class TestRecurrent:
         assert est.per_token_growth_bytes == 2 * 1 * kv * hd * 2
         assert est.fixed_baseline_bytes == (n - 1) * state
 
+    def test_gateddeltanet_missing_conv_kernel_falls_back(self):
+        # GatedDeltaNet head fields present but linear_conv_kernel_dim ABSENT →
+        # cannot size the conv buffer → the whole layer falls back to full
+        # growth rather than silently omitting the conv state (codex round 3
+        # BLOCKING #1).
+        n, kv, hd = 8, 4, 64
+        layer_types = ["linear_attention"] * (n - 1) + ["full_attention"]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            linear_num_value_heads=32,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            # linear_conv_kernel_dim intentionally absent
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.fixed_baseline_bytes == 0
+
+    def test_mamba_missing_conv_kernel_falls_back(self):
+        # Mamba SSM fields present but d_conv/conv_kernel_size ABSENT → fall back
+        # to full growth (codex round 3 BLOCKING #2).
+        n, kv, hd = 8, 4, 64
+        layer_types = ["mamba"] * (n - 1) + ["full_attention"]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            mamba_d_state=128,
+            mamba_n_heads=24,
+            mamba_d_head=64,
+            # mamba_d_conv / conv_kernel_size intentionally absent
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.fixed_baseline_bytes == 0
+
     def test_full_attention_name_containing_linear_is_not_recurrent(self):
         # Exact-match allowlist (codex round 1 BLOCKING #4): an unfamiliar
         # full-attention type that merely CONTAINS "linear"/"gated"/"local" must
