@@ -35,32 +35,50 @@ This module computes an accurate footprint by classifying each layer:
     when the architecture is hybrid.
 
 ``fixed_baseline_bytes``
-    ``2 * dtype_bytes * Σ_sliding (window_L * kv_heads_L * head_dim_L)`` plus a
-    conservative fixed term per recurrent layer. Allocated once per sequence,
-    not per token.
+    ``2 * dtype_bytes * Σ_sliding (window_L * kv_heads_L * head_dim_L)`` — the
+    rotating-window buffers of the sliding-window layers, allocated once per
+    sequence rather than per token.
 
-Borrower (KV-sharing) layers contribute 0 to both.
+Borrower (KV-sharing) layers contribute 0 to both. Recurrent / linear-attention
+layers contribute 0 to per-token growth (see safety point 2 for why their fixed
+state is deliberately not modeled).
 
 Safety contract (this feeds a codex-hardened, over-estimate-safe admission
 path — see ``scheduler._resolve_kv_bytes_per_token``):
 
-1. **Over-estimate-safe fallback.** When the config lacks the layer-structure
-   fields (no per-layer ``layer_types`` and no ``num_kv_shared_layers``), or
-   anything is ambiguous, the estimator returns the caller's uniform figure
-   unchanged (``per_token_growth_bytes == uniform_per_token_bytes`` and
+1. **Over-estimate-safe fallback.** A recognized hybrid must expose a per-layer
+   ``layer_types`` list whose length matches ``num_hidden_layers``. When that is
+   absent, or anything is ambiguous, the estimator returns the caller's uniform
+   figure unchanged (``per_token_growth_bytes == uniform_per_token_bytes`` and
    ``fixed_baseline_bytes == 0``) so dense models (Llama/Qwen dense) and
    unknown/stub configs stay BYTE-IDENTICAL to the historical behavior. Only a
-   recognized hybrid — one that exposes a per-layer ``layer_types`` list of the
-   right length or a valid ``num_kv_shared_layers`` — gets the smaller accurate
-   number.
-2. **Never under-count the counted layers.** ``fixed_baseline + tokens *
-   per_token_growth`` is always >= the true architecture-aware footprint of the
-   counted layers: full-attention layers are charged exactly; sliding layers
-   are charged their whole window (an upper bound for any token count); a
-   sliding layer with no readable window is charged as full-growth; an
-   unrecognized layer type is charged as full-growth. So the estimate can only
-   over-count, never under-count — it can never re-introduce the D-METAL-CAP
-   OOM cliff.
+   recognized hybrid gets the smaller accurate number. ``num_kv_shared_layers``
+   is NOT sufficient on its own — the per-layer map must confirm the borrower
+   split (see point 3).
+2. **Never under-count the per-token GROWTH.** The load-bearing guarantee for
+   the D-METAL-CAP cliff is on the per-token term, since that is what a long
+   generation multiplies without bound: ``per_token_growth`` is >= the true
+   per-token growth of every counted layer. Full-attention layers are charged
+   exactly; a sliding layer with no readable window is charged as full-growth;
+   an unrecognized layer-type string is charged as full-growth (exact-match
+   allowlists, no substring guessing); recurrent and window-bounded layers
+   genuinely have zero per-token growth. The sliding window footprint lands in
+   ``fixed_baseline`` — an exact per-sequence upper bound (the whole window,
+   ignoring token count). The recurrent layers' small FIXED state is
+   architecture-specific (linear key/value head dims, conv kernel) and our
+   configs do not uniformly expose those fields, so — rather than invent a
+   number that could silently under-count — we leave that fixed per-sequence
+   overhead unmodeled, exactly as the gate already leaves model weights and
+   activation buffers unmodeled. This is sound because the gate exists to catch
+   runaway PER-TOKEN growth, not fixed per-sequence overhead: a non-growing
+   term cannot produce the D-METAL-CAP cliff.
+3. **KV-sharing only zeroes verified borrowers.** ``num_kv_shared_layers``
+   declares that the LAST N layers borrow (Gemma-4 / Gemma-3n contract). We zero
+   those borrowers only when the per-layer ``layer_types`` map confirms it —
+   every borrower attention type has a same-type producer below the split
+   (mirroring ``gemma4_text._check_kv_share_config``). If the map does not
+   confirm the last-N contract, no layer is zeroed (over-count, never
+   under-count).
 
 The estimator is a pure function: it reads only plain fields off a config
 object (or its ``text_config``), performs no I/O, loads no weights, and is unit
@@ -72,21 +90,35 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-# Per-layer attention-type classification tokens. Ordered checks in
-# ``_classify_layer`` matter: ``"linear_attention"`` and ``"sliding_attention"``
-# both contain ``"attention"``, so recurrent and sliding are tested BEFORE the
-# generic full-attention tokens.
-_RECURRENT_TOKENS: tuple[str, ...] = (
-    "linear",
-    "mamba",
-    "recurrent",
-    "rwkv",
-    "ssm",
-    "gated",
-    "delta",
+# Per-layer attention-type classification uses EXACT (case-folded) matches, not
+# substrings: a substring rule would misclassify an unfamiliar full-attention
+# name that merely contains ``"linear"`` / ``"gated"`` / ``"local"`` as
+# zero-growth or window-bounded and silently UNDER-count it (codex round 1
+# BLOCKING #4). Any value not on these allowlists falls through to full-growth —
+# the conservative, never-under-count default. Values are the ``layer_types``
+# strings the engine actually ships (Gemma-4 / GPT-OSS ``sliding_attention`` +
+# ``full_attention``; Qwen3.5/3.6 GatedDeltaNet ``linear_attention``; Mamba
+# stacks) plus their common upstream aliases.
+_RECURRENT_TYPES: frozenset[str] = frozenset(
+    {
+        "linear_attention",
+        "gated_delta_net",
+        "gated_deltanet",
+        "mamba",
+        "mamba2",
+        "recurrent",
+        "rwkv",
+    }
 )
-_SLIDING_TOKENS: tuple[str, ...] = ("slid", "swa", "local", "window")
-_FULL_TOKENS: tuple[str, ...] = ("full", "global", "attention", "sdpa")
+_SLIDING_TYPES: frozenset[str] = frozenset(
+    {
+        "sliding_attention",
+        "sliding_window_attention",
+        "local_attention",
+        "local_sliding_attention",
+        "swa",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -99,8 +131,8 @@ class KVFootprintEstimate:
             only. This is the value the D-METAL-CAP projection multiplies by
             ``(prompt_tokens + max_tokens)``.
         fixed_baseline_bytes: Bytes allocated once per sequence regardless of
-            token count — the sliding-window rotating buffers plus a
-            conservative recurrent-state term. Zero for a dense model.
+            token count — the sliding-window rotating buffers. Zero for a dense
+            model and for any hybrid with no sliding-window layers.
     """
 
     per_token_growth_bytes: int
@@ -153,9 +185,13 @@ def _pick_structural_config(model_config: Any, base_num_layers: int) -> Any | No
     Layer-structure fields live either directly on ``model_config`` (text-lane
     configs) or nested under ``model_config.text_config`` (multimodal configs).
     Returns the config whose ``layer_types`` list matches ``base_num_layers``,
-    or — absent that — the one exposing a valid ``num_kv_shared_layers`` in
-    ``(0, base_num_layers)``. Returns ``None`` when neither carries a
-    recognized hybrid signal (the byte-identical dense/unknown fallback).
+    or ``None`` when neither carries one (the byte-identical dense/unknown
+    fallback).
+
+    A per-layer ``layer_types`` list is REQUIRED to engage the hybrid path.
+    ``num_kv_shared_layers`` on its own is not enough: without the per-layer map
+    we cannot verify which layers actually borrow (codex round 1 BLOCKING #3),
+    so a config exposing only a share count stays on the uniform estimate.
     """
     candidates = [model_config]
     text_config = _cfg_get(model_config, "text_config")
@@ -165,29 +201,22 @@ def _pick_structural_config(model_config: Any, base_num_layers: int) -> Any | No
     for cfg in candidates:
         if _valid_layer_types(_cfg_get(cfg, "layer_types"), base_num_layers):
             return cfg
-    for cfg in candidates:
-        shared = _cfg_get(cfg, "num_kv_shared_layers")
-        if isinstance(shared, int) and not isinstance(shared, bool):
-            if 0 < shared < base_num_layers:
-                return cfg
     return None
 
 
 def _classify_layer(layer_type: str) -> str:
-    """Map a lower-cased ``layer_types`` entry to a footprint class.
+    """Map a case-folded ``layer_types`` entry to a footprint class.
 
-    Returns one of ``"recurrent"``, ``"sliding"``, ``"full"``. A recognized
-    full-attention token and an UNrecognized string both resolve to ``"full"``
-    — the conservative (over-counting) default that can never under-count.
+    Returns one of ``"recurrent"``, ``"sliding"``, ``"full"``. Matching is
+    EXACT against the zero-growth / window-bounded allowlists; every other
+    value — a known full-attention type or an unrecognized string — resolves to
+    ``"full"``, the conservative (over-counting) default that can never
+    under-count.
     """
-    if any(tok in layer_type for tok in _RECURRENT_TOKENS):
+    if layer_type in _RECURRENT_TYPES:
         return "recurrent"
-    if any(tok in layer_type for tok in _SLIDING_TOKENS):
+    if layer_type in _SLIDING_TYPES:
         return "sliding"
-    if any(tok in layer_type for tok in _FULL_TOKENS):
-        return "full"
-    # Unrecognized attention-type string → charge as full growth (never
-    # under-count).
     return "full"
 
 
@@ -269,39 +298,59 @@ def estimate_kv_footprint(
     # we cannot bound its footprint, so it is charged as full-growth below.
     window = _pos_int(_cfg_get(struct, "sliding_window"))
 
-    # Borrower split: the last ``num_kv_shared_layers`` layers reuse an earlier
-    # producer's K/V and allocate nothing. ``first_borrower`` is the index at
-    # which borrowing begins.
+    # ``layer_types`` is guaranteed present + length-checked by
+    # ``_pick_structural_config``; the ``is None`` branch is unreachable but
+    # kept as a defensive fallback (avoids an assert that ``python -O`` strips).
+    layer_types = _valid_layer_types(_cfg_get(struct, "layer_types"), base_num_layers)
+    if layer_types is None:
+        return uniform
+
+    # Borrower split: Gemma-4 / Gemma-3n reuse the LAST ``num_kv_shared_layers``
+    # decoder layers' K/V from an earlier same-type producer (split at
+    # ``num_hidden_layers - num_kv_shared_layers`` — see
+    # ``models/gemma4_text._check_kv_share_config``). We only zero those
+    # borrowers when the ACTUAL per-layer map confirms the last-N contract:
+    # every borrower attention type must have a producer of the same type below
+    # the split. If it does not (interleaved / differently-anchored sharing we
+    # do not model), we keep every layer as a producer — an over-count, never an
+    # under-count (codex round 1 BLOCKING #3).
     num_shared = _cfg_get(struct, "num_kv_shared_layers")
     if isinstance(num_shared, int) and not isinstance(num_shared, bool):
-        num_shared = num_shared if 0 <= num_shared < base_num_layers else 0
+        num_shared = num_shared if 0 < num_shared < base_num_layers else 0
     else:
         num_shared = 0
+    if num_shared > 0:
+        split = base_num_layers - num_shared
+        producer_types = set(layer_types[:split])
+        borrower_types = set(layer_types[split:])
+        if not borrower_types <= producer_types:
+            num_shared = 0  # last-N contract unverified → do not zero anything
     first_borrower = base_num_layers - num_shared
-
-    layer_types = _valid_layer_types(_cfg_get(struct, "layer_types"), base_num_layers)
 
     full_per_token = 2 * dtype_bytes * global_kv_heads * global_head_dim
     sliding_full_per_token = 2 * dtype_bytes * local_kv_heads * local_head_dim
     sliding_window_bytes = 2 * dtype_bytes * window * local_kv_heads * local_head_dim
-    # Recurrent state is a fixed per-head state matrix (~head_dim x head_dim per
-    # KV head for GatedDeltaNet / Mamba). It never grows per token, so it lands
-    # entirely in the fixed baseline. A conservative single-matrix term (no K+V
-    # doubling) derived from the local dims — see module docstring.
-    recurrent_state_bytes = (
-        dtype_bytes * local_kv_heads * local_head_dim * local_head_dim
-    )
 
     per_token_growth = 0
     fixed_baseline = 0
     for idx in range(base_num_layers):
         if idx >= first_borrower:
-            # Borrower (KV-sharing) layer — allocates nothing.
+            # Borrower (KV-sharing) layer — reuses a producer's cache, allocates
+            # nothing.
             continue
-        layer_class = _classify_layer(layer_types[idx]) if layer_types else "full"
+        layer_class = _classify_layer(layer_types[idx])
         if layer_class == "recurrent":
-            fixed_baseline += recurrent_state_bytes
-        elif layer_class == "sliding":
+            # Recurrent / linear-attention layers keep a FIXED state that does
+            # not grow per token — zero growth (the load-bearing correctness
+            # win). Their fixed state is small, bounded, and architecture-
+            # specific; deriving it needs family fields (linear key/value head
+            # dims, conv kernel) our configs do not uniformly expose, so we do
+            # NOT invent a term for it (codex round 1 BLOCKING #2). Like model
+            # weights and activation buffers, that fixed per-sequence overhead
+            # is simply out of scope for this KV-GROWTH projection; the gate has
+            # never reserved for non-growing allocations.
+            continue
+        if layer_class == "sliding":
             if window > 0:
                 fixed_baseline += sliding_window_bytes
             else:

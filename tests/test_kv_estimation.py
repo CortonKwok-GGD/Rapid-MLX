@@ -117,9 +117,10 @@ class TestKVSharing:
         assert est.per_token_growth_bytes == 2 * (n - n_shared) * kv * hd * 2
         assert est.fixed_baseline_bytes == 0
 
-    def test_shared_layers_without_layer_types_still_reduce(self):
-        # num_kv_shared_layers alone (no layer_types) is a recognized signal:
-        # reduce by the shared layers, rest treated as full-growth.
+    def test_shared_layers_without_layer_types_falls_back(self):
+        # num_kv_shared_layers alone (no per-layer map) is NOT enough to zero
+        # borrowers — without layer_types we cannot verify the last-N contract,
+        # so we stay on the uniform estimate (codex round 1 BLOCKING #3).
         n, n_shared, kv, hd = 40, 10, 4, 64
         cfg = SimpleNamespace(
             num_hidden_layers=n,
@@ -128,8 +129,31 @@ class TestKVSharing:
             num_kv_shared_layers=n_shared,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        assert est.per_token_growth_bytes == 2 * (n - n_shared) * kv * hd * 2
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+
+    def test_shared_layers_with_unverifiable_split_not_zeroed(self):
+        # num_kv_shared_layers present WITH layer_types, but the last-N borrower
+        # types have no same-type producer below the split (a full-attention
+        # borrower with only sliding producers) → the last-N contract is
+        # unverified, so no layer is zeroed (over-count, never under-count).
+        n, n_shared, kv, hd = 10, 3, 4, 64
+        # First 7 (producers) all sliding; last 3 (borrowers) full → a full
+        # borrower has no full producer below the split.
+        layer_types = ["sliding_attention"] * 7 + ["full_attention"] * 3
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            num_kv_shared_layers=n_shared,
+            sliding_window=128,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        # Nothing zeroed: 3 full layers grow, 7 sliding layers -> window
+        # baseline (all 10 layers counted).
+        assert est.per_token_growth_bytes == 2 * 3 * kv * hd * 2
+        assert est.fixed_baseline_bytes == 2 * 7 * 128 * kv * hd * 2
 
     def test_zero_shared_is_not_a_hybrid_signal(self):
         # num_kv_shared_layers=0 (dense Gemma-4 12B/26B/31B) → no reduction,
@@ -183,11 +207,17 @@ class TestSlidingWindow:
 
 
 class TestRecurrent:
-    """Qwen3.5/3.6 GatedDeltaNet linear-attention layers have zero growth."""
+    """Qwen3.5/3.6 GatedDeltaNet linear-attention layers have zero growth.
 
-    def test_linear_layers_contribute_zero_growth(self):
-        # 48 layers, 3:1 linear:full → 12 full grow, 36 recurrent contribute
-        # only a fixed state baseline.
+    Recurrent layers keep a FIXED state that our configs do not expose the
+    fields to size, so we model zero per-token growth (the correctness win) and
+    do NOT invent a fixed-state term (codex round 1 BLOCKING #2). Only the
+    full-attention layers show up in the estimate.
+    """
+
+    def test_linear_layers_contribute_zero_growth_and_zero_baseline(self):
+        # 48 layers, 3:1 linear:full → only the 12 full layers grow; the 36
+        # recurrent layers contribute nothing to either term.
         n, kv, hd = 48, 2, 128
         pattern = [
             "linear_attention",
@@ -204,11 +234,8 @@ class TestRecurrent:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         n_full = n // 4
-        n_recurrent = n - n_full
         assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
-        # Recurrent state is a fixed per-head state matrix (~head_dim^2 per KV
-        # head), never multiplied by token count.
-        assert est.fixed_baseline_bytes == n_recurrent * 2 * kv * hd * hd
+        assert est.fixed_baseline_bytes == 0
 
     def test_mamba_marker_is_recurrent(self):
         n, kv, hd = 8, 4, 64
@@ -221,7 +248,22 @@ class TestRecurrent:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * 1 * kv * hd * 2
-        assert est.fixed_baseline_bytes == (n - 1) * 2 * kv * hd * hd
+        assert est.fixed_baseline_bytes == 0
+
+    def test_full_attention_name_containing_linear_is_not_recurrent(self):
+        # Exact-match allowlist (codex round 1 BLOCKING #4): an unfamiliar
+        # full-attention type that merely CONTAINS "linear"/"gated"/"local" must
+        # NOT be misread as zero-growth — it is charged as full-growth.
+        n, kv, hd = 6, 4, 64
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=["gated_full_attention", "linear_global_attention"] * (n // 2),
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.fixed_baseline_bytes == 0
 
 
 class TestHybridDimsAndNesting:

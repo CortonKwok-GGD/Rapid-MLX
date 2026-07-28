@@ -863,7 +863,10 @@ class TestArchitectureAwareKVEstimate:
         sched = self._sched(cfg)
         uniform = 2 * n * kv * hd * 2
         assert sched._resolve_kv_bytes_per_token() == uniform // 2
-        assert sched._resolve_kv_fixed_baseline_bytes() == 2 * (n // 2) * window * kv * hd * 2
+        assert (
+            sched._resolve_kv_fixed_baseline_bytes()
+            == 2 * (n // 2) * window * kv * hd * 2
+        )
 
     def test_gemma4_sharing_reduces_per_token(self):
         n, n_shared, kv, hd = 35, 20, 1, 128

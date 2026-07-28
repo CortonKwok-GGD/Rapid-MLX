@@ -3569,10 +3569,12 @@ class Scheduler:
         """
         per_tok = self._resolve_kv_bytes_per_token()
         fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
-        # A hybrid whose full-attention layers were all shared/recurrent could
-        # have zero per-token growth yet a real per-sequence baseline; charge
-        # it too. Both zero (dense MagicMock / no config) short-circuits to 0,
-        # matching ``_estimate_request_kv_bytes``.
+        # Cheap short-circuit only: a hybrid with all-sliding layers has zero
+        # per-token growth but a real per-sequence baseline, so both must be 0
+        # (dense MagicMock / no config) to skip. The per-request charge itself —
+        # including the fixed baseline once per waiting request — is computed by
+        # ``_estimate_request_kv_bytes`` in the loop below, NOT here, so the
+        # baseline is never dropped from the aggregate.
         if per_tok <= 0 and fixed_baseline <= 0:
             return 0
         try:
@@ -3581,6 +3583,9 @@ class Scheduler:
             return 0
         total = 0
         for req in waiting:
+            # ``_estimate_request_kv_bytes`` returns fixed_baseline +
+            # per_tok × tokens for each request — the baseline is charged
+            # per waiting sequence (each allocates its own window buffers).
             total += self._estimate_request_kv_bytes(req)
         return int(total)
 
