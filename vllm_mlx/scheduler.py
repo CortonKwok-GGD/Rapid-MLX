@@ -39,6 +39,7 @@ from ._sampler_fast_path import (  # noqa: E402
     make_fused_top_p_temp_sampler,
 )
 from ._seeded_sampler import make_seeded_sampler  # noqa: E402
+from .kv_estimation import estimate_kv_footprint  # noqa: E402
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig  # noqa: E402
 from .paged_cache import PagedCacheManager
 from .pflash import PFlashConfig, compress_request_tokens
@@ -2220,6 +2221,14 @@ class Scheduler:
         # tests built against MagicMock models).
         self._kv_bytes_per_token: int = 0
         self._kv_bytes_per_token_resolved: bool = False
+        # D-METAL-CAP: cached per-sequence FIXED KV baseline (bytes) for
+        # architecture-aware hybrids — sliding-window rotating buffers plus a
+        # conservative recurrent-state term. Allocated once per sequence, not
+        # per token, so ``_estimate_request_kv_bytes`` charges it as a flat
+        # add-on rather than multiplying by the token count. ``0`` for dense
+        # models and for the byte-identical uniform fallback (see
+        # ``_resolve_kv_bytes_per_token`` and ``kv_estimation``).
+        self._kv_fixed_baseline_bytes: int = 0
 
         # Prompt-boundary cache snapshot callback for the new mlx-lm 0.31+ API.
         # Built lazily once memory_aware_cache exists and reused per step.
@@ -3327,7 +3336,7 @@ class Scheduler:
         to fix the "currently below cap, one large prefill allocates
         past cap" failure mode by default.
 
-        Auto-derivation formula:
+        Auto-derivation formula (uniform baseline):
             ``2 (K + V) × num_layers × num_kv_heads × head_dim × dtype_bytes``
 
         Defaults match ``model_runner.py``'s cache-block-size helper
@@ -3338,6 +3347,25 @@ class Scheduler:
         better than the D-METAL-CAP cliff). Operators on quantized-
         KV deployments can pin a tighter value via the SchedulerConfig
         field to recover precision.
+
+        Architecture-aware refinement (``kv_estimation``): the uniform
+        formula counts EVERY layer as a full-growth attention layer,
+        which over-estimates the per-token figure by up to ~2× for the
+        hybrid architectures we ship — sliding-window layers (GPT-OSS,
+        Gemma-4 local) are window-bounded, KV-sharing borrower layers
+        (Gemma-4 ``num_kv_shared_layers``) allocate nothing, and
+        recurrent / linear-attention layers (Qwen3.5 GatedDeltaNet)
+        carry a fixed state. Once the uniform figure is computed we
+        route it through :func:`kv_estimation.estimate_kv_footprint`,
+        which returns the accurate per-token GROWTH (only the
+        full-attention layers) plus a per-sequence FIXED baseline
+        (window buffers + recurrent state). The estimator is
+        over-estimate-safe: a dense model or an unknown/stub config
+        that exposes no ``layer_types`` / ``num_kv_shared_layers``
+        yields a BYTE-IDENTICAL uniform result (per-token unchanged,
+        baseline 0), so only recognized hybrids get the smaller,
+        accurate number and the D-METAL-CAP OOM cliff is never
+        re-introduced.
 
         Returns ``0`` only when the model config is missing entirely
         (e.g. unit-test ``MagicMock`` model) so back-compat unit
@@ -3362,6 +3390,7 @@ class Scheduler:
         # unit-test admission into a projection rejection. Requiring
         # ints filters that path.
         per_tok = 0
+        fixed_baseline = 0
         try:
             model_config = getattr(self.model, "config", None)
             if model_config is not None:
@@ -3392,6 +3421,23 @@ class Scheduler:
                 dtype_bytes = self._infer_kv_dtype_bytes(model_config)
                 if num_layers > 0 and num_kv_heads > 0 and head_dim > 0:
                     per_tok = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
+                    # Architecture-aware refinement. For dense / unknown
+                    # configs the estimator returns this exact uniform
+                    # ``per_tok`` with a 0 baseline (byte-identical); only a
+                    # recognized hybrid (sliding-window / KV-sharing /
+                    # recurrent layers) reduces the per-token growth and moves
+                    # the window + recurrent-state footprint into the
+                    # per-sequence fixed baseline.
+                    estimate = estimate_kv_footprint(
+                        model_config,
+                        dtype_bytes=dtype_bytes,
+                        uniform_per_token_bytes=per_tok,
+                        base_num_layers=num_layers,
+                        base_kv_heads=num_kv_heads,
+                        base_head_dim=head_dim,
+                    )
+                    per_tok = estimate.per_token_growth_bytes
+                    fixed_baseline = estimate.fixed_baseline_bytes
         except Exception as e:
             logger.debug(
                 "[D-METAL-CAP] failed to auto-derive kv_bytes_per_token "
@@ -3401,19 +3447,45 @@ class Scheduler:
                 e,
             )
             per_tok = 0
+            fixed_baseline = 0
         self._kv_bytes_per_token = per_tok
+        self._kv_fixed_baseline_bytes = fixed_baseline
         self._kv_bytes_per_token_resolved = True
         return per_tok
+
+    def _resolve_kv_fixed_baseline_bytes(self) -> int:
+        """Per-sequence FIXED KV baseline (bytes) for hybrid architectures.
+
+        Companion to :meth:`_resolve_kv_bytes_per_token`: the window /
+        recurrent-state footprint an architecture-aware hybrid allocates ONCE
+        per sequence (not per token). ``0`` for dense models, for the uniform
+        fallback, and under the operator override — so the projection stays
+        byte-identical wherever the baseline is not populated. Resolution and
+        caching happen inside ``_resolve_kv_bytes_per_token`` (both values are
+        computed from the same estimate), so we drive it first, then read the
+        cached baseline.
+        """
+        self._resolve_kv_bytes_per_token()
+        return self._kv_fixed_baseline_bytes
 
     def _estimate_request_kv_bytes(self, request: Request) -> int:
         """Project KV-cache memory the new request would consume.
 
-        Returns ``num_prompt_tokens + max_tokens`` × per-token KV
-        bytes (auto-derived from model config or operator-overridden
-        via ``metal_cap_kv_bytes_per_token``). Used by the admission
-        gate to reject prefill requests that would push Metal active
-        PAST the cap before the allocation happens (codex round 3
-        BLOCKING #1 + round 4 BLOCKING #1+#2).
+        Returns ``fixed_baseline + (num_prompt_tokens + max_tokens) ×
+        per_token_growth`` (auto-derived from model config or
+        operator-overridden via ``metal_cap_kv_bytes_per_token``).
+        Used by the admission gate to reject prefill requests that
+        would push Metal active PAST the cap before the allocation
+        happens (codex round 3 BLOCKING #1 + round 4 BLOCKING #1+#2).
+
+        ``per_token_growth`` counts only the full-attention layers; the
+        window buffers of sliding-window layers and the fixed state of
+        recurrent layers live in ``fixed_baseline`` (allocated once per
+        sequence). For a dense model ``fixed_baseline`` is 0 and this
+        reduces to the historical ``per_tok × tokens`` — byte-identical.
+        The sum is always >= the true architecture-aware footprint of the
+        counted layers (sliding layers charge their whole window), so the
+        gate can only over-estimate, never under-count.
 
         Conservative by design: we count both the prompt and the
         full ``max_tokens`` budget (rather than the much smaller
@@ -3422,7 +3494,8 @@ class Scheduler:
         grow past the cap mid-generation.
         """
         per_tok = self._resolve_kv_bytes_per_token()
-        if per_tok <= 0:
+        fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
+        if per_tok <= 0 and fixed_baseline <= 0:
             return 0
         # ``num_prompt_tokens`` is populated by either the route layer
         # (when prompt_token_ids was supplied) or zero at this point
@@ -3462,7 +3535,12 @@ class Scheduler:
         max_tokens = int(
             getattr(getattr(request, "sampling_params", None), "max_tokens", 0) or 0
         )
-        return per_tok * (prompt_tokens + max_tokens)
+        # Fixed baseline (window buffers + recurrent state) is a per-sequence
+        # allocation charged once, plus the per-token growth of the
+        # full-attention layers over the projected token budget. For a dense
+        # model ``fixed_baseline`` is 0, so this is byte-identical to the
+        # historical ``per_tok × tokens``.
+        return fixed_baseline + per_tok * (prompt_tokens + max_tokens)
 
     def _sum_in_flight_kv_bytes(self) -> int:
         """Sum projected KV reservations of WAITING-only requests.
@@ -3490,7 +3568,12 @@ class Scheduler:
         scheduler lock).
         """
         per_tok = self._resolve_kv_bytes_per_token()
-        if per_tok <= 0:
+        fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
+        # A hybrid whose full-attention layers were all shared/recurrent could
+        # have zero per-token growth yet a real per-sequence baseline; charge
+        # it too. Both zero (dense MagicMock / no config) short-circuits to 0,
+        # matching ``_estimate_request_kv_bytes``.
+        if per_tok <= 0 and fixed_baseline <= 0:
             return 0
         try:
             waiting = self.waiting

@@ -806,3 +806,161 @@ class TestMetricsRoute:
         assert "# TYPE rapid_mlx_metal_cap_violations_total counter" in body, (
             "metric type must be 'counter' for monotonic rate() to work"
         )
+
+
+class TestArchitectureAwareKVEstimate:
+    """Wire-through of the architecture-aware KV estimator into the D-METAL-CAP
+    admission path (``_resolve_kv_bytes_per_token`` /
+    ``_estimate_request_kv_bytes``). The uniform-fallback and operator-override
+    contracts must stay byte-identical (covered by the classes above); these
+    add the hybrid-reduction cases.
+
+    Uses ``SimpleNamespace`` for ``model.config`` so unset fields resolve to
+    ``None`` (a ``MagicMock`` auto-creates every attribute, which would falsely
+    look like a hybrid layer structure).
+    """
+
+    def _sched(self, config_obj, *, kv_bytes_override: int = 0):
+        config = SchedulerConfig(
+            max_num_seqs=8,
+            max_concurrent_requests=64,
+            enable_prefix_cache=False,
+            use_memory_aware_cache=False,
+            use_paged_cache=False,
+            gpu_memory_utilization=0.5,
+            metal_cap_kv_bytes_per_token=kv_bytes_override,
+        )
+        model = MagicMock()
+        model.config = config_obj
+        return Scheduler(model=model, tokenizer=MagicMock(), config=config)
+
+    def test_dense_config_stays_uniform_with_zero_baseline(self):
+        # No layer_types / sliding / sharing → byte-identical uniform, no
+        # fixed baseline.
+        cfg = SimpleNamespace(
+            num_hidden_layers=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        assert sched._resolve_kv_bytes_per_token() == 2 * 32 * 8 * 128 * 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_gpt_oss_hybrid_reduces_per_token_and_sets_baseline(self):
+        # ~50% sliding-window layers → per-token growth halved vs uniform, and
+        # the window footprint lands in the per-sequence fixed baseline.
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        uniform = 2 * n * kv * hd * 2
+        assert sched._resolve_kv_bytes_per_token() == uniform // 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 2 * (n // 2) * window * kv * hd * 2
+
+    def test_gemma4_sharing_reduces_per_token(self):
+        n, n_shared, kv, hd = 35, 20, 1, 128
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=["full_attention"] * n,
+            num_kv_shared_layers=n_shared,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        assert sched._resolve_kv_bytes_per_token() == 2 * (n - n_shared) * kv * hd * 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_operator_override_wins_and_zeroes_baseline(self):
+        # Explicit knob short-circuits the estimator; no baseline is charged.
+        cfg = SimpleNamespace(
+            num_hidden_layers=24,
+            num_key_value_heads=8,
+            head_dim=64,
+            layer_types=["sliding_attention", "full_attention"] * 12,
+            sliding_window=128,
+        )
+        sched = self._sched(cfg, kv_bytes_override=42)
+        assert sched._resolve_kv_bytes_per_token() == 42
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_magicmock_config_yields_zero_and_no_baseline(self):
+        # Bare MagicMock model — int(MagicMock()) path must still yield 0 with
+        # no phantom baseline (back-compat for the stub-model unit tests).
+        config = SchedulerConfig(
+            max_num_seqs=8,
+            max_concurrent_requests=64,
+            enable_prefix_cache=False,
+            use_memory_aware_cache=False,
+            use_paged_cache=False,
+            gpu_memory_utilization=0.5,
+            metal_cap_kv_bytes_per_token=0,
+        )
+        sched = Scheduler(model=MagicMock(), tokenizer=MagicMock(), config=config)
+        assert sched._resolve_kv_bytes_per_token() == 0
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+
+    def test_estimate_request_charges_baseline_plus_growth(self):
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        req = _make_request(tokens=100)
+        req.sampling_params = SamplingParams(max_tokens=50)
+        growth = sched._resolve_kv_bytes_per_token()
+        baseline = sched._resolve_kv_fixed_baseline_bytes()
+        assert baseline > 0
+        assert sched._estimate_request_kv_bytes(req) == baseline + growth * (100 + 50)
+
+    def test_hybrid_admitted_where_uniform_would_reject(self):
+        # The headline win: a GPT-OSS-style hybrid whose uniform per-token
+        # over-count would trip the projection gate is ADMITTED once the
+        # sliding layers are correctly excluded from per-token growth.
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        req = _make_request(tokens=16)
+        req.sampling_params = SamplingParams(max_tokens=8_000)
+        tokens = 16 + 8_000
+        uniform_per_tok = 2 * n * kv * hd * 2
+        arch_projected = sched._estimate_request_kv_bytes(req)
+        uniform_projected = uniform_per_tok * tokens
+        # Arch-aware projection is strictly smaller than the uniform one for a
+        # large token budget (the fixed window baseline is dwarfed by the
+        # halved per-token growth × tokens).
+        assert arch_projected < uniform_projected
+        # Pick a cap that sits between the two projections: uniform rejects,
+        # arch-aware admits.
+        active = 1_000_000_000
+        cap = active + (arch_projected + uniform_projected) // 2
+        with (
+            patch.object(sched, "_resolve_metal_cap_bytes", return_value=cap),
+            patch.object(sched, "_current_metal_active_bytes", return_value=active),
+        ):
+            sched._enforce_metal_cap_at_admission(req)  # must NOT raise
+        assert sched.num_metal_cap_violations == 0
+        # Sanity: the uniform over-count would have exceeded the cap.
+        assert active + uniform_projected > cap
