@@ -31,18 +31,28 @@ This module computes an accurate footprint by classifying each layer:
 
 ``per_token_growth_bytes``
     ``2 * dtype_bytes * Σ (kv_heads_L * head_dim_L)`` over ONLY the
-    full-attention (per-token-growing) layers, honoring per-layer / global dims
-    when the architecture is hybrid.
+    full-attention (unbounded per-token-growing) layers, honoring per-layer /
+    global dims when the architecture is hybrid.
+
+``sliding_per_token_bytes`` / ``sliding_window_tokens``
+    ``2 * dtype_bytes * Σ_sliding (kv_heads_L * head_dim_L)`` — the per-token
+    KV rate of the sliding-window layers — together with the rotating window
+    length. The caller charges ``sliding_per_token * min(tokens, window)``: a
+    rotating cache holds at most ``window`` positions, but a request shorter
+    than the window holds only ``tokens``, so short requests stay byte-identical
+    to the historical uniform figure and only long requests get the window cap
+    (codex round 6 BLOCKING). Flattening the whole window into a fixed baseline
+    would over-charge — and spuriously reject — short requests.
 
 ``fixed_baseline_bytes``
-    ``2 * dtype_bytes * Σ_sliding (window_L * kv_heads_L * head_dim_L)`` (the
-    rotating-window buffers of the sliding-window layers) plus the conservative
-    fixed recurrent state of each recurrent layer we can size from its config.
-    Allocated once per sequence rather than per token.
+    The conservative fixed recurrent state of each recurrent layer we can size
+    from its config. Allocated once per sequence, independent of token count
+    (an SSM/conv state is materialized in full at cache init). Sliding windows
+    are NOT flattened here — see above.
 
-Borrower (KV-sharing) layers contribute 0 to both. Recurrent / linear-attention
-layers contribute 0 to per-token growth; their fixed state is reserved in the
-baseline instead (see safety point 2).
+Borrower (KV-sharing) layers contribute 0 to all terms. Recurrent /
+linear-attention layers contribute 0 to per-token growth; their fixed state is
+reserved in the baseline instead (see safety point 2).
 
 Safety contract (this feeds a codex-hardened, over-estimate-safe admission
 path — see ``scheduler._resolve_kv_bytes_per_token``):
@@ -56,22 +66,23 @@ path — see ``scheduler._resolve_kv_bytes_per_token``):
    recognized hybrid gets the smaller accurate number. ``num_kv_shared_layers``
    is NOT sufficient on its own — the per-layer map must confirm the borrower
    split (see point 3).
-2. **Never under-count the per-token GROWTH.** The load-bearing guarantee for
-   the D-METAL-CAP cliff is on the per-token term, since that is what a long
-   generation multiplies without bound: ``per_token_growth`` is >= the true
-   per-token growth of every counted layer. Full-attention layers are charged
-   exactly; a sliding layer with no readable window is charged as full-growth;
-   an unrecognized layer-type string is charged as full-growth (exact-match
-   allowlists, no substring guessing); recurrent and window-bounded layers
-   genuinely have zero per-token growth. Their per-sequence footprint lands in
-   ``fixed_baseline`` instead: the sliding window term is an exact upper bound
-   (the whole window, ignoring token count), and each recurrent layer's fixed
-   state is sized from its family's real config fields (GatedDeltaNet linear
-   head dims + conv kernel; Mamba d_state/d_conv) and charged at fp32/element to
-   stay conservative. A recurrent layer whose state CANNOT be sized falls back
-   to the uniform per-token estimate (full growth) rather than going
-   unreserved. A fixed baseline is charged once per sequence and never scales
-   with generated tokens.
+2. **Never under-count the counted layers, never over-count short requests.**
+   The load-bearing guarantee for the D-METAL-CAP cliff is that the projected
+   footprint is >= the true footprint of every counted layer. Full-attention
+   layers are charged exactly per token; a sliding layer with no readable window
+   is charged as full unbounded growth; an unrecognized layer-type string is
+   charged as full growth (exact-match allowlists, no substring guessing).
+   Sliding-window layers with a readable window are charged their exact peak —
+   ``rate * min(tokens, window)`` — which is both an upper bound on the rotating
+   cache AND equal to the historical uniform figure for any request shorter than
+   the window, so the reduction never comes at the cost of over-charging (and
+   spuriously rejecting) a short request. Recurrent layers genuinely have zero
+   per-token growth; each recurrent layer's fixed state is sized from its
+   family's real config fields (GatedDeltaNet linear head dims + conv kernel;
+   Mamba d_state/d_conv) and charged at fp32/element to stay conservative, and a
+   recurrent layer whose state CANNOT be sized falls back to full per-token
+   growth rather than going unreserved. The fixed baseline is charged once per
+   sequence and never scales with generated tokens.
 3. **KV-sharing only zeroes verified borrowers.** ``num_kv_shared_layers``
    declares that the LAST N layers borrow (Gemma-4 / Gemma-3n contract). We zero
    those borrowers only when the per-layer ``layer_types`` map confirms it —
@@ -136,19 +147,42 @@ _SLIDING_TYPES: frozenset[str] = frozenset(
 class KVFootprintEstimate:
     """Architecture-aware KV footprint of a single sequence.
 
+    The D-METAL-CAP projection reconstructs a request's peak KV footprint as::
+
+        fixed_baseline_bytes
+          + per_token_growth_bytes * (prompt_tokens + max_tokens)
+          + sliding_per_token_bytes * min(prompt_tokens + max_tokens,
+                                          sliding_window_tokens)
+
+    Splitting the sliding-window term out (rather than flattening the whole
+    window into ``fixed_baseline``) keeps SHORT requests byte-identical to the
+    historical uniform estimate: a rotating-window layer only holds
+    ``min(tokens, window)`` positions, so a request whose token budget is below
+    the window is charged exactly ``tokens`` worth — never the full window
+    (codex round 6 BLOCKING). Long requests still get the reduction: the sliding
+    term is capped at ``window`` while the old uniform figure kept growing.
+
     Attributes:
         per_token_growth_bytes: Bytes of KV cache allocated per additional
-            token, summed over the full-attention (per-token-growing) layers
-            only. This is the value the D-METAL-CAP projection multiplies by
-            ``(prompt_tokens + max_tokens)``.
+            token, summed over the full-attention (unbounded-growth) layers
+            only.
         fixed_baseline_bytes: Bytes allocated once per sequence regardless of
-            token count — the sliding-window rotating buffers plus the
-            conservative fixed recurrent state of each sizeable recurrent layer.
-            Zero for a dense model and for a hybrid with neither.
+            token count — the conservative fixed recurrent state of each
+            sizeable recurrent layer. (Sliding windows are NOT flattened here;
+            see ``sliding_per_token_bytes``.) Zero for a dense model and for a
+            hybrid with no sizeable recurrent layers.
+        sliding_per_token_bytes: Bytes of KV allocated per token by the
+            sliding-window (local-attention) layers, summed over those layers.
+            Capped in the projection at ``sliding_window_tokens`` positions.
+            Zero when there are no readable-window sliding layers.
+        sliding_window_tokens: The rotating window length (tokens) that caps the
+            sliding term. Zero when ``sliding_per_token_bytes`` is zero.
     """
 
     per_token_growth_bytes: int
     fixed_baseline_bytes: int
+    sliding_per_token_bytes: int = 0
+    sliding_window_tokens: int = 0
 
 
 def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
@@ -454,10 +488,16 @@ def estimate_kv_footprint(
     full_per_token = max(
         2 * dtype_bytes * global_kv_heads * global_head_dim, uniform_per_layer
     )
-    sliding_window_bytes = 2 * dtype_bytes * window * local_kv_heads * local_head_dim
+    # Per-token KV rate of ONE sliding-window layer (local dims). The projection
+    # multiplies this by ``min(tokens, window)`` — the true peak occupancy of a
+    # rotating cache — rather than flattening the whole window into the baseline,
+    # so a request shorter than the window is charged only for the tokens it
+    # actually holds (codex round 6 BLOCKING).
+    sliding_per_layer = 2 * dtype_bytes * local_kv_heads * local_head_dim
 
     per_token_growth = 0
     fixed_baseline = 0
+    sliding_per_token = 0
     for idx in range(base_num_layers):
         if idx >= first_borrower:
             # Borrower (KV-sharing) layer — reuses a producer's cache, allocates
@@ -482,7 +522,9 @@ def estimate_kv_footprint(
             continue
         if layer_class == "sliding":
             if window > 0:
-                fixed_baseline += sliding_window_bytes
+                # Window-capped per-token growth — accumulated separately so the
+                # projection can cap it at ``window`` positions.
+                sliding_per_token += sliding_per_layer
             else:
                 # No readable window → cannot bound it → charge the uniform
                 # per-layer growth (never under-count).
@@ -493,4 +535,6 @@ def estimate_kv_footprint(
     return KVFootprintEstimate(
         per_token_growth_bytes=int(per_token_growth),
         fixed_baseline_bytes=int(fixed_baseline),
+        sliding_per_token_bytes=int(sliding_per_token),
+        sliding_window_tokens=int(window) if sliding_per_token > 0 else 0,
     )

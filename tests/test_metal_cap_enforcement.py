@@ -847,9 +847,11 @@ class TestArchitectureAwareKVEstimate:
         assert sched._resolve_kv_bytes_per_token() == 2 * 32 * 8 * 128 * 2
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
 
-    def test_gpt_oss_hybrid_reduces_per_token_and_sets_baseline(self):
-        # ~50% sliding-window layers → per-token growth halved vs uniform, and
-        # the window footprint lands in the per-sequence fixed baseline.
+    def test_gpt_oss_hybrid_reduces_per_token_and_caps_sliding(self):
+        # ~50% sliding-window layers → unbounded per-token growth halved vs
+        # uniform, and the sliding layers become a window-capped per-token term
+        # (NOT a flat baseline, which would over-charge short requests — codex
+        # round 6 BLOCKING). No recurrent state → zero fixed baseline.
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -863,10 +865,9 @@ class TestArchitectureAwareKVEstimate:
         sched = self._sched(cfg)
         uniform = 2 * n * kv * hd * 2
         assert sched._resolve_kv_bytes_per_token() == uniform // 2
-        assert (
-            sched._resolve_kv_fixed_baseline_bytes()
-            == 2 * (n // 2) * window * kv * hd * 2
-        )
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert sched._kv_sliding_per_token_bytes == 2 * (n // 2) * kv * hd * 2
+        assert sched._kv_sliding_window_tokens == window
 
     def test_gemma4_sharing_reduces_per_token(self):
         n, n_shared, kv, hd = 35, 20, 1, 128
@@ -894,6 +895,9 @@ class TestArchitectureAwareKVEstimate:
         sched = self._sched(cfg, kv_bytes_override=42)
         assert sched._resolve_kv_bytes_per_token() == 42
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        # The override short-circuits ALL architecture-aware refinement.
+        assert sched._kv_sliding_per_token_bytes == 0
+        assert sched._kv_sliding_window_tokens == 0
 
     def test_estimator_failure_preserves_uniform_estimate(self):
         # If the architecture-aware estimator raises, the scheduler must keep
@@ -930,7 +934,37 @@ class TestArchitectureAwareKVEstimate:
         assert sched._resolve_kv_bytes_per_token() == 0
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
 
-    def test_estimate_request_charges_baseline_plus_growth(self):
+    def test_estimate_request_charges_recurrent_baseline_plus_growth(self):
+        # A GatedDeltaNet hybrid: the recurrent state is a real per-sequence
+        # fixed baseline (token-independent), charged once on top of the
+        # full-attention layers' per-token growth.
+        n, kv, hd = 16, 8, 64
+        layer_types = ["linear_attention"] * (n - 4) + ["full_attention"] * 4
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            linear_num_value_heads=32,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        req = _make_request(tokens=100)
+        req.sampling_params = SamplingParams(max_tokens=50)
+        growth = sched._resolve_kv_bytes_per_token()
+        baseline = sched._resolve_kv_fixed_baseline_bytes()
+        assert baseline > 0
+        assert sched._kv_sliding_per_token_bytes == 0  # no sliding layers
+        assert sched._estimate_request_kv_bytes(req) == baseline + growth * (100 + 50)
+
+    def test_estimate_request_caps_sliding_term_at_window(self):
+        # A GPT-OSS-style hybrid: the sliding term is charged
+        # ``sliding_per_token × min(tokens, window)`` — capped at the window for
+        # a long request, NOT a flat full-window baseline (codex round 6).
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -942,12 +976,34 @@ class TestArchitectureAwareKVEstimate:
             dtype="bfloat16",
         )
         sched = self._sched(cfg)
-        req = _make_request(tokens=100)
-        req.sampling_params = SamplingParams(max_tokens=50)
         growth = sched._resolve_kv_bytes_per_token()
-        baseline = sched._resolve_kv_fixed_baseline_bytes()
-        assert baseline > 0
-        assert sched._estimate_request_kv_bytes(req) == baseline + growth * (100 + 50)
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        sliding = sched._kv_sliding_per_token_bytes
+
+        # Short request (below the window): sliding charged its actual tokens →
+        # byte-identical to the historical uniform figure, no over-charge.
+        short = _make_request(tokens=40)
+        short.sampling_params = SamplingParams(max_tokens=20)
+        short_tokens = 60
+        uniform_per_tok = 2 * n * kv * hd * 2
+        assert sched._estimate_request_kv_bytes(short) == uniform_per_tok * short_tokens
+        assert (
+            sched._estimate_request_kv_bytes(short)
+            == growth * short_tokens + sliding * short_tokens
+        )
+
+        # Long request (past the window): sliding capped at the window.
+        long_req = _make_request(tokens=1000)
+        long_req.sampling_params = SamplingParams(max_tokens=1000)
+        long_tokens = 2000
+        assert (
+            sched._estimate_request_kv_bytes(long_req)
+            == growth * long_tokens + sliding * window
+        )
+        # And strictly below what the uniform over-count would have projected.
+        assert (
+            sched._estimate_request_kv_bytes(long_req) < uniform_per_tok * long_tokens
+        )
 
     def test_hybrid_admitted_where_uniform_would_reject(self):
         # The headline win: a GPT-OSS-style hybrid whose uniform per-token
@@ -971,8 +1027,9 @@ class TestArchitectureAwareKVEstimate:
         arch_projected = sched._estimate_request_kv_bytes(req)
         uniform_projected = uniform_per_tok * tokens
         # Arch-aware projection is strictly smaller than the uniform one for a
-        # large token budget (the fixed window baseline is dwarfed by the
-        # halved per-token growth × tokens).
+        # large token budget: the full layers grow at half the uniform rate and
+        # the sliding layers are capped at the window instead of the full token
+        # count.
         assert arch_projected < uniform_projected
         # Pick a cap that sits between the two projections: uniform rejects,
         # arch-aware admits.

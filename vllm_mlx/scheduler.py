@@ -2222,13 +2222,22 @@ class Scheduler:
         self._kv_bytes_per_token: int = 0
         self._kv_bytes_per_token_resolved: bool = False
         # D-METAL-CAP: cached per-sequence FIXED KV baseline (bytes) for
-        # architecture-aware hybrids — sliding-window rotating buffers plus a
-        # conservative recurrent-state term. Allocated once per sequence, not
-        # per token, so ``_estimate_request_kv_bytes`` charges it as a flat
+        # architecture-aware hybrids — the conservative recurrent-state term of
+        # a hybrid's linear-attention / Mamba layers. Allocated once per
+        # sequence, not per token (an SSM/conv state is materialized in full at
+        # cache init), so ``_estimate_request_kv_bytes`` charges it as a flat
         # add-on rather than multiplying by the token count. ``0`` for dense
         # models and for the byte-identical uniform fallback (see
         # ``_resolve_kv_bytes_per_token`` and ``kv_estimation``).
         self._kv_fixed_baseline_bytes: int = 0
+        # D-METAL-CAP: cached sliding-window KV term for hybrids. Sliding-window
+        # (local-attention) layers grow per token only up to a rotating window,
+        # so their footprint is ``sliding_per_token × min(tokens, window)`` — NOT
+        # a flat window buffer, which would over-charge (and spuriously reject)
+        # requests shorter than the window (codex round 6 BLOCKING). Both ``0``
+        # for dense models and the uniform fallback.
+        self._kv_sliding_per_token_bytes: int = 0
+        self._kv_sliding_window_tokens: int = 0
 
         # Prompt-boundary cache snapshot callback for the new mlx-lm 0.31+ API.
         # Built lazily once memory_aware_cache exists and reused per step.
@@ -3391,6 +3400,8 @@ class Scheduler:
         # ints filters that path.
         per_tok = 0
         fixed_baseline = 0
+        sliding_per_token = 0
+        sliding_window = 0
         try:
             model_config = getattr(self.model, "config", None)
             if model_config is not None:
@@ -3444,6 +3455,8 @@ class Scheduler:
                         )
                         per_tok = estimate.per_token_growth_bytes
                         fixed_baseline = estimate.fixed_baseline_bytes
+                        sliding_per_token = estimate.sliding_per_token_bytes
+                        sliding_window = estimate.sliding_window_tokens
                     except Exception as est_err:
                         logger.debug(
                             "[D-METAL-CAP] architecture-aware KV estimate "
@@ -3453,6 +3466,8 @@ class Scheduler:
                         )
                         # ``per_tok`` already holds the uniform value; keep it.
                         fixed_baseline = 0
+                        sliding_per_token = 0
+                        sliding_window = 0
         except Exception as e:
             logger.debug(
                 "[D-METAL-CAP] failed to auto-derive kv_bytes_per_token "
@@ -3463,20 +3478,27 @@ class Scheduler:
             )
             per_tok = 0
             fixed_baseline = 0
+            sliding_per_token = 0
+            sliding_window = 0
         self._kv_bytes_per_token = per_tok
         self._kv_fixed_baseline_bytes = fixed_baseline
+        self._kv_sliding_per_token_bytes = sliding_per_token
+        self._kv_sliding_window_tokens = sliding_window
         self._kv_bytes_per_token_resolved = True
         return per_tok
 
     def _resolve_kv_fixed_baseline_bytes(self) -> int:
         """Per-sequence FIXED KV baseline (bytes) for hybrid architectures.
 
-        Companion to :meth:`_resolve_kv_bytes_per_token`: the window /
+        Companion to :meth:`_resolve_kv_bytes_per_token`: the token-independent
         recurrent-state footprint an architecture-aware hybrid allocates ONCE
-        per sequence (not per token). ``0`` for dense models, for the uniform
+        per sequence (not per token). Sliding-window layers are NOT charged here
+        — they grow per token up to a rotating window and live in the separate
+        ``_kv_sliding_per_token_bytes`` / ``_kv_sliding_window_tokens`` term
+        (codex round 6 BLOCKING). ``0`` for dense models, for the uniform
         fallback, and under the operator override — so the projection stays
         byte-identical wherever the baseline is not populated. Resolution and
-        caching happen inside ``_resolve_kv_bytes_per_token`` (both values are
+        caching happen inside ``_resolve_kv_bytes_per_token`` (all values are
         computed from the same estimate), so we drive it first, then read the
         cached baseline.
         """
@@ -3486,21 +3508,27 @@ class Scheduler:
     def _estimate_request_kv_bytes(self, request: Request) -> int:
         """Project KV-cache memory the new request would consume.
 
-        Returns ``fixed_baseline + (num_prompt_tokens + max_tokens) ×
-        per_token_growth`` (auto-derived from model config or
-        operator-overridden via ``metal_cap_kv_bytes_per_token``).
-        Used by the admission gate to reject prefill requests that
-        would push Metal active PAST the cap before the allocation
-        happens (codex round 3 BLOCKING #1 + round 4 BLOCKING #1+#2).
+        Returns ``fixed_baseline + tokens × per_token_growth +
+        sliding_per_token × min(tokens, sliding_window)`` where
+        ``tokens = num_prompt_tokens + max_tokens`` (auto-derived from
+        model config or operator-overridden via
+        ``metal_cap_kv_bytes_per_token``). Used by the admission gate to
+        reject prefill requests that would push Metal active PAST the cap
+        before the allocation happens (codex round 3 BLOCKING #1 + round 4
+        BLOCKING #1+#2 + round 6 BLOCKING).
 
-        ``per_token_growth`` counts only the full-attention layers; the
-        window buffers of sliding-window layers and the fixed state of
-        recurrent layers live in ``fixed_baseline`` (allocated once per
-        sequence). For a dense model ``fixed_baseline`` is 0 and this
-        reduces to the historical ``per_tok × tokens`` — byte-identical.
+        ``per_token_growth`` counts only the unbounded full-attention
+        layers. Sliding-window layers grow per token only up to a rotating
+        window, so they are charged ``sliding_per_token × min(tokens,
+        window)`` — the exact rotating-cache peak, and equal to the old
+        uniform figure for any request shorter than the window (never
+        flattened into a full-window baseline, which would over-charge and
+        spuriously reject short requests). Recurrent layers' token-independent
+        fixed state lives in ``fixed_baseline`` (allocated once per sequence).
+        For a dense model ``fixed_baseline`` and the sliding term are 0 and
+        this reduces to the historical ``per_tok × tokens`` — byte-identical.
         The sum is always >= the true architecture-aware footprint of the
-        counted layers (sliding layers charge their whole window), so the
-        gate can only over-estimate, never under-count.
+        counted layers, so the gate can only over-estimate, never under-count.
 
         Conservative by design: we count both the prompt and the
         full ``max_tokens`` budget (rather than the much smaller
@@ -3510,7 +3538,9 @@ class Scheduler:
         """
         per_tok = self._resolve_kv_bytes_per_token()
         fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
-        if per_tok <= 0 and fixed_baseline <= 0:
+        sliding_per_tok = self._kv_sliding_per_token_bytes
+        sliding_window = self._kv_sliding_window_tokens
+        if per_tok <= 0 and fixed_baseline <= 0 and sliding_per_tok <= 0:
             return 0
         # ``num_prompt_tokens`` is populated by either the route layer
         # (when prompt_token_ids was supplied) or zero at this point
@@ -3550,12 +3580,21 @@ class Scheduler:
         max_tokens = int(
             getattr(getattr(request, "sampling_params", None), "max_tokens", 0) or 0
         )
-        # Fixed baseline (window buffers + recurrent state) is a per-sequence
-        # allocation charged once, plus the per-token growth of the
-        # full-attention layers over the projected token budget. For a dense
-        # model ``fixed_baseline`` is 0, so this is byte-identical to the
-        # historical ``per_tok × tokens``.
-        return fixed_baseline + per_tok * (prompt_tokens + max_tokens)
+        tokens = prompt_tokens + max_tokens
+        # Sliding-window layers grow per token only up to a rotating window, so
+        # their peak occupancy is ``sliding_per_tok × min(tokens, window)`` — the
+        # exact rotating-cache peak, and equal to the old uniform figure for any
+        # request shorter than the window (codex round 6 BLOCKING). Flattening
+        # the full window into the baseline would over-charge short requests and
+        # spuriously reject them.
+        sliding_tokens = min(tokens, sliding_window) if sliding_window > 0 else 0
+        sliding_bytes = sliding_per_tok * sliding_tokens
+        # Fixed baseline (recurrent state) is a per-sequence allocation charged
+        # once, plus the unbounded per-token growth of the full-attention layers
+        # over the projected token budget, plus the window-capped sliding term.
+        # For a dense model ``fixed_baseline`` and ``sliding_bytes`` are 0, so
+        # this is byte-identical to the historical ``per_tok × tokens``.
+        return fixed_baseline + per_tok * tokens + sliding_bytes
 
     def _sum_in_flight_kv_bytes(self) -> int:
         """Sum projected KV reservations of WAITING-only requests.
@@ -3584,13 +3623,15 @@ class Scheduler:
         """
         per_tok = self._resolve_kv_bytes_per_token()
         fixed_baseline = self._resolve_kv_fixed_baseline_bytes()
+        sliding_per_tok = self._kv_sliding_per_token_bytes
         # Cheap short-circuit only: a hybrid with all-sliding layers has zero
-        # per-token growth but a real per-sequence baseline, so both must be 0
-        # (dense MagicMock / no config) to skip. The per-request charge itself —
-        # including the fixed baseline once per waiting request — is computed by
-        # ``_estimate_request_kv_bytes`` in the loop below, NOT here, so the
-        # baseline is never dropped from the aggregate.
-        if per_tok <= 0 and fixed_baseline <= 0:
+        # per-token growth and no recurrent baseline but a real per-token sliding
+        # term, so ALL THREE must be 0 (dense MagicMock / no config) to skip. The
+        # per-request charge itself — including the fixed baseline and the
+        # window-capped sliding term for each waiting request — is computed by
+        # ``_estimate_request_kv_bytes`` in the loop below, NOT here, so no term
+        # is ever dropped from the aggregate.
+        if per_tok <= 0 and fixed_baseline <= 0 and sliding_per_tok <= 0:
             return 0
         try:
             waiting = self.waiting
