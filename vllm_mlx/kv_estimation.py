@@ -532,11 +532,11 @@ def estimate_kv_footprint(
     global_head_dim = _pos_int(_cfg_get(struct, "global_head_dim")) or local_head_dim
 
     # Sliding window size — the SINGLE window every sliding layer shares. Resolved
-    # via ``_uniform_sliding_window``, which returns 0 unless uniformity is proven
-    # (positive scalar, or a per-layer list whose positive entries are all equal).
-    # When a sliding layer's window is unreadable, or sliding layers use DIFFERING
-    # per-layer windows, ``window`` is 0 and those layers are charged as full
-    # per-token growth below (over-count-safe, never under-count).
+    # via ``_uniform_sliding_window``, which is scalar-only: it returns the window
+    # only when ``sliding_window`` is one positive scalar (the shipped GPT-OSS /
+    # Gemma-4 shape). Any per-layer window list/tuple, or an unreadable value,
+    # yields 0 and those sliding layers are charged as full per-token growth below
+    # (over-count-safe, never under-count).
     window = _uniform_sliding_window(struct)
 
     # ``layer_types`` is guaranteed present + length-checked by
