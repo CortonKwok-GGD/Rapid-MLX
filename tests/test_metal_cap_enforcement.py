@@ -1072,6 +1072,14 @@ class TestArchitectureAwareKVEstimate:
         # sliding layers are excluded from per-token growth (their whole window
         # is a bounded per-sequence baseline, dwarfed by the halved growth over a
         # long generation).
+        #
+        # This test carries its OWN negative control (uniform scheduler, SAME cap,
+        # SAME request → REJECTED) so it proves the admission gate genuinely
+        # consumes the projected KV bytes — not merely that the hybrid helper
+        # returns a smaller number. Without the negative control the positive
+        # "does not raise" assertion would still pass even if
+        # ``_enforce_metal_cap_at_admission`` stopped applying the projection
+        # entirely (codex round 10 test-strength BLOCKING).
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -1094,15 +1102,57 @@ class TestArchitectureAwareKVEstimate:
         # the sliding layers contribute a bounded whole-window baseline instead
         # of unbounded per-token growth.
         assert arch_projected < uniform_projected
-        # Pick a cap that sits between the two projections: uniform rejects,
-        # arch-aware admits.
+        # Pick a cap that sits STRICTLY BETWEEN the two projections, so the SAME
+        # cap admits the hybrid and rejects the uniform over-count. Concrete
+        # numbers for this config (dtype=bf16, n=24, kv=8, hd=64, window=128,
+        # 16+8000 tokens): uniform_per_tok = 49_152 B; arch per_tok = 24_576 B
+        # (half) + a 6_291_456 B sliding baseline. So arch_projected ≈ 203.3 MB,
+        # uniform_projected ≈ 394.0 MB, and the cap delta above ``active`` is
+        # their midpoint ≈ 298.6 MB — comfortably above arch, comfortably below
+        # uniform.
         active = 1_000_000_000
         cap = active + (arch_projected + uniform_projected) // 2
+        assert active + arch_projected < cap  # hybrid fits under the cap
+        assert active + uniform_projected > cap  # uniform over-count exceeds it
+
+        # POSITIVE: the architecture-aware hybrid scheduler ADMITS the request at
+        # this cap (does not raise), because its reduced projection fits.
         with (
             patch.object(sched, "_resolve_metal_cap_bytes", return_value=cap),
             patch.object(sched, "_current_metal_active_bytes", return_value=active),
         ):
             sched._enforce_metal_cap_at_admission(req)  # must NOT raise
         assert sched.num_metal_cap_violations == 0
-        # Sanity: the uniform over-count would have exceeded the cap.
-        assert active + uniform_projected > cap
+
+        # NEGATIVE CONTROL: a scheduler on the SAME base dims (same num layers /
+        # kv heads / head_dim) but a DENSE config (no ``layer_types`` / no
+        # ``sliding_window``) forces the UNIFORM estimate — no hybrid reduction,
+        # zero baseline — so its projection for the SAME request is exactly
+        # ``uniform_projected``. At the SAME cap that admitted the hybrid, this
+        # uniform scheduler MUST raise ``BackpressureError``. The pair
+        # (uniform → rejected, hybrid → admitted, same cap, same request) is the
+        # real proof that the reduced estimate is what flips admission and that
+        # the gate is actually applying the projected KV bytes.
+        dense_cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            dtype="bfloat16",  # NO layer_types / sliding_window → uniform, base 0
+        )
+        dense_sched = self._sched(dense_cfg)
+        dense_req = _make_request(tokens=16)
+        dense_req.sampling_params = SamplingParams(max_tokens=8_000)
+        # The dense scheduler really is on the uniform estimate with no baseline,
+        # so its projection is precisely the uniform over-count that exceeds cap.
+        assert dense_sched._resolve_kv_bytes_per_token() == uniform_per_tok
+        assert dense_sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert dense_sched._estimate_request_kv_bytes(dense_req) == uniform_projected
+        with (
+            patch.object(dense_sched, "_resolve_metal_cap_bytes", return_value=cap),
+            patch.object(
+                dense_sched, "_current_metal_active_bytes", return_value=active
+            ),
+            pytest.raises(BackpressureError, match="D-METAL-CAP"),
+        ):
+            dense_sched._enforce_metal_cap_at_admission(dense_req)
+        assert dense_sched.num_metal_cap_violations == 1
