@@ -3405,9 +3405,26 @@ class Scheduler:
         try:
             model_config = getattr(self.model, "config", None)
             if model_config is not None:
+                # Multimodal architectures nest the text-tower dims
+                # (num_hidden_layers, num_key_value_heads, head_dim, layer_types)
+                # under ``text_config``. Read the base dims from whichever config
+                # actually carries ``num_hidden_layers`` so ``base_num_layers``
+                # matches the ``layer_types`` map the estimator inspects —
+                # otherwise a nested hybrid structure is silently rejected by
+                # ``estimate_kv_footprint`` and the reduction never engages
+                # (codex round 8 BLOCKING). The estimator independently
+                # re-validates the layer_types length, so an inconsistent outer
+                # count still falls back to the safe uniform estimate.
+                struct_config = model_config
+                if not isinstance(
+                    getattr(model_config, "num_hidden_layers", None), int
+                ):
+                    text_config = getattr(model_config, "text_config", None)
+                    if text_config is not None:
+                        struct_config = text_config
 
                 def _read_int(name: str, fallback: int = 0) -> int:
-                    raw = getattr(model_config, name, fallback)
+                    raw = getattr(struct_config, name, fallback)
                     return raw if isinstance(raw, int) else 0
 
                 num_layers = _read_int("num_hidden_layers")
@@ -3446,7 +3463,7 @@ class Scheduler:
                     # round 3 BLOCKING #3).
                     try:
                         estimate = estimate_kv_footprint(
-                            model_config,
+                            struct_config,
                             dtype_bytes=dtype_bytes,
                             uniform_per_token_bytes=per_tok,
                             base_num_layers=num_layers,

@@ -883,6 +883,35 @@ class TestArchitectureAwareKVEstimate:
         assert sched._resolve_kv_bytes_per_token() == 2 * (n - n_shared) * kv * hd * 2
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
 
+    def test_multimodal_nested_text_config_engages_reduction(self):
+        # A multimodal config nests the text-tower dims under ``text_config`` and
+        # the OUTER config carries no ``num_hidden_layers``. The scheduler must
+        # resolve the base dims from the nested config so the hybrid reduction
+        # actually engages end-to-end — not just in the pure estimator (codex
+        # round 8 BLOCKING).
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            # outer multimodal config: vision tower + nested text config, NO
+            # top-level num_hidden_layers.
+            vision_config=SimpleNamespace(num_hidden_layers=27),
+            text_config=SimpleNamespace(
+                num_hidden_layers=n,
+                num_key_value_heads=kv,
+                head_dim=hd,
+                layer_types=layer_types,
+                sliding_window=window,
+            ),
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        uniform = 2 * n * kv * hd * 2
+        # Reduction engaged: unbounded growth halved, sliding term populated.
+        assert sched._resolve_kv_bytes_per_token() == uniform // 2
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
+        assert sched._kv_sliding_per_token_bytes == 2 * (n // 2) * kv * hd * 2
+        assert sched._kv_sliding_window_tokens == window
+
     def test_operator_override_wins_and_zeroes_baseline(self):
         # Explicit knob short-circuits the estimator; no baseline is charged.
         cfg = SimpleNamespace(
