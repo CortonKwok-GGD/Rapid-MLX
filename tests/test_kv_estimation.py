@@ -33,6 +33,8 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_mlx.kv_estimation import (
+    _ROTATING_CACHE_KEEP,
+    _ROTATING_CACHE_STEP,
     KVFootprintEstimate,
     estimate_kv_footprint,
     rotating_cache_slots,
@@ -700,3 +702,53 @@ class TestNeverUnderCounts:
         for tokens in (1, 100, 4096, 32768):
             projected = self._project(est, tokens)
             assert projected >= n_full * tokens * full_per_layer + n_recurrent * state
+
+
+class TestRotatingCacheConstantsMatchInstalledMlxLm:
+    """Drift guard: our sliding-slot estimate is grounded in two ``RotatingKVCache``
+    internals from the INSTALLED ``mlx_lm`` — the ``step`` block granularity and
+    the ``keep`` sink count that ``make_prompt_cache`` reserves. If a future
+    ``mlx_lm`` upgrade changes either, ``rotating_cache_slots`` would silently
+    UNDER-reserve KV on the D-METAL-CAP admission path (an OOM risk — the
+    load-bearing failure). These tests import the real module and FAIL LOUDLY on
+    any change so the constant gets re-grounded rather than drifting unnoticed.
+
+    Hermetic: imports an installed pure-Python module and constructs a rotating
+    cache from a fake model (a ``SimpleNamespace`` with ``.layers`` and no
+    ``make_cache``) — no weights, no network, no model load.
+    """
+
+    def test_step_matches_our_constant(self):
+        cache_mod = pytest.importorskip("mlx_lm.models.cache")
+        installed_step = cache_mod.RotatingKVCache.step
+        assert installed_step == _ROTATING_CACHE_STEP, (
+            "mlx_lm RotatingKVCache.step changed from the value kv_estimation "
+            f"assumes ({_ROTATING_CACHE_STEP} -> installed {installed_step}); "
+            "rotating_cache_slots would round to the wrong block size. If step "
+            "GREW this under-reserves KV at admission (OOM risk). Re-ground "
+            "_ROTATING_CACHE_STEP against the new impl."
+        )
+
+    def test_make_prompt_cache_keep_matches_our_bound(self):
+        cache_mod = pytest.importorskip("mlx_lm.models.cache")
+        # Fake model: exposes .layers, no ``make_cache`` -> make_prompt_cache takes
+        # the RotatingKVCache branch when a max_kv_size (window) is supplied.
+        fake_model = SimpleNamespace(layers=[object(), object()])
+        assert not hasattr(fake_model, "make_cache")
+        caches = cache_mod.make_prompt_cache(fake_model, max_kv_size=512)
+        assert caches, "make_prompt_cache returned no layers"
+        assert all(
+            isinstance(c, cache_mod.RotatingKVCache) for c in caches
+        ), "make_prompt_cache(max_kv_size=...) did not build RotatingKVCache layers"
+        installed_keeps = {c.keep for c in caches}
+        assert installed_keeps == {_ROTATING_CACHE_KEEP}, (
+            "mlx_lm make_prompt_cache builds rotating layers with keep="
+            f"{installed_keeps}, but kv_estimation assumes keep="
+            f"{_ROTATING_CACHE_KEEP}. If the installed keep is LARGER than our "
+            "constant, rotating_cache_slots under-reserves KV at admission (OOM "
+            "risk). Re-ground _ROTATING_CACHE_KEEP (it must be >= every keep any "
+            "shipped construction uses)."
+        )
+        # Restate the safety invariant explicitly: our KEEP must remain an upper
+        # bound over the installed construction's keep.
+        assert max(installed_keeps) <= _ROTATING_CACHE_KEEP

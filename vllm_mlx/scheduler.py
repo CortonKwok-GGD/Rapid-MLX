@@ -3380,15 +3380,31 @@ class Scheduler:
         recurrent / linear-attention layers (Qwen3.5 GatedDeltaNet)
         carry a fixed state. Once the uniform figure is computed we
         route it through :func:`kv_estimation.estimate_kv_footprint`,
-        which returns the accurate per-token GROWTH (only the
-        full-attention layers) plus a per-sequence FIXED baseline
-        (window buffers + recurrent state). The estimator is
-        over-estimate-safe: a dense model or an unknown/stub config
-        that exposes no ``layer_types`` / ``num_kv_shared_layers``
-        yields a BYTE-IDENTICAL uniform result (per-token unchanged,
-        baseline 0), so only recognized hybrids get the smaller,
-        accurate number and the D-METAL-CAP OOM cliff is never
-        re-introduced.
+        which decomposes the real footprint into THREE terms that the
+        admission projection recombines per request:
+
+          1. per-token GROWTH bytes — the full-attention layers only;
+             the one term that scales linearly and unbounded with
+             ``prompt + max_tokens``.
+          2. a per-request SLIDING term — the sliding-window layers,
+             charged as ``sliding_slot_bytes ×
+             rotating_cache_slots(window, tokens)``. This is
+             request-dependent and SUBLINEAR: it grows in ``step``
+             blocks up to the window, then stays flat, so short
+             requests are not charged the whole window. Cached here as
+             ``_kv_sliding_slot_bytes`` / ``_kv_sliding_window`` and
+             applied in :meth:`_estimate_request_kv_bytes`.
+          3. a per-sequence FIXED baseline — recurrent /
+             linear-attention state ONLY (a constant that does not grow
+             with sequence length). Note: window buffers are NOT in the
+             baseline; they live in term 2.
+
+        The estimator is over-estimate-safe: a dense model or an
+        unknown/stub config that exposes no ``layer_types`` /
+        ``num_kv_shared_layers`` yields a BYTE-IDENTICAL uniform result
+        (per-token unchanged, sliding + baseline both 0), so only
+        recognized hybrids get the smaller, accurate number and the
+        D-METAL-CAP OOM cliff is never re-introduced.
 
         Returns ``0`` only when the model config is missing entirely
         (e.g. unit-test ``MagicMock`` model) so back-compat unit
