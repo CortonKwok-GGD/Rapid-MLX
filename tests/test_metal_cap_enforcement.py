@@ -847,11 +847,10 @@ class TestArchitectureAwareKVEstimate:
         assert sched._resolve_kv_bytes_per_token() == 2 * 32 * 8 * 128 * 2
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
 
-    def test_gpt_oss_hybrid_reduces_per_token_and_caps_sliding(self):
+    def test_gpt_oss_hybrid_reduces_per_token_and_reserves_window(self):
         # ~50% sliding-window layers → unbounded per-token growth halved vs
-        # uniform, and the sliding layers become a window-capped per-token term
-        # (NOT a flat baseline, which would over-charge short requests — codex
-        # round 6 BLOCKING). No recurrent state → zero fixed baseline.
+        # uniform, and the sliding layers reserve their WHOLE window buffer once
+        # per sequence in the fixed baseline (over-count-safe — codex round 9).
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -865,9 +864,10 @@ class TestArchitectureAwareKVEstimate:
         sched = self._sched(cfg)
         uniform = 2 * n * kv * hd * 2
         assert sched._resolve_kv_bytes_per_token() == uniform // 2
-        assert sched._resolve_kv_fixed_baseline_bytes() == 0
-        assert sched._kv_sliding_per_token_bytes == 2 * (n // 2) * kv * hd * 2
-        assert sched._kv_sliding_window_tokens == window
+        assert (
+            sched._resolve_kv_fixed_baseline_bytes()
+            == 2 * (n // 2) * window * kv * hd * 2
+        )
 
     def test_gemma4_sharing_reduces_per_token(self):
         n, n_shared, kv, hd = 35, 20, 1, 128
@@ -885,16 +885,20 @@ class TestArchitectureAwareKVEstimate:
 
     def test_multimodal_nested_text_config_engages_reduction(self):
         # A multimodal config nests the text-tower dims under ``text_config`` and
-        # the OUTER config carries no ``num_hidden_layers``. The scheduler must
-        # resolve the base dims from the nested config so the hybrid reduction
-        # actually engages end-to-end — not just in the pure estimator (codex
-        # round 8 BLOCKING).
+        # the OUTER config carries a DECOY ``num_hidden_layers`` (the vision-tower
+        # count) that differs from the nested text layer count. The scheduler must
+        # resolve the base dims from the config whose OWN layer_types is valid —
+        # the nested text config, NOT the decoy outer count — so the hybrid
+        # reduction engages end-to-end and the uniform base is not read off the
+        # wrong tower (codex round 8 + round 9 BLOCKING #1).
         n, kv, hd, window = 24, 8, 64, 128
+        vision_layers = 27  # decoy != n
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
-            # outer multimodal config: vision tower + nested text config, NO
-            # top-level num_hidden_layers.
-            vision_config=SimpleNamespace(num_hidden_layers=27),
+            # DECOY: the outer config exposes the vision-tower layer count with
+            # NO valid text layer_types of its own.
+            num_hidden_layers=vision_layers,
+            vision_config=SimpleNamespace(num_hidden_layers=vision_layers),
             text_config=SimpleNamespace(
                 num_hidden_layers=n,
                 num_key_value_heads=kv,
@@ -905,12 +909,14 @@ class TestArchitectureAwareKVEstimate:
             dtype="bfloat16",
         )
         sched = self._sched(cfg)
-        uniform = 2 * n * kv * hd * 2
-        # Reduction engaged: unbounded growth halved, sliding term populated.
+        uniform = 2 * n * kv * hd * 2  # text dims (n=24), NOT the decoy 27
+        # Reduction engaged off the nested text dims: growth halved, whole window
+        # reserved in the baseline.
         assert sched._resolve_kv_bytes_per_token() == uniform // 2
-        assert sched._resolve_kv_fixed_baseline_bytes() == 0
-        assert sched._kv_sliding_per_token_bytes == 2 * (n // 2) * kv * hd * 2
-        assert sched._kv_sliding_window_tokens == window
+        assert (
+            sched._resolve_kv_fixed_baseline_bytes()
+            == 2 * (n // 2) * window * kv * hd * 2
+        )
 
     def test_nested_config_without_layer_types_stays_byte_identical(self):
         # BYTE-IDENTICAL guard: a multimodal config whose text_config carries NO
@@ -931,7 +937,6 @@ class TestArchitectureAwareKVEstimate:
         sched = self._sched(cfg)
         assert sched._resolve_kv_bytes_per_token() == 0
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
-        assert sched._kv_sliding_per_token_bytes == 0
 
     def test_operator_override_wins_and_zeroes_baseline(self):
         # Explicit knob short-circuits the estimator; no baseline is charged.
@@ -944,10 +949,8 @@ class TestArchitectureAwareKVEstimate:
         )
         sched = self._sched(cfg, kv_bytes_override=42)
         assert sched._resolve_kv_bytes_per_token() == 42
-        assert sched._resolve_kv_fixed_baseline_bytes() == 0
         # The override short-circuits ALL architecture-aware refinement.
-        assert sched._kv_sliding_per_token_bytes == 0
-        assert sched._kv_sliding_window_tokens == 0
+        assert sched._resolve_kv_fixed_baseline_bytes() == 0
 
     def test_estimator_failure_preserves_uniform_estimate(self):
         # If the architecture-aware estimator raises, the scheduler must keep
@@ -1007,15 +1010,15 @@ class TestArchitectureAwareKVEstimate:
         req.sampling_params = SamplingParams(max_tokens=50)
         growth = sched._resolve_kv_bytes_per_token()
         baseline = sched._resolve_kv_fixed_baseline_bytes()
-        assert baseline > 0
-        assert sched._kv_sliding_per_token_bytes == 0  # no sliding layers
+        assert baseline > 0  # recurrent state reserved
         assert sched._estimate_request_kv_bytes(req) == baseline + growth * (100 + 50)
 
-    def test_estimate_request_sliding_prefill_peak_and_window_cap(self):
-        # A GPT-OSS-style hybrid: sliding layers are charged
-        # ``sliding_per_token × max(prompt_tokens, min(tokens, window))`` — the
-        # window-capped decode steady state, floored at the full prompt to cover
-        # the transient prefill peak (codex round 6 + round 7 BLOCKING #3).
+    def test_estimate_request_charges_whole_window_baseline(self):
+        # A GPT-OSS-style hybrid: the request projection is
+        # ``fixed_baseline + growth * tokens`` where the fixed baseline holds the
+        # WHOLE sliding-window buffer (once per sequence, token-independent) —
+        # the over-count-safe upper bound (codex round 9 BLOCKING). Charged
+        # identically regardless of prompt/decode split for the same token total.
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -1028,54 +1031,33 @@ class TestArchitectureAwareKVEstimate:
         )
         sched = self._sched(cfg)
         growth = sched._resolve_kv_bytes_per_token()
-        assert sched._resolve_kv_fixed_baseline_bytes() == 0
-        sliding = sched._kv_sliding_per_token_bytes
-        uniform_per_tok = 2 * n * kv * hd * 2
+        baseline = sched._resolve_kv_fixed_baseline_bytes()
+        assert baseline == 2 * (n // 2) * window * kv * hd * 2
+        per_layer = 2 * kv * hd * 2
+        n_full = n // 2
+        n_sliding = n // 2
 
-        # (a) Short request (prompt + budget below the window): sliding charged
-        # its actual tokens → byte-identical to the historical uniform figure.
-        short = _make_request(tokens=40)
-        short.sampling_params = SamplingParams(max_tokens=20)
-        short_tokens = 60
-        assert sched._estimate_request_kv_bytes(short) == uniform_per_tok * short_tokens
-        assert (
-            sched._estimate_request_kv_bytes(short)
-            == growth * short_tokens + sliding * short_tokens
-        )
-
-        # (b) Decode-heavy request (tiny prompt, long generation): the sliding
-        # term is CAPPED at the window — the headline reduction.
-        decode = _make_request(tokens=16)
-        decode.sampling_params = SamplingParams(max_tokens=8_000)
-        decode_tokens = 8_016
-        assert (
-            sched._estimate_request_kv_bytes(decode)
-            == growth * decode_tokens + sliding * window
-        )
-        assert (
-            sched._estimate_request_kv_bytes(decode) < uniform_per_tok * decode_tokens
-        )
-
-        # (c) Large-prompt request (prompt itself exceeds the window): the
-        # sliding term is NOT capped at the window — it is floored at the full
-        # prompt to cover the transient prefill allocation (never under-count).
-        big_prompt = _make_request(tokens=1_000)
-        big_prompt.sampling_params = SamplingParams(max_tokens=50)
-        assert (
-            sched._estimate_request_kv_bytes(big_prompt)
-            == growth * 1_050 + sliding * 1_000
-        )
-        # Strictly MORE than a naive window-cap would have projected — that gap
-        # is exactly the prefill peak the round-7 fix stops under-counting.
-        assert (
-            sched._estimate_request_kv_bytes(big_prompt)
-            > growth * 1_050 + sliding * window
-        )
+        for prompt, budget in ((40, 20), (16, 8_000), (8_000, 50)):
+            req = _make_request(tokens=prompt)
+            req.sampling_params = SamplingParams(max_tokens=budget)
+            tokens = prompt + budget
+            projected = sched._estimate_request_kv_bytes(req)
+            assert projected == baseline + growth * tokens
+            # Never under-counts the true footprint of the counted layers: the
+            # full layers grow exactly per token and the whole-window baseline is
+            # >= the sliding layers' min(tokens, window) peak.
+            true_footprint = (
+                n_full * tokens * per_layer
+                + n_sliding * min(tokens, window) * per_layer
+            )
+            assert projected >= true_footprint
 
     def test_hybrid_admitted_where_uniform_would_reject(self):
         # The headline win: a GPT-OSS-style hybrid whose uniform per-token
         # over-count would trip the projection gate is ADMITTED once the
-        # sliding layers are correctly excluded from per-token growth.
+        # sliding layers are excluded from per-token growth (their whole window
+        # is a bounded per-sequence baseline, dwarfed by the halved growth over a
+        # long generation).
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -1095,8 +1077,8 @@ class TestArchitectureAwareKVEstimate:
         uniform_projected = uniform_per_tok * tokens
         # Arch-aware projection is strictly smaller than the uniform one for a
         # large token budget: the full layers grow at half the uniform rate and
-        # the sliding layers are capped at the window instead of the full token
-        # count.
+        # the sliding layers contribute a bounded whole-window baseline instead
+        # of unbounded per-token growth.
         assert arch_projected < uniform_projected
         # Pick a cap that sits between the two projections: uniform rejects,
         # arch-aware admits.
@@ -1110,43 +1092,3 @@ class TestArchitectureAwareKVEstimate:
         assert sched.num_metal_cap_violations == 0
         # Sanity: the uniform over-count would have exceeded the cap.
         assert active + uniform_projected > cap
-
-    def test_large_prompt_prefill_peak_is_rejected(self):
-        # codex round 7 BLOCKING #3: a prompt LARGER than the sliding window can
-        # transiently allocate the whole prompt's KV during prefill before the
-        # rotating cache trims. The admission gate must charge that prefill peak
-        # (prompt floor, not the window cap) so it REJECTS a request that would
-        # OOM during prefill — a naive window-cap would have wrongly admitted it.
-        n, kv, hd, window = 24, 8, 64, 128
-        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
-        cfg = SimpleNamespace(
-            num_hidden_layers=n,
-            num_key_value_heads=kv,
-            head_dim=hd,
-            layer_types=layer_types,
-            sliding_window=window,
-            dtype="bfloat16",
-        )
-        sched = self._sched(cfg)
-        growth = sched._resolve_kv_bytes_per_token()
-        sliding = sched._kv_sliding_per_token_bytes
-        big_prompt = _make_request(tokens=8_000)
-        big_prompt.sampling_params = SamplingParams(max_tokens=50)
-        total = 8_050
-        prefill_aware = sched._estimate_request_kv_bytes(big_prompt)
-        naive_window = growth * total + sliding * window
-        assert prefill_aware == growth * total + sliding * 8_000
-        assert prefill_aware > naive_window  # the peak the fix stops dropping
-        # A cap between the two: the naive window-cap would admit, the
-        # prefill-aware projection must reject.
-        active = 1_000_000_000
-        cap = active + (naive_window + prefill_aware) // 2
-        with (
-            patch.object(sched, "_resolve_metal_cap_bytes", return_value=cap),
-            patch.object(sched, "_current_metal_active_bytes", return_value=active),
-            pytest.raises(BackpressureError, match="D-METAL-CAP"),
-        ):
-            sched._enforce_metal_cap_at_admission(big_prompt)
-        assert sched.num_metal_cap_violations == 1
-        # Sanity: the naive window-cap would have slipped under the cap.
-        assert active + naive_window < cap

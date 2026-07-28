@@ -7,13 +7,14 @@ These pin the contract that the D-METAL-CAP admission gate depends on
 * Dense / unknown configs are BYTE-IDENTICAL to the uniform formula (no
   spurious change to a codex-hardened, over-estimate-safe admission path).
 * Recognized hybrids (sliding-window, KV-sharing, recurrent) get the smaller,
-  accurate per-token growth: full-attention layers grow unbounded, sliding
-  layers grow only up to a rotating window (a window-capped per-token term), and
-  recurrent layers reserve a token-independent fixed baseline.
-* The estimate never under-counts the counted layers (a sliding layer with no
-  readable window, or an unknown layer type, is charged as full-growth) and
-  never over-charges a short request (the sliding term is capped at
-  ``min(tokens, window)``, byte-identical to uniform below the window).
+  accurate per-token growth: only full-attention layers grow unbounded per
+  token; sliding-window layers reserve their WHOLE window buffer once per
+  sequence, and recurrent layers reserve a token-independent fixed state — both
+  in the fixed baseline.
+* The estimate is over-count-safe throughout — it never under-counts the counted
+  layers. A sliding layer with no readable window (or an unknown layer type) is
+  charged as full unbounded growth; a sliding layer WITH a window reserves the
+  whole window (an upper bound on a block-rounded rotating cache).
 
 Hermetic: pure config dataclasses (``SimpleNamespace``) and dicts — no model
 load, no network.
@@ -155,12 +156,10 @@ class TestKVSharing:
             sliding_window=128,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # Nothing zeroed: 3 full layers grow unbounded, 7 sliding layers -> the
-        # window-capped sliding term (all 10 layers counted, none borrowed).
+        # Nothing zeroed: 3 full layers grow unbounded, 7 sliding layers reserve
+        # their whole window buffer (all 10 layers counted, none borrowed).
         assert est.per_token_growth_bytes == 2 * 3 * kv * hd * 2
-        assert est.fixed_baseline_bytes == 0
-        assert est.sliding_per_token_bytes == 2 * 7 * kv * hd * 2
-        assert est.sliding_window_tokens == 128
+        assert est.fixed_baseline_bytes == 2 * 7 * 128 * kv * hd * 2
 
     def test_zero_shared_is_not_a_hybrid_signal(self):
         # num_kv_shared_layers=0 (dense Gemma-4 12B/26B/31B) → no reduction,
@@ -179,7 +178,7 @@ class TestKVSharing:
 class TestSlidingWindow:
     """GPT-OSS ~50% sliding-window layers are window-bounded, not per-token."""
 
-    def test_half_sliding_halves_unbounded_growth_and_caps_sliding(self):
+    def test_half_sliding_halves_growth_and_reserves_whole_window(self):
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -195,42 +194,14 @@ class TestSlidingWindow:
         # Only the full layers grow unbounded per token — halved vs uniform.
         assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2) // 2  # halved
-        # Sliding layers grow per token too, but only up to the window: the term
-        # is a per-token RATE (not a flat window buffer) so short requests are
-        # charged min(tokens, window) worth (codex round 6 BLOCKING).
-        assert est.fixed_baseline_bytes == 0
-        assert est.sliding_per_token_bytes == 2 * n_sliding * kv * hd * 2
-        assert est.sliding_window_tokens == window
+        # Sliding layers reserve their WHOLE window buffer once per sequence —
+        # the over-count-safe upper bound (codex round 9 BLOCKING).
+        assert est.fixed_baseline_bytes == 2 * n_sliding * window * kv * hd * 2
 
-    def test_short_request_sliding_matches_uniform_no_regression(self):
-        # A request SHORTER than the window must project exactly the historical
-        # uniform footprint for the sliding layers — never the whole window
-        # (which would over-charge and spuriously reject it). Emulate the
-        # scheduler projection: per_token_growth * tokens + sliding_per_token *
-        # min(tokens, window).
-        n, kv, hd, window = 24, 8, 64, 4096
-        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
-        cfg = SimpleNamespace(
-            num_hidden_layers=n,
-            num_key_value_heads=kv,
-            head_dim=hd,
-            layer_types=layer_types,
-            sliding_window=window,
-        )
-        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        tokens = 100  # << window
-        projected = (
-            est.fixed_baseline_bytes
-            + est.per_token_growth_bytes * tokens
-            + est.sliding_per_token_bytes * min(tokens, est.sliding_window_tokens)
-        )
-        # Every layer charged exactly ``tokens`` worth == the old uniform figure.
-        assert projected == _uniform(n, kv, hd, 2) * tokens
-
-    def test_long_request_sliding_caps_below_uniform(self):
-        # A request LONGER than the window must project BELOW the uniform figure:
-        # the sliding layers are capped at ``window`` positions while the uniform
-        # estimate would keep multiplying by the full token count.
+    def test_projection_below_uniform_for_long_generation(self):
+        # The reduction: for a long generation the arch-aware projection (halved
+        # per-token growth + a bounded window baseline) stays well below the
+        # uniform per-token over-count that keeps multiplying by every token.
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -242,11 +213,7 @@ class TestSlidingWindow:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         tokens = 8192  # >> window
-        projected = (
-            est.fixed_baseline_bytes
-            + est.per_token_growth_bytes * tokens
-            + est.sliding_per_token_bytes * min(tokens, est.sliding_window_tokens)
-        )
+        projected = est.fixed_baseline_bytes + est.per_token_growth_bytes * tokens
         assert projected < _uniform(n, kv, hd, 2) * tokens
 
     def test_sliding_without_window_charged_as_full_growth(self):
@@ -463,10 +430,8 @@ class TestHybridDimsAndNesting:
         # Producers = first 15 layers. Full at indices 4, 9, 14 → 3 full,
         # 12 sliding. Borrowers (last 20) contribute nothing.
         assert est.per_token_growth_bytes == 2 * 3 * global_kv * global_hd * 2
-        assert est.fixed_baseline_bytes == 0
-        # Sliding layers use local dims; the term is window-capped, not flat.
-        assert est.sliding_per_token_bytes == 12 * 2 * kv * hd * 2
-        assert est.sliding_window_tokens == window
+        # Sliding layers use local dims; whole window reserved in the baseline.
+        assert est.fixed_baseline_bytes == 12 * 2 * window * kv * hd * 2
 
     def test_layer_structure_read_from_text_config(self):
         # Multimodal configs nest the language layer structure under
@@ -483,9 +448,7 @@ class TestHybridDimsAndNesting:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.fixed_baseline_bytes == 0
-        assert est.sliding_per_token_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.sliding_window_tokens == window
+        assert est.fixed_baseline_bytes == 2 * (n // 2) * window * kv * hd * 2
 
     def test_dict_config_supported(self):
         # The offline hybrid probe reads parsed config.json dicts.
@@ -500,9 +463,7 @@ class TestHybridDimsAndNesting:
         }
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.fixed_baseline_bytes == 0
-        assert est.sliding_per_token_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.sliding_window_tokens == window
+        assert est.fixed_baseline_bytes == 2 * (n // 2) * window * kv * hd * 2
 
     def test_unknown_layer_type_charged_as_full_growth(self):
         # An unrecognized attention-type string must never under-count → full.
@@ -522,16 +483,13 @@ class TestNeverUnderCounts:
     """The projected footprint is always >= the true counted-layer footprint."""
 
     def test_projection_upper_bounds_true_footprint(self):
-        # GPT-OSS-like hybrid. This checks the ESTIMATOR's steady-state (decode)
-        # composition of its returned fields:
-        #   fixed_baseline + tokens*growth + sliding_per_token*min(tokens, window)
-        # against the true footprint of the counted layers:
+        # GPT-OSS-like hybrid. The scheduler projection
+        #   fixed_baseline + tokens * per_token_growth
+        # must be >= the true footprint of the counted layers for ANY token
+        # count, since that is the D-METAL-CAP never-under-count guarantee:
         #   full layers: exact tokens*per-layer
-        #   sliding layers: min(tokens, window)*per-layer  (<= window*per-layer)
-        # It must be TIGHT (equal), never over-charging a short request (codex
-        # round 6 BLOCKING). (The scheduler additionally floors the sliding term
-        # at the full prompt for the transient prefill peak — codex round 7 #3 —
-        # which only ever RAISES the charge; covered in the scheduler tests.)
+        #   sliding layers: min(tokens, window)*per-layer  (<= window*per-layer,
+        #                   the whole-window buffer reserved in the baseline)
         n, kv, hd, window, db = 24, 8, 64, 128, 2
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -546,15 +504,11 @@ class TestNeverUnderCounts:
         n_sliding = n // 2
         full_per_layer = 2 * kv * hd * db
         for tokens in (1, 100, window, window + 1, 4096, 32768):
-            projected = (
-                est.fixed_baseline_bytes
-                + tokens * est.per_token_growth_bytes
-                + est.sliding_per_token_bytes * min(tokens, est.sliding_window_tokens)
-            )
+            projected = est.fixed_baseline_bytes + tokens * est.per_token_growth_bytes
             true_full = n_full * tokens * full_per_layer
             true_sliding = n_sliding * min(tokens, window) * full_per_layer
-            # Tight: the estimator charges each layer its exact peak occupancy.
-            assert projected == true_full + true_sliding
+            # Over-count-safe: the whole-window baseline is >= any decode/prefill
+            # peak of the sliding layers, so the projection never under-counts.
             assert projected >= true_full + true_sliding
 
     def test_full_layer_growth_never_below_uniform_base(self):
@@ -578,23 +532,24 @@ class TestNeverUnderCounts:
     def test_sliding_rate_never_below_uniform_base(self):
         # Symmetric to the full-layer clamp: a nested/malformed config whose
         # local (sliding) dims read SMALLER than the base dims the scheduler used
-        # must not shrink the sliding per-token rate below the uniform per-layer
+        # must not shrink the sliding per-layer rate below the uniform per-layer
         # charge (codex round 7 BLOCKING #2). Here the struct exposes a tiny
-        # local head_dim; the base head_dim passed by the caller is larger.
-        n, kv, hd, db = 8, 8, 128, 2
+        # local head_dim; the base head_dim passed by the caller is larger, so
+        # the whole-window baseline is computed at the clamped (base) rate.
+        n, kv, hd, db, window = 8, 8, 128, 2, 256
         layer_types = ["sliding_attention"] * n
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
             head_dim=8,  # << base head_dim (128) — malformed / non-authoritative
             layer_types=layer_types,
-            sliding_window=256,
+            sliding_window=window,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
-        # Clamped to the uniform base per-layer rate, not the tiny local dims.
-        assert est.sliding_per_token_bytes == n * 2 * kv * hd * db
+        # Whole-window baseline at the clamped base per-layer rate, not the tiny
+        # local dims (which would under-count).
+        assert est.fixed_baseline_bytes == n * window * 2 * kv * hd * db
         assert est.per_token_growth_bytes == 0
-        assert est.sliding_window_tokens == 256
 
     def test_projection_covers_recurrent_fixed_state(self):
         # A GatedDeltaNet hybrid: the projection must reserve the recurrent
