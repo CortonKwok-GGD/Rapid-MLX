@@ -267,13 +267,13 @@ class TestSlidingWindow:
 
 
 class TestRecurrent:
-    """Qwen3.5/3.6 GatedDeltaNet / Mamba layers have zero PER-TOKEN growth.
+    """Qwen3.5/3.6 GatedDeltaNet layers have zero PER-TOKEN growth.
 
     Their fixed recurrent state does not grow with generated tokens, so it lands
-    in the per-sequence baseline (sized from the family's real config fields)
-    rather than the per-token term. A recurrent layer whose state cannot be
-    sized falls back to full per-token growth so it is never left unreserved
-    (codex round 2 BLOCKING #1).
+    in the per-sequence baseline (sized from GatedDeltaNet's real config fields)
+    rather than the per-token term. Any recurrent family we do NOT size exactly
+    (Mamba/Mamba2, RWKV, generic) falls back to full per-token growth so it is
+    never left unreserved (codex round 2 BLOCKING #1 + round 7 BLOCKING #1).
     """
 
     # GatedDeltaNet state, sized from the same fields as
@@ -358,25 +358,29 @@ class TestRecurrent:
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
 
-    def test_mamba_state_reserved_in_baseline(self):
+    def test_mamba_not_sized_falls_back_to_full_growth(self):
+        # We deliberately do NOT size a Mamba/Mamba2 state: the conv buffer
+        # channel count differs between Mamba1 (d_inner) and Mamba2 (d_inner +
+        # grouped B/C channels), so a single formula would under-reserve Mamba2
+        # (codex round 7 BLOCKING #1). This engine ships no Mamba model, so its
+        # layers conservatively fall back to full per-token growth — over-count
+        # safe, never unreserved — even when Mamba-shaped fields are present.
         n, kv, hd = 8, 4, 64
-        d_state, d_conv, n_heads, d_head = 128, 4, 24, 64
         layer_types = ["mamba"] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
             head_dim=hd,
             layer_types=layer_types,
-            mamba_d_state=d_state,
-            mamba_d_conv=d_conv,
-            mamba_n_heads=n_heads,
-            mamba_d_head=d_head,
+            mamba_d_state=128,
+            mamba_d_conv=4,
+            mamba_n_heads=24,
+            mamba_d_head=64,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        d_inner = n_heads * d_head
-        state = 4 * (d_inner * d_state + d_inner * (d_conv - 1))
-        assert est.per_token_growth_bytes == 2 * 1 * kv * hd * 2
-        assert est.fixed_baseline_bytes == (n - 1) * state
+        # All 8 layers charged full growth — no baseline, no under-count.
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.fixed_baseline_bytes == 0
 
     def test_gateddeltanet_missing_conv_kernel_falls_back(self):
         # GatedDeltaNet head fields present but linear_conv_kernel_dim ABSENT →
@@ -400,25 +404,6 @@ class TestRecurrent:
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
 
-    def test_mamba_missing_conv_kernel_falls_back(self):
-        # Mamba SSM fields present but d_conv/conv_kernel_size ABSENT → fall back
-        # to full growth (codex round 3 BLOCKING #2).
-        n, kv, hd = 8, 4, 64
-        layer_types = ["mamba"] * (n - 1) + ["full_attention"]
-        cfg = SimpleNamespace(
-            num_hidden_layers=n,
-            num_key_value_heads=kv,
-            head_dim=hd,
-            layer_types=layer_types,
-            mamba_d_state=128,
-            mamba_n_heads=24,
-            mamba_d_head=64,
-            # mamba_d_conv / conv_kernel_size intentionally absent
-        )
-        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
-        assert est.fixed_baseline_bytes == 0
-
     def test_full_attention_name_containing_linear_is_not_recurrent(self):
         # Exact-match allowlist (codex round 1 BLOCKING #4): an unfamiliar
         # full-attention type that merely CONTAINS "linear"/"gated"/"local" must
@@ -434,11 +419,11 @@ class TestRecurrent:
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
 
-    def test_generic_recurrent_family_not_mis_sized_as_mamba(self):
+    def test_generic_recurrent_family_not_mis_sized(self):
         # An RWKV (or other generic recurrent) layer that incidentally exposes
-        # Mamba-ish generic fields must NOT be sized as Mamba — its exact state
-        # layout is not implemented, so it falls back to full growth (codex
-        # round 4 BLOCKING #2).
+        # Mamba-ish generic fields must NOT be stamped with a bogus fixed state —
+        # only GatedDeltaNet is sized; every other recurrent family falls back to
+        # full growth (codex round 4 BLOCKING #2 + round 7 BLOCKING #1).
         n, kv, hd = 8, 4, 64
         layer_types = ["rwkv"] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
@@ -446,13 +431,13 @@ class TestRecurrent:
             num_key_value_heads=kv,
             head_dim=hd,
             layer_types=layer_types,
-            # generic fields that the Mamba branch would otherwise consume:
+            # generic fields a naive recurrent sizer might otherwise consume:
             state_size=128,
             intermediate_size=1536,
             conv_kernel_size=4,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # No baseline reserved (not sized as Mamba); all layers charged full.
+        # No baseline reserved (only GatedDeltaNet is sized); all layers full.
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
 
@@ -537,13 +522,16 @@ class TestNeverUnderCounts:
     """The projected footprint is always >= the true counted-layer footprint."""
 
     def test_projection_upper_bounds_true_footprint(self):
-        # GPT-OSS-like hybrid. For any token count, the full scheduler projection
+        # GPT-OSS-like hybrid. This checks the ESTIMATOR's steady-state (decode)
+        # composition of its returned fields:
         #   fixed_baseline + tokens*growth + sliding_per_token*min(tokens, window)
-        # must be >= the true footprint of the counted layers:
+        # against the true footprint of the counted layers:
         #   full layers: exact tokens*per-layer
         #   sliding layers: min(tokens, window)*per-layer  (<= window*per-layer)
-        # AND it must be TIGHT (equal), never over-charging a short request
-        # (codex round 6 BLOCKING).
+        # It must be TIGHT (equal), never over-charging a short request (codex
+        # round 6 BLOCKING). (The scheduler additionally floors the sliding term
+        # at the full prompt for the transient prefill peak — codex round 7 #3 —
+        # which only ever RAISES the charge; covered in the scheduler tests.)
         n, kv, hd, window, db = 24, 8, 64, 128, 2
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -586,6 +574,27 @@ class TestNeverUnderCounts:
         # Clamped to the uniform base-layer size, not the tiny global dims.
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, db)
         assert est.fixed_baseline_bytes == 0
+
+    def test_sliding_rate_never_below_uniform_base(self):
+        # Symmetric to the full-layer clamp: a nested/malformed config whose
+        # local (sliding) dims read SMALLER than the base dims the scheduler used
+        # must not shrink the sliding per-token rate below the uniform per-layer
+        # charge (codex round 7 BLOCKING #2). Here the struct exposes a tiny
+        # local head_dim; the base head_dim passed by the caller is larger.
+        n, kv, hd, db = 8, 8, 128, 2
+        layer_types = ["sliding_attention"] * n
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=8,  # << base head_dim (128) — malformed / non-authoritative
+            layer_types=layer_types,
+            sliding_window=256,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
+        # Clamped to the uniform base per-layer rate, not the tiny local dims.
+        assert est.sliding_per_token_bytes == n * 2 * kv * hd * db
+        assert est.per_token_growth_bytes == 0
+        assert est.sliding_window_tokens == 256
 
     def test_projection_covers_recurrent_fixed_state(self):
         # A GatedDeltaNet hybrid: the projection must reserve the recurrent

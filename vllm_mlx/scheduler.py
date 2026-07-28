@@ -3509,26 +3509,29 @@ class Scheduler:
         """Project KV-cache memory the new request would consume.
 
         Returns ``fixed_baseline + tokens × per_token_growth +
-        sliding_per_token × min(tokens, sliding_window)`` where
-        ``tokens = num_prompt_tokens + max_tokens`` (auto-derived from
+        sliding_per_token × max(prompt_tokens, min(tokens, sliding_window))``
+        where ``tokens = num_prompt_tokens + max_tokens`` (auto-derived from
         model config or operator-overridden via
         ``metal_cap_kv_bytes_per_token``). Used by the admission gate to
         reject prefill requests that would push Metal active PAST the cap
         before the allocation happens (codex round 3 BLOCKING #1 + round 4
-        BLOCKING #1+#2 + round 6 BLOCKING).
+        BLOCKING #1+#2 + round 6 BLOCKING + round 7 BLOCKING #3).
 
         ``per_token_growth`` counts only the unbounded full-attention
-        layers. Sliding-window layers grow per token only up to a rotating
-        window, so they are charged ``sliding_per_token × min(tokens,
-        window)`` — the exact rotating-cache peak, and equal to the old
-        uniform figure for any request shorter than the window (never
-        flattened into a full-window baseline, which would over-charge and
-        spuriously reject short requests). Recurrent layers' token-independent
-        fixed state lives in ``fixed_baseline`` (allocated once per sequence).
-        For a dense model ``fixed_baseline`` and the sliding term are 0 and
-        this reduces to the historical ``per_tok × tokens`` — byte-identical.
-        The sum is always >= the true architecture-aware footprint of the
-        counted layers, so the gate can only over-estimate, never under-count.
+        layers. Sliding-window layers rotate their KV at ``window`` positions
+        during decode, but a prefill longer than the window can transiently
+        hold the whole prompt before the cache trims — so they are charged
+        ``sliding_per_token × max(prompt_tokens, min(tokens, window))``: the
+        window-capped steady state, floored at the full prompt to cover the
+        transient prefill peak (the large-prefill OOM this gate targets). For
+        any request shorter than the window this is exactly ``tokens`` worth —
+        equal to the old uniform figure, never over-charging (and spuriously
+        rejecting) a short request. Recurrent layers' token-independent fixed
+        state lives in ``fixed_baseline`` (allocated once per sequence). For a
+        dense model ``fixed_baseline`` and the sliding term are 0 and this
+        reduces to the historical ``per_tok × tokens`` — byte-identical. The sum
+        is always >= the true architecture-aware footprint of the counted
+        layers, so the gate can only over-estimate, never under-count.
 
         Conservative by design: we count both the prompt and the
         full ``max_tokens`` budget (rather than the much smaller
@@ -3581,14 +3584,25 @@ class Scheduler:
             getattr(getattr(request, "sampling_params", None), "max_tokens", 0) or 0
         )
         tokens = prompt_tokens + max_tokens
-        # Sliding-window layers grow per token only up to a rotating window, so
-        # their peak occupancy is ``sliding_per_tok × min(tokens, window)`` — the
-        # exact rotating-cache peak, and equal to the old uniform figure for any
-        # request shorter than the window (codex round 6 BLOCKING). Flattening
-        # the full window into the baseline would over-charge short requests and
-        # spuriously reject them.
-        sliding_tokens = min(tokens, sliding_window) if sliding_window > 0 else 0
-        sliding_bytes = sliding_per_tok * sliding_tokens
+        # Sliding-window layers rotate their KV at ``window`` positions during
+        # DECODE, but a PREFILL longer than the window can transiently
+        # materialize the whole prompt's KV before the rotating cache trims it —
+        # the exact large-prefill allocation this admission gate exists to catch.
+        # Charging only ``min(tokens, window)`` would ignore that transient peak
+        # and could admit a prompt that OOMs during prefill (codex round 7
+        # BLOCKING #3). So the sliding peak is the LARGER of:
+        #   * the full prompt (conservative prefill peak), and
+        #   * the window-capped steady state ``min(tokens, window)`` (decode).
+        # For a request shorter than the window this is exactly ``tokens`` —
+        # byte-identical to the old uniform figure, no over-charge (codex round 6
+        # BLOCKING). For a small prompt + long generation it stays capped at the
+        # window (the reduction this delivers); only a prompt that itself exceeds
+        # the window pays the uncapped prefill price.
+        if sliding_window > 0:
+            sliding_positions = max(prompt_tokens, min(tokens, sliding_window))
+        else:
+            sliding_positions = 0
+        sliding_bytes = sliding_per_tok * sliding_positions
         # Fixed baseline (recurrent state) is a per-sequence allocation charged
         # once, plus the unbounded per-token growth of the full-attention layers
         # over the projected token budget, plus the window-capped sliding term.

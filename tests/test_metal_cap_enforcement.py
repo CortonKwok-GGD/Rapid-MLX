@@ -961,10 +961,11 @@ class TestArchitectureAwareKVEstimate:
         assert sched._kv_sliding_per_token_bytes == 0  # no sliding layers
         assert sched._estimate_request_kv_bytes(req) == baseline + growth * (100 + 50)
 
-    def test_estimate_request_caps_sliding_term_at_window(self):
-        # A GPT-OSS-style hybrid: the sliding term is charged
-        # ``sliding_per_token × min(tokens, window)`` — capped at the window for
-        # a long request, NOT a flat full-window baseline (codex round 6).
+    def test_estimate_request_sliding_prefill_peak_and_window_cap(self):
+        # A GPT-OSS-style hybrid: sliding layers are charged
+        # ``sliding_per_token × max(prompt_tokens, min(tokens, window))`` — the
+        # window-capped decode steady state, floored at the full prompt to cover
+        # the transient prefill peak (codex round 6 + round 7 BLOCKING #3).
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -979,30 +980,46 @@ class TestArchitectureAwareKVEstimate:
         growth = sched._resolve_kv_bytes_per_token()
         assert sched._resolve_kv_fixed_baseline_bytes() == 0
         sliding = sched._kv_sliding_per_token_bytes
+        uniform_per_tok = 2 * n * kv * hd * 2
 
-        # Short request (below the window): sliding charged its actual tokens →
-        # byte-identical to the historical uniform figure, no over-charge.
+        # (a) Short request (prompt + budget below the window): sliding charged
+        # its actual tokens → byte-identical to the historical uniform figure.
         short = _make_request(tokens=40)
         short.sampling_params = SamplingParams(max_tokens=20)
         short_tokens = 60
-        uniform_per_tok = 2 * n * kv * hd * 2
         assert sched._estimate_request_kv_bytes(short) == uniform_per_tok * short_tokens
         assert (
             sched._estimate_request_kv_bytes(short)
             == growth * short_tokens + sliding * short_tokens
         )
 
-        # Long request (past the window): sliding capped at the window.
-        long_req = _make_request(tokens=1000)
-        long_req.sampling_params = SamplingParams(max_tokens=1000)
-        long_tokens = 2000
+        # (b) Decode-heavy request (tiny prompt, long generation): the sliding
+        # term is CAPPED at the window — the headline reduction.
+        decode = _make_request(tokens=16)
+        decode.sampling_params = SamplingParams(max_tokens=8_000)
+        decode_tokens = 8_016
         assert (
-            sched._estimate_request_kv_bytes(long_req)
-            == growth * long_tokens + sliding * window
+            sched._estimate_request_kv_bytes(decode)
+            == growth * decode_tokens + sliding * window
         )
-        # And strictly below what the uniform over-count would have projected.
         assert (
-            sched._estimate_request_kv_bytes(long_req) < uniform_per_tok * long_tokens
+            sched._estimate_request_kv_bytes(decode) < uniform_per_tok * decode_tokens
+        )
+
+        # (c) Large-prompt request (prompt itself exceeds the window): the
+        # sliding term is NOT capped at the window — it is floored at the full
+        # prompt to cover the transient prefill allocation (never under-count).
+        big_prompt = _make_request(tokens=1_000)
+        big_prompt.sampling_params = SamplingParams(max_tokens=50)
+        assert (
+            sched._estimate_request_kv_bytes(big_prompt)
+            == growth * 1_050 + sliding * 1_000
+        )
+        # Strictly MORE than a naive window-cap would have projected — that gap
+        # is exactly the prefill peak the round-7 fix stops under-counting.
+        assert (
+            sched._estimate_request_kv_bytes(big_prompt)
+            > growth * 1_050 + sliding * window
         )
 
     def test_hybrid_admitted_where_uniform_would_reject(self):
@@ -1043,3 +1060,43 @@ class TestArchitectureAwareKVEstimate:
         assert sched.num_metal_cap_violations == 0
         # Sanity: the uniform over-count would have exceeded the cap.
         assert active + uniform_projected > cap
+
+    def test_large_prompt_prefill_peak_is_rejected(self):
+        # codex round 7 BLOCKING #3: a prompt LARGER than the sliding window can
+        # transiently allocate the whole prompt's KV during prefill before the
+        # rotating cache trims. The admission gate must charge that prefill peak
+        # (prompt floor, not the window cap) so it REJECTS a request that would
+        # OOM during prefill — a naive window-cap would have wrongly admitted it.
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=window,
+            dtype="bfloat16",
+        )
+        sched = self._sched(cfg)
+        growth = sched._resolve_kv_bytes_per_token()
+        sliding = sched._kv_sliding_per_token_bytes
+        big_prompt = _make_request(tokens=8_000)
+        big_prompt.sampling_params = SamplingParams(max_tokens=50)
+        total = 8_050
+        prefill_aware = sched._estimate_request_kv_bytes(big_prompt)
+        naive_window = growth * total + sliding * window
+        assert prefill_aware == growth * total + sliding * 8_000
+        assert prefill_aware > naive_window  # the peak the fix stops dropping
+        # A cap between the two: the naive window-cap would admit, the
+        # prefill-aware projection must reject.
+        active = 1_000_000_000
+        cap = active + (naive_window + prefill_aware) // 2
+        with (
+            patch.object(sched, "_resolve_metal_cap_bytes", return_value=cap),
+            patch.object(sched, "_current_metal_active_bytes", return_value=active),
+            pytest.raises(BackpressureError, match="D-METAL-CAP"),
+        ):
+            sched._enforce_metal_cap_at_admission(big_prompt)
+        assert sched.num_metal_cap_violations == 1
+        # Sanity: the naive window-cap would have slipped under the cap.
+        assert active + naive_window < cap

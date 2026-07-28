@@ -72,17 +72,19 @@ path — see ``scheduler._resolve_kv_bytes_per_token``):
    layers are charged exactly per token; a sliding layer with no readable window
    is charged as full unbounded growth; an unrecognized layer-type string is
    charged as full growth (exact-match allowlists, no substring guessing).
-   Sliding-window layers with a readable window are charged their exact peak —
-   ``rate * min(tokens, window)`` — which is both an upper bound on the rotating
-   cache AND equal to the historical uniform figure for any request shorter than
-   the window, so the reduction never comes at the cost of over-charging (and
-   spuriously rejecting) a short request. Recurrent layers genuinely have zero
-   per-token growth; each recurrent layer's fixed state is sized from its
-   family's real config fields (GatedDeltaNet linear head dims + conv kernel;
-   Mamba d_state/d_conv) and charged at fp32/element to stay conservative, and a
-   recurrent layer whose state CANNOT be sized falls back to full per-token
-   growth rather than going unreserved. The fixed baseline is charged once per
-   sequence and never scales with generated tokens.
+   Sliding-window layers with a readable window report a per-token ``rate`` and
+   the window; the caller charges ``rate * min(tokens, window)`` for decode (an
+   upper bound on the rotating cache, equal to the historical uniform figure for
+   any request shorter than the window) floored at the full prompt to cover the
+   transient prefill peak — so the reduction never comes at the cost of
+   over-charging a short request nor under-charging a large prefill. Recurrent
+   layers genuinely have zero per-token growth; a GatedDeltaNet layer's fixed
+   state is sized from its real config fields (linear head dims + conv kernel)
+   and charged at fp32/element to stay conservative. Every other recurrent family
+   (Mamba/Mamba2, RWKV, generic) is NOT sized — its exact cache layout is not
+   modelled here — and falls back to full per-token growth rather than a possibly
+   wrong fixed state, so it is never under-reserved. The fixed baseline is
+   charged once per sequence and never scales with generated tokens.
 3. **KV-sharing only zeroes verified borrowers.** ``num_kv_shared_layers``
    declares that the LAST N layers borrow (Gemma-4 / Gemma-3n contract). We zero
    those borrowers only when the per-layer ``layer_types`` map confirms it —
@@ -300,55 +302,28 @@ def _gateddeltanet_state_bytes(struct: Any) -> int | None:
     return _RECURRENT_STATE_BYTES_PER_ELEM * (recurrent_elems + conv_elems)
 
 
-def _mamba_state_bytes(struct: Any) -> int | None:
-    """Mamba / Mamba2 per-sequence state bytes.
-
-    State = the SSM state ``d_inner × d_state`` plus the conv ring buffer
-    ``d_inner × (d_conv − 1)``.
-
-    Sized ONLY from ``mamba_``-prefixed config fields, never from generic
-    ``state_size`` / ``intermediate_size`` / ``conv_kernel_size`` (codex round 4
-    BLOCKING #2). Those generic names are not Mamba-specific: another recurrent
-    family (RWKV, etc.) commonly exposes ``intermediate_size`` / ``state_size``
-    for an entirely different tensor, so reading them here would stamp a bogus
-    Mamba-shaped fixed state onto a non-Mamba layer and zero its per-token
-    growth — an under-count on the D-METAL-CAP path. A layer that does not carry
-    the Mamba-specific fields returns ``None`` so the caller charges it full
-    per-token growth (the safe, never-under-count fallback).
-
-    Same all-or-nothing rule: ``d_state`` AND the inner dimension AND the conv
-    kernel must all be readable from Mamba-specific fields, else return ``None``
-    so the conv buffer is never silently dropped (codex round 3 BLOCKING #2).
-    """
-    d_state = _pos_int(_cfg_get(struct, "mamba_d_state"))
-    n_heads = _pos_int(_cfg_get(struct, "mamba_n_heads"))
-    d_head = _pos_int(_cfg_get(struct, "mamba_d_head"))
-    d_inner = (n_heads * d_head) if (n_heads and d_head) else 0
-    if d_inner == 0:
-        d_inner = _pos_int(_cfg_get(struct, "mamba_intermediate_size"))
-    d_conv = _pos_int(_cfg_get(struct, "mamba_d_conv"))
-    if not (d_state and d_inner and d_conv):
-        return None
-    ssm_elems = d_inner * d_state
-    conv_elems = d_inner * (d_conv - 1)
-    return _RECURRENT_STATE_BYTES_PER_ELEM * (ssm_elems + conv_elems)
-
-
 def _recurrent_state_bytes(struct: Any, layer_type: str) -> int | None:
     """Conservative per-sequence FIXED state of one recurrent layer, in bytes.
 
-    Dispatches by the EXACT recurrent family named in ``layer_type`` and sizes
-    the state only from that family's real config fields — so a family we do not
-    model (generic ``"recurrent"`` / ``"rwkv"``) never gets a bogus Mamba/GDN
-    estimate from incidentally-matching generic fields (codex round 4
-    BLOCKING #2). Returns ``None`` (→ caller charges full per-token growth) for
-    any family we cannot size exactly.
-
-    Every GatedDeltaNet alias the classifier treats as recurrent
+    Sizes the state only for the recurrent family whose EXACT state + conv
+    layout we have validated against the shipped implementation — GatedDeltaNet
+    (Qwen3-Next / Qwen3.5 / Qwen3.6), keyed on its family-specific ``linear_*``
+    fields. Every GatedDeltaNet alias the classifier treats as recurrent
     (``_GATEDDELTANET_TYPES``: ``linear_attention`` + the ``gated_delta_net`` /
     ``gated_deltanet`` upstream spellings) routes to the same sizer, so a config
     that names its linear layers with an alias still gets the reduction rather
     than silently reverting to full per-token growth (codex round 5 BLOCKING).
+
+    Every OTHER recurrent family — Mamba / Mamba2, RWKV, generic ``recurrent`` —
+    returns ``None`` so the caller charges the layer full per-token growth (the
+    safe, never-under-count fallback). We deliberately do NOT attempt to size a
+    Mamba state: the conv buffer channel count differs between Mamba1
+    (``d_inner``) and Mamba2 (``d_inner`` + grouped ``B``/``C`` channels =
+    ``d_inner + 2·n_groups·d_state``), so a single generic formula would
+    UNDER-reserve Mamba2 (codex round 7 BLOCKING) — and this engine ships no
+    Mamba model, so over-counting those layers as full growth costs nothing while
+    keeping the OOM-safety guarantee intact. When a real Mamba family is shipped,
+    add a family-specific sizer here mirroring its exact cache shapes.
 
     The returned term is a per-sequence constant (it does not grow with
     generated tokens), so it lands in the fixed baseline, never in per-token
@@ -356,10 +331,7 @@ def _recurrent_state_bytes(struct: Any, layer_type: str) -> int | None:
     """
     if layer_type in _GATEDDELTANET_TYPES:
         return _gateddeltanet_state_bytes(struct)
-    if layer_type in ("mamba", "mamba2"):
-        return _mamba_state_bytes(struct)
-    # Generic / unimplemented recurrent family (e.g. "recurrent", "rwkv"): we do
-    # not know its exact state layout, so we cannot size it → full-growth.
+    # Mamba/Mamba2/RWKV/other recurrent: state layout not modelled → full growth.
     return None
 
 
@@ -492,8 +464,14 @@ def estimate_kv_footprint(
     # multiplies this by ``min(tokens, window)`` — the true peak occupancy of a
     # rotating cache — rather than flattening the whole window into the baseline,
     # so a request shorter than the window is charged only for the tokens it
-    # actually holds (codex round 6 BLOCKING).
-    sliding_per_layer = 2 * dtype_bytes * local_kv_heads * local_head_dim
+    # actually holds (codex round 6 BLOCKING). Clamped to the uniform base-layer
+    # floor for the same reason full layers are (codex round 7 BLOCKING #2): if a
+    # malformed or semantically-different nested config exposes smaller local
+    # dims than the base the scheduler read, the sliding term must not drop below
+    # the uniform per-layer charge and open an under-count.
+    sliding_per_layer = max(
+        2 * dtype_bytes * local_kv_heads * local_head_dim, uniform_per_layer
+    )
 
     per_token_growth = 0
     fixed_baseline = 0
