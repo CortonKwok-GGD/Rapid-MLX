@@ -206,6 +206,18 @@ def rotating_cache_slots(window: int, tokens: int) -> int:
 
     Returns ``0`` when there is no window or no tokens (no sliding term).
     """
+    # Why ONE global (step=256, keep=4) is valid for every sliding layer we
+    # reduce: rapid-mlx constructs ALL sliding-window caches through mlx_lm's
+    # ``RotatingKVCache`` (directly, or via ``make_prompt_cache`` / the vendored
+    # Gemma-4 / DeepSeek-V4 stacks), which share the class-default ``step = 256``
+    # and a ``keep`` of 0–4. That global invariant IS the per-architecture
+    # verification codex asks for — pinned by the hermetic drift test
+    # ``tests/test_kv_estimation.py::TestRotatingCacheConstantsMatchInstalledMlxLm``
+    # against the INSTALLED mlx_lm (fails loudly if step/keep ever change). If a
+    # future family ships a sliding cache that is NOT mlx_lm ``RotatingKVCache``
+    # (different granularity/retention), that combination must be re-verified
+    # before its ``layer_types`` entry is added to ``_SLIDING_TYPES`` — otherwise
+    # this slot count could under-reserve it.
     if window <= 0 or tokens <= 0:
         return 0
     effective = min(tokens, window) + _ROTATING_CACHE_KEEP
@@ -350,6 +362,38 @@ def _classify_layer(layer_type: str) -> str:
     if layer_type in _SLIDING_TYPES:
         return "sliding"
     return "full"
+
+
+def _uniform_sliding_window(struct: Any) -> int:
+    """Return the single rotating-window size shared by ALL sliding layers, or 0.
+
+    The per-request slot model (``sliding_slot_bytes × rotating_cache_slots(window,
+    T)``) charges every sliding layer with ONE window. That is exact only when the
+    sliding layers genuinely share a single window — the shipped shape: GPT-OSS and
+    Gemma-4 expose ``sliding_window`` as one positive scalar. This resolver returns
+    a window ONLY when it can prove uniformity:
+
+    * a positive int scalar → the uniform window (shipped case);
+    * a per-layer list/tuple whose positive entries are ALL EQUAL → that one
+      distinct window (still uniform, so still exact);
+    * otherwise (a list with DIFFERING positive windows, or an unreadable shape) →
+      ``0``.
+
+    Returning ``0`` makes the caller fold those sliding layers into full per-token
+    growth (over-count-safe) rather than charging every sliding layer with one
+    scalar window that could UNDER-count a layer whose real window is larger
+    (codex round 13 BLOCKING #3). It never picks the min/first of differing
+    windows — which would be the under-counting mistake.
+    """
+    raw = _cfg_get(struct, "sliding_window")
+    scalar = _pos_int(raw)
+    if scalar:
+        return scalar
+    if isinstance(raw, (list, tuple)):
+        distinct = {v for v in (_pos_int(entry) for entry in raw) if v > 0}
+        if len(distinct) == 1:
+            return next(iter(distinct))
+    return 0
 
 
 # mlx-lm materializes the recurrent conv/SSM state buffers with ``mx.zeros``,
@@ -497,9 +541,13 @@ def estimate_kv_footprint(
     )
     global_head_dim = _pos_int(_cfg_get(struct, "global_head_dim")) or local_head_dim
 
-    # Sliding window size. When a layer is sliding but the window is unreadable
-    # we cannot bound its footprint, so it is charged as full-growth below.
-    window = _pos_int(_cfg_get(struct, "sliding_window"))
+    # Sliding window size — the SINGLE window every sliding layer shares. Resolved
+    # via ``_uniform_sliding_window``, which returns 0 unless uniformity is proven
+    # (positive scalar, or a per-layer list whose positive entries are all equal).
+    # When a sliding layer's window is unreadable, or sliding layers use DIFFERING
+    # per-layer windows, ``window`` is 0 and those layers are charged as full
+    # per-token growth below (over-count-safe, never under-count).
+    window = _uniform_sliding_window(struct)
 
     # ``layer_types`` is guaranteed present + length-checked by
     # ``_pick_structural_config``; the ``is None`` branch is unreachable but
@@ -541,6 +589,16 @@ def estimate_kv_footprint(
         for producer_idx in range(split):
             last_producer_by_type[layer_types[producer_idx]] = producer_idx
         for borrower_idx in range(split, base_num_layers):
+            # KV sharing reuses an earlier producer's ATTENTION K/V. A recurrent /
+            # linear-attention layer that happens to sit in the last-N borrower
+            # positions has no attention KV to share — it keeps its OWN fixed
+            # recurrent state — so it must NEVER be zeroed here; it falls through
+            # to the recurrent branch below and is charged its state (or
+            # full-growth fallback). Only an attention-class borrower can borrow
+            # and allocate zero (codex round 13 BLOCKING #1: zeroing a recurrent
+            # borrower would drop its state and under-count).
+            if _classify_layer(layer_types[borrower_idx]) == "recurrent":
+                continue
             mapped = last_producer_by_type.get(layer_types[borrower_idx])
             # ``mapped`` is keyed by type, so ``layer_types[mapped]`` is the
             # borrower's own type whenever the lookup hits — the exact

@@ -282,6 +282,45 @@ class TestKVSharing:
         assert est.sliding_slot_bytes == 1 * 2 * kv * hd * 2  # idx3 orphan charged
         assert est.sliding_window == window
 
+    def test_recurrent_layer_in_borrower_range_is_charged_not_zeroed(self):
+        # A recurrent (linear_attention) layer that sits in the last-N borrower
+        # positions and whose type matches an earlier recurrent producer must NOT
+        # be zeroed: KV sharing shares ATTENTION K/V, never recurrent state. It is
+        # charged its own fixed recurrent state (codex round 13 BLOCKING #1). The
+        # full borrower (idx2) still maps to a full producer and is zeroed.
+        n, kv, hd = 4, 2, 128
+        gdn = dict(
+            linear_num_value_heads=32,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )
+        layer_types = [
+            "linear_attention",  # 0 producer (recurrent)
+            "full_attention",  # 1 producer (full)
+            "full_attention",  # 2 borrower → maps to full producer 1 → zeroed
+            "linear_attention",  # 3 borrower, recurrent → charged, NOT zeroed
+        ]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            num_kv_shared_layers=2,
+            **gdn,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        key_dim = 16 * 128
+        value_dim = 32 * 128
+        state = 4 * (32 * 128 * 128 + (4 - 1) * (2 * key_dim + value_dim))
+        # idx0 producer + idx3 recurrent borrower (NOT zeroed) → both charged.
+        assert est.fixed_baseline_bytes == 2 * state
+        # idx1 full producer grows; idx2 full borrower is zeroed.
+        assert est.per_token_growth_bytes == 2 * kv * hd * 2
+        assert est.sliding_slot_bytes == 0
+        assert est.sliding_window == 0
+
     def test_zero_shared_is_not_a_hybrid_signal(self):
         cfg = SimpleNamespace(
             num_hidden_layers=32,
@@ -352,6 +391,49 @@ class TestSlidingWindow:
         assert est.per_token_growth_bytes == 0
         assert est.sliding_slot_bytes == 2 * n * kv * hd * 2
         assert est.sliding_window == window
+
+    def test_mixed_per_layer_windows_fold_into_full_growth(self):
+        # A per-layer window LIST with DIFFERING sizes cannot be bounded by one
+        # scalar window without under-counting the larger-window layers, so every
+        # sliding layer is charged as full per-token growth instead of the slot
+        # model (over-count-safe; codex round 13 BLOCKING #3). The estimate never
+        # picks the min/first of the differing windows.
+        n, kv, hd = 24, 8, 64
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=[128, 4096] * (n // 2),  # differing per-layer windows
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        # No single safe window → every layer grows unbounded (uniform result).
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.sliding_slot_bytes == 0
+        assert est.sliding_window == 0
+        assert est.fixed_baseline_bytes == 0
+
+    def test_uniform_per_layer_window_list_keeps_slot_model(self):
+        # A per-layer window LIST whose positive entries are ALL EQUAL is still a
+        # single uniform window → keep the accurate per-request slot model. Null
+        # entries (full layers carry no window) are ignored.
+        n, kv, hd, window = 24, 8, 64, 128
+        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            sliding_window=[window, None] * (n // 2),  # sliding=128, full=None
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        n_full = n // 2
+        n_sliding = n // 2
+        assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
+        assert est.sliding_slot_bytes == 2 * n_sliding * kv * hd * 2
+        assert est.sliding_window == window
+        assert est.fixed_baseline_bytes == 0
 
 
 class TestRecurrent:
@@ -737,9 +819,9 @@ class TestRotatingCacheConstantsMatchInstalledMlxLm:
         assert not hasattr(fake_model, "make_cache")
         caches = cache_mod.make_prompt_cache(fake_model, max_kv_size=512)
         assert caches, "make_prompt_cache returned no layers"
-        assert all(
-            isinstance(c, cache_mod.RotatingKVCache) for c in caches
-        ), "make_prompt_cache(max_kv_size=...) did not build RotatingKVCache layers"
+        assert all(isinstance(c, cache_mod.RotatingKVCache) for c in caches), (
+            "make_prompt_cache(max_kv_size=...) did not build RotatingKVCache layers"
+        )
         installed_keeps = {c.keep for c in caches}
         assert installed_keeps == {_ROTATING_CACHE_KEEP}, (
             "mlx_lm make_prompt_cache builds rotating layers with keep="
