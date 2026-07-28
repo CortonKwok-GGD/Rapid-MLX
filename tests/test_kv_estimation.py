@@ -2,21 +2,25 @@
 """Unit tests for the architecture-aware KV footprint estimator.
 
 These pin the contract that the D-METAL-CAP admission gate depends on
-(``scheduler._resolve_kv_bytes_per_token`` → ``estimate_kv_footprint``):
+(``scheduler._resolve_kv_bytes_per_token`` → ``estimate_kv_footprint`` /
+``rotating_cache_slots``):
 
-* Dense / unknown configs are BYTE-IDENTICAL to the uniform formula (no
-  spurious change to a codex-hardened, over-estimate-safe admission path).
-* Recognized hybrids (sliding-window, KV-sharing, recurrent) get the smaller,
-  accurate per-token growth: only full-attention layers grow unbounded per
-  token; sliding-window layers reserve their WHOLE rotating-cache buffer once per
-  sequence, and recurrent layers reserve a token-independent fixed state — both
-  in the fixed baseline.
+* Dense / unknown configs are BYTE-IDENTICAL to the uniform formula: the
+  estimate is ``(uniform, 0, 0, 0)`` — no baseline, no sliding term.
+* Recognized hybrids get the accurate per-request footprint split across three
+  terms: only full-attention layers grow unbounded per token
+  (``per_token_growth_bytes``); sliding-window layers are a request-dependent
+  slot term (``sliding_slot_bytes`` × ``rotating_cache_slots(window, T)``);
+  recurrent layers reserve a token-independent fixed state
+  (``fixed_baseline_bytes``).
 * The estimate is over-count-safe throughout — it never under-counts the counted
   layers. A sliding layer with no readable window (or an unknown layer type) is
-  charged as full unbounded growth; a sliding layer WITH a window reserves the
-  step-rounded, sink-inclusive rotating-cache capacity
-  (``ceil((window + keep) / step) * step`` slots), an upper bound on the real
-  ``RotatingKVCache`` allocation.
+  folded into full unbounded growth; a sliding layer WITH a window contributes a
+  slot term whose per-request slot count is an upper bound on the real
+  ``RotatingKVCache`` allocation at every token count, capped at the full window.
+* KV-sharing zeroes a borrower ONLY when the exact per-index producer map
+  (mirrored from ``models/gemma4_vendored/language.py``) gives it a same-type
+  producer below the split; an orphan borrower is charged, never zeroed.
 
 Hermetic: pure config dataclasses (``SimpleNamespace``) and dicts — no model
 load, no network.
@@ -28,25 +32,30 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_mlx.kv_estimation import KVFootprintEstimate, estimate_kv_footprint
+from vllm_mlx.kv_estimation import (
+    KVFootprintEstimate,
+    estimate_kv_footprint,
+    rotating_cache_slots,
+)
 
-
-def _uniform(num_layers: int, kv_heads: int, head_dim: int, dtype_bytes: int) -> int:
-    return 2 * num_layers * kv_heads * head_dim * dtype_bytes
-
-
-# Rotating-cache capacity granularity — mirrors kv_estimation's
-# ``_ROTATING_CACHE_STEP`` / ``_ROTATING_CACHE_KEEP`` (sourced from mlx_lm's
-# ``RotatingKVCache.step = 256`` and ``make_prompt_cache(... keep=4)``). A
-# sliding-window layer reserves ``ceil((window + keep) / step) * step`` slots —
-# the step-rounded, sink-inclusive capacity — NOT the raw window.
+# Rotating-cache granularity — mirrors kv_estimation's ``_ROTATING_CACHE_STEP`` /
+# ``_ROTATING_CACHE_KEEP`` (sourced from mlx_lm's ``RotatingKVCache.step = 256``;
+# ``KEEP = 4`` is the largest ``keep`` any shipped construction uses, so the slot
+# count is an upper bound for every path).
 _STEP = 256
 _KEEP = 4
 
 
-def _slots(window: int) -> int:
-    """Step-rounded, sink-inclusive rotating-cache capacity for ``window``."""
-    return ((window + _KEEP + _STEP - 1) // _STEP) * _STEP
+def _slots(window: int, tokens: int) -> int:
+    """Reference re-implementation of ``rotating_cache_slots`` for assertions."""
+    if window <= 0 or tokens <= 0:
+        return 0
+    effective = min(tokens, window) + _KEEP
+    return ((effective + _STEP - 1) // _STEP) * _STEP
+
+
+def _uniform(num_layers: int, kv_heads: int, head_dim: int, dtype_bytes: int) -> int:
+    return 2 * num_layers * kv_heads * head_dim * dtype_bytes
 
 
 def _est(cfg, *, num_layers, kv_heads, head_dim, dtype_bytes=2) -> KVFootprintEstimate:
@@ -60,29 +69,85 @@ def _est(cfg, *, num_layers, kv_heads, head_dim, dtype_bytes=2) -> KVFootprintEs
     )
 
 
+class TestRotatingCacheSlots:
+    """The per-request slot count: an over-count-safe, sublinear upper bound."""
+
+    def test_reference_agreement(self):
+        for window, tokens in [(4096, 1), (128, 10_000), (500, 9_999), (256, 300)]:
+            assert rotating_cache_slots(window, tokens) == _slots(window, tokens)
+
+    def test_zero_window_or_tokens_is_zero(self):
+        assert rotating_cache_slots(0, 100) == 0
+        assert rotating_cache_slots(128, 0) == 0
+        assert rotating_cache_slots(0, 0) == 0
+
+    def test_short_request_far_below_full_window(self):
+        # T=1 against a 4096 window rounds up (1 + keep) to ONE step block, not
+        # the whole window — the codex-flagged over-count of short requests.
+        assert rotating_cache_slots(4096, 1) == 256
+        full = rotating_cache_slots(4096, 4096)
+        assert full > 256  # short request charged far less than the full window
+
+    def test_caps_at_full_window_for_long_request(self):
+        window = 128
+        full = rotating_cache_slots(window, window)  # ceil((128+4)/256)*256 = 256
+        assert full == 256
+        for tokens in (window, window + 1, 10_000, 1_000_000):
+            assert rotating_cache_slots(window, tokens) == full  # flat past window
+
+    def test_monotonic_non_decreasing_in_tokens(self):
+        window = 4096
+        prev = -1
+        for tokens in range(1, 6000, 37):
+            slots = rotating_cache_slots(window, tokens)
+            assert slots >= prev
+            prev = slots
+
+    def test_is_upper_bound_of_real_buffer(self):
+        # The real RotatingKVCache buffer after t tokens is
+        # ``min(ceil(t/step)*step, max_size)`` (decode path). Our slot count adds
+        # ``keep`` before rounding, so it is >= that real buffer for every t.
+        window = 1000
+        for tokens in (1, 100, 256, 257, 999, 1000, 1001, 5000):
+            real = min(((tokens + _STEP - 1) // _STEP) * _STEP, window)
+            assert rotating_cache_slots(window, tokens) >= real
+
+    def test_step_aligned_multiples(self):
+        # ceil((min(T,window)+keep)/step)*step is always a multiple of step and
+        # >= min(T,window)+keep.
+        for window, tokens in [(500, 5000), (513, 5000), (128, 50), (256, 256)]:
+            slots = rotating_cache_slots(window, tokens)
+            assert slots % _STEP == 0
+            assert slots >= min(tokens, window) + _KEEP
+
+
 class TestDenseFallback:
     """Anything not a recognized hybrid stays byte-identical to uniform."""
 
-    def test_dense_config_is_byte_identical(self):
-        # No layer_types, no sliding_window, no num_kv_shared_layers.
-        cfg = SimpleNamespace(num_hidden_layers=32, num_key_value_heads=8, head_dim=128)
-        est = _est(cfg, num_layers=32, kv_heads=8, head_dim=128)
-        assert est.per_token_growth_bytes == _uniform(32, 8, 128, 2)
+    def _assert_byte_identical(self, est, num_layers, kv, hd, dtype_bytes=2):
+        assert est.per_token_growth_bytes == _uniform(num_layers, kv, hd, dtype_bytes)
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
+        assert est.sliding_window == 0
+
+    def test_dense_config_is_byte_identical(self):
+        cfg = SimpleNamespace(num_hidden_layers=32, num_key_value_heads=8, head_dim=128)
+        self._assert_byte_identical(
+            _est(cfg, num_layers=32, kv_heads=8, head_dim=128), 32, 8, 128
+        )
 
     def test_sliding_window_without_layer_types_falls_back(self):
         # Mistral-like: a global ``sliding_window`` field but NO per-layer
-        # ``layer_types``. We must NOT treat every layer as sliding (that would
-        # zero the per-token growth) — ambiguous → uniform.
+        # ``layer_types``. Ambiguous → uniform, no sliding term.
         cfg = SimpleNamespace(
             num_hidden_layers=32,
             num_key_value_heads=8,
             head_dim=128,
             sliding_window=4096,
         )
-        est = _est(cfg, num_layers=32, kv_heads=8, head_dim=128)
-        assert est.per_token_growth_bytes == _uniform(32, 8, 128, 2)
-        assert est.fixed_baseline_bytes == 0
+        self._assert_byte_identical(
+            _est(cfg, num_layers=32, kv_heads=8, head_dim=128), 32, 8, 128
+        )
 
     def test_wrong_length_layer_types_falls_back(self):
         cfg = SimpleNamespace(
@@ -91,9 +156,9 @@ class TestDenseFallback:
             head_dim=128,
             layer_types=["full_attention"] * 30,  # len != num_layers
         )
-        est = _est(cfg, num_layers=32, kv_heads=8, head_dim=128)
-        assert est.per_token_growth_bytes == _uniform(32, 8, 128, 2)
-        assert est.fixed_baseline_bytes == 0
+        self._assert_byte_identical(
+            _est(cfg, num_layers=32, kv_heads=8, head_dim=128), 32, 8, 128
+        )
 
     def test_non_string_layer_types_falls_back(self):
         cfg = SimpleNamespace(
@@ -102,13 +167,11 @@ class TestDenseFallback:
             head_dim=128,
             layer_types=[0, 1, 2, 3],  # not strings
         )
-        est = _est(cfg, num_layers=4, kv_heads=8, head_dim=128)
-        assert est.per_token_growth_bytes == _uniform(4, 8, 128, 2)
-        assert est.fixed_baseline_bytes == 0
+        self._assert_byte_identical(
+            _est(cfg, num_layers=4, kv_heads=8, head_dim=128), 4, 8, 128
+        )
 
     def test_zero_base_dims_returns_uniform(self):
-        # Defensive: the scheduler never calls us with 0 uniform, but the
-        # estimator must not crash / invent an estimate on degenerate input.
         cfg = SimpleNamespace(num_hidden_layers=0)
         est = estimate_kv_footprint(
             cfg,
@@ -120,10 +183,13 @@ class TestDenseFallback:
         )
         assert est.per_token_growth_bytes == 0
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
+        assert est.sliding_window == 0
 
 
 class TestKVSharing:
-    """Gemma-4 / Gemma-3n ``num_kv_shared_layers`` borrower layers = 0 KV."""
+    """Gemma-4 / Gemma-3n ``num_kv_shared_layers`` borrowers = 0 KV, validated
+    against the EXACT per-index producer map (codex round 11 BLOCKING #2)."""
 
     def test_shared_layers_reduce_growth_exactly(self):
         # 35 layers, all full-attention, last 20 borrow → 15 producers grow.
@@ -138,11 +204,11 @@ class TestKVSharing:
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * (n - n_shared) * kv * hd * 2
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
     def test_shared_layers_without_layer_types_falls_back(self):
-        # num_kv_shared_layers alone (no per-layer map) is NOT enough to zero
-        # borrowers — without layer_types we cannot verify the last-N contract,
-        # so we stay on the uniform estimate (codex round 1 BLOCKING #3).
+        # num_kv_shared_layers alone (no per-layer map) can't verify the borrower
+        # map, so we stay on uniform (codex round 1 BLOCKING #3).
         n, n_shared, kv, hd = 40, 10, 4, 64
         cfg = SimpleNamespace(
             num_hidden_layers=n,
@@ -153,33 +219,68 @@ class TestKVSharing:
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
-    def test_shared_layers_with_unverifiable_split_not_zeroed(self):
-        # num_kv_shared_layers present WITH layer_types, but the last-N borrower
-        # types have no same-type producer below the split (a full-attention
-        # borrower with only sliding producers) → the last-N contract is
-        # unverified, so no layer is zeroed (over-count, never under-count).
-        n, n_shared, kv, hd = 10, 3, 4, 64
-        # First 7 (producers) all sliding; last 3 (borrowers) full → a full
-        # borrower has no full producer below the split.
-        layer_types = ["sliding_attention"] * 7 + ["full_attention"] * 3
+    def test_codex_example_all_borrowers_validly_mapped_are_zeroed(self):
+        # Codex round 11's counterexample: producers ``[full, sliding, full]``,
+        # borrowers ``[full, full, sliding]``. Under the SHIPPED type-keyed map
+        # (``models/gemma4_vendored/language.py``: each borrower reuses the LAST
+        # same-type producer below the split) EVERY borrower here has a same-type
+        # producer — full→idx2, full→idx2, sliding→idx1 — so zeroing all three is
+        # CORRECT, not a mis-sourced mapping. Remaining charged: the 3 producers
+        # (2 full grow per token, 1 sliding contributes a slot term).
+        n, kv, hd, window = 6, 1, 64, 128
+        layer_types = [
+            "full_attention",
+            "sliding_attention",
+            "full_attention",  # producers 0..2
+            "full_attention",
+            "full_attention",
+            "sliding_attention",  # borrowers 3..5
+        ]
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
             head_dim=hd,
             layer_types=layer_types,
-            num_kv_shared_layers=n_shared,
-            sliding_window=128,
+            num_kv_shared_layers=3,
+            sliding_window=window,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # Nothing zeroed: 3 full layers grow unbounded, 7 sliding layers reserve
-        # their whole rotating-cache buffer (all 10 layers counted, none borrowed).
-        assert est.per_token_growth_bytes == 2 * 3 * kv * hd * 2
-        assert est.fixed_baseline_bytes == 2 * 7 * _slots(128) * kv * hd * 2
+        assert est.per_token_growth_bytes == 2 * 2 * kv * hd * 2  # idx0, idx2 full
+        assert est.sliding_slot_bytes == 1 * 2 * kv * hd * 2  # idx1 sliding producer
+        assert est.sliding_window == window
+        assert est.fixed_baseline_bytes == 0
+
+    def test_orphan_borrower_type_is_charged_not_zeroed(self):
+        # The per-index map DIVERGES from a plain set check here: producers are
+        # all ``full`` (idx0,1), borrowers are ``full`` (idx2) and ``sliding``
+        # (idx3). The full borrower maps to a same-type producer → zeroed; the
+        # sliding borrower has NO sliding producer below the split → it is NOT
+        # zeroed but charged its own (sliding) footprint. A set-subset test would
+        # instead refuse to zero ANYTHING; the exact per-index map correctly
+        # zeroes the mappable borrower and charges only the orphan.
+        n, kv, hd, window = 4, 1, 64, 128
+        layer_types = [
+            "full_attention",
+            "full_attention",  # producers 0..1
+            "full_attention",  # borrower 2 → maps to a full producer → zeroed
+            "sliding_attention",  # borrower 3 → orphan → charged as sliding
+        ]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            num_kv_shared_layers=2,
+            sliding_window=window,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        assert est.per_token_growth_bytes == 2 * 2 * kv * hd * 2  # idx0, idx1 full
+        assert est.sliding_slot_bytes == 1 * 2 * kv * hd * 2  # idx3 orphan charged
+        assert est.sliding_window == window
 
     def test_zero_shared_is_not_a_hybrid_signal(self):
-        # num_kv_shared_layers=0 (dense Gemma-4 12B/26B/31B) → no reduction,
-        # uniform fallback.
         cfg = SimpleNamespace(
             num_hidden_layers=32,
             num_key_value_heads=8,
@@ -189,12 +290,13 @@ class TestKVSharing:
         est = _est(cfg, num_layers=32, kv_heads=8, head_dim=128)
         assert est.per_token_growth_bytes == _uniform(32, 8, 128, 2)
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
 
 class TestSlidingWindow:
-    """GPT-OSS ~50% sliding-window layers are window-bounded, not per-token."""
+    """GPT-OSS ~50% sliding layers → a request-dependent slot term, not growth."""
 
-    def test_half_sliding_halves_growth_and_reserves_whole_window(self):
+    def test_half_sliding_halves_growth_and_exposes_slot_term(self):
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -209,33 +311,17 @@ class TestSlidingWindow:
         n_sliding = n // 2
         # Only the full layers grow unbounded per token — halved vs uniform.
         assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
-        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2) // 2  # halved
-        # Sliding layers reserve their WHOLE rotating-cache buffer once per
-        # sequence — the step-rounded, sink-inclusive capacity, an over-count-safe
-        # upper bound on the real RotatingKVCache (codex round 10 BLOCKING).
-        assert est.fixed_baseline_bytes == 2 * n_sliding * _slots(window) * kv * hd * 2
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2) // 2
+        # Sliding layers contribute a per-SLOT term (one slot's bytes across all
+        # sliding layers) plus the shared window — NOT a fixed whole-window
+        # baseline (codex round 11 BLOCKING #1).
+        assert est.sliding_slot_bytes == 2 * n_sliding * kv * hd * 2
+        assert est.sliding_window == window
+        assert est.fixed_baseline_bytes == 0
 
-    def test_projection_below_uniform_for_long_generation(self):
-        # The reduction: for a long generation the arch-aware projection (halved
-        # per-token growth + a bounded window baseline) stays well below the
-        # uniform per-token over-count that keeps multiplying by every token.
-        n, kv, hd, window = 24, 8, 64, 128
-        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
-        cfg = SimpleNamespace(
-            num_hidden_layers=n,
-            num_key_value_heads=kv,
-            head_dim=hd,
-            layer_types=layer_types,
-            sliding_window=window,
-        )
-        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        tokens = 8192  # >> window
-        projected = est.fixed_baseline_bytes + est.per_token_growth_bytes * tokens
-        assert projected < _uniform(n, kv, hd, 2) * tokens
-
-    def test_sliding_without_window_charged_as_full_growth(self):
-        # A sliding layer whose window is unreadable cannot be bounded → it is
-        # charged as full-growth so we never under-count.
+    def test_sliding_without_window_folds_into_full_growth(self):
+        # A sliding layer whose window is unreadable cannot be bounded → folded
+        # into full per-token growth; no sliding term is advertised.
         n, kv, hd = 24, 8, 64
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -247,70 +333,29 @@ class TestSlidingWindow:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.sliding_slot_bytes == 0
+        assert est.sliding_window == 0
         assert est.fixed_baseline_bytes == 0
 
-    def test_non_step_aligned_window_rounds_up_to_capacity(self):
-        # The real RotatingKVCache does NOT allocate exactly ``window`` slots: it
-        # grows the buffer in step=256 increments and retains keep=4 sinks above
-        # the window, so a window of 500 charges ceil((500+4)/256)*256 = 512
-        # slots — STRICTLY MORE than the raw 500 (codex round 10 BLOCKING: the
-        # whole-window figure still under-counts the block-rounded, sink-retaining
-        # allocation).
-        n, kv, hd, window = 8, 4, 64, 500
-        layer_types = ["sliding_attention"] * n
+    def test_all_sliding_has_zero_per_token_growth(self):
+        n, kv, hd, window = 8, 4, 64, 256
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
             head_dim=hd,
-            layer_types=layer_types,
+            layer_types=["sliding_attention"] * n,
             sliding_window=window,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        slots = _slots(window)
-        assert slots == 512
-        # Capacity property: at least window+keep, and a whole multiple of step.
-        assert slots >= window + _KEEP
-        assert slots % _STEP == 0
-        # Charged at the rounded-up capacity, strictly greater than the raw window.
         assert est.per_token_growth_bytes == 0
-        assert est.fixed_baseline_bytes == 2 * n * slots * kv * hd * 2
-        assert est.fixed_baseline_bytes > 2 * n * window * kv * hd * 2
-
-    def test_step_aligned_multi_block_window_rounds_to_768(self):
-        # A window whose (window + keep) crosses into the THIRD step block rounds
-        # up to 768 slots: ceil((513 + 4) / 256) * 256 = ceil(517/256)*256 =
-        # 3*256 = 768. Confirms the round-up spans multiple step blocks, not just
-        # a single-block nudge.
-        n, kv, hd, window = 8, 4, 64, 513
-        layer_types = ["sliding_attention"] * n
-        cfg = SimpleNamespace(
-            num_hidden_layers=n,
-            num_key_value_heads=kv,
-            head_dim=hd,
-            layer_types=layer_types,
-            sliding_window=window,
-        )
-        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        slots = _slots(window)
-        assert slots == 768
-        assert slots >= window + _KEEP
-        assert slots % _STEP == 0
-        assert est.fixed_baseline_bytes == 2 * n * slots * kv * hd * 2
-        assert est.fixed_baseline_bytes > 2 * n * window * kv * hd * 2
+        assert est.sliding_slot_bytes == 2 * n * kv * hd * 2
+        assert est.sliding_window == window
 
 
 class TestRecurrent:
-    """Qwen3.5/3.6 GatedDeltaNet layers have zero PER-TOKEN growth.
+    """Qwen3.5/3.6 GatedDeltaNet layers have zero PER-TOKEN growth; their fixed
+    state lands in the token-independent baseline (never the sliding term)."""
 
-    Their fixed recurrent state does not grow with generated tokens, so it lands
-    in the per-sequence baseline (sized from GatedDeltaNet's real config fields)
-    rather than the per-token term. Any recurrent family we do NOT size exactly
-    (Mamba/Mamba2, RWKV, generic) falls back to full per-token growth so it is
-    never left unreserved (codex round 2 BLOCKING #1 + round 7 BLOCKING #1).
-    """
-
-    # GatedDeltaNet state, sized from the same fields as
-    # ``mlx_lm.models.qwen3_next.Qwen3NextGatedDeltaNet``, at fp32/element.
     _GDN_FIELDS = dict(
         linear_num_value_heads=32,
         linear_num_key_heads=16,
@@ -330,8 +375,6 @@ class TestRecurrent:
         return 4 * (recurrent + conv_state)
 
     def test_gateddeltanet_state_reserved_in_baseline_zero_growth(self):
-        # 48 layers, 3:1 linear:full → only the 12 full layers grow per token;
-        # the 36 GatedDeltaNet layers reserve their fixed state in the baseline.
         n, kv, hd = 48, 2, 128
         pattern = ["linear_attention"] * 3 + ["full_attention"]
         layer_types = pattern * (n // 4)
@@ -347,18 +390,14 @@ class TestRecurrent:
         n_recurrent = n - n_full
         assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
         assert est.fixed_baseline_bytes == n_recurrent * self._gdn_state_bytes()
+        assert est.sliding_slot_bytes == 0
+        assert est.sliding_window == 0
 
     @pytest.mark.parametrize(
         "gdn_type",
         ["linear_attention", "gated_delta_net", "gated_deltanet"],
     )
     def test_gateddeltanet_aliases_all_sized(self, gdn_type):
-        # Every GatedDeltaNet alias the classifier treats as recurrent must ALSO
-        # route to the GatedDeltaNet sizer — otherwise the alias classifies as
-        # zero-growth but its state cannot be sized, reverting to full per-token
-        # growth and losing the reduction this module exists to deliver (codex
-        # round 5 BLOCKING). All three spellings must yield the identical zero
-        # per-token growth + baseline-reserved fixed state.
         n, kv, hd = 8, 4, 64
         layer_types = [gdn_type] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
@@ -369,15 +408,11 @@ class TestRecurrent:
             **self._GDN_FIELDS,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # Only the single full layer grows per token; the recurrent layers reserve
-        # their fixed state in the baseline (never full per-token growth).
         assert est.per_token_growth_bytes == 2 * 1 * kv * hd * 2
         assert est.fixed_baseline_bytes == (n - 1) * self._gdn_state_bytes()
+        assert est.sliding_slot_bytes == 0
 
     def test_unsizeable_recurrent_falls_back_to_full_growth(self):
-        # linear_attention layers WITHOUT any GatedDeltaNet/Mamba sizing fields
-        # → cannot size the state → charged the uniform per-token estimate
-        # (full growth), never left unreserved.
         n, kv, hd = 8, 4, 64
         layer_types = ["linear_attention"] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
@@ -387,17 +422,11 @@ class TestRecurrent:
             layer_types=layer_types,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # All 8 layers charged full growth (uniform) — no reduction, no baseline.
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
     def test_mamba_not_sized_falls_back_to_full_growth(self):
-        # We deliberately do NOT size a Mamba/Mamba2 state: the conv buffer
-        # channel count differs between Mamba1 (d_inner) and Mamba2 (d_inner +
-        # grouped B/C channels), so a single formula would under-reserve Mamba2
-        # (codex round 7 BLOCKING #1). This engine ships no Mamba model, so its
-        # layers conservatively fall back to full per-token growth — over-count
-        # safe, never unreserved — even when Mamba-shaped fields are present.
         n, kv, hd = 8, 4, 64
         layer_types = ["mamba"] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
@@ -411,15 +440,11 @@ class TestRecurrent:
             mamba_d_head=64,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # All 8 layers charged full growth — no baseline, no under-count.
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
     def test_gateddeltanet_missing_conv_kernel_falls_back(self):
-        # GatedDeltaNet head fields present but linear_conv_kernel_dim ABSENT →
-        # cannot size the conv buffer → the whole layer falls back to full
-        # growth rather than silently omitting the conv state (codex round 3
-        # BLOCKING #1).
         n, kv, hd = 8, 4, 64
         layer_types = ["linear_attention"] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
@@ -438,9 +463,6 @@ class TestRecurrent:
         assert est.fixed_baseline_bytes == 0
 
     def test_full_attention_name_containing_linear_is_not_recurrent(self):
-        # Exact-match allowlist (codex round 1 BLOCKING #4): an unfamiliar
-        # full-attention type that merely CONTAINS "linear"/"gated"/"local" must
-        # NOT be misread as zero-growth — it is charged as full-growth.
         n, kv, hd = 6, 4, 64
         cfg = SimpleNamespace(
             num_hidden_layers=n,
@@ -451,12 +473,9 @@ class TestRecurrent:
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
     def test_generic_recurrent_family_not_mis_sized(self):
-        # An RWKV (or other generic recurrent) layer that incidentally exposes
-        # Mamba-ish generic fields must NOT be stamped with a bogus fixed state —
-        # only GatedDeltaNet is sized; every other recurrent family falls back to
-        # full growth (codex round 4 BLOCKING #2 + round 7 BLOCKING #1).
         n, kv, hd = 8, 4, 64
         layer_types = ["rwkv"] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
@@ -464,21 +483,20 @@ class TestRecurrent:
             num_key_value_heads=kv,
             head_dim=hd,
             layer_types=layer_types,
-            # generic fields a naive recurrent sizer might otherwise consume:
             state_size=128,
             intermediate_size=1536,
             conv_kernel_size=4,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # No baseline reserved (only GatedDeltaNet is sized); all layers full.
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
 
 class TestHybridDimsAndNesting:
     def test_global_head_dim_used_for_full_layers(self):
-        # Realistic Gemma-4 text: 35 layers, 4:1 sliding:full pattern, last 20
-        # borrow, full layers use the wider global_head_dim/global kv heads.
+        # Realistic Gemma-4 text: 35 layers, 4:1 sliding:full, last 20 borrow,
+        # full layers use the wider global_head_dim/global kv heads.
         n, n_shared, kv, hd = 35, 20, 1, 256
         global_hd, global_kv, window = 512, 1, 512
         layer_types = (["sliding_attention"] * 4 + ["full_attention"]) * (n // 5)
@@ -496,12 +514,12 @@ class TestHybridDimsAndNesting:
         # Producers = first 15 layers. Full at indices 4, 9, 14 → 3 full,
         # 12 sliding. Borrowers (last 20) contribute nothing.
         assert est.per_token_growth_bytes == 2 * 3 * global_kv * global_hd * 2
-        # Sliding layers use local dims; whole rotating-cache capacity reserved.
-        assert est.fixed_baseline_bytes == 12 * 2 * _slots(window) * kv * hd * 2
+        # Sliding layers use local dims for the per-slot term.
+        assert est.sliding_slot_bytes == 12 * 2 * kv * hd * 2
+        assert est.sliding_window == window
+        assert est.fixed_baseline_bytes == 0
 
     def test_layer_structure_read_from_text_config(self):
-        # Multimodal configs nest the language layer structure under
-        # ``text_config``; the estimator must find it there.
         n, kv, hd, window = 24, 8, 64, 128
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -514,7 +532,8 @@ class TestHybridDimsAndNesting:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.fixed_baseline_bytes == 2 * (n // 2) * _slots(window) * kv * hd * 2
+        assert est.sliding_slot_bytes == 2 * (n // 2) * kv * hd * 2
+        assert est.sliding_window == window
 
     def test_dict_config_supported(self):
         # The offline hybrid probe reads parsed config.json dicts.
@@ -529,10 +548,10 @@ class TestHybridDimsAndNesting:
         }
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == 2 * (n // 2) * kv * hd * 2
-        assert est.fixed_baseline_bytes == 2 * (n // 2) * _slots(window) * kv * hd * 2
+        assert est.sliding_slot_bytes == 2 * (n // 2) * kv * hd * 2
+        assert est.sliding_window == window
 
     def test_unknown_layer_type_charged_as_full_growth(self):
-        # An unrecognized attention-type string must never under-count → full.
         n, kv, hd = 4, 8, 128
         cfg = SimpleNamespace(
             num_hidden_layers=n,
@@ -542,21 +561,28 @@ class TestHybridDimsAndNesting:
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.sliding_slot_bytes == 0
         assert est.fixed_baseline_bytes == 0
 
 
 class TestNeverUnderCounts:
-    """The projected footprint is always >= the true counted-layer footprint."""
+    """The per-request projection is always >= the true counted-layer footprint,
+    at every token count — and never over-counts a short request past the full
+    window."""
+
+    def _project(self, est, tokens):
+        return (
+            est.fixed_baseline_bytes
+            + est.per_token_growth_bytes * tokens
+            + est.sliding_slot_bytes * rotating_cache_slots(est.sliding_window, tokens)
+        )
 
     def test_projection_upper_bounds_true_footprint(self):
-        # GPT-OSS-like hybrid. The scheduler projection
-        #   fixed_baseline + tokens * per_token_growth
-        # must be >= the true footprint of the counted layers for ANY token
-        # count, since that is the D-METAL-CAP never-under-count guarantee:
-        #   full layers: exact tokens*per-layer
-        #   sliding layers: min(tokens, window)*per-layer  (<= slots*per-layer,
-        #                   the step-rounded rotating-cache capacity reserved in
-        #                   the baseline, where slots >= window)
+        # GPT-OSS-like hybrid. For ANY token count the projection must be >= the
+        # true footprint of the counted layers:
+        #   full layers: exact tokens × per-layer
+        #   sliding layers: min(tokens, window) × per-layer  (real buffer ≤ this,
+        #                   rounded up to step blocks — bounded by our slot count)
         n, kv, hd, window, db = 24, 8, 64, 128, 2
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -569,19 +595,52 @@ class TestNeverUnderCounts:
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
         n_full = n // 2
         n_sliding = n // 2
-        full_per_layer = 2 * kv * hd * db
+        per_layer = 2 * kv * hd * db
         for tokens in (1, 100, window, window + 1, 4096, 32768):
-            projected = est.fixed_baseline_bytes + tokens * est.per_token_growth_bytes
-            true_full = n_full * tokens * full_per_layer
-            true_sliding = n_sliding * min(tokens, window) * full_per_layer
-            # Over-count-safe: the whole-window baseline is >= any decode/prefill
-            # peak of the sliding layers, so the projection never under-counts.
+            projected = self._project(est, tokens)
+            true_full = n_full * tokens * per_layer
+            true_sliding = n_sliding * min(tokens, window) * per_layer
             assert projected >= true_full + true_sliding
 
+    def test_short_request_not_over_charged_full_window(self):
+        # The codex round 11 win: a SHORT request (T=1) against a big window is
+        # NOT charged the whole window. Its sliding term is one step block, far
+        # below what a fixed whole-window baseline would have charged.
+        n, kv, hd, window, db = 8, 4, 64, 4096, 2
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=["sliding_attention"] * n,
+            sliding_window=window,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
+        short = self._project(est, 1)
+        full_window = est.sliding_slot_bytes * rotating_cache_slots(window, window)
+        assert short == est.sliding_slot_bytes * 256  # one step block
+        assert short < full_window  # strictly less than the whole-window charge
+
+    def test_monotonic_and_capped_projection(self):
+        n, kv, hd, window, db = 8, 4, 64, 512, 2
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=["sliding_attention", "full_attention"] * (n // 2),
+            sliding_window=window,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
+        # The sliding CONTRIBUTION alone is monotonic non-decreasing and caps at
+        # the full-window buffer.
+        cap = est.sliding_slot_bytes * rotating_cache_slots(window, window)
+        prev = -1
+        for tokens in (1, 200, 511, 512, 513, 5000):
+            slide = est.sliding_slot_bytes * rotating_cache_slots(window, tokens)
+            assert slide >= prev
+            assert slide <= cap
+            prev = slide
+
     def test_full_layer_growth_never_below_uniform_base(self):
-        # A pathological config where global_head_dim / num_global_key_value_heads
-        # are SMALLER than the base dims must not shrink full-layer per-token
-        # growth below the uniform base-layer charge (codex round 4 BLOCKING #1).
         n, kv, hd, db = 8, 8, 128, 2
         cfg = SimpleNamespace(
             num_hidden_layers=n,
@@ -592,36 +651,28 @@ class TestNeverUnderCounts:
             num_global_key_value_heads=1,  # << base kv heads
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
-        # Clamped to the uniform base-layer size, not the tiny global dims.
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, db)
-        assert est.fixed_baseline_bytes == 0
+        assert est.sliding_slot_bytes == 0
 
-    def test_sliding_rate_never_below_uniform_base(self):
-        # Symmetric to the full-layer clamp: a nested/malformed config whose
-        # local (sliding) dims read SMALLER than the base dims the scheduler used
-        # must not shrink the sliding per-layer rate below the uniform per-layer
-        # charge (codex round 7 BLOCKING #2). Here the struct exposes a tiny
-        # local head_dim; the base head_dim passed by the caller is larger, so
-        # the whole-window baseline is computed at the clamped (base) rate.
+    def test_sliding_slot_rate_never_below_uniform_base(self):
+        # A nested/malformed config whose local (sliding) dims read SMALLER than
+        # the base dims must not shrink the per-slot rate below the uniform
+        # per-layer charge (codex round 7 BLOCKING #2).
         n, kv, hd, db, window = 8, 8, 128, 2, 256
-        layer_types = ["sliding_attention"] * n
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
             head_dim=8,  # << base head_dim (128) — malformed / non-authoritative
-            layer_types=layer_types,
+            layer_types=["sliding_attention"] * n,
             sliding_window=window,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
-        # Whole-capacity baseline at the clamped base per-layer rate, not the tiny
-        # local dims (which would under-count). Capacity = step-rounded slots.
-        assert est.fixed_baseline_bytes == n * _slots(window) * 2 * kv * hd * db
+        # Per-slot term at the clamped base per-layer rate, not the tiny local
+        # dims (which would under-count).
+        assert est.sliding_slot_bytes == n * 2 * kv * hd * db
         assert est.per_token_growth_bytes == 0
 
     def test_projection_covers_recurrent_fixed_state(self):
-        # A GatedDeltaNet hybrid: the projection must reserve the recurrent
-        # layers' fixed state (in the baseline) on top of the full layers'
-        # growth — it is never omitted (codex round 2 BLOCKING #1 + #3).
         n, kv, hd, db = 16, 2, 128, 2
         gdn = dict(
             linear_num_value_heads=32,
@@ -641,13 +692,11 @@ class TestNeverUnderCounts:
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
         n_full = n // 4
         n_recurrent = n - n_full
-        # Per-layer GatedDeltaNet state (fp32/element), independently recomputed.
         key_dim = 16 * 128
         value_dim = 32 * 128
         state = 4 * (32 * 128 * 128 + (4 - 1) * (2 * key_dim + value_dim))
         assert est.fixed_baseline_bytes == n_recurrent * state
         full_per_layer = 2 * kv * hd * db
         for tokens in (1, 100, 4096, 32768):
-            projected = est.fixed_baseline_bytes + tokens * est.per_token_growth_bytes
-            # >= full-attention growth + the reserved recurrent fixed state.
+            projected = self._project(est, tokens)
             assert projected >= n_full * tokens * full_per_layer + n_recurrent * state

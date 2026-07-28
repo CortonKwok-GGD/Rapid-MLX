@@ -32,25 +32,30 @@ This module computes an accurate footprint by classifying each layer:
 ``per_token_growth_bytes``
     ``2 * dtype_bytes * Σ (kv_heads_L * head_dim_L)`` over ONLY the
     full-attention (unbounded per-token-growing) layers, honoring per-layer /
-    global dims when the architecture is hybrid.
+    global dims when the architecture is hybrid. Multiplied by
+    ``T = prompt_tokens + max_tokens`` in the projection.
+
+``sliding_slot_bytes`` + ``sliding_window``
+    The sliding-window layers grow SUBLINEARLY: up to a rotating window, then
+    flat. ``sliding_slot_bytes`` is the per-SLOT bytes summed over the
+    window-bounded sliding layers (``2 * dtype_bytes * Σ_sliding (kv_heads_L *
+    head_dim_L)``); the scheduler multiplies it by the per-request slot count
+    ``rotating_cache_slots(sliding_window, T)`` — an over-count-safe UPPER BOUND
+    of the real ``mlx_lm`` ``RotatingKVCache`` allocation that grows with ``T``
+    up to ``ceil((window + keep) / step) * step`` (``step=256``, ``keep=4``) and
+    then caps. Modelling this per request keeps it >= the true allocation at
+    every ``T`` (never OOM) yet <= the full window (a short request is not
+    over-charged the whole buffer). See :func:`rotating_cache_slots`.
 
 ``fixed_baseline_bytes``
-    Charged once per sequence, independent of the token budget:
-    ``2 * dtype_bytes * Σ_sliding (slots * kv_heads_L * head_dim_L)`` — the WHOLE
-    rotating-cache buffer of each sliding-window layer, where ``slots`` is the
-    real ``mlx_lm`` ``RotatingKVCache`` capacity: ``window`` plus its retained
-    sink positions, rounded UP to the buffer's step granularity
-    (``ceil((window + keep) / step) * step`` with ``step=256``, ``keep=4``). That
-    step-rounded, sink-inclusive capacity is an over-count-safe upper bound on the
-    actual buffer (the cache grows in block increments and keeps sinks above the
-    window, so it can exceed the raw window) — plus the conservative fixed
-    recurrent state of each sizeable recurrent layer. Even at whole capacity this
-    is a massive reduction vs unbounded per-token growth, because the window is
-    bounded (e.g. 512-4096) while generation is not.
+    Charged once per sequence, independent of the token budget: the conservative
+    fixed recurrent state of each sizeable recurrent (GatedDeltaNet) layer. Zero
+    for a dense model and for a hybrid without recurrent layers.
 
-Borrower (KV-sharing) layers contribute 0 to both terms. Sliding-window and
-recurrent layers contribute 0 to per-token growth; their worst-case allocation
-is reserved in the baseline instead (see safety point 2).
+Borrower (KV-sharing) layers contribute 0 to all terms. Sliding-window and
+recurrent layers contribute 0 to per-token growth; a sliding layer's footprint
+is charged per request via the slot term, a recurrent layer's via the fixed
+baseline (see safety point 2).
 
 Safety contract (this feeds a codex-hardened, over-estimate-safe admission
 path — see ``scheduler._resolve_kv_bytes_per_token``):
@@ -59,39 +64,41 @@ path — see ``scheduler._resolve_kv_bytes_per_token``):
    ``layer_types`` list whose length matches ``num_hidden_layers``. When that is
    absent, or anything is ambiguous, the estimator returns the caller's uniform
    figure unchanged (``per_token_growth_bytes == uniform_per_token_bytes`` and
-   ``fixed_baseline_bytes == 0``) so dense models (Llama/Qwen dense) and
-   unknown/stub configs stay BYTE-IDENTICAL to the historical behavior. Only a
-   recognized hybrid gets the smaller accurate number. ``num_kv_shared_layers``
-   is NOT sufficient on its own — the per-layer map must confirm the borrower
-   split (see point 3).
+   ``fixed_baseline_bytes == sliding_slot_bytes == sliding_window == 0``) so dense
+   models (Llama/Qwen dense) and unknown/stub configs stay BYTE-IDENTICAL to the
+   historical behavior. Only a recognized hybrid gets the smaller accurate
+   number. ``num_kv_shared_layers`` is NOT sufficient on its own — the per-layer
+   map must confirm the borrower split (see point 3).
 2. **Never under-count the counted layers (over-count-safe throughout).** The
    load-bearing guarantee for the D-METAL-CAP cliff is that the projected
    footprint is >= the true footprint of every counted layer, so every estimate
    errs UP. Full-attention layers are charged exactly per token; a sliding layer
    with no readable window is charged as full unbounded growth; an unrecognized
    layer-type string is charged as full growth (exact-match allowlists, no
-   substring guessing). A sliding-window layer WITH a readable window reserves
-   its WHOLE rotating-cache buffer once per sequence
-   (``2·dtype·slots·kv·head_dim`` where ``slots = ceil((window + keep) / step) *
-   step`` is the real ``RotatingKVCache`` capacity — the window rounded up to the
-   buffer's step granularity plus its retained sink positions) — an upper bound
-   on a cache that grows in block increments and keeps sinks above the window, so
-   a request is never charged less than its true sliding allocation regardless of
-   token budget or prefill length. Recurrent
-   layers genuinely have zero per-token growth; a GatedDeltaNet layer's fixed
-   state is sized from its real config fields (linear head dims + conv kernel)
-   and charged at fp32/element to stay conservative. Every other recurrent family
-   (Mamba/Mamba2, RWKV, generic) is NOT sized — its exact cache layout is not
-   modelled here — and falls back to full per-token growth rather than a possibly
-   wrong fixed state, so it is never under-reserved. The fixed baseline is
-   charged once per sequence and never scales with generated tokens.
-3. **KV-sharing only zeroes verified borrowers.** ``num_kv_shared_layers``
-   declares that the LAST N layers borrow (Gemma-4 / Gemma-3n contract). We zero
-   those borrowers only when the per-layer ``layer_types`` map confirms it —
-   every borrower attention type has a same-type producer below the split
-   (mirroring ``gemma4_text._check_kv_share_config``). If the map does not
-   confirm the last-N contract, no layer is zeroed (over-count, never
-   under-count).
+   substring guessing). A sliding-window layer WITH a readable window is charged
+   per request as ``slot_bytes × rotating_cache_slots(window, T)``, where
+   ``rotating_cache_slots`` rounds ``min(T, window) + keep`` UP to the buffer's
+   step granularity — a provable upper bound of the real ``RotatingKVCache``
+   buffer at every ``T`` (it grows in ``step`` blocks up to the window and keeps
+   ``keep`` sinks), so a request is never charged less than its true sliding
+   allocation, yet a SHORT request is not charged the whole window (which would
+   over-count and spuriously reject it). Recurrent layers genuinely have zero
+   per-token growth; a GatedDeltaNet layer's fixed state is sized from its real
+   config fields (linear head dims + conv kernel) and charged at fp32/element to
+   stay conservative. Every other recurrent family (Mamba/Mamba2, RWKV, generic)
+   is NOT sized — its exact cache layout is not modelled here — and falls back to
+   full per-token growth rather than a possibly wrong fixed state, so it is never
+   under-reserved. The fixed baseline is charged once per sequence and never
+   scales with generated tokens.
+3. **KV-sharing zeroes only borrowers with a verified same-type producer.**
+   ``num_kv_shared_layers`` declares that the LAST N layers borrow (Gemma-4 /
+   Gemma-3n contract). We reconstruct the EXACT producer→borrower index map the
+   shipped model builds (``models/gemma4_vendored/language.py``: each borrower
+   reuses the LAST same-type producer below the split) and zero a borrower ONLY
+   when that same-type producer exists. A borrower whose type has no producer
+   below the split is charged its own footprint, never zeroed (over-count, never
+   under-count) — the shipped model would fail to build such a config, so no
+   runnable request is under-reserved.
 
 The estimator is a pure function: it reads only plain fields off a config
 object (or its ``text_config``), performs no I/O, loads no weights, and is unit
@@ -148,54 +155,120 @@ _SLIDING_TYPES: frozenset[str] = frozenset(
 # ``mlx_lm.models.cache.RotatingKVCache`` implementation:
 #
 #   * ``RotatingKVCache.step = 256`` — the class attribute that sizes buffer
-#     growth: the cache grows its KV buffer in ``step``-token increments
-#     (``_update_in_place``: ``new_size = min(self.step, self.max_size - prev)``).
-#   * ``keep=4`` — ``mlx_lm.models.cache.make_prompt_cache`` constructs every
-#     rotating layer as ``RotatingKVCache(max_size=max_kv_size, keep=4)``, so the
-#     cache retains 4 sink positions in ADDITION to the rotating window.
+#     growth: the single-token decode path grows the KV buffer in ``step``-token
+#     increments up to ``max_size`` and only then rotates in place
+#     (``_update_in_place``: ``new_size = min(self.step, self.max_size - prev)``),
+#     so the live buffer after ``t`` tokens is ``min(ceil(t/step)*step, max_size)``.
+#   * ``keep`` — the number of retained sink positions. The construction path
+#     varies across the sliding models this engine serves: the vendored Gemma-4
+#     stack (``models/gemma4_vendored/language.py``) and DeepSeek-V4
+#     (``models/deepseek_v4.py``) build ``RotatingKVCache(max_size=sliding_window,
+#     keep=0)``, while ``mlx_lm.models.cache.make_prompt_cache`` (the generic
+#     factory) passes ``keep=4``. We pin ``KEEP = 4`` — the LARGEST keep any
+#     shipped path uses — so the slot estimate is a valid upper bound for every
+#     construction (more retained sinks ⇒ more slots ⇒ a looser, still-safe
+#     bound; a ``keep=0`` model is over-counted by at most a fraction of one step).
 #
-# The real per-layer capacity is therefore the ``step``-rounded size of the
-# window PLUS its sink positions, which can exceed the raw ``sliding_window``
-# figure. Grounding the sliding baseline in this capacity (rather than the raw
-# window) keeps the estimate an over-count-safe upper bound on the actual buffer
-# (codex round 10 BLOCKING: the whole-window baseline still under-counts the
-# block-rounded, sink-retaining allocation). These are the shipped defaults; if a
-# future mlx-lm changes them, update here to match the impl.
+# See :func:`rotating_cache_slots` for how these ground the per-request slot
+# count. Sourced from the shipped defaults; if a future mlx-lm changes them,
+# update here to match the impl.
 _ROTATING_CACHE_STEP = 256
 _ROTATING_CACHE_KEEP = 4
+
+
+def rotating_cache_slots(window: int, tokens: int) -> int:
+    """Upper-bound slot count a ``RotatingKVCache`` allocates for ``tokens``.
+
+    The real per-layer buffer of a sliding-window (rotating) cache is
+    SUBLINEAR in the token count: the decode path grows it in
+    ``_ROTATING_CACHE_STEP``-token blocks up to ``window`` (``max_size``) and
+    then rotates at a fixed size, retaining ``_ROTATING_CACHE_KEEP`` sink
+    positions. So the live buffer after ``t`` tokens is
+    ``min(ceil(t/step)*step, max_size)`` (verified against
+    ``mlx_lm.models.cache.RotatingKVCache._update_in_place``).
+
+    This returns a provable UPPER BOUND of that buffer for any ``tokens``::
+
+        slots(T) = ceil( (min(T, window) + KEEP) / STEP ) * STEP
+                 = min( ceil((T + KEEP)/STEP)*STEP, ceil((window + KEEP)/STEP)*STEP )
+
+    which is:
+
+    * ``>=`` the real buffer at every ``T`` (rounds UP to the step block and
+      adds the retained sinks), so the D-METAL-CAP projection never under-counts
+      the sliding allocation and trips the OOM cliff;
+    * ``<=`` the full-window buffer ``ceil((window + KEEP)/STEP)*STEP`` for every
+      ``T`` (the ``min(T, window)`` clamp), so a SHORT request is charged only
+      what it can actually grow to — not the whole window (codex round 11
+      BLOCKING #1: a fixed whole-window baseline over-counts short requests and
+      can spuriously reject a request the uniform estimator would have admitted);
+    * monotonic non-decreasing in ``T`` and flat once ``T >= window``.
+
+    Returns ``0`` when there is no window or no tokens (no sliding term).
+    """
+    if window <= 0 or tokens <= 0:
+        return 0
+    effective = min(tokens, window) + _ROTATING_CACHE_KEEP
+    blocks = (effective + _ROTATING_CACHE_STEP - 1) // _ROTATING_CACHE_STEP
+    return blocks * _ROTATING_CACHE_STEP
 
 
 @dataclass(frozen=True)
 class KVFootprintEstimate:
     """Architecture-aware KV footprint of a single sequence.
 
-    The D-METAL-CAP projection reconstructs a request's peak KV footprint as::
+    The D-METAL-CAP projection reconstructs a request's peak KV footprint,
+    per request with ``T = prompt_tokens + max_tokens``, as::
 
-        fixed_baseline_bytes + per_token_growth_bytes * (prompt_tokens + max_tokens)
+        fixed_baseline_bytes
+          + per_token_growth_bytes * T
+          + sliding_slot_bytes * rotating_cache_slots(sliding_window, T)
 
-    Only the full-attention (unbounded-growth) layers land in
-    ``per_token_growth_bytes``; every window-bounded or fixed-state layer is
-    charged its worst-case allocation ONCE in ``fixed_baseline_bytes`` so the
-    projection can never under-count and trip the D-METAL-CAP OOM cliff.
+    The three terms model the three footprint SHAPES this engine's hybrids mix:
+
+    * full-attention layers grow UNBOUNDED per token → ``per_token_growth_bytes``
+      (multiplied by ``T``);
+    * sliding-window layers grow SUBLINEARLY — up to a rotating window, then flat
+      → ``sliding_slot_bytes`` (per-slot bytes) times the per-request slot count
+      ``rotating_cache_slots(sliding_window, T)`` (grounded in the real
+      ``RotatingKVCache`` allocation; see :func:`rotating_cache_slots`);
+    * recurrent / linear-attention layers carry a FIXED state → part of
+      ``fixed_baseline_bytes`` (token-independent, charged once).
+
+    Modelling sliding layers per request — rather than as either a flat window
+    baseline (over-counts short requests, spuriously rejecting them) or unbounded
+    per-token growth (over-counts long requests) — makes the projection an
+    over-count-safe UPPER BOUND at every ``T`` while keeping the GPT-OSS/Gemma-4
+    reduction: a short request is charged only what it can grow to, a long one is
+    capped at the full rotating buffer.
 
     Attributes:
-        per_token_growth_bytes: Bytes of KV cache allocated per additional
-            token, summed over the full-attention (unbounded-growth) layers
-            only. This is the value the projection multiplies by
-            ``(prompt_tokens + max_tokens)``.
-        fixed_baseline_bytes: Bytes allocated once per sequence, independent of
-            the token budget — the WHOLE rotating-cache buffer of each
-            sliding-window layer (``2·dtype·slots·kv_heads·head_dim`` where
-            ``slots = ceil((window + keep) / step) * step`` is the real
-            ``RotatingKVCache`` capacity: the window rounded up to the buffer's
-            step granularity plus its retained sink positions, an upper bound on a
-            cache that grows in block increments and keeps sinks above the window)
-            plus the conservative fixed recurrent state of each sizeable recurrent
-            layer. Zero for a dense model and for a hybrid with neither.
+        per_token_growth_bytes: Bytes of KV cache allocated per additional token,
+            summed over the full-attention (unbounded-growth) layers only. The
+            projection multiplies this by ``T``. A sliding layer whose window is
+            unreadable is folded in here (charged as full growth) so it is never
+            silently dropped.
+        fixed_baseline_bytes: Token-independent bytes allocated once per
+            sequence — the conservative fixed recurrent state of each sizeable
+            recurrent (GatedDeltaNet) layer. Zero for a dense model and for a
+            hybrid without recurrent layers. (Sliding-window buffers are NOT here;
+            they are request-dependent — see ``sliding_slot_bytes``.)
+        sliding_slot_bytes: Bytes for ONE rotating-cache slot summed across all
+            window-bounded sliding-window layers —
+            ``Σ_sliding (2 · dtype · kv_heads_L · head_dim_L)`` (each layer clamped
+            to the uniform per-layer floor). The per-request projection multiplies
+            this by ``rotating_cache_slots(sliding_window, T)``. Zero when the
+            config has no window-bounded sliding layer.
+        sliding_window: The rotating window size (``max_size``) shared by the
+            sliding-window layers. ``0`` when there is no sliding term (dense /
+            unknown, or the window was unreadable and those layers were folded
+            into ``per_token_growth_bytes``).
     """
 
     per_token_growth_bytes: int
     fixed_baseline_bytes: int
+    sliding_slot_bytes: int
+    sliding_window: int
 
 
 def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
@@ -375,11 +448,15 @@ def estimate_kv_footprint(
 
     Returns:
         A :class:`KVFootprintEstimate`. For a non-hybrid config this is exactly
-        ``(uniform_per_token_bytes, 0)``.
+        ``(uniform_per_token_bytes, 0, 0, 0)`` — the uniform per-token figure with
+        no fixed baseline and no sliding term (byte-identical to the historical
+        ``per_tok × tokens`` projection).
     """
     uniform = KVFootprintEstimate(
         per_token_growth_bytes=uniform_per_token_bytes,
         fixed_baseline_bytes=0,
+        sliding_slot_bytes=0,
+        sliding_window=0,
     )
 
     # Guard the primitives. If the caller could not read a positive uniform
@@ -431,34 +508,45 @@ def estimate_kv_footprint(
     if layer_types is None:
         return uniform
 
-    # Borrower split: Gemma-4 / Gemma-3n reuse the LAST ``num_kv_shared_layers``
-    # decoder layers' K/V from an earlier same-type producer (split at
-    # ``num_hidden_layers - num_kv_shared_layers`` — see
-    # ``models/gemma4_text._check_kv_share_config``). We only zero those
-    # borrowers when the ACTUAL per-layer map confirms the last-N contract:
-    # every borrower attention type must have a producer of the same type below
-    # the split. If it does not (interleaved / differently-anchored sharing we
-    # do not model), we keep every layer as a producer — an over-count, never an
-    # under-count (codex round 1 BLOCKING #3).
+    # Borrower map: Gemma-4 / Gemma-3n reuse the LAST ``num_kv_shared_layers``
+    # decoder layers' K/V from an earlier producer (split at
+    # ``num_hidden_layers - num_kv_shared_layers``). We build the EXACT
+    # producer→borrower index map the shipped model builds, mirroring
+    # ``models/gemma4_vendored/language.py`` (``LanguageModel.__init__``)::
     #
-    # For FOOTPRINT purposes the set-of-types check is sufficient (and mirrors
-    # the shipped ``_check_kv_share_config`` orphan check exactly): a borrower
-    # whose attention type has ANY same-type producer below the split allocates
-    # zero KV — it reuses that producer's cache. WHICH producer index it borrows
-    # from does not change the borrower's own footprint (still zero), so a
-    # per-index source mapping would not alter this estimate.
+    #     M = num_hidden_layers - num_kv_shared_layers          # split
+    #     last_producer_by_type = {layer_types[i]: i for i in range(M)}  # last wins
+    #     previous_kvs[j] = last_producer_by_type[layer_types[j]]  (j in [M, N))
+    #
+    # so a borrower ``j`` reuses the LAST producer BELOW the split whose
+    # attention type matches its own, and allocates zero KV. We zero borrower
+    # ``j`` ONLY when such a same-type producer exists — i.e. its mapped
+    # producer's type equals its own (true by construction of the map). A
+    # borrower whose type has NO producer below the split is NOT zeroed: it is
+    # charged its own footprint (the shipped model would raise a KeyError at
+    # build time for that config, so no runnable request is ever under-reserved —
+    # over-count, never under-count). This exact per-index map supersedes the old
+    # set-subset test, which could zero a borrower without validating the actual
+    # producer it maps to (codex round 11 BLOCKING #2). If ``num_kv_shared_layers``
+    # is absent / out of range, no layer borrows.
     num_shared = _cfg_get(struct, "num_kv_shared_layers")
     if isinstance(num_shared, int) and not isinstance(num_shared, bool):
         num_shared = num_shared if 0 < num_shared < base_num_layers else 0
     else:
         num_shared = 0
+    borrowed_layers: set[int] = set()
     if num_shared > 0:
         split = base_num_layers - num_shared
-        producer_types = set(layer_types[:split])
-        borrower_types = set(layer_types[split:])
-        if not borrower_types <= producer_types:
-            num_shared = 0  # last-N contract unverified → do not zero anything
-    first_borrower = base_num_layers - num_shared
+        last_producer_by_type: dict[str, int] = {}
+        for producer_idx in range(split):
+            last_producer_by_type[layer_types[producer_idx]] = producer_idx
+        for borrower_idx in range(split, base_num_layers):
+            mapped = last_producer_by_type.get(layer_types[borrower_idx])
+            # ``mapped`` is keyed by type, so ``layer_types[mapped]`` is the
+            # borrower's own type whenever the lookup hits — the exact
+            # same-type-producer condition the shipped model relies on.
+            if mapped is not None and layer_types[mapped] == layer_types[borrower_idx]:
+                borrowed_layers.add(borrower_idx)
 
     # The uniform per-layer charge (base dims). It is the never-under-count
     # floor: no per-token-growing layer is ever charged LESS than this.
@@ -471,37 +559,30 @@ def estimate_kv_footprint(
     full_per_token = max(
         2 * dtype_bytes * global_kv_heads * global_head_dim, uniform_per_layer
     )
-    # Per-token KV rate of ONE sliding-window layer (local dims), clamped to the
-    # uniform base-layer floor for the same reason full layers are (codex round 7
-    # BLOCKING #2): a malformed / non-authoritative nested config exposing
-    # smaller local dims than the base must not drop a layer's charge below the
-    # uniform per-layer rate and open an under-count.
+    # Per-slot (per-token-position) KV bytes of ONE sliding-window layer (local
+    # dims), clamped to the uniform base-layer floor for the same reason full
+    # layers are (codex round 7 BLOCKING #2): a malformed / non-authoritative
+    # nested config exposing smaller local dims than the base must not drop a
+    # layer's charge below the uniform per-layer rate and open an under-count.
     sliding_per_layer = max(
         2 * dtype_bytes * local_kv_heads * local_head_dim, uniform_per_layer
     )
-    # WHOLE-capacity buffer of ONE sliding-window layer, charged once per
-    # sequence. The real ``RotatingKVCache`` does NOT allocate exactly ``window``
-    # slots: it grows the buffer in ``_ROTATING_CACHE_STEP``-token increments and
-    # retains ``_ROTATING_CACHE_KEEP`` sink positions ABOVE the rotating window,
-    # so its true capacity is ``window + keep`` rounded UP to the next ``step``
-    # multiple — which can exceed the raw window (codex round 10 BLOCKING: the
-    # whole-window figure still under-counts the block-rounded, sink-retaining
-    # allocation). Reserving that step-rounded capacity is the over-count-SAFE
-    # upper bound that can never trip the D-METAL-CAP OOM cliff, regardless of the
-    # token budget. Still a massive reduction vs unbounded per-token growth: the
-    # window is bounded (e.g. 512-4096) while generation is not.
-    sliding_slots = (
-        (window + _ROTATING_CACHE_KEEP + _ROTATING_CACHE_STEP - 1)
-        // _ROTATING_CACHE_STEP
-    ) * _ROTATING_CACHE_STEP
-    sliding_window_bytes = sliding_slots * sliding_per_layer
 
     per_token_growth = 0
     fixed_baseline = 0
+    # ``sliding_slot_bytes`` accumulates the per-SLOT bytes of every
+    # window-bounded sliding layer. The scheduler multiplies it by the
+    # per-request slot count ``rotating_cache_slots(window, T)`` — a SUBLINEAR
+    # bound that grows with the request's token budget up to the full rotating
+    # buffer (codex round 11 BLOCKING #1: a fixed whole-window baseline
+    # over-counts short requests). Sliding layers therefore contribute nothing to
+    # the token-independent ``fixed_baseline`` (which now holds recurrent state
+    # only) — their footprint is genuinely request-dependent.
+    sliding_slot_bytes = 0
     for idx in range(base_num_layers):
-        if idx >= first_borrower:
-            # Borrower (KV-sharing) layer — reuses a producer's cache, allocates
-            # nothing.
+        if idx in borrowed_layers:
+            # Borrower (KV-sharing) layer — reuses its mapped same-type
+            # producer's cache, allocates nothing.
             continue
         layer_type = layer_types[idx]
         layer_class = _classify_layer(layer_type)
@@ -522,8 +603,10 @@ def estimate_kv_footprint(
             continue
         if layer_class == "sliding":
             if window > 0:
-                # Window-bounded: the whole rotating buffer, once per sequence.
-                fixed_baseline += sliding_window_bytes
+                # Window-bounded: contributes one slot's bytes to the
+                # per-request sliding term (charged as
+                # ``sliding_slot_bytes × rotating_cache_slots(window, T)``).
+                sliding_slot_bytes += sliding_per_layer
             else:
                 # No readable window → cannot bound it → charge the uniform
                 # per-layer growth (never under-count).
@@ -531,7 +614,14 @@ def estimate_kv_footprint(
         else:  # "full"
             per_token_growth += full_per_token
 
+    # Advertise the window only when at least one window-bounded sliding layer
+    # actually contributed a slot term — otherwise there is no sliding term and
+    # the scheduler must not multiply anything by a stray window.
+    effective_sliding_window = window if sliding_slot_bytes > 0 else 0
+
     return KVFootprintEstimate(
         per_token_growth_bytes=int(per_token_growth),
         fixed_baseline_bytes=int(fixed_baseline),
+        sliding_slot_bytes=int(sliding_slot_bytes),
+        sliding_window=int(effective_sliding_window),
     )
