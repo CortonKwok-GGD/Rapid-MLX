@@ -365,35 +365,25 @@ def _classify_layer(layer_type: str) -> str:
 
 
 def _uniform_sliding_window(struct: Any) -> int:
-    """Return the single rotating-window size shared by ALL sliding layers, or 0.
+    """Return the sliding window when it is a single positive scalar, else ``0``.
 
     The per-request slot model (``sliding_slot_bytes × rotating_cache_slots(window,
-    T)``) charges every sliding layer with ONE window. That is exact only when the
-    sliding layers genuinely share a single window — the shipped shape: GPT-OSS and
-    Gemma-4 expose ``sliding_window`` as one positive scalar. This resolver returns
-    a window ONLY when it can prove uniformity:
+    T)``) charges EVERY sliding layer with ONE window, so it is sound only when the
+    config states a single window that all sliding layers share. Shipped hybrids
+    (GPT-OSS, Gemma-4) expose ``sliding_window`` as exactly that positive scalar.
 
-    * a positive int scalar → the uniform window (shipped case);
-    * a per-layer list/tuple whose positive entries are ALL EQUAL → that one
-      distinct window (still uniform, so still exact);
-    * otherwise (a list with DIFFERING positive windows, or an unreadable shape) →
-      ``0``.
-
-    Returning ``0`` makes the caller fold those sliding layers into full per-token
-    growth (over-count-safe) rather than charging every sliding layer with one
-    scalar window that could UNDER-count a layer whose real window is larger
-    (codex round 13 BLOCKING #3). It never picks the min/first of differing
-    windows — which would be the under-counting mistake.
+    Any NON-scalar shape — a per-layer window ``list`` / ``tuple``, or an
+    unreadable value — returns ``0`` so the caller folds those sliding layers into
+    full per-token growth (over-count-safe) instead. We deliberately do NOT try to
+    collapse a per-layer list to one window: a partial / misaligned list (e.g. a
+    positive window on one sliding index and a ``None`` on another) could borrow the
+    known layer's window for a sliding layer whose real window is UNKNOWN and
+    possibly larger, under-reserving KV (codex round 13 BLOCKING #3 and follow-up).
+    Verifying full ``layer_types``-aligned per-index uniformity would be the only
+    safe way to trust a list — and no shipped model expresses a list window — so
+    the safe, minimal policy is scalar-only, list ⇒ full-growth fallback.
     """
-    raw = _cfg_get(struct, "sliding_window")
-    scalar = _pos_int(raw)
-    if scalar:
-        return scalar
-    if isinstance(raw, (list, tuple)):
-        distinct = {v for v in (_pos_int(entry) for entry in raw) if v > 0}
-        if len(distinct) == 1:
-            return next(iter(distinct))
-    return 0
+    return _pos_int(_cfg_get(struct, "sliding_window"))
 
 
 # mlx-lm materializes the recurrent conv/SSM state buffers with ``mx.zeros``,

@@ -392,12 +392,13 @@ class TestSlidingWindow:
         assert est.sliding_slot_bytes == 2 * n * kv * hd * 2
         assert est.sliding_window == window
 
-    def test_mixed_per_layer_windows_fold_into_full_growth(self):
-        # A per-layer window LIST with DIFFERING sizes cannot be bounded by one
-        # scalar window without under-counting the larger-window layers, so every
-        # sliding layer is charged as full per-token growth instead of the slot
-        # model (over-count-safe; codex round 13 BLOCKING #3). The estimate never
-        # picks the min/first of the differing windows.
+    def test_per_layer_window_list_folds_into_full_growth(self):
+        # The per-request slot model charges every sliding layer with ONE window,
+        # so it is only sound for a single positive SCALAR window. A per-layer
+        # window LIST is never collapsed to one scalar (scalar-only policy) — it
+        # folds every sliding layer into full per-token growth (over-count-safe;
+        # codex round 13 BLOCKING #3). Differing entries here would obviously
+        # under-count if reduced to the min/first.
         n, kv, hd = 24, 8, 64
         layer_types = ["sliding_attention", "full_attention"] * (n // 2)
         cfg = SimpleNamespace(
@@ -408,31 +409,38 @@ class TestSlidingWindow:
             sliding_window=[128, 4096] * (n // 2),  # differing per-layer windows
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        # No single safe window → every layer grows unbounded (uniform result).
+        # A list window → every layer grows unbounded (uniform result).
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.sliding_slot_bytes == 0
         assert est.sliding_window == 0
         assert est.fixed_baseline_bytes == 0
 
-    def test_uniform_per_layer_window_list_keeps_slot_model(self):
-        # A per-layer window LIST whose positive entries are ALL EQUAL is still a
-        # single uniform window → keep the accurate per-request slot model. Null
-        # entries (full layers carry no window) are ignored.
-        n, kv, hd, window = 24, 8, 64, 128
-        layer_types = ["sliding_attention", "full_attention"] * (n // 2)
+    def test_partial_window_list_does_not_borrow_for_unknown_sliding_layer(self):
+        # codex counterexample: a MISALIGNED per-layer window list where one
+        # sliding layer has a positive window and ANOTHER sliding layer's entry is
+        # null (unknown). Borrowing the known 128 for the unknown-window sliding
+        # layer would under-reserve if its real window were larger, so ANY list
+        # shape — even one with a single distinct positive value — folds every
+        # sliding layer into full per-token growth. The estimate must NOT expose a
+        # slot term or a window here.
+        n, kv, hd = 4, 8, 64
+        layer_types = [
+            "sliding_attention",  # 0 — window 128
+            "sliding_attention",  # 1 — window UNKNOWN (null)
+            "full_attention",
+            "full_attention",
+        ]
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
             head_dim=hd,
             layer_types=layer_types,
-            sliding_window=[window, None] * (n // 2),  # sliding=128, full=None
+            sliding_window=[128, None, None, None],  # only one distinct positive
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        n_full = n // 2
-        n_sliding = n // 2
-        assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
-        assert est.sliding_slot_bytes == 2 * n_sliding * kv * hd * 2
-        assert est.sliding_window == window
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)  # all full growth
+        assert est.sliding_slot_bytes == 0
+        assert est.sliding_window == 0
         assert est.fixed_baseline_bytes == 0
 
 
