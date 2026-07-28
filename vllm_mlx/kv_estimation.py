@@ -229,65 +229,86 @@ def _classify_layer(layer_type: str) -> str:
 _RECURRENT_STATE_BYTES_PER_ELEM = 4
 
 
-def _recurrent_state_bytes(struct: Any) -> int | None:
-    """Conservative per-sequence FIXED state of one recurrent layer, in bytes.
+def _gateddeltanet_state_bytes(struct: Any) -> int | None:
+    """GatedDeltaNet (Qwen3-Next / Qwen3.5 / Qwen3.6) per-sequence state bytes.
 
-    Returns ``None`` when the config exposes no recognized recurrent-state
-    fields — the caller then charges that layer the uniform per-token estimate
-    (full-growth) as the safe fallback, rather than leaving its state
-    unreserved (codex round 2 BLOCKING #1).
-
-    Two supported families, sized from their real config fields:
-
-    * **GatedDeltaNet** (Qwen3-Next / Qwen3.5 / Qwen3.6): the recurrent state is
-      a per-value-head ``head_k_dim × head_v_dim`` matrix plus the causal-conv
-      ring buffer over ``conv_dim = 2·key_dim + value_dim`` channels. Shapes
-      match ``mlx_lm.models.qwen3_next.Qwen3NextGatedDeltaNet``.
-    * **Mamba / Mamba2**: the SSM state ``d_inner × d_state`` plus the conv ring
-      buffer ``d_inner × (d_conv − 1)``.
-
-    Every term is a per-sequence constant (it does not grow with generated
-    tokens), so it lands in the fixed baseline, never in per-token growth.
+    State = a per-value-head ``head_k_dim × head_v_dim`` matrix plus the
+    causal-conv ring buffer over ``conv_dim = 2·key_dim + value_dim`` channels.
+    Shapes match ``mlx_lm.models.qwen3_next.Qwen3NextGatedDeltaNet``. ALL of the
+    state + conv dimensions must be present and positive — including the conv
+    kernel — else return ``None`` so the caller charges full growth rather than
+    silently omitting the conv buffer and under-reserving (codex round 3
+    BLOCKING #1).
     """
-    # GatedDeltaNet. ALL of the state + conv dimensions must be present and
-    # positive — including the conv kernel. If any is missing we cannot size
-    # the full state, so we return None (the caller charges full growth) rather
-    # than silently omitting the conv buffer and under-reserving (codex round 3
-    # BLOCKING #1).
     num_v = _pos_int(_cfg_get(struct, "linear_num_value_heads"))
     num_k = _pos_int(_cfg_get(struct, "linear_num_key_heads"))
     head_k = _pos_int(_cfg_get(struct, "linear_key_head_dim"))
     head_v = _pos_int(_cfg_get(struct, "linear_value_head_dim"))
     conv_kernel = _pos_int(_cfg_get(struct, "linear_conv_kernel_dim"))
-    if num_v and num_k and head_k and head_v and conv_kernel:
-        key_dim = num_k * head_k
-        value_dim = num_v * head_v
-        recurrent_elems = num_v * head_k * head_v
-        conv_dim = 2 * key_dim + value_dim
-        conv_elems = (conv_kernel - 1) * conv_dim
-        return _RECURRENT_STATE_BYTES_PER_ELEM * (recurrent_elems + conv_elems)
+    if not (num_v and num_k and head_k and head_v and conv_kernel):
+        return None
+    key_dim = num_k * head_k
+    value_dim = num_v * head_v
+    recurrent_elems = num_v * head_k * head_v
+    conv_dim = 2 * key_dim + value_dim
+    conv_elems = (conv_kernel - 1) * conv_dim
+    return _RECURRENT_STATE_BYTES_PER_ELEM * (recurrent_elems + conv_elems)
 
-    # Mamba / Mamba2 — same all-or-nothing rule: the SSM state, the inner
-    # dimension AND the conv kernel must all be readable, else return None so
-    # the conv buffer is never silently dropped (codex round 3 BLOCKING #2).
-    d_state = _pos_int(_cfg_get(struct, "mamba_d_state")) or _pos_int(
-        _cfg_get(struct, "state_size")
-    )
+
+def _mamba_state_bytes(struct: Any) -> int | None:
+    """Mamba / Mamba2 per-sequence state bytes.
+
+    State = the SSM state ``d_inner × d_state`` plus the conv ring buffer
+    ``d_inner × (d_conv − 1)``.
+
+    Sized ONLY from ``mamba_``-prefixed config fields, never from generic
+    ``state_size`` / ``intermediate_size`` / ``conv_kernel_size`` (codex round 4
+    BLOCKING #2). Those generic names are not Mamba-specific: another recurrent
+    family (RWKV, etc.) commonly exposes ``intermediate_size`` / ``state_size``
+    for an entirely different tensor, so reading them here would stamp a bogus
+    Mamba-shaped fixed state onto a non-Mamba layer and zero its per-token
+    growth — an under-count on the D-METAL-CAP path. A layer that does not carry
+    the Mamba-specific fields returns ``None`` so the caller charges it full
+    per-token growth (the safe, never-under-count fallback).
+
+    Same all-or-nothing rule: ``d_state`` AND the inner dimension AND the conv
+    kernel must all be readable from Mamba-specific fields, else return ``None``
+    so the conv buffer is never silently dropped (codex round 3 BLOCKING #2).
+    """
+    d_state = _pos_int(_cfg_get(struct, "mamba_d_state"))
     n_heads = _pos_int(_cfg_get(struct, "mamba_n_heads"))
     d_head = _pos_int(_cfg_get(struct, "mamba_d_head"))
     d_inner = (n_heads * d_head) if (n_heads and d_head) else 0
     if d_inner == 0:
-        d_inner = _pos_int(_cfg_get(struct, "mamba_intermediate_size")) or _pos_int(
-            _cfg_get(struct, "intermediate_size")
-        )
-    d_conv = _pos_int(_cfg_get(struct, "mamba_d_conv")) or _pos_int(
-        _cfg_get(struct, "conv_kernel_size")
-    )
-    if d_state and d_inner and d_conv:
-        ssm_elems = d_inner * d_state
-        conv_elems = d_inner * (d_conv - 1)
-        return _RECURRENT_STATE_BYTES_PER_ELEM * (ssm_elems + conv_elems)
+        d_inner = _pos_int(_cfg_get(struct, "mamba_intermediate_size"))
+    d_conv = _pos_int(_cfg_get(struct, "mamba_d_conv"))
+    if not (d_state and d_inner and d_conv):
+        return None
+    ssm_elems = d_inner * d_state
+    conv_elems = d_inner * (d_conv - 1)
+    return _RECURRENT_STATE_BYTES_PER_ELEM * (ssm_elems + conv_elems)
 
+
+def _recurrent_state_bytes(struct: Any, layer_type: str) -> int | None:
+    """Conservative per-sequence FIXED state of one recurrent layer, in bytes.
+
+    Dispatches by the EXACT recurrent family named in ``layer_type`` and sizes
+    the state only from that family's real config fields — so a family we do not
+    model (generic ``"recurrent"`` / ``"rwkv"``) never gets a bogus Mamba/GDN
+    estimate from incidentally-matching generic fields (codex round 4
+    BLOCKING #2). Returns ``None`` (→ caller charges full per-token growth) for
+    any family we cannot size exactly.
+
+    The returned term is a per-sequence constant (it does not grow with
+    generated tokens), so it lands in the fixed baseline, never in per-token
+    growth.
+    """
+    if layer_type == "linear_attention":
+        return _gateddeltanet_state_bytes(struct)
+    if layer_type in ("mamba", "mamba2"):
+        return _mamba_state_bytes(struct)
+    # Generic / unimplemented recurrent family (e.g. "recurrent", "rwkv"): we do
+    # not know its exact state layout, so we cannot size it → full-growth.
     return None
 
 
@@ -405,8 +426,17 @@ def estimate_kv_footprint(
             num_shared = 0  # last-N contract unverified → do not zero anything
     first_borrower = base_num_layers - num_shared
 
-    full_per_token = 2 * dtype_bytes * global_kv_heads * global_head_dim
-    sliding_full_per_token = 2 * dtype_bytes * local_kv_heads * local_head_dim
+    # The uniform per-layer charge (base dims). It is the never-under-count
+    # floor: no per-token-growing layer is ever charged LESS than this.
+    uniform_per_layer = 2 * dtype_bytes * base_kv_heads * base_head_dim
+    # Full-attention layers use the (wider) global dims when present, but never
+    # below the uniform base-layer size — a config whose ``global_head_dim`` /
+    # ``num_global_key_value_heads`` are smaller than (or unrelated to) the base
+    # dims must not shrink a full layer's per-token growth below uniform and
+    # open an under-count (codex round 4 BLOCKING #1).
+    full_per_token = max(
+        2 * dtype_bytes * global_kv_heads * global_head_dim, uniform_per_layer
+    )
     sliding_window_bytes = 2 * dtype_bytes * window * local_kv_heads * local_head_dim
 
     per_token_growth = 0
@@ -416,7 +446,8 @@ def estimate_kv_footprint(
             # Borrower (KV-sharing) layer — reuses a producer's cache, allocates
             # nothing.
             continue
-        layer_class = _classify_layer(layer_types[idx])
+        layer_type = layer_types[idx]
+        layer_class = _classify_layer(layer_type)
         if layer_class == "recurrent":
             # Recurrent / linear-attention layers keep a FIXED state that does
             # not grow per token. When we can size that state from the family's
@@ -426,19 +457,19 @@ def estimate_kv_footprint(
             # load-bearing correctness win for Qwen3.5/3.6/Mamba. When we CANNOT
             # size it, we fall back to charging the layer the uniform per-token
             # estimate (full growth), which never under-counts.
-            state = _recurrent_state_bytes(struct)
+            state = _recurrent_state_bytes(struct, layer_type)
             if state is not None:
                 fixed_baseline += state
             else:
-                per_token_growth += sliding_full_per_token
+                per_token_growth += uniform_per_layer
             continue
         if layer_class == "sliding":
             if window > 0:
                 fixed_baseline += sliding_window_bytes
             else:
-                # No readable window → cannot bound it → charge as full growth
-                # (never under-count).
-                per_token_growth += sliding_full_per_token
+                # No readable window → cannot bound it → charge the uniform
+                # per-layer growth (never under-count).
+                per_token_growth += uniform_per_layer
         else:  # "full"
             per_token_growth += full_per_token
 

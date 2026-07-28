@@ -348,6 +348,28 @@ class TestRecurrent:
         assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
 
+    def test_generic_recurrent_family_not_mis_sized_as_mamba(self):
+        # An RWKV (or other generic recurrent) layer that incidentally exposes
+        # Mamba-ish generic fields must NOT be sized as Mamba — its exact state
+        # layout is not implemented, so it falls back to full growth (codex
+        # round 4 BLOCKING #2).
+        n, kv, hd = 8, 4, 64
+        layer_types = ["rwkv"] * (n - 1) + ["full_attention"]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            # generic fields that the Mamba branch would otherwise consume:
+            state_size=128,
+            intermediate_size=1536,
+            conv_kernel_size=4,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        # No baseline reserved (not sized as Mamba); all layers charged full.
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
+        assert est.fixed_baseline_bytes == 0
+
 
 class TestHybridDimsAndNesting:
     def test_global_head_dim_used_for_full_layers(self):
@@ -444,6 +466,24 @@ class TestNeverUnderCounts:
             true_full = n_full * tokens * full_per_layer
             true_sliding = n_sliding * min(tokens, window) * full_per_layer
             assert projected >= true_full + true_sliding
+
+    def test_full_layer_growth_never_below_uniform_base(self):
+        # A pathological config where global_head_dim / num_global_key_value_heads
+        # are SMALLER than the base dims must not shrink full-layer per-token
+        # growth below the uniform base-layer charge (codex round 4 BLOCKING #1).
+        n, kv, hd, db = 8, 8, 128, 2
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=["full_attention"] * n,
+            global_head_dim=16,  # << base head_dim
+            num_global_key_value_heads=1,  # << base kv heads
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
+        # Clamped to the uniform base-layer size, not the tiny global dims.
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, db)
+        assert est.fixed_baseline_bytes == 0
 
     def test_projection_covers_recurrent_fixed_state(self):
         # A GatedDeltaNet hybrid: the projection must reserve the recurrent
