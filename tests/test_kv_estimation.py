@@ -842,3 +842,68 @@ class TestRotatingCacheConstantsMatchInstalledMlxLm:
         # Restate the safety invariant explicitly: our KEEP must remain an upper
         # bound over the installed construction's keep.
         assert max(installed_keeps) <= _ROTATING_CACHE_KEEP
+
+    def test_no_shipped_rotating_cache_construction_exceeds_our_keep(self):
+        # ``make_prompt_cache`` (tested above) is the GENERIC construction path,
+        # but the engine ALSO builds ``RotatingKVCache`` DIRECTLY in vendored
+        # stacks (Gemma-4, DeepSeek-V4). If any shipped direct construction set
+        # ``keep`` ABOVE our ``_ROTATING_CACHE_KEEP`` bound, ``rotating_cache_slots``
+        # would under-reserve KV at admission (OOM risk). Statically scan EVERY
+        # ``RotatingKVCache(...)`` call in the package and assert its literal
+        # ``keep`` kwarg never exceeds our bound — the "validate the max keep
+        # across all constructors" guarantee, hermetic (AST parse, no imports run,
+        # no model load). Re-wrap constructions that pass ``keep=getattr(src,
+        # "keep", 0)`` inherit the source cache's keep, so bounding the source
+        # literals bounds them too; a non-constant ``keep`` is not asserted here.
+        import ast
+        import pathlib
+
+        import vllm_mlx
+
+        pkg_root = pathlib.Path(vllm_mlx.__file__).parent
+        literal_constructions: list[tuple[str, int, int]] = []
+        total_constructions = 0
+        for py in pkg_root.rglob("*.py"):
+            try:
+                tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if isinstance(func, ast.Attribute):
+                    name = func.attr
+                elif isinstance(func, ast.Name):
+                    name = func.id
+                else:
+                    continue
+                # EXACT match — ``BatchRotatingKVCache`` is a distinct batch-decode
+                # re-pack with its own signature and is intentionally excluded.
+                if name != "RotatingKVCache":
+                    continue
+                total_constructions += 1
+                for kw in node.keywords:
+                    if kw.arg == "keep" and isinstance(kw.value, ast.Constant):
+                        keep_val = kw.value.value
+                        if isinstance(keep_val, int) and not isinstance(keep_val, bool):
+                            literal_constructions.append(
+                                (py.name, node.lineno, keep_val)
+                            )
+        # The vendored Gemma-4 / DeepSeek-V4 stacks are in-tree, so the scan must
+        # find real constructions — a zero count means the scan silently missed
+        # them (e.g. a rename) and would give false assurance.
+        assert total_constructions > 0, (
+            "no RotatingKVCache(...) constructions found in vllm_mlx — the keep "
+            "drift scan matched nothing and cannot guard the bound"
+        )
+        assert literal_constructions, (
+            "no RotatingKVCache(keep=<literal>) constructions found to validate"
+        )
+        for fname, lineno, keep_val in literal_constructions:
+            assert keep_val <= _ROTATING_CACHE_KEEP, (
+                f"{fname}:{lineno} constructs RotatingKVCache(keep={keep_val}), which "
+                f"EXCEEDS _ROTATING_CACHE_KEEP={_ROTATING_CACHE_KEEP}; "
+                "rotating_cache_slots would under-reserve KV at admission (OOM "
+                "risk). Raise _ROTATING_CACHE_KEEP to bound every shipped keep."
+            )
