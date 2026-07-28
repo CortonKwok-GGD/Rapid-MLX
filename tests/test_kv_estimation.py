@@ -207,39 +207,60 @@ class TestSlidingWindow:
 
 
 class TestRecurrent:
-    """Qwen3.5/3.6 GatedDeltaNet linear-attention layers have zero growth.
+    """Qwen3.5/3.6 GatedDeltaNet / Mamba layers have zero PER-TOKEN growth.
 
-    Recurrent layers keep a FIXED state that our configs do not expose the
-    fields to size, so we model zero per-token growth (the correctness win) and
-    do NOT invent a fixed-state term (codex round 1 BLOCKING #2). Only the
-    full-attention layers show up in the estimate.
+    Their fixed recurrent state does not grow with generated tokens, so it lands
+    in the per-sequence baseline (sized from the family's real config fields)
+    rather than the per-token term. A recurrent layer whose state cannot be
+    sized falls back to full per-token growth so it is never left unreserved
+    (codex round 2 BLOCKING #1).
     """
 
-    def test_linear_layers_contribute_zero_growth_and_zero_baseline(self):
-        # 48 layers, 3:1 linear:full → only the 12 full layers grow; the 36
-        # recurrent layers contribute nothing to either term.
+    # GatedDeltaNet state, sized from the same fields as
+    # ``mlx_lm.models.qwen3_next.Qwen3NextGatedDeltaNet``, at fp32/element.
+    _GDN_FIELDS = dict(
+        linear_num_value_heads=32,
+        linear_num_key_heads=16,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+
+    @staticmethod
+    def _gdn_state_bytes():
+        num_v, num_k, hk, hv, conv = 32, 16, 128, 128, 4
+        key_dim = num_k * hk
+        value_dim = num_v * hv
+        recurrent = num_v * hk * hv
+        conv_dim = 2 * key_dim + value_dim
+        conv_state = (conv - 1) * conv_dim
+        return 4 * (recurrent + conv_state)
+
+    def test_gateddeltanet_state_reserved_in_baseline_zero_growth(self):
+        # 48 layers, 3:1 linear:full → only the 12 full layers grow per token;
+        # the 36 GatedDeltaNet layers reserve their fixed state in the baseline.
         n, kv, hd = 48, 2, 128
-        pattern = [
-            "linear_attention",
-            "linear_attention",
-            "linear_attention",
-            "full_attention",
-        ]
+        pattern = ["linear_attention"] * 3 + ["full_attention"]
         layer_types = pattern * (n // 4)
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
             head_dim=hd,
             layer_types=layer_types,
+            **self._GDN_FIELDS,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
         n_full = n // 4
+        n_recurrent = n - n_full
         assert est.per_token_growth_bytes == 2 * n_full * kv * hd * 2
-        assert est.fixed_baseline_bytes == 0
+        assert est.fixed_baseline_bytes == n_recurrent * self._gdn_state_bytes()
 
-    def test_mamba_marker_is_recurrent(self):
+    def test_unsizeable_recurrent_falls_back_to_full_growth(self):
+        # linear_attention layers WITHOUT any GatedDeltaNet/Mamba sizing fields
+        # → cannot size the state → charged the uniform per-token estimate
+        # (full growth), never left unreserved.
         n, kv, hd = 8, 4, 64
-        layer_types = ["mamba"] * (n - 1) + ["full_attention"]
+        layer_types = ["linear_attention"] * (n - 1) + ["full_attention"]
         cfg = SimpleNamespace(
             num_hidden_layers=n,
             num_key_value_heads=kv,
@@ -247,8 +268,29 @@ class TestRecurrent:
             layer_types=layer_types,
         )
         est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
-        assert est.per_token_growth_bytes == 2 * 1 * kv * hd * 2
+        # All 8 layers charged full growth (uniform) — no reduction, no baseline.
+        assert est.per_token_growth_bytes == _uniform(n, kv, hd, 2)
         assert est.fixed_baseline_bytes == 0
+
+    def test_mamba_state_reserved_in_baseline(self):
+        n, kv, hd = 8, 4, 64
+        d_state, d_conv, n_heads, d_head = 128, 4, 24, 64
+        layer_types = ["mamba"] * (n - 1) + ["full_attention"]
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            mamba_d_state=d_state,
+            mamba_d_conv=d_conv,
+            mamba_n_heads=n_heads,
+            mamba_d_head=d_head,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd)
+        d_inner = n_heads * d_head
+        state = 4 * (d_inner * d_state + d_inner * (d_conv - 1))
+        assert est.per_token_growth_bytes == 2 * 1 * kv * hd * 2
+        assert est.fixed_baseline_bytes == (n - 1) * state
 
     def test_full_attention_name_containing_linear_is_not_recurrent(self):
         # Exact-match allowlist (codex round 1 BLOCKING #4): an unfamiliar
@@ -361,3 +403,37 @@ class TestNeverUnderCounts:
             true_full = n_full * tokens * full_per_layer
             true_sliding = n_sliding * min(tokens, window) * full_per_layer
             assert projected >= true_full + true_sliding
+
+    def test_projection_covers_recurrent_fixed_state(self):
+        # A GatedDeltaNet hybrid: the projection must reserve the recurrent
+        # layers' fixed state (in the baseline) on top of the full layers'
+        # growth — it is never omitted (codex round 2 BLOCKING #1 + #3).
+        n, kv, hd, db = 16, 2, 128, 2
+        gdn = dict(
+            linear_num_value_heads=32,
+            linear_num_key_heads=16,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+        )
+        layer_types = (["linear_attention"] * 3 + ["full_attention"]) * (n // 4)
+        cfg = SimpleNamespace(
+            num_hidden_layers=n,
+            num_key_value_heads=kv,
+            head_dim=hd,
+            layer_types=layer_types,
+            **gdn,
+        )
+        est = _est(cfg, num_layers=n, kv_heads=kv, head_dim=hd, dtype_bytes=db)
+        n_full = n // 4
+        n_recurrent = n - n_full
+        # Per-layer GatedDeltaNet state (fp32/element), independently recomputed.
+        key_dim = 16 * 128
+        value_dim = 32 * 128
+        state = 4 * (32 * 128 * 128 + (4 - 1) * (2 * key_dim + value_dim))
+        assert est.fixed_baseline_bytes == n_recurrent * state
+        full_per_layer = 2 * kv * hd * db
+        for tokens in (1, 100, 4096, 32768):
+            projected = est.fixed_baseline_bytes + tokens * est.per_token_growth_bytes
+            # >= full-attention growth + the reserved recurrent fixed state.
+            assert projected >= n_full * tokens * full_per_layer + n_recurrent * state

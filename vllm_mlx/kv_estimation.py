@@ -35,13 +35,14 @@ This module computes an accurate footprint by classifying each layer:
     when the architecture is hybrid.
 
 ``fixed_baseline_bytes``
-    ``2 * dtype_bytes * Σ_sliding (window_L * kv_heads_L * head_dim_L)`` — the
-    rotating-window buffers of the sliding-window layers, allocated once per
-    sequence rather than per token.
+    ``2 * dtype_bytes * Σ_sliding (window_L * kv_heads_L * head_dim_L)`` (the
+    rotating-window buffers of the sliding-window layers) plus the conservative
+    fixed recurrent state of each recurrent layer we can size from its config.
+    Allocated once per sequence rather than per token.
 
 Borrower (KV-sharing) layers contribute 0 to both. Recurrent / linear-attention
-layers contribute 0 to per-token growth (see safety point 2 for why their fixed
-state is deliberately not modeled).
+layers contribute 0 to per-token growth; their fixed state is reserved in the
+baseline instead (see safety point 2).
 
 Safety contract (this feeds a codex-hardened, over-estimate-safe admission
 path — see ``scheduler._resolve_kv_bytes_per_token``):
@@ -62,16 +63,15 @@ path — see ``scheduler._resolve_kv_bytes_per_token``):
    exactly; a sliding layer with no readable window is charged as full-growth;
    an unrecognized layer-type string is charged as full-growth (exact-match
    allowlists, no substring guessing); recurrent and window-bounded layers
-   genuinely have zero per-token growth. The sliding window footprint lands in
-   ``fixed_baseline`` — an exact per-sequence upper bound (the whole window,
-   ignoring token count). The recurrent layers' small FIXED state is
-   architecture-specific (linear key/value head dims, conv kernel) and our
-   configs do not uniformly expose those fields, so — rather than invent a
-   number that could silently under-count — we leave that fixed per-sequence
-   overhead unmodeled, exactly as the gate already leaves model weights and
-   activation buffers unmodeled. This is sound because the gate exists to catch
-   runaway PER-TOKEN growth, not fixed per-sequence overhead: a non-growing
-   term cannot produce the D-METAL-CAP cliff.
+   genuinely have zero per-token growth. Their per-sequence footprint lands in
+   ``fixed_baseline`` instead: the sliding window term is an exact upper bound
+   (the whole window, ignoring token count), and each recurrent layer's fixed
+   state is sized from its family's real config fields (GatedDeltaNet linear
+   head dims + conv kernel; Mamba d_state/d_conv) and charged at fp32/element to
+   stay conservative. A recurrent layer whose state CANNOT be sized falls back
+   to the uniform per-token estimate (full growth) rather than going
+   unreserved. A fixed baseline is charged once per sequence and never scales
+   with generated tokens.
 3. **KV-sharing only zeroes verified borrowers.** ``num_kv_shared_layers``
    declares that the LAST N layers borrow (Gemma-4 / Gemma-3n contract). We zero
    those borrowers only when the per-layer ``layer_types`` map confirms it —
@@ -131,8 +131,9 @@ class KVFootprintEstimate:
             only. This is the value the D-METAL-CAP projection multiplies by
             ``(prompt_tokens + max_tokens)``.
         fixed_baseline_bytes: Bytes allocated once per sequence regardless of
-            token count — the sliding-window rotating buffers. Zero for a dense
-            model and for any hybrid with no sliding-window layers.
+            token count — the sliding-window rotating buffers plus the
+            conservative fixed recurrent state of each sizeable recurrent layer.
+            Zero for a dense model and for a hybrid with neither.
     """
 
     per_token_growth_bytes: int
@@ -218,6 +219,71 @@ def _classify_layer(layer_type: str) -> str:
     if layer_type in _SLIDING_TYPES:
         return "sliding"
     return "full"
+
+
+# mlx-lm materializes the recurrent conv/SSM state buffers with ``mx.zeros``,
+# which defaults to float32 — so we size the recurrent per-sequence state at 4
+# bytes/element regardless of the (possibly smaller) KV dtype. Over-charging a
+# small fixed term is the safe direction and guarantees we never under-reserve
+# it (codex round 2 BLOCKING #1).
+_RECURRENT_STATE_BYTES_PER_ELEM = 4
+
+
+def _recurrent_state_bytes(struct: Any) -> int | None:
+    """Conservative per-sequence FIXED state of one recurrent layer, in bytes.
+
+    Returns ``None`` when the config exposes no recognized recurrent-state
+    fields — the caller then charges that layer the uniform per-token estimate
+    (full-growth) as the safe fallback, rather than leaving its state
+    unreserved (codex round 2 BLOCKING #1).
+
+    Two supported families, sized from their real config fields:
+
+    * **GatedDeltaNet** (Qwen3-Next / Qwen3.5 / Qwen3.6): the recurrent state is
+      a per-value-head ``head_k_dim × head_v_dim`` matrix plus the causal-conv
+      ring buffer over ``conv_dim = 2·key_dim + value_dim`` channels. Shapes
+      match ``mlx_lm.models.qwen3_next.Qwen3NextGatedDeltaNet``.
+    * **Mamba / Mamba2**: the SSM state ``d_inner × d_state`` plus the conv ring
+      buffer ``d_inner × (d_conv − 1)``.
+
+    Every term is a per-sequence constant (it does not grow with generated
+    tokens), so it lands in the fixed baseline, never in per-token growth.
+    """
+    # GatedDeltaNet.
+    num_v = _pos_int(_cfg_get(struct, "linear_num_value_heads"))
+    num_k = _pos_int(_cfg_get(struct, "linear_num_key_heads"))
+    head_k = _pos_int(_cfg_get(struct, "linear_key_head_dim"))
+    head_v = _pos_int(_cfg_get(struct, "linear_value_head_dim"))
+    if num_v and num_k and head_k and head_v:
+        conv_kernel = _pos_int(_cfg_get(struct, "linear_conv_kernel_dim"))
+        key_dim = num_k * head_k
+        value_dim = num_v * head_v
+        recurrent_elems = num_v * head_k * head_v
+        conv_dim = 2 * key_dim + value_dim
+        conv_elems = max(conv_kernel - 1, 0) * conv_dim
+        return _RECURRENT_STATE_BYTES_PER_ELEM * (recurrent_elems + conv_elems)
+
+    # Mamba / Mamba2.
+    d_state = _pos_int(_cfg_get(struct, "mamba_d_state")) or _pos_int(
+        _cfg_get(struct, "state_size")
+    )
+    if d_state:
+        n_heads = _pos_int(_cfg_get(struct, "mamba_n_heads"))
+        d_head = _pos_int(_cfg_get(struct, "mamba_d_head"))
+        d_inner = (n_heads * d_head) if (n_heads and d_head) else 0
+        if d_inner == 0:
+            d_inner = _pos_int(_cfg_get(struct, "mamba_intermediate_size")) or _pos_int(
+                _cfg_get(struct, "intermediate_size")
+            )
+        if d_inner:
+            d_conv = _pos_int(_cfg_get(struct, "mamba_d_conv")) or _pos_int(
+                _cfg_get(struct, "conv_kernel_size")
+            )
+            ssm_elems = d_inner * d_state
+            conv_elems = d_inner * max(d_conv - 1, 0)
+            return _RECURRENT_STATE_BYTES_PER_ELEM * (ssm_elems + conv_elems)
+
+    return None
 
 
 def estimate_kv_footprint(
@@ -314,6 +380,13 @@ def estimate_kv_footprint(
     # the split. If it does not (interleaved / differently-anchored sharing we
     # do not model), we keep every layer as a producer — an over-count, never an
     # under-count (codex round 1 BLOCKING #3).
+    #
+    # For FOOTPRINT purposes the set-of-types check is sufficient (and mirrors
+    # the shipped ``_check_kv_share_config`` orphan check exactly): a borrower
+    # whose attention type has ANY same-type producer below the split allocates
+    # zero KV — it reuses that producer's cache. WHICH producer index it borrows
+    # from does not change the borrower's own footprint (still zero), so a
+    # per-index source mapping would not alter this estimate.
     num_shared = _cfg_get(struct, "num_kv_shared_layers")
     if isinstance(num_shared, int) and not isinstance(num_shared, bool):
         num_shared = num_shared if 0 < num_shared < base_num_layers else 0
@@ -341,14 +414,18 @@ def estimate_kv_footprint(
         layer_class = _classify_layer(layer_types[idx])
         if layer_class == "recurrent":
             # Recurrent / linear-attention layers keep a FIXED state that does
-            # not grow per token — zero growth (the load-bearing correctness
-            # win). Their fixed state is small, bounded, and architecture-
-            # specific; deriving it needs family fields (linear key/value head
-            # dims, conv kernel) our configs do not uniformly expose, so we do
-            # NOT invent a term for it (codex round 1 BLOCKING #2). Like model
-            # weights and activation buffers, that fixed per-sequence overhead
-            # is simply out of scope for this KV-GROWTH projection; the gate has
-            # never reserved for non-growing allocations.
+            # not grow per token. When we can size that state from the family's
+            # real config fields we reserve it in the per-sequence baseline (so
+            # concurrent sequences don't silently allocate past the cap — codex
+            # round 2 BLOCKING #1) while keeping per-token growth at zero — the
+            # load-bearing correctness win for Qwen3.5/3.6/Mamba. When we CANNOT
+            # size it, we fall back to charging the layer the uniform per-token
+            # estimate (full growth), which never under-counts.
+            state = _recurrent_state_bytes(struct)
+            if state is not None:
+                fixed_baseline += state
+            else:
+                per_token_growth += sliding_full_per_token
             continue
         if layer_class == "sliding":
             if window > 0:
