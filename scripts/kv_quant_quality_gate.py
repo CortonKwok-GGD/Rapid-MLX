@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""KV-quant differential quality gate (offline, advisory).
+
+Runs the SAME model twice on the SAME prompts — a ``bf16``-KV BASELINE and a
+quantized-KV CANDIDATE (``int8`` / ``int4``) — and measures how well the
+candidate AGREES WITH ITS OWN bf16 baseline. This differential framing isolates
+*quantization-induced* degradation from a model's plain inability at a prompt:
+the gate only faults a candidate the quantized cache made worse than its own
+full-precision self.
+
+Today, ``vllm_mlx/kv_cache_dtype.py`` decides whether int4/int8 KV is "safe" via
+a hand-written empirical safelist. This harness produces the *measured* signal
+that list currently lacks.
+
+It ships **advisory** (measure-first, mirroring the ``diff_coverage`` pattern):
+it prints a full report + PASS/FAIL but exits ``0`` regardless. Pass
+``--enforce`` to make a FAIL exit non-zero (for a future promotion to a blocking
+gate once thresholds are calibrated on fleet data).
+
+All *scoring* lives in the pure, hermetically-tested :mod:`vllm_mlx.kv_quant_gate`;
+this file only drives inference and prints. Chip-tier gating of the optional NIAH
+metric uses :mod:`vllm_mlx.chip_tier`.
+
+Usage:
+    python -m scripts.kv_quant_quality_gate qwen3.5-4b-4bit
+    python -m scripts.kv_quant_quality_gate mlx-community/Qwen3-0.6B-4bit \\
+        --candidate int8 int4 --max-tokens 48 --json-out report.json
+    python -m scripts.kv_quant_quality_gate <model> --niah --enforce
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+
+# Allow ``python scripts/kv_quant_quality_gate.py`` (not just ``-m``) by putting
+# the repo root on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from vllm_mlx.chip_tier import classify_chip_tier, detect_chip_tier  # noqa: E402
+from vllm_mlx.kv_cache_dtype import dtype_to_quantization_bits  # noqa: E402
+from vllm_mlx.kv_quant_gate import (  # noqa: E402
+    AgreementResult,
+    LogitDivergence,
+    build_report,
+    default_thresholds,
+    greedy_agreement_rate,
+    logit_divergence,
+    structured_output_retention,
+)
+
+# Built-in prompt set. A couple explicitly ask for JSON so the structured-output
+# retention metric has attributable prompts. Kept small — this is an M-sized
+# advisory tool, not a benchmark suite.
+_DEFAULT_PROMPTS: list[dict[str, str]] = [
+    {"kind": "text", "prompt": "Explain what a KV cache is in two sentences."},
+    {"kind": "text", "prompt": "List three prime numbers greater than 100."},
+    {"kind": "text", "prompt": "Write a haiku about unified memory."},
+    {
+        "kind": "json",
+        "prompt": (
+            "Respond with ONLY a JSON object with keys "
+            '"name" (string) and "age" (number) for a fictional person. '
+            "No prose, no code fence."
+        ),
+    },
+    {
+        "kind": "json",
+        "prompt": (
+            "Return ONLY a JSON array of three city names as strings. "
+            "No prose, no code fence."
+        ),
+    },
+]
+
+# NIAH needle prompt scaffold. Deliberately modest length — the gate is advisory
+# and RAM-tier-gated; a full long-context sweep is out of MVP scope.
+_NIAH_MAGIC = "7431905"
+_NIAH_MIN_RAM_GB = 32.0
+
+
+def _greedy_sampler():
+    import mlx.core as mx
+
+    return lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+
+def _eos_ids(tokenizer) -> set[int]:
+    ids = getattr(tokenizer, "eos_token_ids", None)
+    if ids:
+        return {int(i) for i in ids}
+    eos = getattr(tokenizer, "eos_token_id", None)
+    return {int(eos)} if eos is not None else set()
+
+
+def _encode_prompt(tokenizer, text: str) -> list[int]:
+    """Encode a user turn, applying the chat template when one exists."""
+    if getattr(tokenizer, "chat_template", None):
+        return list(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                add_generation_prompt=True,
+            )
+        )
+    return list(tokenizer.encode(text))
+
+
+def _run_generation(
+    model,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    kv_bits: int | None,
+    kv_group_size: int,
+    eos_ids: set[int],
+    collect_logprobs: bool,
+    stop_on_eos: bool,
+):
+    """Greedy (temp=0) generation, capturing tokens and optional per-step logprobs.
+
+    Returns ``(tokens, logprobs_list, cache)``. ``logprobs_list`` holds one
+    float32 log-probability vector per generated step when ``collect_logprobs``,
+    else is empty. ``cache`` is the (possibly now-quantized) prompt cache — after
+    a ``kv_bits`` run mlx-lm has quantized it in place, so it measures the
+    candidate footprint.
+    """
+    import mlx.core as mx
+    from mlx_lm.generate import generate_step
+    from mlx_lm.models.cache import make_prompt_cache
+
+    cache = make_prompt_cache(model)
+    kwargs: dict = {
+        "max_tokens": max_tokens,
+        "prompt_cache": cache,
+        "sampler": _greedy_sampler(),
+        "kv_group_size": kv_group_size,
+    }
+    if kv_bits is not None:
+        kwargs["kv_bits"] = kv_bits
+
+    tokens: list[int] = []
+    logprobs_list: list[np.ndarray] = []
+    for token, logprobs in generate_step(mx.array(prompt_ids), model, **kwargs):
+        tid = int(token.item()) if hasattr(token, "item") else int(token)
+        tokens.append(tid)
+        if collect_logprobs:
+            # mlx compute dtype is often bf16; np.asarray can't read its buffer
+            # (PEP-3118 itemsize mismatch), so cast to float32 in MLX first.
+            logprobs_list.append(np.array(logprobs.astype(mx.float32)).reshape(-1))
+        if stop_on_eos and tid in eos_ids:
+            break
+    return tokens, logprobs_list, cache
+
+
+def _kv_cache_bytes(cache) -> int:
+    """Sum the FULL allocated bytes of every KV array in a prompt cache.
+
+    Consistent across cache types: a plain ``KVCache`` exposes ``keys`` /
+    ``values`` as single arrays; a ``QuantizedKVCache`` exposes them as
+    ``(packed, scales, biases)`` tuples. We sum ``.nbytes`` (shape+dtype
+    metadata — no lazy-eval spike) over ALL of them WITHOUT trimming to the used
+    offset.
+
+    Deliberately NOT ``vllm_mlx.memory_cache.estimate_kv_cache_memory``: that
+    helper trims a ``KVCache`` to its used ``offset`` (via ``.state``) but counts
+    a ``QuantizedKVCache``'s full padded buffer, which would skew a differential
+    bf16-vs-quantized comparison. Both caches here reach the SAME offset and the
+    SAME step-padded buffer, so a full-buffer byte sum is the apples-to-apples
+    measurement.
+    """
+    total = 0
+    for layer in cache:
+        if layer is None:
+            continue
+        for attr in (getattr(layer, "keys", None), getattr(layer, "values", None)):
+            if attr is None:
+                continue
+            arrays = attr if isinstance(attr, (list, tuple)) else (attr,)
+            for a in arrays:
+                if a is not None and hasattr(a, "nbytes"):
+                    total += int(a.nbytes)
+    return total
+
+
+def _measure_kv_bytes(
+    model,
+    prompt_ids: list[int],
+    *,
+    mem_tokens: int,
+    kv_bits: int | None,
+    kv_group_size: int,
+) -> int:
+    """Measure the KV-cache footprint after a FIXED-length generation.
+
+    Fixed length (no EOS stop) so baseline and candidate reach the same offset
+    and the byte comparison is apples-to-apples (see :func:`_kv_cache_bytes`).
+    """
+    _, _, cache = _run_generation(
+        model,
+        prompt_ids,
+        max_tokens=mem_tokens,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        eos_ids=set(),
+        collect_logprobs=False,
+        stop_on_eos=False,
+    )
+    return _kv_cache_bytes(cache)
+
+
+def _combine_agreement(results: list[AgreementResult]) -> AgreementResult:
+    total = sum(r.total for r in results)
+    matched = sum(r.matched for r in results)
+    rate = (matched / total) if total > 0 else 1.0
+    return AgreementResult(
+        total=total, matched=matched, rate=rate, first_divergence_index=None
+    )
+
+
+def _combine_logits(results: list[LogitDivergence]) -> LogitDivergence:
+    steps = sum(r.compared_steps for r in results)
+    if steps == 0:
+        return LogitDivergence(
+            compared_steps=0, mean_kl=0.0, max_kl=0.0, top1_agreement_rate=1.0
+        )
+    mean_kl = sum(r.mean_kl * r.compared_steps for r in results) / steps
+    top1 = sum(r.top1_agreement_rate * r.compared_steps for r in results) / steps
+    max_kl = max(r.max_kl for r in results)
+    return LogitDivergence(
+        compared_steps=steps,
+        mean_kl=mean_kl,
+        max_kl=max_kl,
+        top1_agreement_rate=top1,
+    )
+
+
+def _maybe_run_niah(
+    model,
+    tokenizer,
+    chip,
+    *,
+    enabled: bool,
+    max_tokens: int,
+    kv_bits: int,
+    kv_group_size: int,
+    eos_ids: set[int],
+    total_ram_gb: float | None,
+) -> dict:
+    """Optional needle-in-a-haystack retrieval metric, RAM/compute-tier-gated.
+
+    Gated on the chip tier (#5): only runs on an M3-or-newer chip with enough
+    RAM. A low-RAM M1/M2 skips it cleanly (the long-ish context is the expensive
+    part). This is the concrete #5 -> #4 wiring; the metric itself is kept modest
+    (single moderate-context needle) per the advisory MVP scope.
+    """
+    if not enabled:
+        return {"status": "skipped", "reason": "not requested (pass --niah)"}
+    if not chip.is_m3_or_newer:
+        return {
+            "status": "skipped",
+            "reason": f"chip tier below M3 (gen={chip.generation}) — NIAH gated off",
+        }
+    if total_ram_gb is not None and total_ram_gb < _NIAH_MIN_RAM_GB:
+        return {
+            "status": "skipped",
+            "reason": f"RAM {total_ram_gb:.0f}GB < {_NIAH_MIN_RAM_GB:.0f}GB gate",
+        }
+
+    filler = "The garden was quiet in the early morning light. " * 60
+    needle = f"The secret access code is {_NIAH_MAGIC}. "
+    question = (
+        "\n\nBased on the text above, what is the secret access code? "
+        "Answer with only the number."
+    )
+    context = filler[: len(filler) // 2] + needle + filler[len(filler) // 2 :]
+    prompt_ids = _encode_prompt(tokenizer, context + question)
+
+    base_tokens, _, _ = _run_generation(
+        model,
+        prompt_ids,
+        max_tokens=max_tokens,
+        kv_bits=None,
+        kv_group_size=kv_group_size,
+        eos_ids=eos_ids,
+        collect_logprobs=False,
+        stop_on_eos=True,
+    )
+    cand_tokens, _, _ = _run_generation(
+        model,
+        prompt_ids,
+        max_tokens=max_tokens,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        eos_ids=eos_ids,
+        collect_logprobs=False,
+        stop_on_eos=True,
+    )
+    base_found = _NIAH_MAGIC in tokenizer.decode(base_tokens)
+    cand_found = _NIAH_MAGIC in tokenizer.decode(cand_tokens)
+    if not base_found:
+        return {
+            "status": "skipped",
+            "reason": "baseline itself missed the needle — not attributable",
+            "baseline_found": False,
+            "candidate_found": cand_found,
+        }
+    return {
+        "status": "pass" if cand_found else "fail",
+        "reason": "candidate retained needle"
+        if cand_found
+        else "candidate lost needle",
+        "baseline_found": True,
+        "candidate_found": cand_found,
+    }
+
+
+def run_gate(
+    *,
+    model_arg: str,
+    candidate_dtypes: list[str],
+    prompts: list[dict[str, str]],
+    max_tokens: int,
+    mem_tokens: int,
+    kv_group_size: int,
+    advisory: bool,
+    run_niah: bool,
+    json_out: Path | None,
+) -> int:
+    """Load the model, run every candidate dtype, print + optionally dump reports.
+
+    Returns a process exit code. Advisory runs always return 0; enforced runs
+    return 1 if any candidate's overall verdict is FAIL.
+    """
+    from mlx_lm import load
+
+    from vllm_mlx.model_aliases import resolve_model
+
+    hf_path = resolve_model(model_arg)
+    print(f"[kv-quant-gate] loading {model_arg} -> {hf_path} ...", file=sys.stderr)
+    model, tokenizer = load(hf_path)
+    eos_ids = _eos_ids(tokenizer)
+
+    try:
+        chip = detect_chip_tier()
+    except Exception:
+        chip = classify_chip_tier(None)
+    chip_dict = asdict(chip)
+
+    total_ram_gb: float | None
+    try:
+        from vllm_mlx.optimizations import get_system_memory_gb
+
+        total_ram_gb = get_system_memory_gb()
+    except Exception:
+        total_ram_gb = None
+
+    json_prompts = [p for p in prompts if p.get("kind") == "json"]
+    mem_prompt_ids = _encode_prompt(tokenizer, prompts[0]["prompt"])
+
+    any_fail = False
+    reports: list[dict] = []
+    for cdtype in candidate_dtypes:
+        _, cand_bits = dtype_to_quantization_bits(cdtype)
+        thresholds = default_thresholds(cdtype)
+
+        agreements: list[AgreementResult] = []
+        divergences: list[LogitDivergence] = []
+        retention_pairs: list[tuple[str, str]] = []
+
+        for spec in prompts:
+            prompt_ids = _encode_prompt(tokenizer, spec["prompt"])
+            base_tokens, base_lp, _ = _run_generation(
+                model,
+                prompt_ids,
+                max_tokens=max_tokens,
+                kv_bits=None,
+                kv_group_size=kv_group_size,
+                eos_ids=eos_ids,
+                collect_logprobs=True,
+                stop_on_eos=True,
+            )
+            cand_tokens, cand_lp, _ = _run_generation(
+                model,
+                prompt_ids,
+                max_tokens=max_tokens,
+                kv_bits=cand_bits,
+                kv_group_size=kv_group_size,
+                eos_ids=eos_ids,
+                collect_logprobs=True,
+                stop_on_eos=True,
+            )
+            ag = greedy_agreement_rate(base_tokens, cand_tokens)
+            agreements.append(ag)
+            # Same-context prefix: up to AND INCLUDING the first divergence step
+            # (its distributions still share a context), else the whole overlap.
+            compare_len = (
+                ag.first_divergence_index + 1
+                if ag.first_divergence_index is not None
+                else ag.total
+            )
+            divergences.append(
+                logit_divergence(base_lp, cand_lp, compare_len=compare_len)
+            )
+            if spec.get("kind") == "json":
+                retention_pairs.append(
+                    (tokenizer.decode(base_tokens), tokenizer.decode(cand_tokens))
+                )
+
+        base_bytes = _measure_kv_bytes(
+            model,
+            mem_prompt_ids,
+            mem_tokens=mem_tokens,
+            kv_bits=None,
+            kv_group_size=kv_group_size,
+        )
+        cand_bytes = _measure_kv_bytes(
+            model,
+            mem_prompt_ids,
+            mem_tokens=mem_tokens,
+            kv_bits=cand_bits,
+            kv_group_size=kv_group_size,
+        )
+        from vllm_mlx.kv_quant_gate import memory_delta
+
+        niah = _maybe_run_niah(
+            model,
+            tokenizer,
+            chip,
+            enabled=run_niah,
+            max_tokens=max_tokens,
+            kv_bits=cand_bits,
+            kv_group_size=kv_group_size,
+            eos_ids=eos_ids,
+            total_ram_gb=total_ram_gb,
+        )
+
+        report = build_report(
+            model=model_arg,
+            hf_path=hf_path,
+            baseline_dtype="bf16",
+            candidate_dtype=cdtype,
+            num_prompts=len(prompts),
+            advisory=advisory,
+            chip=chip_dict,
+            thresholds=thresholds,
+            agreement=_combine_agreement(agreements),
+            logits=_combine_logits(divergences),
+            retention=structured_output_retention(retention_pairs)
+            if json_prompts
+            else structured_output_retention([]),
+            memory=memory_delta(base_bytes, cand_bytes),
+            niah=niah,
+        )
+        print(report.human_summary())
+        print()
+        reports.append(report.to_dict())
+        if report.overall == "FAIL":
+            any_fail = True
+
+    if json_out is not None:
+        json_out.write_text(json.dumps(reports, indent=2))
+        print(f"[kv-quant-gate] wrote JSON report -> {json_out}", file=sys.stderr)
+
+    if advisory:
+        return 0
+    return 1 if any_fail else 0
+
+
+def _load_prompts(path: Path | None) -> list[dict[str, str]]:
+    if path is None:
+        return list(_DEFAULT_PROMPTS)
+    data = json.loads(path.read_text())
+    if not isinstance(data, list) or not data:
+        raise ValueError("prompts file must be a non-empty JSON array")
+    prompts: list[dict[str, str]] = []
+    for entry in data:
+        if isinstance(entry, str):
+            prompts.append({"kind": "text", "prompt": entry})
+        elif isinstance(entry, dict) and isinstance(entry.get("prompt"), str):
+            prompts.append(
+                {"kind": str(entry.get("kind", "text")), "prompt": entry["prompt"]}
+            )
+        else:
+            raise ValueError(f"bad prompt entry: {entry!r}")
+    return prompts
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    p.add_argument("model", help="alias or HF path (e.g. qwen3.5-4b-4bit)")
+    p.add_argument(
+        "--candidate",
+        nargs="+",
+        default=["int8", "int4"],
+        choices=["int8", "int4"],
+        help="candidate KV dtype(s) to test against the bf16 baseline",
+    )
+    p.add_argument("--max-tokens", type=int, default=48)
+    p.add_argument(
+        "--mem-tokens",
+        type=int,
+        default=128,
+        help="fixed generation length for the memory-delta measurement",
+    )
+    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--prompts-file", type=Path, default=None)
+    p.add_argument(
+        "--niah",
+        action="store_true",
+        help="run the optional NIAH retrieval metric (RAM/chip-tier-gated)",
+    )
+    p.add_argument(
+        "--enforce",
+        action="store_true",
+        help="exit non-zero on FAIL (default: advisory, always exit 0)",
+    )
+    p.add_argument("--json-out", type=Path, default=None)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    prompts = _load_prompts(args.prompts_file)
+    return run_gate(
+        model_arg=args.model,
+        candidate_dtypes=list(dict.fromkeys(args.candidate)),
+        prompts=prompts,
+        max_tokens=args.max_tokens,
+        mem_tokens=args.mem_tokens,
+        kv_group_size=args.group_size,
+        advisory=not args.enforce,
+        run_niah=args.niah,
+        json_out=args.json_out,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
