@@ -154,13 +154,19 @@ async def _run_job(
     started = False
     output = _jobs_root / job.id / "output.mp4"
 
-    async def generate_under_gate() -> None:
+    async def generate_under_gate() -> bool:
         nonlocal started
         # This inner task owns the gate, so cancellation of the request-facing
         # job never releases it while an uncancellable MLX thread is running.
         async with _generation_gate:
-            started = True
             with _jobs_lock:
+                if (
+                    job.status == "failed"
+                    and job.error is not None
+                    and job.error.get("code") == "video_generation_cancelled"
+                ):
+                    return False
+                started = True
                 job.status = "in_progress"
                 job.progress = 1
             await asyncio.to_thread(
@@ -174,10 +180,13 @@ async def _run_job(
                 seed=seed,
                 image=image_path,
             )
+            return True
 
     runner = asyncio.create_task(generate_under_gate())
     try:
-        await asyncio.shield(runner)
+        generated = await asyncio.shield(runner)
+        if not generated:
+            return
         with _jobs_lock:
             job.status = "completed"
             job.progress = 100
@@ -383,6 +392,12 @@ async def delete_video(video_id: str):
                 status_code=409, detail="video generation is in progress"
             )
         task = _tasks.get(video_id) if job is not None else None
+        if job is not None and job.status == "queued":
+            job.status = "failed"
+            job.error = {
+                "code": "video_generation_cancelled",
+                "message": "Video generation was cancelled.",
+            }
         if job is not None and job.status != "queued":
             _jobs.pop(video_id, None)
     if job is None:
