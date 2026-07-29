@@ -6,7 +6,7 @@ import asyncio
 import sys
 import threading
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -14,7 +14,7 @@ from PIL import Image
 
 from vllm_mlx.model_aliases import resolve_profile
 from vllm_mlx.routes import video
-from vllm_mlx.runtime.video_lane import VideoEngine
+from vllm_mlx.runtime.video_lane import VideoEngine, require_video_runtime_or_exit
 
 
 def test_ltx23_alias_routes_to_video_lane() -> None:
@@ -24,6 +24,45 @@ def test_ltx23_alias_routes_to_video_lane() -> None:
     assert profile.modality == "video-gen"
     assert profile.min_memory_gb == 24
     assert profile.supports_spec_decode is False
+
+
+def test_ltx23_model_discovery_is_video_shaped() -> None:
+    from vllm_mlx.routes.models import _build_model_info
+
+    info = _build_model_info("ltx-2.3-mlx-q4")
+    assert info.modality == "video-gen"
+    assert info.capabilities == ["video.generation"]
+
+
+def test_video_runtime_preflight_fails_before_download(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("importlib.util.find_spec", lambda _: None)
+    monkeypatch.setattr("shutil.which", lambda _: None)
+
+    with pytest.raises(SystemExit) as exc:
+        require_video_runtime_or_exit()
+
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "rapid-mlx[video]" in error
+    assert "brew install ffmpeg" in error
+
+
+def test_serve_dispatches_video_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_mlx import cli
+    from vllm_mlx.runtime import video_lane
+
+    class PreflightReachedError(RuntimeError):
+        pass
+
+    def stop_at_preflight() -> None:
+        raise PreflightReachedError
+
+    monkeypatch.setattr(video_lane, "require_video_runtime_or_exit", stop_at_preflight)
+    args = SimpleNamespace(model="ltx-2.3-mlx-q4", max_tokens=None, watchdog_ppid=None)
+    with pytest.raises(PreflightReachedError):
+        cli.serve_command(args)
 
 
 def test_video_engine_calls_mlx_native_pipeline(

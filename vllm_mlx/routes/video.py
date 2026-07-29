@@ -14,7 +14,7 @@ import time
 import uuid
 import warnings
 import weakref
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -355,9 +355,10 @@ async def create_video(
 def _get_job(video_id: str) -> _VideoJob:
     with _jobs_lock:
         job = _jobs.get(video_id)
-    if job is None:
+        snapshot = replace(job) if job is not None else None
+    if snapshot is None:
         raise HTTPException(status_code=404, detail="video job not found")
-    return job
+    return snapshot
 
 
 @router.get("/v1/videos/{video_id}", dependencies=[Depends(verify_api_key)])
@@ -396,8 +397,11 @@ async def retrieve_video_content(video_id: str):
 @router.get("/v1/videos", dependencies=[Depends(verify_api_key)])
 async def list_videos(limit: int = Query(20, ge=1, le=100)):
     with _jobs_lock:
-        data = sorted(_jobs.values(), key=lambda item: item.created_at, reverse=True)[
-            :limit
+        data = [
+            replace(job)
+            for job in sorted(
+                _jobs.values(), key=lambda item: item.created_at, reverse=True
+            )[:limit]
         ]
     return {"object": "list", "data": [job.public() for job in data]}
 

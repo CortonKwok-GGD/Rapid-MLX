@@ -3,13 +3,32 @@
 
 from __future__ import annotations
 
+import importlib.util
 import shutil
+import sys
 import threading
 from pathlib import Path
 
 
 class VideoRuntimeError(RuntimeError):
     """Safe, actionable generation error suitable for the public API."""
+
+
+def require_video_runtime_or_exit() -> None:
+    """Fail before model download when the optional video stack is absent."""
+    missing = []
+    if importlib.util.find_spec("mlx_video") is None:
+        missing.append("the `rapid-mlx[video]` Python extra")
+    if shutil.which("ffmpeg") is None:
+        missing.append("ffmpeg (`brew install ffmpeg`)")
+    if missing:
+        print(
+            "\n  Error: LTX-2.3 video generation requires "
+            + " and ".join(missing)
+            + ".\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
 
 class VideoEngine:
