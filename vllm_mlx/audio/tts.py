@@ -330,7 +330,7 @@ class TTSEngine:
             self.load()
 
         if self._model_family == "f5":
-            return self._generate_f5(text, ref_audio, ref_text)
+            return self._generate_f5(text, ref_audio, ref_text, speed)
 
         try:
             import mlx.core as mx
@@ -386,12 +386,19 @@ class TTSEngine:
             raise
 
     def _generate_f5(
-        self, text: str, ref_audio: str | None, ref_text: str | None
+        self,
+        text: str,
+        ref_audio: str | None,
+        ref_text: str | None,
+        speed: float,
     ) -> AudioOutput:
         """F5-TTS inference (pure MLX). Clones the reference clip's timbre and
         speaks ``text`` in it; with no ``ref_audio`` it uses the packaged default
         reference. Mirrors ``f5_tts_mlx.generate.generate`` but reuses the
         already-loaded model (no per-call reload)."""
+        if (ref_audio is None) != (ref_text is None):
+            raise ValueError("F5 voice cloning requires both ref_audio and ref_text.")
+
         import pkgutil
 
         import mlx.core as mx
@@ -404,34 +411,41 @@ class TTSEngine:
             estimated_duration,
         )
 
-        if ref_audio:
+        if ref_audio is not None:
+            assert ref_text is not None  # paired-input validation above
             aud, sr = sf.read(ref_audio)
             if sr != SAMPLE_RATE:
                 raise ValueError(
                     f"F5 ref_audio must be {SAMPLE_RATE} Hz (got {sr}); resample it."
                 )
-            rtext = ref_text or ""
+            rtext = ref_text
         else:
             # packaged short reference (its timbre; content comes from `text`)
             data = pkgutil.get_data("f5_tts_mlx", "tests/test_en_1_ref_short.wav")
-            tmp = "/tmp/f5_default_ref.wav"
-            with open(tmp, "wb") as f:
-                f.write(data)  # type: ignore[arg-type]
-            aud, _sr = sf.read(tmp)
+            if data is None:
+                raise RuntimeError("F5-TTS packaged reference audio is missing.")
+            aud, _sr = sf.read(io.BytesIO(data))
             rtext = "Some call me nature, others call me mother nature."
 
+        if aud.ndim != 1:
+            raise ValueError("F5 ref_audio must be mono.")
         aud = mx.array(aud)
         rms = mx.sqrt(mx.mean(mx.square(aud)))
-        if rms < TARGET_RMS:
+        mx.eval(rms)
+        rms_value = float(rms)
+        if not np.isfinite(rms_value) or rms_value <= 0:
+            raise ValueError("F5 ref_audio must contain finite, non-silent audio.")
+        if rms_value < TARGET_RMS:
             aud = aud * TARGET_RMS / rms
         # explicit duration estimate — F5's auto heuristic can collapse to ~0s
-        dur = int(estimated_duration(aud, rtext, text, 1.0) * FRAMES_PER_SEC)
+        dur = int(estimated_duration(aud, rtext, text, speed) * FRAMES_PER_SEC)
         ptext = convert_char_to_pinyin([rtext + " " + text])
         wave, _ = self.model.sample(
             mx.expand_dims(aud, axis=0),
             text=ptext,
             duration=dur,
             steps=8,
+            speed=speed,
             cfg_strength=2.0,
             sway_sampling_coef=-1.0,
         )

@@ -1472,6 +1472,12 @@ def _allowed_voices_for(model_name: str) -> list[str]:
         # registry ``default_voice`` (``Serena``) is a member of this
         # list so the cold-start / voice-omitted path validates.
         return list(QWEN3_TTS_VOICES)
+    if "f5-tts" in name_lower or "f5_tts" in name_lower:
+        # F5 conditions on a reference waveform rather than a named
+        # safetensors voice. ``clone`` is the registry's UI/API sentinel;
+        # when no custom reference is supplied the engine uses its packaged
+        # reference voice.
+        return ["clone"]
     if "vibevoice" in name_lower:
         # Cold-start fallback for VibeVoice — the canonical English
         # default is ``en-Grace_woman`` (per the upstream repo's
