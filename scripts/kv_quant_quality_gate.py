@@ -133,6 +133,32 @@ def _decode_text(tokenizer, token_ids: list[int]) -> str:
         return tokenizer.decode(token_ids)
 
 
+def _enable_hf_offline() -> None:
+    """Force HuggingFace offline mode RELIABLY, whatever the import order.
+
+    Setting the env vars alone is not enough: ``huggingface_hub.constants``
+    snapshots ``HF_HUB_OFFLINE`` from the environment ONCE at import time, and
+    ``is_offline_mode()`` returns that frozen module global. A programmatic
+    caller that already imported ``huggingface_hub`` (while online) would have
+    the snapshot pinned to ``False``, so a later env-var change is silently
+    ignored and the "no network fetch" contract breaks. We therefore ALSO patch
+    the already-imported constant to ``True`` — ``is_offline_mode()`` reads it at
+    call time, so the load fails fast on an uncached model either way.
+    """
+    import os
+
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        import huggingface_hub.constants as hf_constants
+
+        hf_constants.HF_HUB_OFFLINE = True
+    except Exception:
+        # huggingface_hub not importable — the env vars are still set for any
+        # process that imports it fresh later.
+        pass
+
+
 def _run_generation(
     model,
     prompt_ids: list[int],
@@ -389,8 +415,10 @@ def run_gate(
     Returns a process exit code. Advisory runs always return 0; enforced runs
     return 1 if any candidate's overall verdict is FAIL.
 
-    When ``offline`` is set, HuggingFace offline mode is forced before the load so
-    an uncached model fails fast instead of triggering a network fetch.
+    When ``offline`` is set, HuggingFace offline mode is forced before the load
+    (env vars AND the already-imported ``constants.HF_HUB_OFFLINE``, see
+    :func:`_enable_hf_offline`) so an uncached model fails fast instead of
+    triggering a network fetch — reliably even if the hub was imported earlier.
 
     Raises:
         ValueError: If ``max_tokens`` / ``mem_tokens`` / ``kv_group_size`` are not
@@ -414,12 +442,9 @@ def run_gate(
         raise ValueError("candidate_dtypes must be a non-empty list")
 
     if offline:
-        # Forbid any network fetch — the load fails fast if the model isn't fully
-        # cached. Set before importing/using mlx_lm.load so the HF hub honors it.
-        import os
-
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        # Forbid any network fetch — the load then fails fast if the model isn't
+        # fully cached (mlx_lm.load -> snapshot_download raises OfflineModeIsEnabled).
+        _enable_hf_offline()
 
     from mlx_lm import load
 

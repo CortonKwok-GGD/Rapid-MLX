@@ -400,6 +400,49 @@ def test_decode_text_falls_back_when_kwarg_unsupported():
 
 
 # ---------------------------------------------------------------------------
+# Offline enforcement is reliable even if huggingface_hub was imported first
+# (codex round 5 blocking) — hermetic, no model load.
+# ---------------------------------------------------------------------------
+def test_enable_hf_offline_overrides_preimported_constant():
+    """RED-GREEN: ``huggingface_hub.constants`` snapshots ``HF_HUB_OFFLINE`` from
+    the env ONCE at import; ``is_offline_mode()`` returns that frozen global. If
+    the hub was imported while ONLINE, setting the env var alone leaves
+    ``is_offline_mode()`` False and a network fetch can still happen.
+    ``_enable_hf_offline`` must also patch the in-memory constant so the "no
+    fetch" contract holds regardless of import order.
+    """
+    import os
+
+    hf = pytest.importorskip("huggingface_hub.constants")
+    from scripts.kv_quant_quality_gate import _enable_hf_offline
+
+    saved_const = hf.HF_HUB_OFFLINE
+    saved_env = {
+        k: os.environ.get(k) for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    }
+    try:
+        # Simulate a process that imported the hub while online.
+        hf.HF_HUB_OFFLINE = False
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        assert hf.is_offline_mode() is False  # precondition: online
+
+        _enable_hf_offline()
+
+        # Env-var-only would leave this False; the constant patch flips it.
+        assert hf.is_offline_mode() is True
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+    finally:
+        hf.HF_HUB_OFFLINE = saved_const
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
 # Thresholds + report schema + PASS/FAIL logic
 # ---------------------------------------------------------------------------
 def test_default_thresholds_int4_more_lenient_than_int8():
