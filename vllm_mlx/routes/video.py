@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import logging
 import shutil
 import tempfile
@@ -120,6 +121,7 @@ async def _run_job(
     seed: int,
     image_path: Path | None,
 ) -> None:
+    worker: asyncio.Task | None = None
     try:
         # Wait outside the executor so queued jobs consume no worker threads.
         async with _generation_gate:
@@ -127,22 +129,39 @@ async def _run_job(
                 job.status = "in_progress"
                 job.progress = 1
             output = _jobs_root / job.id / "output.mp4"
-            await asyncio.to_thread(
-                engine.generate,
-                prompt=job.prompt,
-                output_path=output,
-                width=width,
-                height=height,
-                num_frames=_frame_count(seconds),
-                fps=24,
-                seed=seed,
-                image=image_path,
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    engine.generate,
+                    prompt=job.prompt,
+                    output_path=output,
+                    width=width,
+                    height=height,
+                    num_frames=_frame_count(seconds),
+                    fps=24,
+                    seed=seed,
+                    image=image_path,
+                )
             )
+            # Cancellation cannot stop a running MLX graph. Shield the worker;
+            # the cancellation handler waits for it before cleaning files.
+            await asyncio.shield(worker)
             with _jobs_lock:
                 job.status = "completed"
                 job.progress = 100
                 job.completed_at = int(time.time())
                 job.output_path = str(output)
+    except asyncio.CancelledError:
+        if worker is not None:
+            with contextlib.suppress(Exception):
+                await worker
+        with _jobs_lock:
+            job.status = "failed"
+            job.error = {
+                "code": "video_generation_cancelled",
+                "message": "Video generation was cancelled.",
+            }
+        await asyncio.to_thread(shutil.rmtree, _jobs_root / job.id, True)
+        raise
     except Exception as exc:  # noqa: BLE001
         from ..runtime.video_lane import VideoRuntimeError
 
@@ -187,6 +206,7 @@ async def create_video(
     job_dir.mkdir(mode=0o700)
     image_path = None
     enqueued = False
+    evicted_id: str | None = None
     try:
         if input_reference is not None:
             image_path = job_dir / "reference.img"
@@ -221,12 +241,16 @@ async def create_video(
                     )
                 oldest = min(finished, key=lambda item: item.created_at)
                 _jobs.pop(oldest.id, None)
-                shutil.rmtree(_jobs_root / oldest.id, ignore_errors=True)
+                evicted_id = oldest.id
             _jobs[job.id] = job
             enqueued = True
     finally:
         if not enqueued:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, job_dir, ignore_errors=True)
+    if evicted_id is not None:
+        await asyncio.to_thread(
+            shutil.rmtree, _jobs_root / evicted_id, ignore_errors=True
+        )
     task = asyncio.create_task(
         _run_job(
             job,
@@ -305,7 +329,7 @@ async def delete_video(video_id: str):
             _jobs.pop(video_id, None)
     if job is None:
         raise HTTPException(status_code=404, detail="video job not found")
-    shutil.rmtree(_jobs_root / video_id, ignore_errors=True)
+    await asyncio.to_thread(shutil.rmtree, _jobs_root / video_id, ignore_errors=True)
     response = job.public()
     response["deleted"] = True
     return response

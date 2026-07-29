@@ -165,10 +165,53 @@ async def test_video_jobs_stay_queued_until_worker_is_free(
     assert (await video.retrieve_video(first["id"]))["status"] == "in_progress"
     assert (await video.retrieve_video(second["id"]))["status"] == "queued"
     release.set()
+    second_status = None
     for _ in range(200):
-        if (await video.retrieve_video(second["id"]))["status"] == "completed":
+        second_status = (await video.retrieve_video(second["id"]))["status"]
+        if second_status == "completed":
             break
         await asyncio.sleep(0.01)
     assert calls == 2
+    assert second_status == "completed"
+    response = await video.retrieve_video_content(second["id"])
+    assert b"".join([chunk async for chunk in response.body_iterator]) == b"mp4"
     await video.delete_video(first["id"])
     await video.delete_video(second["id"])
+
+
+@pytest.mark.asyncio
+async def test_cancelled_job_reaches_terminal_state_and_cleans_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            started.set()
+            assert release.wait(timeout=5)
+            output_path.write_bytes(b"late-output")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: BlockingEngine())
+    created = await video.create_video(
+        prompt="cancel me",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="512x512",
+        seed=3,
+        input_reference=None,
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    task = next(task for task in video._tasks if not task.done())
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    current = await video.retrieve_video(created["id"])
+    assert current["status"] == "failed"
+    assert current["error"]["code"] == "video_generation_cancelled"
+    assert not (video._jobs_root / created["id"]).exists()
+    await video.delete_video(created["id"])
