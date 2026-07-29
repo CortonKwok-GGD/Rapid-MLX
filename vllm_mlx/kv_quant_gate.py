@@ -235,62 +235,77 @@ def logit_divergence(
 # ---------------------------------------------------------------------------
 # Structured-output retention
 # ---------------------------------------------------------------------------
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+# A fence is only unwrapped when the WHOLE (stripped) output is exactly one
+# ```...``` block — a fence embedded in prose does not satisfy an "ONLY JSON"
+# instruction and must not be leniently extracted.
+_JSON_FENCE_FULL_RE = re.compile(
+    r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE
+)
+
+# Sentinel for "did not parse". ``None`` is a legal JSON value (``null``), so we
+# cannot use it to signal failure.
+_JSON_INVALID = object()
 
 
-def extract_json_candidate(text: str) -> str:
-    """Return the most likely JSON substring from a model output.
+def _parse_strict_json(text: str) -> Any:
+    """Parse the WHOLE output as a single JSON value, or return ``_JSON_INVALID``.
 
-    Prefers a fenced ```json ... ``` block; otherwise the span from the first
-    ``{`` / ``[`` to the matching last ``}`` / ``]``. Returns the stripped whole
-    string when no bracket is found. Purely lexical — validity is decided by
-    :func:`is_valid_json`.
+    The structured prompts instruct the model to reply with ONLY JSON. So the
+    contract is strict: the entire stripped output (optionally wrapped in a
+    single code fence) must parse as one JSON value via ``json.loads`` — which,
+    unlike an incremental ``raw_decode`` scan, rejects trailing/leading prose
+    (``"Sorry, [1]"``) and stray bracket fragments (``"see [x] then {..}"``).
+    A candidate that buries JSON in prose has NOT honored the format contract and
+    should not count as retained.
     """
-    if not text:
-        return ""
-    fence = _JSON_FENCE_RE.search(text)
+    if not text or not text.strip():
+        return _JSON_INVALID
+    candidate = text.strip()
+    fence = _JSON_FENCE_FULL_RE.fullmatch(candidate)
     if fence:
-        return fence.group(1).strip()
-    start = min(
-        (i for i in (text.find("{"), text.find("[")) if i != -1),
-        default=-1,
-    )
-    if start == -1:
-        return text.strip()
-    end = max(text.rfind("}"), text.rfind("]"))
-    if end <= start:
-        return text.strip()
-    return text[start : end + 1].strip()
+        candidate = fence.group(1).strip()
+    try:
+        return json.loads(candidate)
+    except (ValueError, TypeError):
+        return _JSON_INVALID
 
 
 def is_valid_json(text: str) -> bool:
-    """True iff ``text`` contains a parseable JSON value.
+    """True iff the WHOLE output parses as a single JSON value (see the note on
+    strictness in :func:`_parse_strict_json`)."""
+    return _parse_strict_json(text) is not _JSON_INVALID
 
-    First tries the whole extracted candidate span (fenced block or bracket
-    span). If that fails, scans each opening ``{`` / ``[`` delimiter and attempts
-    an incremental ``json.JSONDecoder().raw_decode()`` from there — so a valid
-    embedded object survives even when other bracketed fragments in the
-    surrounding prose would break a naive "first-brace-to-last-bracket" span
-    (e.g. ``"see [x] then {\\"a\\": 1}"``).
+
+def _json_shape(obj: Any) -> tuple[str, frozenset[str] | None]:
+    """Classify a parsed JSON value into a comparable shape signature.
+
+    Returns ``("object", frozenset(keys))`` for a dict, ``("array", None)`` for a
+    list, and ``("scalar", None)`` for anything else (string / number / bool /
+    null). Used to require the candidate to preserve the baseline's structure.
     """
-    if not text:
+    if isinstance(obj, dict):
+        return "object", frozenset(obj.keys())
+    if isinstance(obj, list):
+        return "array", None
+    return "scalar", None
+
+
+def _retains_shape(baseline_obj: Any, candidate_obj: Any) -> bool:
+    """True iff the candidate preserves the baseline's JSON contract.
+
+    Same top-level type, and — for objects — the candidate must carry AT LEAST
+    the baseline's keys (a requested key vanishing under quantization is a
+    regression). This closes the generic-validity hole where an object prompt
+    could "retain" as an array/scalar or silently drop keys.
+    """
+    base_type, base_keys = _json_shape(baseline_obj)
+    cand_type, cand_keys = _json_shape(candidate_obj)
+    if base_type != cand_type:
         return False
-    candidate = extract_json_candidate(text)
-    if candidate:
-        try:
-            json.loads(candidate)
-            return True
-        except (ValueError, TypeError):
-            pass
-    decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch in "{[":
-            try:
-                decoder.raw_decode(text, i)
-                return True
-            except ValueError:
-                continue
-    return False
+    if base_type == "object":
+        assert base_keys is not None and cand_keys is not None
+        return base_keys <= cand_keys
+    return True
 
 
 @dataclass(frozen=True)
@@ -298,14 +313,16 @@ class RetentionResult:
     """Structured-output retention across a set of (baseline, candidate) outputs.
 
     Attributes:
-        attributable: Prompts where the BASELINE emitted valid JSON — the only
-            prompts where a candidate failure is attributable to quantization.
-        retained: Of the attributable prompts, how many the candidate ALSO kept
-            valid.
+        attributable: Prompts where the BASELINE emitted a valid JSON document —
+            the only prompts where a candidate failure is attributable to
+            quantization.
+        retained: Of the attributable prompts, how many the candidate kept valid
+            AND matching the baseline's JSON contract (same top-level type; for
+            objects, no baseline key dropped).
         rate: ``retained / attributable``, or ``None`` when nothing was
             attributable (no baseline produced valid JSON — the metric is N/A).
         baseline_invalid: Prompts excluded because the baseline itself did not
-            emit valid JSON (not a quantization signal).
+            emit a valid JSON document (not a quantization signal).
     """
 
     attributable: int
@@ -317,24 +334,30 @@ class RetentionResult:
 def structured_output_retention(
     pairs: Sequence[tuple[str, str]],
 ) -> RetentionResult:
-    """Retention of valid JSON output under quantization.
+    """Shape-aware retention of the baseline's JSON contract under quantization.
 
     ``pairs`` is a sequence of ``(baseline_text, candidate_text)``. Only prompts
-    where the baseline produced valid JSON count toward the rate; of those, the
-    fraction where the candidate ALSO produced valid JSON is the retention rate.
-    A prompt the baseline already failed is excluded (not attributable to the
-    cache dtype). ``rate`` is ``None`` when nothing is attributable.
+    where the baseline produced a valid JSON document count toward the rate; of
+    those, a prompt is RETAINED iff the candidate is also valid JSON AND
+    preserves the baseline's contract (same top-level type; for objects, retains
+    every baseline key — see :func:`_retains_shape`). A prompt the baseline
+    already failed is excluded (not attributable to the cache dtype). ``rate`` is
+    ``None`` when nothing is attributable.
     """
     attributable = 0
     retained = 0
     baseline_invalid = 0
     for baseline_text, candidate_text in pairs:
-        if is_valid_json(baseline_text):
-            attributable += 1
-            if is_valid_json(candidate_text):
-                retained += 1
-        else:
+        baseline_obj = _parse_strict_json(baseline_text)
+        if baseline_obj is _JSON_INVALID:
             baseline_invalid += 1
+            continue
+        attributable += 1
+        candidate_obj = _parse_strict_json(candidate_text)
+        if candidate_obj is not _JSON_INVALID and _retains_shape(
+            baseline_obj, candidate_obj
+        ):
+            retained += 1
     rate = (retained / attributable) if attributable > 0 else None
     return RetentionResult(
         attributable=attributable,
@@ -401,7 +424,12 @@ class GateThresholds:
 
 
 def default_thresholds(candidate_dtype: str) -> GateThresholds:
-    """Return provisional thresholds for a candidate dtype (``int8`` / ``int4``)."""
+    """Return provisional thresholds for a candidate dtype.
+
+    Only ``int8`` and ``int4`` are supported; any other value raises rather than
+    silently borrowing the int8 thresholds (a typo or a future dtype would
+    otherwise get a misleading verdict).
+    """
     if candidate_dtype == "int4":
         return GateThresholds(
             min_greedy_agreement=0.40,
@@ -409,12 +437,15 @@ def default_thresholds(candidate_dtype: str) -> GateThresholds:
             min_structured_retention=1.0,
             min_memory_reduction_ratio=2.5,
         )
-    # int8 (and any other 8-bit-ish candidate) — tighter.
-    return GateThresholds(
-        min_greedy_agreement=0.60,
-        max_mean_kl=0.05,
-        min_structured_retention=1.0,
-        min_memory_reduction_ratio=1.5,
+    if candidate_dtype == "int8":
+        return GateThresholds(
+            min_greedy_agreement=0.60,
+            max_mean_kl=0.05,
+            min_structured_retention=1.0,
+            min_memory_reduction_ratio=1.5,
+        )
+    raise ValueError(
+        f"unsupported candidate dtype {candidate_dtype!r}; expected 'int8' or 'int4'"
     )
 
 

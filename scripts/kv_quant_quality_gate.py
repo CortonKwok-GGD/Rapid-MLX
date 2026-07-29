@@ -360,6 +360,10 @@ def run_gate(
         )
     if not prompts:
         raise ValueError("prompts must be a non-empty list")
+    if not candidate_dtypes:
+        # An empty candidate list would run the loop zero times and let an
+        # --enforce invocation return success having measured NOTHING.
+        raise ValueError("candidate_dtypes must be a non-empty list")
 
     from mlx_lm import load
 

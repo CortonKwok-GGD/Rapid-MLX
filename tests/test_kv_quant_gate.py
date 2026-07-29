@@ -23,7 +23,6 @@ from vllm_mlx.kv_quant_gate import (
     RetentionResult,
     build_report,
     default_thresholds,
-    extract_json_candidate,
     greedy_agreement_rate,
     is_valid_json,
     logit_divergence,
@@ -154,30 +153,27 @@ def test_logit_divergence_shape_mismatch_step_skipped():
 # ---------------------------------------------------------------------------
 # Structured-output retention + JSON helpers
 # ---------------------------------------------------------------------------
-def test_is_valid_json_plain_and_fenced_and_embedded():
+def test_is_valid_json_strict_whole_output():
+    # Whole output IS one JSON value (optionally a single fence) -> valid.
     assert is_valid_json('{"a": 1}')
     assert is_valid_json('```json\n{"a": 1}\n```')
-    assert is_valid_json('Sure! Here you go: {"a": [1, 2, 3]} — done.')
     assert is_valid_json("[1, 2, 3]")
+    assert is_valid_json("  42  ")  # a scalar is a valid JSON document
+    # Empty / non-JSON -> invalid.
     assert not is_valid_json("not json at all")
     assert not is_valid_json("")
 
 
-def test_extract_json_candidate_prefers_fence():
-    assert extract_json_candidate('```json\n{"x": 1}\n```') == '{"x": 1}'
-    assert extract_json_candidate('prefix {"x": 1} suffix') == '{"x": 1}'
-
-
-def test_is_valid_json_embedded_despite_other_brackets():
-    """RED-GREEN: a valid object survives even when another bracketed fragment in
-    the prose would break a naive first-brace-through-last-bracket span. The old
-    span logic yielded ``[x] then {"a": 1}`` / ``[1, 2] and {"ok": true}`` (both
-    unparseable); the raw_decode scan recovers the real JSON value.
+def test_is_valid_json_strict_rejects_prose_wrapped_json():
+    """RED-GREEN: under the 'ONLY JSON' contract, JSON buried in prose is NOT
+    valid. A lenient raw_decode/first-brace scan would (wrongly) accept these;
+    strict whole-output parsing rejects them so a candidate that stops honoring
+    the format contract is caught.
     """
-    assert is_valid_json('see [x] then {"a": 1}')
-    assert is_valid_json('result: [1, 2] and {"ok": true}')
-    # A genuinely JSON-free string still returns False.
-    assert not is_valid_json("no brackets, no json here")
+    assert not is_valid_json('Sure! Here you go: {"a": [1, 2, 3]} — done.')
+    assert not is_valid_json("Sorry, [1]")
+    assert not is_valid_json('see [x] then {"a": 1}')
+    assert not is_valid_json('result: [1, 2] and {"ok": true}')
 
 
 def test_retention_both_valid():
@@ -215,6 +211,30 @@ def test_retention_mixed():
     assert r.baseline_invalid == 1
 
 
+def test_retention_shape_mismatch_not_retained():
+    """RED-GREEN: an object prompt must NOT 'retain' as an array/scalar. Generic
+    JSON validity would count ``[1, 2]`` as retained; shape-aware retention
+    (same top-level type) correctly rejects it.
+    """
+    r = structured_output_retention([('{"a": 1}', "[1, 2]")])
+    assert r.attributable == 1
+    assert r.retained == 0
+    assert r.rate == 0.0
+
+
+def test_retention_dropped_key_not_retained():
+    """RED-GREEN: a candidate object that drops a baseline key is NOT retained —
+    the requested field vanished under quantization.
+    """
+    r = structured_output_retention([('{"name": "x", "age": 3}', '{"name": "x"}')])
+    assert r.attributable == 1
+    assert r.retained == 0
+    assert r.rate == 0.0
+    # Superset of keys is fine (candidate added a field but kept the contract).
+    r2 = structured_output_retention([('{"name": "x"}', '{"name": "y", "extra": 1}')])
+    assert r2.retained == 1
+
+
 # ---------------------------------------------------------------------------
 # Memory delta
 # ---------------------------------------------------------------------------
@@ -245,6 +265,15 @@ def test_default_thresholds_int4_more_lenient_than_int8():
     assert t4.min_greedy_agreement < t8.min_greedy_agreement
     assert t4.max_mean_kl > t8.max_mean_kl
     assert t4.min_memory_reduction_ratio > t8.min_memory_reduction_ratio
+
+
+def test_default_thresholds_rejects_unsupported_dtype():
+    """RED-GREEN: an unknown dtype must raise, not silently borrow int8's
+    thresholds (which would give a misleading verdict for a typo/future dtype).
+    """
+    for bad in ("int2", "bf16", "fp8", ""):
+        with pytest.raises(ValueError):
+            default_thresholds(bad)
 
 
 def _passing_inputs():
@@ -430,6 +459,7 @@ def _run_gate_kwargs(**overrides):
         {"mem_tokens": 0},
         {"kv_group_size": 0},
         {"prompts": []},
+        {"candidate_dtypes": []},  # empty -> enforced no-op "pass" without it
     ],
 )
 def test_run_gate_rejects_bad_config_before_load(override):
@@ -529,35 +559,58 @@ _SMOKE_MODEL_CANDIDATES = [
 ]
 
 
-# A COMPLETE snapshot needs config + tokenizer + at least one weights artifact.
-# Probing only ``config.json`` would let ``mlx_lm.load`` fetch a missing shard /
-# tokenizer over the network — violating the cache-only (no-download) contract.
+# A COMPLETE snapshot needs config + tokenizer config + a tokenizer data file +
+# ALL weight shards. Probing only ``config.json`` (or an index without its
+# shards) would let ``mlx_lm.load`` fetch a missing file over the network —
+# violating the cache-only (no-download) contract.
 _REQUIRED_CACHE_FILES = ("config.json", "tokenizer_config.json")
-_WEIGHT_CANDIDATE_FILES = ("model.safetensors", "model.safetensors.index.json")
+# Tokenizer payload — a repo ships exactly one of these; require at least one.
+_TOKENIZER_DATA_FILES = ("tokenizer.json", "tokenizer.model", "vocab.json")
 
 
 def _model_fully_cached(repo: str) -> bool:
     """True iff a COMPLETE local snapshot of ``repo`` is in the HF cache.
 
     Deterministic cache probe (``try_to_load_from_cache`` — a real ``str`` path
-    means present) for config + tokenizer + a weights artifact. No network, no
-    exception-message classification (the flaky pattern the gemma4 tests warned
-    against).
+    means present). Verifies config + tokenizer config + a tokenizer data file +
+    a full weight set: either a single ``model.safetensors`` OR a
+    ``model.safetensors.index.json`` whose ``weight_map`` shards are ALL cached.
+    No network, no exception-message classification (the flaky pattern the gemma4
+    tests warned against).
     """
     try:
+        import json as _json
+        from pathlib import Path as _Path
+
         from huggingface_hub import try_to_load_from_cache
     except Exception:
         return False
 
-    def cached(filename: str) -> bool:
+    def cached_path(filename: str) -> str | None:
         try:
-            return isinstance(try_to_load_from_cache(repo, filename), str)
+            path = try_to_load_from_cache(repo, filename)
         except Exception:
-            return False
+            return None
+        return path if isinstance(path, str) else None
 
-    if not all(cached(f) for f in _REQUIRED_CACHE_FILES):
+    if not all(cached_path(f) for f in _REQUIRED_CACHE_FILES):
         return False
-    return any(cached(f) for f in _WEIGHT_CANDIDATE_FILES)
+    if not any(cached_path(f) for f in _TOKENIZER_DATA_FILES):
+        return False
+
+    # Single-file weights.
+    if cached_path("model.safetensors"):
+        return True
+    # Sharded weights: the index must be cached AND every shard it references.
+    index_path = cached_path("model.safetensors.index.json")
+    if index_path is None:
+        return False
+    try:
+        weight_map = _json.loads(_Path(index_path).read_text())["weight_map"]
+        shards = set(weight_map.values())
+    except Exception:
+        return False
+    return bool(shards) and all(cached_path(shard) for shard in shards)
 
 
 def _first_cached_model() -> str | None:
