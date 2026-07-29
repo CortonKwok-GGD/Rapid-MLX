@@ -130,6 +130,20 @@ async def shutdown_video_jobs(timeout: float = 30.0) -> None:
                 "detaching daemon MLX worker(s)",
                 len(pending),
             )
+            with _jobs_lock:
+                pending_set = set(pending)
+                for job_id, task in _tasks.items():
+                    if task in pending_set:
+                        job = _jobs.get(job_id)
+                        if job is not None:
+                            job.status = "failed"
+                            job.error = {
+                                "code": "video_server_shutdown",
+                                "message": (
+                                    "Video generation was cancelled during "
+                                    "server shutdown."
+                                ),
+                            }
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
@@ -300,11 +314,12 @@ async def _run_job(
             job.generation_finished = True
     except asyncio.CancelledError:
         with _jobs_lock:
-            job.status = "failed"
-            job.error = {
-                "code": "video_generation_cancelled",
-                "message": "Video generation was cancelled.",
-            }
+            if job.status != "failed":
+                job.status = "failed"
+                job.error = {
+                    "code": "video_generation_cancelled",
+                    "message": "Video generation was cancelled.",
+                }
         if not started:
             runner.cancel()
 

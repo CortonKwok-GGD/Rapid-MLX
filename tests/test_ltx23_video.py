@@ -268,11 +268,14 @@ async def test_video_jobs_stay_queued_until_worker_is_free(
 async def test_delete_cancels_a_queued_job(monkeypatch: pytest.MonkeyPatch) -> None:
     started = threading.Event()
     release = threading.Event()
+    calls = 0
 
     class BlockingEngine:
         model_name = "notapalindrome/ltx23-mlx-av-q4"
 
         def generate(self, *, output_path: Path, **kwargs) -> None:
+            nonlocal calls
+            calls += 1
             started.set()
             assert release.wait(timeout=5)
             output_path.write_bytes(b"mp4")
@@ -303,6 +306,7 @@ async def test_delete_cancels_a_queued_job(monkeypatch: pytest.MonkeyPatch) -> N
         if (await video.retrieve_video(first["id"]))["status"] == "completed":
             break
         await asyncio.sleep(0.01)
+    assert calls == 1
     await video.delete_video(first["id"])
 
 
@@ -419,6 +423,7 @@ async def test_shutdown_is_bounded_and_stops_video_admission(
     await video.shutdown_video_jobs(timeout=0.02)
     assert loop.time() - began < 0.5
     assert video._jobs[created["id"]].generation_finished is False
+    assert video._jobs[created["id"]].error["code"] == "video_server_shutdown"
     with pytest.raises(HTTPException, match="shutting down") as exc:
         await video.create_video(
             prompt="too late",
