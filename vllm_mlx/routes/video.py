@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 
 from ..middleware.auth import verify_api_key
 
@@ -51,6 +51,7 @@ class _VideoJob:
 
 _jobs: dict[str, _VideoJob] = {}
 _tasks: set[asyncio.Task] = set()
+_generation_gate = asyncio.Lock()
 
 
 def _cleanup_jobs() -> None:
@@ -119,27 +120,29 @@ async def _run_job(
     seed: int,
     image_path: Path | None,
 ) -> None:
-    with _jobs_lock:
-        job.status = "in_progress"
-        job.progress = 1
     try:
-        output = _jobs_root / job.id / "output.mp4"
-        await asyncio.to_thread(
-            engine.generate,
-            prompt=job.prompt,
-            output_path=output,
-            width=width,
-            height=height,
-            num_frames=_frame_count(seconds),
-            fps=24,
-            seed=seed,
-            image=image_path,
-        )
-        with _jobs_lock:
-            job.status = "completed"
-            job.progress = 100
-            job.completed_at = int(time.time())
-            job.output_path = str(output)
+        # Wait outside the executor so queued jobs consume no worker threads.
+        async with _generation_gate:
+            with _jobs_lock:
+                job.status = "in_progress"
+                job.progress = 1
+            output = _jobs_root / job.id / "output.mp4"
+            await asyncio.to_thread(
+                engine.generate,
+                prompt=job.prompt,
+                output_path=output,
+                width=width,
+                height=height,
+                num_frames=_frame_count(seconds),
+                fps=24,
+                seed=seed,
+                image=image_path,
+            )
+            with _jobs_lock:
+                job.status = "completed"
+                job.progress = 100
+                job.completed_at = int(time.time())
+                job.output_path = str(output)
     except Exception as exc:  # noqa: BLE001
         from ..runtime.video_lane import VideoRuntimeError
 
@@ -183,43 +186,47 @@ async def create_video(
     job_dir = _jobs_root / job_id
     job_dir.mkdir(mode=0o700)
     image_path = None
-    if input_reference is not None:
-        image_path = job_dir / "reference.img"
-        total = 0
-        with image_path.open("xb") as target:
-            while chunk := await input_reference.read(1024 * 1024):
-                total += len(chunk)
-                if total > _MAX_REFERENCE_BYTES:
-                    target.close()
-                    image_path.unlink(missing_ok=True)
-                    shutil.rmtree(job_dir, ignore_errors=True)
-                    raise HTTPException(
-                        status_code=413, detail="input_reference exceeds 20 MB"
-                    )
-                target.write(chunk)
+    enqueued = False
+    try:
+        if input_reference is not None:
+            image_path = job_dir / "reference.img"
+            total = 0
+            with image_path.open("xb") as target:
+                while chunk := await input_reference.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > _MAX_REFERENCE_BYTES:
+                        raise HTTPException(
+                            status_code=413, detail="input_reference exceeds 20 MB"
+                        )
+                    target.write(chunk)
 
-    job = _VideoJob(
-        id=job_id,
-        model="ltx-2.3-mlx-q4",
-        prompt=prompt,
-        seconds=str(seconds_int),
-        size=f"{width}x{height}",
-        created_at=int(time.time()),
-    )
-    with _jobs_lock:
-        if len(_jobs) >= _MAX_JOBS:
-            finished = [
-                item
-                for item in _jobs.values()
-                if item.status in {"completed", "failed"}
-            ]
-            if not finished:
-                shutil.rmtree(job_dir, ignore_errors=True)
-                raise HTTPException(status_code=429, detail="video job queue is full")
-            oldest = min(finished, key=lambda item: item.created_at)
-            _jobs.pop(oldest.id, None)
-            shutil.rmtree(_jobs_root / oldest.id, ignore_errors=True)
-        _jobs[job.id] = job
+        job = _VideoJob(
+            id=job_id,
+            model="ltx-2.3-mlx-q4",
+            prompt=prompt,
+            seconds=str(seconds_int),
+            size=f"{width}x{height}",
+            created_at=int(time.time()),
+        )
+        with _jobs_lock:
+            if len(_jobs) >= _MAX_JOBS:
+                finished = [
+                    item
+                    for item in _jobs.values()
+                    if item.status in {"completed", "failed"}
+                ]
+                if not finished:
+                    raise HTTPException(
+                        status_code=429, detail="video job queue is full"
+                    )
+                oldest = min(finished, key=lambda item: item.created_at)
+                _jobs.pop(oldest.id, None)
+                shutil.rmtree(_jobs_root / oldest.id, ignore_errors=True)
+            _jobs[job.id] = job
+            enqueued = True
+    finally:
+        if not enqueued:
+            shutil.rmtree(job_dir, ignore_errors=True)
     task = asyncio.create_task(
         _run_job(
             job,
@@ -254,8 +261,26 @@ async def retrieve_video_content(video_id: str):
     job = _get_job(video_id)
     if job.status != "completed" or job.output_path is None:
         raise HTTPException(status_code=409, detail="video is not completed")
-    return FileResponse(
-        job.output_path, media_type="video/mp4", filename=f"{job.id}.mp4"
+    # Open before releasing control. A concurrent delete/eviction may unlink
+    # the path, but the already-open descriptor remains streamable on macOS.
+    try:
+        source = open(job.output_path, "rb")  # noqa: SIM115
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=410, detail="video content has expired"
+        ) from exc
+
+    def chunks():
+        try:
+            while data := source.read(1024 * 1024):
+                yield data
+        finally:
+            source.close()
+
+    return StreamingResponse(
+        chunks(),
+        media_type="video/mp4",
+        headers={"Content-Disposition": f'attachment; filename="{job.id}.mp4"'},
     )
 
 

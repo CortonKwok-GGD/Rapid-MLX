@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType
 
@@ -64,6 +65,31 @@ def test_video_parameter_validation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_reference_upload_is_cleaned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+    class BrokenUpload:
+        async def read(self, size: int) -> bytes:
+            raise OSError("upload interrupted")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    before = set(video._jobs_root.iterdir())
+    with pytest.raises(OSError, match="upload interrupted"):
+        await video.create_video(
+            prompt="test",
+            model="ltx-2.3-mlx-q4",
+            seconds="1",
+            size="512x512",
+            seed=1,
+            input_reference=BrokenUpload(),
+        )
+    assert set(video._jobs_root.iterdir()) == before
+
+
+@pytest.mark.asyncio
 async def test_video_job_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeEngine:
         model_name = "notapalindrome/ltx23-mlx-av-q4"
@@ -91,6 +117,58 @@ async def test_video_job_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     assert current["status"] == "completed"
     assert current["progress"] == 100
     response = await video.retrieve_video_content(video_id)
-    assert Path(response.path).read_bytes() == b"generated-mp4"
+    chunks = [chunk async for chunk in response.body_iterator]
+    assert b"".join(chunks) == b"generated-mp4"
     deleted = await video.delete_video(video_id)
     assert deleted["deleted"] is True
+
+
+@pytest.mark.asyncio
+async def test_video_jobs_stay_queued_until_worker_is_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    class BlockingEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                assert release.wait(timeout=5)
+            output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: BlockingEngine())
+    first = await video.create_video(
+        prompt="first",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="512x512",
+        seed=1,
+        input_reference=None,
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    second = await video.create_video(
+        prompt="second",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="512x512",
+        seed=2,
+        input_reference=None,
+    )
+    await asyncio.sleep(0.05)
+
+    assert (await video.retrieve_video(first["id"]))["status"] == "in_progress"
+    assert (await video.retrieve_video(second["id"]))["status"] == "queued"
+    release.set()
+    for _ in range(200):
+        if (await video.retrieve_video(second["id"]))["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+    assert calls == 2
+    await video.delete_video(first["id"])
+    await video.delete_video(second["id"])
