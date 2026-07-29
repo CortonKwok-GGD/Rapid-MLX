@@ -156,6 +156,33 @@ def test_logit_divergence_all_nan_stays_finite_and_high():
     assert r.mean_kl > 1.0
 
 
+def test_logit_divergence_unnormalized_shift_invariant():
+    # RED-GREEN (codex round 4 blocking #2): the SAME distribution expressed as
+    # raw logits offset by DIFFERENT additive constants is identical as a
+    # probability distribution -> forward KL must be ~0. The half-normalized code
+    # (weights renormalized, but the log-ratio taken on raw values) reported a
+    # spurious non-zero here; renormalizing BOTH vectors via log-sum-exp fixes it.
+    logits = np.array([2.0, 1.0, 0.5, -1.0, 3.0])
+    base = [logits + 7.0]  # shifted up
+    cand = [logits - 4.0]  # shifted down — same softmax
+    r = logit_divergence(base, cand)
+    assert r.compared_steps == 1
+    assert r.mean_kl == pytest.approx(0.0, abs=1e-9)
+    assert r.max_kl == pytest.approx(0.0, abs=1e-9)
+    assert r.top1_agreement_rate == 1.0
+
+
+def test_logit_divergence_raw_logits_match_logsoftmax_inputs():
+    # Feeding raw logits must give the same KL as feeding their log_softmax — the
+    # metric renormalizes internally, so callers need not pre-normalize.
+    base_logits = np.array([4.0, 1.0, 0.0, 2.0])
+    cand_logits = np.array([3.0, 2.0, 0.0, 1.0])
+    r_raw = logit_divergence([base_logits], [cand_logits])
+    r_norm = logit_divergence([_logsoftmax(base_logits)], [_logsoftmax(cand_logits)])
+    assert r_raw.mean_kl == pytest.approx(r_norm.mean_kl, abs=1e-9)
+    assert r_raw.mean_kl > 0.0
+
+
 def test_logit_divergence_empty():
     r = logit_divergence([], [])
     assert r.compared_steps == 0
@@ -324,6 +351,52 @@ def test_baseline_kv_dtype_ignores_quantized_and_returns_unknown():
     # A quantized layer's ``keys`` is a tuple -> not a plain baseline dtype.
     assert _baseline_kv_dtype([_FakeQuantLayer()]) == "unknown"
     assert _baseline_kv_dtype([]) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Decode strips special tokens (harness helper) — codex round 4 blocking #1
+# ---------------------------------------------------------------------------
+class _FakeTokenizerWithEOS:
+    """Greedy generation stops ON the EOS token (id 9), which is appended to the
+    stream; a naive decode leaves ``<|im_end|>`` trailing and breaks strict JSON.
+    """
+
+    _VOCAB = {1: "{", 2: '"ok":', 3: "true", 4: "}", 9: "<|im_end|>"}
+
+    def decode(self, ids, skip_special_tokens: bool = False) -> str:
+        text = "".join(self._VOCAB[i] for i in ids)
+        if skip_special_tokens:
+            text = text.replace("<|im_end|>", "")
+        return text
+
+
+class _OldTokenizerNoKwarg:
+    def decode(self, ids) -> str:  # no skip_special_tokens kwarg at all
+        return "x" * len(ids)
+
+
+def test_decode_text_strips_trailing_eos_so_strict_json_holds():
+    """RED-GREEN: retention decoded WITHOUT skip_special_tokens keeps a trailing
+    EOS control token, which fails the strict whole-output JSON parse and falsely
+    scores structured retention N/A/FAIL. ``_decode_text`` must strip it.
+    """
+    from scripts.kv_quant_quality_gate import _decode_text
+    from vllm_mlx.kv_quant_gate import is_valid_json
+
+    tok = _FakeTokenizerWithEOS()
+    with_eos = [1, 2, 3, 4, 9]  # JSON then the appended EOS
+    assert tok.decode(with_eos) == '{"ok":true}<|im_end|>'
+    assert not is_valid_json(tok.decode(with_eos))  # the bug: prose-wrapped
+    text = _decode_text(tok, with_eos)
+    assert text == '{"ok":true}'
+    assert is_valid_json(text)  # fixed: strict JSON survives
+
+
+def test_decode_text_falls_back_when_kwarg_unsupported():
+    from scripts.kv_quant_quality_gate import _decode_text
+
+    # A tokenizer whose decode rejects the kwarg must not crash the gate.
+    assert _decode_text(_OldTokenizerNoKwarg(), [1, 2, 3]) == "xxx"
 
 
 # ---------------------------------------------------------------------------

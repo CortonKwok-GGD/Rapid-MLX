@@ -118,6 +118,21 @@ def _encode_prompt(tokenizer, text: str) -> list[int]:
     return list(tokenizer.encode(text))
 
 
+def _decode_text(tokenizer, token_ids: list[int]) -> str:
+    """Decode generated tokens to plain text, dropping special/control tokens.
+
+    Greedy generation stops ON the EOS token (it is appended before the break),
+    so a naive ``decode`` leaves a trailing control token like ``<|im_end|>`` in
+    the string — which breaks the strict whole-output JSON check. We pass
+    ``skip_special_tokens=True`` and fall back gracefully for the rare tokenizer
+    that does not accept the kwarg.
+    """
+    try:
+        return tokenizer.decode(token_ids, skip_special_tokens=True)
+    except TypeError:
+        return tokenizer.decode(token_ids)
+
+
 def _run_generation(
     model,
     prompt_ids: list[int],
@@ -432,6 +447,47 @@ def run_gate(
     json_prompts = [p for p in prompts if p.get("kind") == "json"]
     mem_prompt_ids = _encode_prompt(tokenizer, prompts[0]["prompt"])
 
+    # The baseline is candidate-INDEPENDENT — the bf16 generation, its logprobs,
+    # its JSON text, and its KV footprint do not change with the candidate dtype.
+    # Run it ONCE here (the baseline generation is the dominant inference cost;
+    # recomputing it inside the candidate loop would double the work of the
+    # default two-dtype ``int8 int4`` run) and reuse it for every candidate.
+    baseline_runs: list[dict] = []
+    for spec in prompts:
+        prompt_ids = _encode_prompt(tokenizer, spec["prompt"])
+        base_tokens, base_lp, _ = _run_generation(
+            model,
+            prompt_ids,
+            max_tokens=max_tokens,
+            kv_bits=None,
+            kv_group_size=kv_group_size,
+            eos_ids=eos_ids,
+            collect_logprobs=True,
+            stop_on_eos=True,
+        )
+        baseline_runs.append(
+            {
+                "prompt_ids": prompt_ids,
+                "kind": spec.get("kind"),
+                "tokens": base_tokens,
+                "logprobs": base_lp,
+                # Baseline JSON text is candidate-independent too — decode once.
+                "text": (
+                    _decode_text(tokenizer, base_tokens)
+                    if spec.get("kind") == "json"
+                    else None
+                ),
+            }
+        )
+
+    base_bytes, baseline_kv_dtype = _measure_kv_bytes(
+        model,
+        mem_prompt_ids,
+        mem_tokens=mem_tokens,
+        kv_bits=None,
+        kv_group_size=kv_group_size,
+    )
+
     any_fail = False
     reports: list[dict] = []
     for cdtype in candidate_dtypes:
@@ -442,21 +498,10 @@ def run_gate(
         divergences: list[LogitDivergence] = []
         retention_pairs: list[tuple[str, str]] = []
 
-        for spec in prompts:
-            prompt_ids = _encode_prompt(tokenizer, spec["prompt"])
-            base_tokens, base_lp, _ = _run_generation(
-                model,
-                prompt_ids,
-                max_tokens=max_tokens,
-                kv_bits=None,
-                kv_group_size=kv_group_size,
-                eos_ids=eos_ids,
-                collect_logprobs=True,
-                stop_on_eos=True,
-            )
+        for base in baseline_runs:
             cand_tokens, cand_lp, _ = _run_generation(
                 model,
-                prompt_ids,
+                base["prompt_ids"],
                 max_tokens=max_tokens,
                 kv_bits=cand_bits,
                 kv_group_size=kv_group_size,
@@ -464,7 +509,7 @@ def run_gate(
                 collect_logprobs=True,
                 stop_on_eos=True,
             )
-            ag = greedy_agreement_rate(base_tokens, cand_tokens)
+            ag = greedy_agreement_rate(base["tokens"], cand_tokens)
             agreements.append(ag)
             # Same-context prefix: up to AND INCLUDING the first divergence step
             # (its distributions still share a context), else the whole overlap.
@@ -474,20 +519,15 @@ def run_gate(
                 else ag.total
             )
             divergences.append(
-                logit_divergence(base_lp, cand_lp, compare_len=compare_len)
+                logit_divergence(base["logprobs"], cand_lp, compare_len=compare_len)
             )
-            if spec.get("kind") == "json":
+            if base["kind"] == "json":
+                # Candidate decoded with skip_special_tokens so a trailing EOS
+                # control token can't break the strict whole-output JSON parse.
                 retention_pairs.append(
-                    (tokenizer.decode(base_tokens), tokenizer.decode(cand_tokens))
+                    (base["text"], _decode_text(tokenizer, cand_tokens))
                 )
 
-        base_bytes, baseline_kv_dtype = _measure_kv_bytes(
-            model,
-            mem_prompt_ids,
-            mem_tokens=mem_tokens,
-            kv_bits=None,
-            kv_group_size=kv_group_size,
-        )
         cand_bytes, _ = _measure_kv_bytes(
             model,
             mem_prompt_ids,

@@ -59,6 +59,19 @@ FAIL = "FAIL"
 NA = "NA"
 
 
+def _logsumexp(x: np.ndarray) -> float:
+    """Numerically-stable ``log(sum(exp(x)))``.
+
+    Returns ``-inf`` for an all ``-inf`` vector (a degenerate distribution) and
+    ``+inf``/``nan`` if the input carries one — the caller guards on finiteness.
+    """
+    m = float(np.max(x))
+    if not np.isfinite(m):
+        # All -inf (m == -inf) or a stray +inf/nan: no valid shift exists.
+        return m
+    return m + float(np.log(np.sum(np.exp(x - m))))
+
+
 # ---------------------------------------------------------------------------
 # Greedy agreement
 # ---------------------------------------------------------------------------
@@ -183,11 +196,14 @@ def logit_divergence(
     difference between the two distributions is the KV-cache dtype. When ``None``,
     all overlapping steps are compared (``min`` of the two lengths).
 
-    Robust to slightly-unnormalized inputs (renormalizes) and to a vocab entry
-    that is ``-inf`` in one distribution but has mass in the other (that step
+    Both vectors are renormalized to true log-probabilities via log-sum-exp
+    before the KL, so the metric is shift-invariant: two distributions that are
+    identical up to different additive constants (raw logits, or only
+    slightly-normalized logprobs) score ~0, not a spurious non-zero. A vocab
+    entry that is ``-inf`` in one distribution but has mass in the other
     contributes ``+inf`` KL, clipped to a large finite ceiling so the mean stays
-    reportable). A NaN in either distribution, or a degenerate baseline whose
-    probability mass is ~0 / non-finite, is treated as a CATASTROPHIC step
+    reportable. A NaN in either distribution, or a degenerate distribution whose
+    log-sum-exp is non-finite (all ``-inf``), is treated as a CATASTROPHIC step
     (charged the ceiling), never as zero divergence — so broken inference can
     never masquerade as perfect agreement.
     """
@@ -218,21 +234,24 @@ def logit_divergence(
             continue
         if int(np.argmax(base)) == int(np.argmax(cand)):
             top1_matches += 1
-        p = np.exp(base)
-        total_mass = float(np.sum(p))
-        # A valid ``log_softmax`` baseline has ``exp`` summing to ~1. If the mass
-        # is non-finite or ~0 (an all -inf / degenerate baseline), the
-        # distribution is broken — ``mask`` would select nothing and the old code
-        # scored a spurious 0.0 KL. Treat it as catastrophic instead.
-        if not np.isfinite(total_mass) or total_mass <= 1e-12:
+        # Renormalize BOTH vectors to true log-probabilities via log-sum-exp. The
+        # weighting AND the log-ratio must use normalized values, else two
+        # distributions that are identical up to different additive constants
+        # (raw logits, or slightly-unnormalized logprobs) score a spurious
+        # non-zero KL. If either normalizer is non-finite (an all -inf / broken
+        # distribution), no valid probability exists — charge the catastrophic
+        # ceiling instead of scoring a spurious 0.0.
+        base_lse = _logsumexp(base)
+        cand_lse = _logsumexp(cand)
+        if not (np.isfinite(base_lse) and np.isfinite(cand_lse)):
             kls.append(_KL_CEIL)
             continue
-        # Normalize so the forward-KL weights are a true probability distribution
-        # even if the input logprobs were slightly unnormalized.
-        p = p / total_mass
+        base_norm = base - base_lse
+        cand_norm = cand - cand_lse
+        p = np.exp(base_norm)
         mask = p > 0.0
-        diff = base[mask] - cand[mask]
-        # cand == -inf where base has mass -> +inf; clip to keep the mean finite.
+        # cand == -inf where base has mass -> diff +inf; clip to keep mean finite.
+        diff = base_norm[mask] - cand_norm[mask]
         step_kl = float(np.sum(p[mask] * np.clip(diff, -_KL_CEIL, _KL_CEIL)))
         if not np.isfinite(step_kl):
             step_kl = _KL_CEIL
