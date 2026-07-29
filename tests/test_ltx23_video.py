@@ -333,17 +333,22 @@ async def test_cancelled_job_reaches_terminal_state_and_cleans_files(
     assert await asyncio.to_thread(started.wait, 2)
     task = video._tasks[created["id"]]
     task.cancel()
-    release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     current = await video.retrieve_video(created["id"])
     assert current["status"] == "failed"
     assert current["error"]["code"] == "video_generation_cancelled"
+    assert video._jobs[created["id"]].generation_finished is False
+    release.set()
     for _ in range(200):
-        if not (video._jobs_root / created["id"]).exists():
+        if (
+            video._jobs[created["id"]].generation_finished
+            and not (video._jobs_root / created["id"]).exists()
+        ):
             break
         await asyncio.sleep(0.01)
+    assert video._jobs[created["id"]].generation_finished is True
     assert not (video._jobs_root / created["id"]).exists()
     await video.delete_video(created["id"])
 
@@ -413,6 +418,7 @@ async def test_shutdown_is_bounded_and_stops_video_admission(
     began = loop.time()
     await video.shutdown_video_jobs(timeout=0.02)
     assert loop.time() - began < 0.5
+    assert video._jobs[created["id"]].generation_finished is False
     with pytest.raises(HTTPException, match="shutting down") as exc:
         await video.create_video(
             prompt="too late",
@@ -426,8 +432,12 @@ async def test_shutdown_is_bounded_and_stops_video_admission(
 
     release.set()
     for _ in range(200):
-        if not video._generation_threads:
+        if (
+            not video._generation_threads
+            and video._jobs[created["id"]].generation_finished
+        ):
             break
         await asyncio.sleep(0.01)
+    assert video._jobs[created["id"]].generation_finished is True
     video.start_video_jobs()
     await video.delete_video(created["id"])

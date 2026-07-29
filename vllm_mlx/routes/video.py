@@ -46,10 +46,12 @@ class _VideoJob:
     completed_at: int | None = None
     error: dict[str, str] | None = None
     output_path: str | None = None
+    generation_finished: bool = False
 
     def public(self) -> dict:
         value = asdict(self)
         value.pop("output_path")
+        value.pop("generation_finished")
         value["object"] = "video"
         return value
 
@@ -102,6 +104,7 @@ async def shutdown_video_jobs(timeout: float = 30.0) -> None:
     loop = asyncio.get_running_loop()
     with _jobs_lock:
         _accepting_jobs = False
+        cancelled_job_ids: list[str] = []
         current_tasks = [
             task
             for task in _tasks.values()
@@ -115,6 +118,8 @@ async def shutdown_video_jobs(timeout: float = 30.0) -> None:
                     "code": "video_server_shutdown",
                     "message": "Video generation was cancelled during server shutdown.",
                 }
+                job.generation_finished = True
+                cancelled_job_ids.append(job_id)
                 task.cancel()
 
     if current_tasks:
@@ -128,6 +133,8 @@ async def shutdown_video_jobs(timeout: float = 30.0) -> None:
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+    for job_id in cancelled_job_ids:
+        await asyncio.to_thread(shutil.rmtree, _jobs_root / job_id, ignore_errors=True)
 
 
 async def _run_in_generation_thread(function, /, **kwargs) -> None:
@@ -146,8 +153,10 @@ async def _run_in_generation_thread(function, /, **kwargs) -> None:
     def target() -> None:
         try:
             function(**kwargs)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             result = exc
+        except BaseException:  # pragma: no cover - defensive thread boundary
+            result = RuntimeError("video generation worker terminated unexpectedly")
         else:
             result = None
         finally:
@@ -260,11 +269,7 @@ async def _run_job(
         # job never releases it while an uncancellable MLX thread is running.
         async with generation_gate:
             with _jobs_lock:
-                if (
-                    job.status == "failed"
-                    and job.error is not None
-                    and job.error.get("code") == "video_generation_cancelled"
-                ):
+                if job.status == "failed":
                     return False
                 started = True
                 job.status = "in_progress"
@@ -292,6 +297,7 @@ async def _run_job(
             job.progress = 100
             job.completed_at = int(time.time())
             job.output_path = str(output)
+            job.generation_finished = True
     except asyncio.CancelledError:
         with _jobs_lock:
             job.status = "failed"
@@ -305,6 +311,8 @@ async def _run_job(
         async def reap_cancelled_job() -> None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await runner
+            with _jobs_lock:
+                job.generation_finished = True
             await asyncio.to_thread(
                 shutil.rmtree, _jobs_root / job.id, ignore_errors=True
             )
@@ -325,6 +333,7 @@ async def _run_job(
         with _jobs_lock:
             job.status = "failed"
             job.error = {"code": "video_generation_failed", "message": message}
+            job.generation_finished = True
         await asyncio.to_thread(shutil.rmtree, _jobs_root / job.id, ignore_errors=True)
 
 
@@ -370,6 +379,7 @@ async def create_video(
     image_path = None
     enqueued = False
     evicted_id: str | None = None
+    task: asyncio.Task | None = None
     try:
         if input_reference is not None:
             image_path = job_dir / "reference.img"
@@ -405,6 +415,7 @@ async def create_video(
                     item
                     for item in _jobs.values()
                     if item.status in {"completed", "failed"}
+                    and item.generation_finished
                 ]
                 if not finished:
                     raise HTTPException(
@@ -414,22 +425,23 @@ async def create_video(
                 _jobs.pop(oldest.id, None)
                 evicted_id = oldest.id
             _jobs[job.id] = job
+            task = asyncio.create_task(
+                _run_job(
+                    job,
+                    engine=engine,
+                    width=width,
+                    height=height,
+                    seconds=seconds_int,
+                    seed=seed,
+                    image_path=image_path,
+                )
+            )
+            _tasks[job.id] = task
             enqueued = True
     finally:
         if not enqueued:
             await asyncio.to_thread(shutil.rmtree, job_dir, ignore_errors=True)
-    task = asyncio.create_task(
-        _run_job(
-            job,
-            engine=engine,
-            width=width,
-            height=height,
-            seconds=seconds_int,
-            seed=seed,
-            image_path=image_path,
-        )
-    )
-    _tasks[job.id] = task
+    assert task is not None
 
     def discard_task(done: asyncio.Task) -> None:
         if _tasks.get(job.id) is done:
