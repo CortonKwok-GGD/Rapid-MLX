@@ -450,6 +450,9 @@ class TTSEngine:
         # explicit duration estimate — F5's auto heuristic can collapse to ~0s
         dur = int(estimated_duration(aud, rtext, text, speed) * FRAMES_PER_SEC)
         ptext = convert_char_to_pinyin([rtext + " " + text])
+        # F5TTS.from_pretrained injects Vocos.decode as ``_vocoder``.
+        # sample() therefore returns the decoded 1-D waveform (Vocos'
+        # ISTFTHead squeezes the single batch axis), not mel frames.
         wave, _ = self.model.sample(
             mx.expand_dims(aud, axis=0),
             text=ptext,
@@ -459,7 +462,11 @@ class TTSEngine:
             cfg_strength=2.0,
             sway_sampling_coef=-1.0,
         )
-        wave = wave[0, aud.shape[0] :]  # select batch 0, trim reference prefix
+        if wave.ndim != 1:
+            raise RuntimeError(
+                f"F5-TTS returned an unexpected waveform shape: {wave.shape}"
+            )
+        wave = wave[aud.shape[0] :]  # trim the decoded reference prefix
         mx.eval(wave)
         out = np.array(wave, dtype=np.float32)
         return AudioOutput(

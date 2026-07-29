@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import io
+import pkgutil
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -24,6 +25,7 @@ def test_f5_family_is_detected() -> None:
 
 def test_installed_f5_sample_contract() -> None:
     f5 = pytest.importorskip("f5_tts_mlx.cfm")
+    assert pkgutil.get_data("f5_tts_mlx", "tests/test_en_1_ref_short.wav")
     parameters = inspect.signature(f5.F5TTS.sample).parameters
     assert {"cond", "text", "duration", "steps", "speed", "cfg_strength"} <= set(
         parameters
@@ -86,7 +88,7 @@ def test_f5_generation_uses_safe_in_memory_default_and_speed(
     monkeypatch.setattr("soundfile.read", read)
 
     model = MagicMock()
-    model.sample.return_value = (np.ones((1, 480), dtype=np.float32), None)
+    model.sample.return_value = (np.ones(480, dtype=np.float32), None)
     engine = TTSEngine("lucasnewman/f5-tts-mlx")
     engine.model = model
 
