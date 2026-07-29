@@ -57,6 +57,8 @@ class _VideoJob:
 _jobs: dict[str, _VideoJob] = {}
 _tasks: dict[str, asyncio.Task] = {}
 _cleanup_tasks: set[asyncio.Task] = set()
+_generation_threads: set[threading.Thread] = set()
+_accepting_jobs = True
 _generation_gates: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
 ] = weakref.WeakKeyDictionary()
@@ -79,6 +81,88 @@ def _cleanup_jobs() -> None:
 
 
 atexit.register(_cleanup_jobs)
+
+
+def start_video_jobs() -> None:
+    """Reset the route lifecycle when an application instance starts."""
+    global _accepting_jobs
+    with _jobs_lock:
+        _accepting_jobs = True
+
+
+async def shutdown_video_jobs(timeout: float = 30.0) -> None:
+    """Stop admission and drain video jobs within a bounded shutdown budget.
+
+    MLX generation cannot be interrupted safely once a Metal graph is running.
+    Queued jobs are cancelled immediately; an active job gets ``timeout``
+    seconds to finish. Generation itself runs on a daemon thread, so exceeding
+    the budget cannot keep the Python process alive indefinitely.
+    """
+    global _accepting_jobs
+    loop = asyncio.get_running_loop()
+    with _jobs_lock:
+        _accepting_jobs = False
+        current_tasks = [
+            task
+            for task in _tasks.values()
+            if not task.done() and task.get_loop() is loop
+        ]
+        for job_id, task in list(_tasks.items()):
+            job = _jobs.get(job_id)
+            if task in current_tasks and job is not None and job.status == "queued":
+                job.status = "failed"
+                job.error = {
+                    "code": "video_server_shutdown",
+                    "message": "Video generation was cancelled during server shutdown.",
+                }
+                task.cancel()
+
+    if current_tasks:
+        _, pending = await asyncio.wait(current_tasks, timeout=max(0.0, timeout))
+        if pending:
+            logger.warning(
+                "Video shutdown budget expired with %d active generation job(s); "
+                "detaching daemon MLX worker(s)",
+                len(pending),
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _run_in_generation_thread(function, /, **kwargs) -> None:
+    """Run uncancellable MLX work without owning a non-daemon executor thread."""
+    loop = asyncio.get_running_loop()
+    completed = loop.create_future()
+
+    def finish(result: BaseException | None) -> None:
+        if completed.done():
+            return
+        if result is None:
+            completed.set_result(None)
+        else:
+            completed.set_exception(result)
+
+    def target() -> None:
+        try:
+            function(**kwargs)
+        except BaseException as exc:  # noqa: BLE001
+            result = exc
+        else:
+            result = None
+        finally:
+            with _jobs_lock:
+                _generation_threads.discard(thread)
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(finish, result)
+
+    thread = threading.Thread(
+        target=target, name="rapid-mlx-video-generation", daemon=True
+    )
+    with _jobs_lock:
+        _generation_threads.add(thread)
+    thread.start()
+    await completed
 
 
 def _video_engine():
@@ -185,7 +269,7 @@ async def _run_job(
                 started = True
                 job.status = "in_progress"
                 job.progress = 1
-            await asyncio.to_thread(
+            await _run_in_generation_thread(
                 engine.generate,
                 prompt=job.prompt,
                 output_path=output,
@@ -254,6 +338,9 @@ async def create_video(
     input_reference: UploadFile | None = File(None),
 ):
     engine = _video_engine()
+    with _jobs_lock:
+        if not _accepting_jobs:
+            raise HTTPException(status_code=503, detail="video server is shutting down")
     prompt = prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt must not be blank")
@@ -309,6 +396,10 @@ async def create_video(
             created_at=int(time.time()),
         )
         with _jobs_lock:
+            if not _accepting_jobs:
+                raise HTTPException(
+                    status_code=503, detail="video server is shutting down"
+                )
             if len(_jobs) >= _MAX_JOBS:
                 finished = [
                     item

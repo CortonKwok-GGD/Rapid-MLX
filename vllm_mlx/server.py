@@ -645,6 +645,9 @@ async def lifespan(app: FastAPI):
     # starts returning 200. Anything that races a request before this point
     # would otherwise hit a not-yet-warmed engine.
     _cfg = get_config()
+    from .routes.video import start_video_jobs
+
+    start_video_jobs()
     _cfg.ready = True
 
     # Print the real "Ready:" banner now — only here is the port truly
@@ -695,6 +698,9 @@ async def lifespan(app: FastAPI):
     # ``is_enabled()``-gated and ``@_safe`` → a no-op when telemetry is off
     # and never masks the failure.
     try:
+        from .routes.video import shutdown_video_jobs
+
+        await shutdown_video_jobs()
         await _shutdown_save_prefix_cache()
 
         # Shutdown: Close MCP connections and stop engine

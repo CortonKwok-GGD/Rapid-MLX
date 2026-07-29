@@ -380,3 +380,54 @@ async def test_failed_generation_removes_partial_artifacts(
     )
     assert not (video._jobs_root / created["id"]).exists()
     await video.delete_video(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_shutdown_is_bounded_and_stops_video_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            started.set()
+            assert release.wait(timeout=5)
+            output_path.write_bytes(b"late-output")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: BlockingEngine())
+    video.start_video_jobs()
+    created = await video.create_video(
+        prompt="shutdown",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="512x512",
+        seed=5,
+        input_reference=None,
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    await video.shutdown_video_jobs(timeout=0.02)
+    assert loop.time() - began < 0.5
+    with pytest.raises(HTTPException, match="shutting down") as exc:
+        await video.create_video(
+            prompt="too late",
+            model="ltx-2.3-mlx-q4",
+            seconds="1",
+            size="512x512",
+            seed=6,
+            input_reference=None,
+        )
+    assert exc.value.status_code == 503
+
+    release.set()
+    for _ in range(200):
+        if not video._generation_threads:
+            break
+        await asyncio.sleep(0.01)
+    video.start_video_jobs()
+    await video.delete_video(created["id"])
