@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_REFERENCE_BYTES = 20 * 1024 * 1024
 _MAX_JOBS = 100
+_MAX_PIXEL_FRAMES = 768 * 512 * 97
 _jobs_lock = threading.Lock()
 _jobs_root = Path(tempfile.mkdtemp(prefix="rapid-mlx-videos-"))
 
@@ -214,6 +215,14 @@ async def create_video(
     if not 1 <= seconds_int <= 20:
         raise HTTPException(status_code=400, detail="seconds must be between 1 and 20")
     width, height = _parse_size(size)
+    if width * height * _frame_count(seconds_int) > _MAX_PIXEL_FRAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "requested video exceeds the safe LTX-2.3 Q4 workload limit "
+                "(768x512 at 4 seconds); reduce size or duration"
+            ),
+        )
 
     job_id = f"video_{uuid.uuid4().hex}"
     job_dir = _jobs_root / job_id
@@ -340,14 +349,21 @@ async def list_videos(limit: int = Query(20, ge=1, le=100)):
 async def delete_video(video_id: str):
     with _jobs_lock:
         job = _jobs.get(video_id)
-        if job is not None and job.status in {"queued", "in_progress"}:
+        if job is not None and job.status == "in_progress":
             raise HTTPException(
                 status_code=409, detail="video generation is in progress"
             )
-        if job is not None:
+        task = _tasks.get(video_id) if job is not None else None
+        if job is not None and job.status != "queued":
             _jobs.pop(video_id, None)
     if job is None:
         raise HTTPException(status_code=404, detail="video job not found")
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        with _jobs_lock:
+            _jobs.pop(video_id, None)
     await asyncio.to_thread(shutil.rmtree, _jobs_root / video_id, ignore_errors=True)
     response = job.public()
     response["deleted"] = True

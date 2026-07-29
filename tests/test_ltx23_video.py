@@ -81,6 +81,26 @@ def test_video_parameter_validation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_video_rejects_unsafe_pixel_time_workload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    with pytest.raises(HTTPException, match="safe LTX-2.3 Q4 workload") as exc:
+        await video.create_video(
+            prompt="too large",
+            model="ltx-2.3-mlx-q4",
+            seconds="20",
+            size="1920x1920",
+            seed=1,
+            input_reference=None,
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_failed_reference_upload_is_cleaned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -193,6 +213,48 @@ async def test_video_jobs_stay_queued_until_worker_is_free(
     assert b"".join([chunk async for chunk in response.body_iterator]) == b"mp4"
     await video.delete_video(first["id"])
     await video.delete_video(second["id"])
+
+
+@pytest.mark.asyncio
+async def test_delete_cancels_a_queued_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            started.set()
+            assert release.wait(timeout=5)
+            output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: BlockingEngine())
+    first = await video.create_video(
+        prompt="first",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="512x512",
+        seed=1,
+        input_reference=None,
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    queued = await video.create_video(
+        prompt="queued",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="512x512",
+        seed=2,
+        input_reference=None,
+    )
+    assert (await video.retrieve_video(queued["id"]))["status"] == "queued"
+    deleted = await video.delete_video(queued["id"])
+    assert deleted["deleted"] is True
+    release.set()
+    for _ in range(200):
+        if (await video.retrieve_video(first["id"]))["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+    await video.delete_video(first["id"])
 
 
 @pytest.mark.asyncio
