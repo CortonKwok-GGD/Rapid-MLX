@@ -217,13 +217,12 @@ def _parse_size(value: str) -> tuple[int, int]:
         raise HTTPException(
             status_code=400, detail="size must be WIDTHxHEIGHT"
         ) from exc
-    if (
-        width < 256
-        or height < 256
-        or width > 1920
-        or height > 1920
-        or width % 64
-        or height % 64
+    openai_sizes = {(1280, 720), (720, 1280)}
+    is_model_aligned = width % 64 == 0 and height % 64 == 0
+    if not (
+        256 <= width <= 1920
+        and 256 <= height <= 1920
+        and (is_model_aligned or (width, height) in openai_sizes)
     ):
         raise HTTPException(
             status_code=400,
@@ -276,6 +275,8 @@ async def _run_job(
     started = False
     output = _jobs_root / job.id / "output.mp4"
     generation_gate = _generation_gate_for_current_loop()
+    generation_width = ((width + 63) // 64) * 64
+    generation_height = ((height + 63) // 64) * 64
 
     async def generate_under_gate() -> bool:
         nonlocal started
@@ -292,12 +293,14 @@ async def _run_job(
                 engine.generate,
                 prompt=job.prompt,
                 output_path=output,
-                width=width,
-                height=height,
+                width=generation_width,
+                height=generation_height,
                 num_frames=_frame_count(seconds),
                 fps=24,
                 seed=seed,
                 image=image_path,
+                output_width=width,
+                output_height=height,
             )
             return True
 
@@ -379,7 +382,12 @@ async def create_video(
     if not 1 <= seconds_int <= 20:
         raise HTTPException(status_code=400, detail="seconds must be between 1 and 20")
     width, height = _parse_size(size)
-    if width * height * _frame_count(seconds_int) > _MAX_PIXEL_FRAMES:
+    generation_width = ((width + 63) // 64) * 64
+    generation_height = ((height + 63) // 64) * 64
+    if (
+        generation_width * generation_height * _frame_count(seconds_int)
+        > _MAX_PIXEL_FRAMES
+    ):
         raise HTTPException(
             status_code=400,
             detail=(

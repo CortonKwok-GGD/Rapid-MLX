@@ -116,6 +116,8 @@ def test_video_engine_calls_mlx_native_pipeline(
 
 def test_video_parameter_validation() -> None:
     assert video._parse_size("768x512") == (768, 512)
+    assert video._parse_size("1280x720") == (1280, 720)
+    assert video._parse_size("720x1280") == (720, 1280)
     assert video._frame_count(4) == 97
     with pytest.raises(HTTPException, match="divisible by 64") as exc:
         video._parse_size("700x512")
@@ -147,6 +149,39 @@ async def test_video_rejects_unsafe_pixel_time_workload(
             input_reference=None,
         )
     assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_openai_720p_size_is_aligned_then_cropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    class FakeEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            captured.update(kwargs)
+            output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    created = await video.create_video(
+        prompt="landscape",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="1280x720",
+        seed=1,
+        input_reference=None,
+    )
+    for _ in range(200):
+        if (await video.retrieve_video(created["id"]))["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+    assert captured["width"] == 1280
+    assert captured["height"] == 768
+    assert captured["output_width"] == 1280
+    assert captured["output_height"] == 720
+    await video.delete_video(created["id"])
 
 
 @pytest.mark.asyncio

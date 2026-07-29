@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -57,6 +58,8 @@ class VideoEngine:
         fps: int,
         seed: int,
         image: Path | None,
+        output_width: int | None = None,
+        output_height: int | None = None,
     ) -> None:
         if shutil.which("ffmpeg") is None:
             raise VideoRuntimeError(
@@ -92,6 +95,40 @@ class VideoEngine:
             raise VideoRuntimeError(
                 "LTX-2.3 generation completed without an MP4 output."
             )
+        requested_width = output_width or width
+        requested_height = output_height or height
+        if (requested_width, requested_height) != (width, height):
+            cropped = output_path.with_name(f"{output_path.stem}.cropped.mp4")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(output_path),
+                        "-vf",
+                        (
+                            f"crop={requested_width}:{requested_height}:"
+                            "(iw-ow)/2:(ih-oh)/2"
+                        ),
+                        "-c:v",
+                        "libx264",
+                        "-c:a",
+                        "copy",
+                        str(cropped),
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                cropped.replace(output_path)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise VideoRuntimeError(
+                    "LTX-2.3 generated video but could not crop it to the "
+                    "requested OpenAI-compatible size."
+                ) from exc
+            finally:
+                cropped.unlink(missing_ok=True)
 
     def generate_warmup(self) -> None:
         """Video weights load lazily; startup must not trigger a 40+ GB pull."""
