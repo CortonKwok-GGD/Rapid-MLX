@@ -183,10 +183,13 @@ def logit_divergence(
     difference between the two distributions is the KV-cache dtype. When ``None``,
     all overlapping steps are compared (``min`` of the two lengths).
 
-    Robust to slightly-unnormalized inputs (clamps probabilities) and to a vocab
-    entry that is ``-inf`` in one distribution but has mass in the other (that
-    step contributes ``+inf`` KL, correctly flagging a catastrophic divergence,
-    but is clipped to a large finite value so the mean stays reportable).
+    Robust to slightly-unnormalized inputs (renormalizes) and to a vocab entry
+    that is ``-inf`` in one distribution but has mass in the other (that step
+    contributes ``+inf`` KL, clipped to a large finite ceiling so the mean stays
+    reportable). A NaN in either distribution, or a degenerate baseline whose
+    probability mass is ~0 / non-finite, is treated as a CATASTROPHIC step
+    (charged the ceiling), never as zero divergence — so broken inference can
+    never masquerade as perfect agreement.
     """
     overlap = min(len(baseline_logprobs), len(candidate_logprobs))
     n = overlap if compare_len is None else min(overlap, max(compare_len, 0))
@@ -206,10 +209,27 @@ def logit_divergence(
         if base.shape != cand.shape or base.size == 0:
             # Shape mismatch is a harness bug, not a model signal — skip the step.
             continue
+        # A NaN in either distribution means the inference itself broke. That is
+        # NOT zero divergence — charge the catastrophic ceiling so a NaN baseline
+        # can never masquerade as perfect agreement (the argmax is meaningless
+        # here too, so this step is not counted as a top-1 match).
+        if np.isnan(base).any() or np.isnan(cand).any():
+            kls.append(_KL_CEIL)
+            continue
         if int(np.argmax(base)) == int(np.argmax(cand)):
             top1_matches += 1
         p = np.exp(base)
-        # Only positions with baseline mass contribute to forward KL.
+        total_mass = float(np.sum(p))
+        # A valid ``log_softmax`` baseline has ``exp`` summing to ~1. If the mass
+        # is non-finite or ~0 (an all -inf / degenerate baseline), the
+        # distribution is broken — ``mask`` would select nothing and the old code
+        # scored a spurious 0.0 KL. Treat it as catastrophic instead.
+        if not np.isfinite(total_mass) or total_mass <= 1e-12:
+            kls.append(_KL_CEIL)
+            continue
+        # Normalize so the forward-KL weights are a true probability distribution
+        # even if the input logprobs were slightly unnormalized.
+        p = p / total_mass
         mask = p > 0.0
         diff = base[mask] - cand[mask]
         # cand == -inf where base has mass -> +inf; clip to keep the mean finite.

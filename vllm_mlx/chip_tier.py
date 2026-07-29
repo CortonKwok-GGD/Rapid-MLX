@@ -181,6 +181,7 @@ def detect_chip_tier() -> ChipTier:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=2,
             )
             chip_name = result.stdout.strip()
         except Exception:

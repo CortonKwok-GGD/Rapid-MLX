@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""KV-quant differential quality gate (offline, advisory).
+"""KV-quant differential quality gate (local, advisory).
 
-Runs the SAME model twice on the SAME prompts — a ``bf16``-KV BASELINE and a
+Runs the SAME model twice on the SAME prompts — an unquantized-KV BASELINE and a
 quantized-KV CANDIDATE (``int8`` / ``int4``) — and measures how well the
-candidate AGREES WITH ITS OWN bf16 baseline. This differential framing isolates
-*quantization-induced* degradation from a model's plain inability at a prompt:
-the gate only faults a candidate the quantized cache made worse than its own
-full-precision self.
+candidate AGREES WITH ITS OWN unquantized baseline. This differential framing
+isolates *quantization-induced* degradation from a model's plain inability at a
+prompt: the gate only faults a candidate the quantized cache made worse than its
+own full-precision self. (The baseline dtype is the model's native KV dtype —
+usually bf16 or fp16 — and is detected and reported, not assumed.)
 
 Today, ``vllm_mlx/kv_cache_dtype.py`` decides whether int4/int8 KV is "safe" via
 a hand-written empirical safelist. This harness produces the *measured* signal
 that list currently lacks.
+
+It runs entirely locally (no external-service calls). Like any inference tool it
+loads the model through the standard HuggingFace cache, which fetches the weights
+once if they are not already cached; pass ``--offline`` to forbid any network
+fetch (the load then fails fast if the model isn't fully cached). The bundled
+tests never download — they are cache-only and skip when the model is absent.
 
 It ships **advisory** (measure-first, mirroring the ``diff_coverage`` pattern):
 it prints a full report + PASS/FAIL but exits ``0`` regardless. Pass
@@ -26,7 +33,7 @@ Usage:
     python -m scripts.kv_quant_quality_gate qwen3.5-4b-4bit
     python -m scripts.kv_quant_quality_gate mlx-community/Qwen3-0.6B-4bit \\
         --candidate int8 int4 --max-tokens 48 --json-out report.json
-    python -m scripts.kv_quant_quality_gate <model> --niah --enforce
+    python -m scripts.kv_quant_quality_gate <model> --niah --enforce --offline
 """
 
 from __future__ import annotations
@@ -188,6 +195,25 @@ def _kv_cache_bytes(cache) -> int:
     return total
 
 
+def _baseline_kv_dtype(cache) -> str:
+    """Return the element dtype of a NON-quantized KV cache, e.g. ``"bfloat16"``.
+
+    The baseline cache's dtype follows the loaded model/runtime — it is NOT
+    guaranteed to be bf16 (many mlx checkpoints are fp16). Reading the actual
+    ``keys`` array dtype keeps the report honest instead of hardcoding a label.
+    Returns ``"unknown"`` if it can't be read.
+    """
+    for layer in cache:
+        keys = getattr(layer, "keys", None)
+        # A plain KVCache exposes ``keys`` as a single array (not a tuple, which
+        # only a QuantizedKVCache uses).
+        if keys is not None and not isinstance(keys, (list, tuple)):
+            dtype = getattr(keys, "dtype", None)
+            if dtype is not None:
+                return str(dtype).replace("mlx.core.", "")
+    return "unknown"
+
+
 def _measure_kv_bytes(
     model,
     prompt_ids: list[int],
@@ -195,11 +221,13 @@ def _measure_kv_bytes(
     mem_tokens: int,
     kv_bits: int | None,
     kv_group_size: int,
-) -> int:
-    """Measure the KV-cache footprint after a FIXED-length generation.
+) -> tuple[int, str]:
+    """Measure KV-cache footprint (bytes) and element dtype after a fixed run.
 
     Fixed length (no EOS stop) so baseline and candidate reach the same offset
     and the byte comparison is apples-to-apples (see :func:`_kv_cache_bytes`).
+    The returned dtype string is meaningful for the (unquantized) baseline; for a
+    quantized run it reflects the packed representation and the caller ignores it.
     """
     _, _, cache = _run_generation(
         model,
@@ -211,7 +239,7 @@ def _measure_kv_bytes(
         collect_logprobs=False,
         stop_on_eos=False,
     )
-    return _kv_cache_bytes(cache)
+    return _kv_cache_bytes(cache), _baseline_kv_dtype(cache)
 
 
 def _combine_agreement(results: list[AgreementResult]) -> AgreementResult:
@@ -339,18 +367,23 @@ def run_gate(
     advisory: bool,
     run_niah: bool,
     json_out: Path | None,
+    offline: bool = False,
 ) -> int:
     """Load the model, run every candidate dtype, print + optionally dump reports.
 
     Returns a process exit code. Advisory runs always return 0; enforced runs
     return 1 if any candidate's overall verdict is FAIL.
 
+    When ``offline`` is set, HuggingFace offline mode is forced before the load so
+    an uncached model fails fast instead of triggering a network fetch.
+
     Raises:
         ValueError: If ``max_tokens`` / ``mem_tokens`` / ``kv_group_size`` are not
-            strictly positive, or if ``prompts`` is empty. A non-positive token
-            budget yields empty generations that would score a vacuous ``1.0``
-            agreement — an enforced gate must never "pass" without measuring
-            anything. Validated up front, before any model load.
+            strictly positive, or if ``prompts`` / ``candidate_dtypes`` is empty.
+            A non-positive token budget yields empty generations that would score
+            a vacuous ``1.0`` agreement, and an empty candidate list would let an
+            enforced gate "pass" having measured nothing — both must never slip
+            through. Validated up front, before any model load.
     """
     if max_tokens <= 0 or mem_tokens <= 0 or kv_group_size <= 0:
         raise ValueError(
@@ -364,6 +397,14 @@ def run_gate(
         # An empty candidate list would run the loop zero times and let an
         # --enforce invocation return success having measured NOTHING.
         raise ValueError("candidate_dtypes must be a non-empty list")
+
+    if offline:
+        # Forbid any network fetch — the load fails fast if the model isn't fully
+        # cached. Set before importing/using mlx_lm.load so the HF hub honors it.
+        import os
+
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     from mlx_lm import load
 
@@ -440,14 +481,14 @@ def run_gate(
                     (tokenizer.decode(base_tokens), tokenizer.decode(cand_tokens))
                 )
 
-        base_bytes = _measure_kv_bytes(
+        base_bytes, baseline_kv_dtype = _measure_kv_bytes(
             model,
             mem_prompt_ids,
             mem_tokens=mem_tokens,
             kv_bits=None,
             kv_group_size=kv_group_size,
         )
-        cand_bytes = _measure_kv_bytes(
+        cand_bytes, _ = _measure_kv_bytes(
             model,
             mem_prompt_ids,
             mem_tokens=mem_tokens,
@@ -471,7 +512,7 @@ def run_gate(
         report = build_report(
             model=model_arg,
             hf_path=hf_path,
-            baseline_dtype="bf16",
+            baseline_dtype=baseline_kv_dtype,
             candidate_dtype=cdtype,
             num_prompts=len(prompts),
             advisory=advisory,
@@ -556,6 +597,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit non-zero on FAIL (default: advisory, always exit 0)",
     )
+    p.add_argument(
+        "--offline",
+        action="store_true",
+        help="set HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE before load (cached models only)",
+    )
     p.add_argument("--json-out", type=Path, default=None)
     return p
 
@@ -573,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
         advisory=not args.enforce,
         run_niah=args.niah,
         json_out=args.json_out,
+        offline=args.offline,
     )
 
 

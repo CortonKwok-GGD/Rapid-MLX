@@ -136,6 +136,26 @@ def test_logit_divergence_catastrophic_neg_inf_is_finite():
     assert r.mean_kl > 1.0  # clearly flags the divergence
 
 
+def test_logit_divergence_nan_in_logits_is_finite():
+    # A NaN anywhere in either vector must NOT poison the aggregate KL (which
+    # would make the whole gate report NaN and silently pass every threshold).
+    base = [_logsoftmax([4.0, 0.0, 1.0]), _logsoftmax([1.0, 2.0, 0.0])]
+    cand = [np.array([np.nan, 0.0, 1.0]), _logsoftmax([1.0, 2.0, 0.0])]
+    r = logit_divergence(base, cand)
+    assert math.isfinite(r.mean_kl)
+    assert math.isfinite(r.max_kl)
+    assert r.mean_kl > 0.0  # the NaN step is charged the ceiling, not dropped
+    assert r.compared_steps == 2
+
+
+def test_logit_divergence_all_nan_stays_finite_and_high():
+    base = [_logsoftmax([3.0, 0.0])]
+    cand = [np.array([np.nan, np.nan])]
+    r = logit_divergence(base, cand)
+    assert math.isfinite(r.mean_kl)
+    assert r.mean_kl > 1.0
+
+
 def test_logit_divergence_empty():
     r = logit_divergence([], [])
     assert r.compared_steps == 0
@@ -254,6 +274,56 @@ def test_memory_delta_no_saving():
     d = memory_delta(1000, 1000)
     assert d.reduction_ratio == 1.0
     assert d.saved_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# Baseline KV-cache dtype detection (harness helper, hermetic — no mlx load)
+# ---------------------------------------------------------------------------
+class _FakeDtype:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __str__(self) -> str:  # mimics mlx: str(mx.bfloat16) == "mlx.core.bfloat16"
+        return self._name
+
+
+class _FakeArr:
+    def __init__(self, dtype: _FakeDtype) -> None:
+        self.dtype = dtype
+
+
+class _FakeKVLayer:
+    """A plain (non-quantized) KVCache exposes ``keys`` as a single array."""
+
+    def __init__(self, dtype_name: str) -> None:
+        self.keys = _FakeArr(_FakeDtype(dtype_name))
+
+
+class _FakeQuantLayer:
+    """A QuantizedKVCache exposes ``keys`` as a (packed, scales, biases) tuple."""
+
+    def __init__(self) -> None:
+        self.keys = (_FakeArr(_FakeDtype("uint32")), object(), object())
+
+
+def test_baseline_kv_dtype_reads_real_dtype_not_hardcoded():
+    """RED-GREEN: report must reflect the loaded model's actual KV dtype.
+
+    Hardcoding ``"bf16"`` mislabels the many fp16 mlx checkpoints; the helper
+    strips the ``mlx.core.`` prefix and returns the true element dtype.
+    """
+    from scripts.kv_quant_quality_gate import _baseline_kv_dtype
+
+    assert _baseline_kv_dtype([_FakeKVLayer("mlx.core.bfloat16")]) == "bfloat16"
+    assert _baseline_kv_dtype([_FakeKVLayer("mlx.core.float16")]) == "float16"
+
+
+def test_baseline_kv_dtype_ignores_quantized_and_returns_unknown():
+    from scripts.kv_quant_quality_gate import _baseline_kv_dtype
+
+    # A quantized layer's ``keys`` is a tuple -> not a plain baseline dtype.
+    assert _baseline_kv_dtype([_FakeQuantLayer()]) == "unknown"
+    assert _baseline_kv_dtype([]) == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +742,9 @@ def test_smoke_real_harness_on_cached_model(tmp_path, monkeypatch):
     rep = reports[0]
     assert rep["schema"] == 1
     assert rep["candidate_dtype"] == "int8"
-    assert rep["baseline_dtype"] == "bf16"
+    # Baseline dtype is READ from the real cache, not hardcoded — dense mlx
+    # checkpoints are bfloat16 or float16, never a quantized "int*" label.
+    assert rep["baseline_dtype"] in {"bfloat16", "float16"}
     assert 0.0 <= rep["agreement"]["rate"] <= 1.0
     # int8 KV must actually save memory vs bf16 on a dense model.
     assert rep["memory"]["reduction_ratio"] > 1.0
