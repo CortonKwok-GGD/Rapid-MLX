@@ -83,6 +83,13 @@ def test_video_parameter_validation() -> None:
     assert exc.value.status_code == 400
 
 
+def test_generation_gate_is_owned_by_event_loop() -> None:
+    async def get_gate() -> asyncio.Lock:
+        return video._generation_gate_for_current_loop()
+
+    assert asyncio.run(get_gate()) is not asyncio.run(get_gate())
+
+
 @pytest.mark.asyncio
 async def test_video_rejects_unsafe_pixel_time_workload(
     monkeypatch: pytest.MonkeyPatch,

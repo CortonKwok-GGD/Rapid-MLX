@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 import warnings
+import weakref
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -56,7 +57,21 @@ class _VideoJob:
 _jobs: dict[str, _VideoJob] = {}
 _tasks: dict[str, asyncio.Task] = {}
 _cleanup_tasks: set[asyncio.Task] = set()
-_generation_gate = asyncio.Lock()
+_generation_gates: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Lock
+] = weakref.WeakKeyDictionary()
+_generation_gates_lock = threading.Lock()
+
+
+def _generation_gate_for_current_loop() -> asyncio.Lock:
+    """Return the serial generation gate owned by the active event loop."""
+    loop = asyncio.get_running_loop()
+    with _generation_gates_lock:
+        gate = _generation_gates.get(loop)
+        if gate is None:
+            gate = asyncio.Lock()
+            _generation_gates[loop] = gate
+        return gate
 
 
 def _cleanup_jobs() -> None:
@@ -153,12 +168,13 @@ async def _run_job(
 ) -> None:
     started = False
     output = _jobs_root / job.id / "output.mp4"
+    generation_gate = _generation_gate_for_current_loop()
 
     async def generate_under_gate() -> bool:
         nonlocal started
         # This inner task owns the gate, so cancellation of the request-facing
         # job never releases it while an uncancellable MLX thread is running.
-        async with _generation_gate:
+        async with generation_gate:
             with _jobs_lock:
                 if (
                     job.status == "failed"
@@ -271,15 +287,18 @@ async def create_video(
         if input_reference is not None:
             image_path = job_dir / "reference.img"
             total = 0
-            with image_path.open("xb") as target:
+            target = await asyncio.to_thread(image_path.open, "xb")
+            try:
                 while chunk := await input_reference.read(1024 * 1024):
                     total += len(chunk)
                     if total > _MAX_REFERENCE_BYTES:
                         raise HTTPException(
                             status_code=413, detail="input_reference exceeds 20 MB"
                         )
-                    target.write(chunk)
-            _validate_reference_image(image_path)
+                    await asyncio.to_thread(target.write, chunk)
+            finally:
+                await asyncio.to_thread(target.close)
+            await asyncio.to_thread(_validate_reference_image, image_path)
 
         job = _VideoJob(
             id=job_id,
