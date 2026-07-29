@@ -9,9 +9,11 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
+from vllm_mlx.api.models import AudioSpeechRequest
 from vllm_mlx.audio.tts import TTSEngine
-from vllm_mlx.routes.audio import _allowed_voices_for
+from vllm_mlx.routes.audio import _allowed_voices_for, _decode_tts_ref_audio
 
 
 def test_f5_family_is_detected() -> None:
@@ -23,6 +25,17 @@ def test_f5_clone_requires_audio_and_transcript_together() -> None:
     engine = TTSEngine("lucasnewman/f5-tts-mlx")
     with pytest.raises(ValueError, match="both ref_audio and ref_text"):
         engine._generate_f5("hello", "/tmp/unused.wav", None, 1.0)
+
+
+def test_f5_api_reference_is_base64_and_requires_a_pair() -> None:
+    encoded = "data:audio/wav;base64,UklGRg=="
+    request = AudioSpeechRequest(input="你好", ref_audio=encoded, ref_text="参考")
+    assert _decode_tts_ref_audio(request.ref_audio or "") == b"RIFF"
+
+    with pytest.raises(ValidationError, match="provided together"):
+        AudioSpeechRequest(input="你好", ref_audio=encoded)
+    with pytest.raises(ValueError, match="valid base64"):
+        _decode_tts_ref_audio("not base64")
 
 
 def test_f5_generation_uses_safe_in_memory_default_and_speed(
