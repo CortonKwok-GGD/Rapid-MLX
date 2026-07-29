@@ -9,6 +9,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from fastapi import HTTPException
 
 from vllm_mlx.model_aliases import resolve_profile
 from vllm_mlx.routes import video
@@ -30,9 +31,23 @@ def test_video_engine_calls_mlx_native_pipeline(
     captured = {}
     fake = ModuleType("mlx_video")
 
-    def generate_video_with_audio(**kwargs) -> None:
-        captured.update(kwargs)
-        Path(kwargs["output_path"]).write_bytes(b"mp4")
+    def generate_video_with_audio(
+        *,
+        model_repo,
+        text_encoder_repo,
+        prompt,
+        height,
+        width,
+        num_frames,
+        seed,
+        fps,
+        output_path,
+        image,
+        verbose,
+        enhance_prompt,
+    ) -> None:
+        captured.update(locals())
+        Path(output_path).write_bytes(b"mp4")
 
     fake.generate_video_with_audio = generate_video_with_audio
     monkeypatch.setitem(sys.modules, "mlx_video", fake)
@@ -60,8 +75,9 @@ def test_video_engine_calls_mlx_native_pipeline(
 def test_video_parameter_validation() -> None:
     assert video._parse_size("768x512") == (768, 512)
     assert video._frame_count(4) == 97
-    with pytest.raises(Exception, match="divisible by 64"):
+    with pytest.raises(HTTPException, match="divisible by 64") as exc:
         video._parse_size("700x512")
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -213,6 +229,10 @@ async def test_cancelled_job_reaches_terminal_state_and_cleans_files(
     current = await video.retrieve_video(created["id"])
     assert current["status"] == "failed"
     assert current["error"]["code"] == "video_generation_cancelled"
+    for _ in range(200):
+        if not (video._jobs_root / created["id"]).exists():
+            break
+        await asyncio.sleep(0.01)
     assert not (video._jobs_root / created["id"]).exists()
     await video.delete_video(created["id"])
 

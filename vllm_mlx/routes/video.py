@@ -52,6 +52,7 @@ class _VideoJob:
 
 _jobs: dict[str, _VideoJob] = {}
 _tasks: dict[str, asyncio.Task] = {}
+_cleanup_tasks: set[asyncio.Task] = set()
 _generation_gate = asyncio.Lock()
 
 
@@ -121,46 +122,58 @@ async def _run_job(
     seed: int,
     image_path: Path | None,
 ) -> None:
-    worker: asyncio.Task | None = None
-    try:
-        # Wait outside the executor so queued jobs consume no worker threads.
+    started = False
+    output = _jobs_root / job.id / "output.mp4"
+
+    async def generate_under_gate() -> None:
+        nonlocal started
+        # This inner task owns the gate, so cancellation of the request-facing
+        # job never releases it while an uncancellable MLX thread is running.
         async with _generation_gate:
+            started = True
             with _jobs_lock:
                 job.status = "in_progress"
                 job.progress = 1
-            output = _jobs_root / job.id / "output.mp4"
-            worker = asyncio.create_task(
-                asyncio.to_thread(
-                    engine.generate,
-                    prompt=job.prompt,
-                    output_path=output,
-                    width=width,
-                    height=height,
-                    num_frames=_frame_count(seconds),
-                    fps=24,
-                    seed=seed,
-                    image=image_path,
-                )
+            await asyncio.to_thread(
+                engine.generate,
+                prompt=job.prompt,
+                output_path=output,
+                width=width,
+                height=height,
+                num_frames=_frame_count(seconds),
+                fps=24,
+                seed=seed,
+                image=image_path,
             )
-            # Cancellation cannot stop a running MLX graph. Shield the worker;
-            # the cancellation handler waits for it before cleaning files.
-            await asyncio.shield(worker)
-            with _jobs_lock:
-                job.status = "completed"
-                job.progress = 100
-                job.completed_at = int(time.time())
-                job.output_path = str(output)
+
+    runner = asyncio.create_task(generate_under_gate())
+    try:
+        await asyncio.shield(runner)
+        with _jobs_lock:
+            job.status = "completed"
+            job.progress = 100
+            job.completed_at = int(time.time())
+            job.output_path = str(output)
     except asyncio.CancelledError:
-        if worker is not None:
-            with contextlib.suppress(Exception):
-                await worker
         with _jobs_lock:
             job.status = "failed"
             job.error = {
                 "code": "video_generation_cancelled",
                 "message": "Video generation was cancelled.",
             }
-        await asyncio.to_thread(shutil.rmtree, _jobs_root / job.id, True)
+        if not started:
+            runner.cancel()
+
+        async def reap_cancelled_job() -> None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await runner
+            await asyncio.to_thread(
+                shutil.rmtree, _jobs_root / job.id, ignore_errors=True
+            )
+
+        cleanup = asyncio.create_task(reap_cancelled_job())
+        _cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(_cleanup_tasks.discard)
         raise
     except Exception as exc:  # noqa: BLE001
         from ..runtime.video_lane import VideoRuntimeError

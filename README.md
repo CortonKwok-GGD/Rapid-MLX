@@ -124,6 +124,7 @@ curl http://localhost:8000/v1/videos \
   -F seconds=4 \
   -F size=768x512
 
+# Poll until GET /v1/videos/VIDEO_ID reports "status": "completed", then:
 curl http://localhost:8000/v1/videos/VIDEO_ID/content -o output.mp4
 ```
 
