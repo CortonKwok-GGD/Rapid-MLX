@@ -18,14 +18,15 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..middleware.auth import verify_api_key
+from ..middleware.auth import _verify_api_key_values, verify_api_key
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _MAX_REFERENCE_BYTES = 20 * 1024 * 1024
+_VIDEO_REQUEST_BYTES = _MAX_REFERENCE_BYTES + 1024 * 1024
 _MAX_JOBS = 100
 _MAX_PIXEL_FRAMES = 768 * 512 * 97
 _MAX_REFERENCE_PIXELS = 16_777_216
@@ -65,6 +66,76 @@ _generation_gates: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
 ] = weakref.WeakKeyDictionary()
 _generation_gates_lock = threading.Lock()
+
+
+class _VideoBodyTooLargeError(Exception):
+    """Internal ASGI sentinel for a streamed multipart body over the cap."""
+
+
+class VideoBodyLimitMiddleware:
+    """Authenticate and cap video multipart bodies before FastAPI parses them."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/v1/videos"
+        ):
+            return await self.app(scope, receive, send)
+
+        headers = {name.lower(): value for name, value in scope.get("headers", ())}
+        authorization = headers.get(b"authorization", b"").decode(
+            "latin-1", errors="ignore"
+        )
+        scheme, _, token = authorization.partition(" ")
+        bearer = token if scheme.lower() == "bearer" and token else None
+        try:
+            _verify_api_key_values(bearer)
+        except HTTPException as exc:
+            response = JSONResponse(
+                status_code=exc.status_code, content={"detail": exc.detail}
+            )
+            return await response(scope, receive, send)
+
+        advertised = headers.get(b"content-length")
+        if advertised is not None:
+            try:
+                advertised_bytes = int(advertised.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                advertised_bytes = None
+            if advertised_bytes is not None and advertised_bytes > _VIDEO_REQUEST_BYTES:
+                response = JSONResponse(
+                    status_code=413,
+                    content={"detail": "video request body exceeds 21 MB"},
+                )
+                return await response(scope, receive, send)
+
+        total = 0
+
+        async def bounded_receive():
+            nonlocal total
+            message = await receive()
+            if message.get("type") == "http.request":
+                total += len(message.get("body", b"") or b"")
+                if total > _VIDEO_REQUEST_BYTES:
+                    raise _VideoBodyTooLargeError
+            return message
+
+        try:
+            await self.app(scope, bounded_receive, send)
+        except _VideoBodyTooLargeError:
+            response = JSONResponse(
+                status_code=413,
+                content={"detail": "video request body exceeds 21 MB"},
+            )
+            await response(scope, receive, send)
+
+
+def install_video_body_limit_middleware(app) -> None:
+    app.add_middleware(VideoBodyLimitMiddleware)
 
 
 def _generation_gate_for_current_loop() -> asyncio.Lock:
@@ -226,7 +297,10 @@ def _parse_size(value: str) -> tuple[int, int]:
     ):
         raise HTTPException(
             status_code=400,
-            detail="video width/height must be 256..1920 and divisible by 64",
+            detail=(
+                "video width/height must be 256..1920 and divisible by 64, "
+                "or use 1280x720 / 720x1280"
+            ),
         )
     return width, height
 

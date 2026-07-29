@@ -54,6 +54,139 @@ def test_video_runtime_preflight_fails_before_download(
     assert "brew install ffmpeg" in error
 
 
+@pytest.mark.asyncio
+async def test_video_multipart_gate_authenticates_before_reading_body() -> None:
+    from vllm_mlx.config import get_config
+
+    cfg = get_config()
+    saved_key = cfg.api_key
+    cfg.api_key = "secret"
+    receive_calls = 0
+    sent = []
+
+    async def downstream(scope, receive, send) -> None:
+        raise AssertionError("unauthenticated request reached FastAPI")
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        return {"type": "http.request", "body": b"x", "more_body": False}
+
+    async def send(message) -> None:
+        sent.append(message)
+
+    try:
+        middleware = video.VideoBodyLimitMiddleware(downstream)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/videos",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+    finally:
+        cfg.api_key = saved_key
+
+    assert receive_calls == 0
+    assert sent[0]["status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_video_multipart_gate_rejects_content_length_before_read() -> None:
+    from vllm_mlx.config import get_config
+
+    cfg = get_config()
+    saved_key = cfg.api_key
+    cfg.api_key = None
+    receive_calls = 0
+    sent = []
+
+    async def downstream(scope, receive, send) -> None:
+        raise AssertionError("oversized request reached FastAPI")
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        return {"type": "http.request", "body": b"x", "more_body": False}
+
+    async def send(message) -> None:
+        sent.append(message)
+
+    try:
+        middleware = video.VideoBodyLimitMiddleware(downstream)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/videos",
+                "headers": [
+                    (
+                        b"content-length",
+                        str(video._VIDEO_REQUEST_BYTES + 1).encode(),
+                    )
+                ],
+            },
+            receive,
+            send,
+        )
+    finally:
+        cfg.api_key = saved_key
+
+    assert receive_calls == 0
+    assert sent[0]["status"] == 413
+
+
+@pytest.mark.asyncio
+async def test_video_multipart_gate_caps_chunked_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_mlx.config import get_config
+
+    cfg = get_config()
+    saved_key = cfg.api_key
+    cfg.api_key = None
+    monkeypatch.setattr(video, "_VIDEO_REQUEST_BYTES", 4)
+    chunks = iter(
+        [
+            {"type": "http.request", "body": b"abc", "more_body": True},
+            {"type": "http.request", "body": b"def", "more_body": False},
+        ]
+    )
+    sent = []
+
+    async def downstream(scope, receive, send) -> None:
+        while True:
+            message = await receive()
+            if not message.get("more_body", False):
+                return
+
+    async def receive():
+        return next(chunks)
+
+    async def send(message) -> None:
+        sent.append(message)
+
+    try:
+        middleware = video.VideoBodyLimitMiddleware(downstream)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/videos",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+    finally:
+        cfg.api_key = saved_key
+
+    assert sent[0]["status"] == 413
+
+
 def test_serve_dispatches_video_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_mlx import cli
     from vllm_mlx.runtime import video_lane
@@ -117,6 +250,12 @@ def test_video_engine_calls_mlx_native_pipeline(
     assert captured["model_repo"] == "notapalindrome/ltx23-mlx-av-q4"
     assert captured["num_frames"] == 97
     assert captured["image"] == str(reference)
+
+
+def test_video_engines_share_process_generation_lock() -> None:
+    first = VideoEngine("one/model")
+    second = VideoEngine("two/model")
+    assert first._generation_lock is second._generation_lock
 
 
 def test_video_crop_timeout_is_actionable(

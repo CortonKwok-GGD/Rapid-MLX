@@ -15,6 +15,9 @@ class VideoRuntimeError(RuntimeError):
     """Safe, actionable generation error suitable for the public API."""
 
 
+_PROCESS_GENERATION_LOCK = threading.Lock()
+
+
 def require_video_runtime_or_exit() -> None:
     """Fail before model download when the optional video stack is absent."""
     missing = []
@@ -45,7 +48,10 @@ class VideoEngine:
 
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        self._generation_lock = threading.Lock()
+        # Shared across engine instances and app lifespans. A bounded shutdown
+        # may detach an old daemon worker; an in-process restart must not run a
+        # second Metal graph concurrently with that still-draining worker.
+        self._generation_lock = _PROCESS_GENERATION_LOCK
 
     def generate(
         self,
