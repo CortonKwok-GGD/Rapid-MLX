@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -14,7 +15,11 @@ from PIL import Image
 
 from vllm_mlx.model_aliases import resolve_profile
 from vllm_mlx.routes import video
-from vllm_mlx.runtime.video_lane import VideoEngine, require_video_runtime_or_exit
+from vllm_mlx.runtime.video_lane import (
+    VideoEngine,
+    VideoRuntimeError,
+    require_video_runtime_or_exit,
+)
 
 
 def test_ltx23_alias_routes_to_video_lane() -> None:
@@ -112,6 +117,38 @@ def test_video_engine_calls_mlx_native_pipeline(
     assert captured["model_repo"] == "notapalindrome/ltx23-mlx-av-q4"
     assert captured["num_frames"] == 97
     assert captured["image"] == str(reference)
+
+
+def test_video_crop_timeout_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = ModuleType("mlx_video")
+
+    def generate_video_with_audio(**kwargs) -> None:
+        Path(kwargs["output_path"]).write_bytes(b"mp4")
+
+    fake.generate_video_with_audio = generate_video_with_audio
+    monkeypatch.setitem(sys.modules, "mlx_video", fake)
+    monkeypatch.setattr("shutil.which", lambda _: "/opt/homebrew/bin/ffmpeg")
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("ffmpeg", 120)
+
+    monkeypatch.setattr("subprocess.run", timeout)
+    engine = VideoEngine("notapalindrome/ltx23-mlx-av-q4")
+    with pytest.raises(VideoRuntimeError, match="could not crop"):
+        engine.generate(
+            prompt="portrait",
+            output_path=tmp_path / "result.mp4",
+            width=768,
+            height=1280,
+            num_frames=9,
+            fps=24,
+            seed=1,
+            image=None,
+            output_width=720,
+            output_height=1280,
+        )
 
 
 def test_video_parameter_validation() -> None:

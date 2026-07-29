@@ -120,9 +120,14 @@ class VideoEngine:
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    timeout=120,
                 )
                 cropped.replace(output_path)
-            except (OSError, subprocess.CalledProcessError) as exc:
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
                 raise VideoRuntimeError(
                     "LTX-2.3 generated video but could not crop it to the "
                     "requested OpenAI-compatible size."
