@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import sys
 from types import ModuleType, SimpleNamespace
@@ -19,6 +20,14 @@ from vllm_mlx.routes.audio import _allowed_voices_for, _decode_tts_ref_audio
 def test_f5_family_is_detected() -> None:
     assert TTSEngine("lucasnewman/f5-tts-mlx")._model_family == "f5"
     assert _allowed_voices_for("lucasnewman/f5-tts-mlx") == ["clone"]
+
+
+def test_installed_f5_sample_contract() -> None:
+    f5 = pytest.importorskip("f5_tts_mlx.cfm")
+    parameters = inspect.signature(f5.F5TTS.sample).parameters
+    assert {"cond", "text", "duration", "steps", "speed", "cfg_strength"} <= set(
+        parameters
+    )
 
 
 def test_f5_clone_requires_audio_and_transcript_together() -> None:
@@ -70,6 +79,10 @@ def test_f5_generation_uses_safe_in_memory_default_and_speed(
 
     monkeypatch.setattr("pkgutil.get_data", lambda *_: b"packaged-wave", raising=True)
     read = MagicMock(return_value=(np.ones(240, dtype=np.float32), 24_000))
+    monkeypatch.setattr(
+        "soundfile.info",
+        lambda *_: SimpleNamespace(samplerate=24_000, channels=1, frames=240),
+    )
     monkeypatch.setattr("soundfile.read", read)
 
     model = MagicMock()
@@ -112,12 +125,16 @@ def test_f5_rejects_stereo_and_silent_references(
 
     engine = TTSEngine("lucasnewman/f5-tts-mlx")
     monkeypatch.setattr(
-        "soundfile.read",
-        lambda *_: (np.ones((240, 2), dtype=np.float32), 24_000),
+        "soundfile.info",
+        lambda *_: SimpleNamespace(samplerate=24_000, channels=2, frames=240),
     )
     with pytest.raises(ValueError, match="mono"):
         engine._generate_f5("hello", "ref.wav", "reference", 1.0)
 
+    monkeypatch.setattr(
+        "soundfile.info",
+        lambda *_: SimpleNamespace(samplerate=24_000, channels=1, frames=240),
+    )
     monkeypatch.setattr(
         "soundfile.read", lambda *_: (np.zeros(240, dtype=np.float32), 24_000)
     )

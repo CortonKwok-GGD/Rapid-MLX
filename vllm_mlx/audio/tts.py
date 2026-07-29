@@ -411,24 +411,34 @@ class TTSEngine:
             estimated_duration,
         )
 
+        def read_reference(source):
+            info = sf.info(source)
+            if info.samplerate != SAMPLE_RATE:
+                raise ValueError(
+                    f"F5 ref_audio must be {SAMPLE_RATE} Hz "
+                    f"(got {info.samplerate}); resample it."
+                )
+            if info.channels != 1:
+                raise ValueError("F5 ref_audio must be mono.")
+            if info.frames <= 0 or info.frames > SAMPLE_RATE * 30:
+                raise ValueError("F5 ref_audio must be between 0 and 30 seconds.")
+            if hasattr(source, "seek"):
+                source.seek(0)
+            audio, _ = sf.read(source)
+            return audio
+
         if ref_audio is not None:
             assert ref_text is not None  # paired-input validation above
-            aud, sr = sf.read(ref_audio)
-            if sr != SAMPLE_RATE:
-                raise ValueError(
-                    f"F5 ref_audio must be {SAMPLE_RATE} Hz (got {sr}); resample it."
-                )
+            aud = read_reference(ref_audio)
             rtext = ref_text
         else:
             # packaged short reference (its timbre; content comes from `text`)
             data = pkgutil.get_data("f5_tts_mlx", "tests/test_en_1_ref_short.wav")
             if data is None:
                 raise RuntimeError("F5-TTS packaged reference audio is missing.")
-            aud, _sr = sf.read(io.BytesIO(data))
+            aud = read_reference(io.BytesIO(data))
             rtext = "Some call me nature, others call me mother nature."
 
-        if aud.ndim != 1:
-            raise ValueError("F5 ref_audio must be mono.")
         aud = mx.array(aud)
         rms = mx.sqrt(mx.mean(mx.square(aud)))
         mx.eval(rms)
