@@ -449,7 +449,7 @@ class TTSEngine:
             cfg_strength=2.0,
             sway_sampling_coef=-1.0,
         )
-        wave = wave[aud.shape[0] :]  # trim the reference prefix
+        wave = wave[0, aud.shape[0] :]  # select batch 0, trim reference prefix
         mx.eval(wave)
         out = np.array(wave, dtype=np.float32)
         return AudioOutput(

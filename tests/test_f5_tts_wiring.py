@@ -73,7 +73,7 @@ def test_f5_generation_uses_safe_in_memory_default_and_speed(
     monkeypatch.setattr("soundfile.read", read)
 
     model = MagicMock()
-    model.sample.return_value = (np.ones(480, dtype=np.float32), None)
+    model.sample.return_value = (np.ones((1, 480), dtype=np.float32), None)
     engine = TTSEngine("lucasnewman/f5-tts-mlx")
     engine.model = model
 

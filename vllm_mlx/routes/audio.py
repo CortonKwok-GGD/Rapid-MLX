@@ -1591,6 +1591,20 @@ async def create_speech(request: AudioSpeechRequest = Body(...)):
         # the future land in :data:`TTS_MODEL_ALIASES` once, not in the
         # handler body.
         model_name = _resolve_tts_model(model)
+        if ref_audio is not None and not (
+            "f5-tts" in model_name.lower() or "f5_tts" in model_name.lower()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": "ref_audio/ref_text voice cloning requires F5-TTS.",
+                        "type": "invalid_request_error",
+                        "code": "unsupported_voice_cloning",
+                        "param": "model",
+                    }
+                },
+            )
 
         # Qwen3-TTS ships two shapes: CustomVoice (predefined speakers,
         # reference-free — what we alias and support) and Base (voice-
