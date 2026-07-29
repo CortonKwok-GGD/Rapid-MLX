@@ -204,7 +204,7 @@ async def test_cancelled_job_reaches_terminal_state_and_cleans_files(
         input_reference=None,
     )
     assert await asyncio.to_thread(started.wait, 2)
-    task = next(task for task in video._tasks if not task.done())
+    task = video._tasks[created["id"]]
     task.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -213,5 +213,39 @@ async def test_cancelled_job_reaches_terminal_state_and_cleans_files(
     current = await video.retrieve_video(created["id"])
     assert current["status"] == "failed"
     assert current["error"]["code"] == "video_generation_cancelled"
+    assert not (video._jobs_root / created["id"]).exists()
+    await video.delete_video(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_failed_generation_removes_partial_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            output_path.write_bytes(b"partial")
+            raise RuntimeError("private /tmp/detail")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FailingEngine())
+    created = await video.create_video(
+        prompt="fail",
+        model="ltx-2.3-mlx-q4",
+        seconds="1",
+        size="512x512",
+        seed=4,
+        input_reference=None,
+    )
+    for _ in range(200):
+        current = await video.retrieve_video(created["id"])
+        if current["status"] == "failed":
+            break
+        await asyncio.sleep(0.01)
+
+    assert current["status"] == "failed"
+    assert current["error"]["message"] == (
+        "Video generation failed; check the server logs for details."
+    )
     assert not (video._jobs_root / created["id"]).exists()
     await video.delete_video(created["id"])

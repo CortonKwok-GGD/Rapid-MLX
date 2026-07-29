@@ -51,7 +51,7 @@ class _VideoJob:
 
 
 _jobs: dict[str, _VideoJob] = {}
-_tasks: set[asyncio.Task] = set()
+_tasks: dict[str, asyncio.Task] = {}
 _generation_gate = asyncio.Lock()
 
 
@@ -174,6 +174,7 @@ async def _run_job(
         with _jobs_lock:
             job.status = "failed"
             job.error = {"code": "video_generation_failed", "message": message}
+        await asyncio.to_thread(shutil.rmtree, _jobs_root / job.id, ignore_errors=True)
 
 
 @router.post("/v1/videos", dependencies=[Depends(verify_api_key)])
@@ -247,10 +248,6 @@ async def create_video(
     finally:
         if not enqueued:
             await asyncio.to_thread(shutil.rmtree, job_dir, ignore_errors=True)
-    if evicted_id is not None:
-        await asyncio.to_thread(
-            shutil.rmtree, _jobs_root / evicted_id, ignore_errors=True
-        )
     task = asyncio.create_task(
         _run_job(
             job,
@@ -262,8 +259,17 @@ async def create_video(
             image_path=image_path,
         )
     )
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+    _tasks[job.id] = task
+
+    def discard_task(done: asyncio.Task) -> None:
+        if _tasks.get(job.id) is done:
+            _tasks.pop(job.id, None)
+
+    task.add_done_callback(discard_task)
+    if evicted_id is not None:
+        await asyncio.to_thread(
+            shutil.rmtree, _jobs_root / evicted_id, ignore_errors=True
+        )
     return job.public()
 
 
