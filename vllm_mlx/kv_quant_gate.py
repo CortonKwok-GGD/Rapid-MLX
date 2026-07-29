@@ -67,14 +67,19 @@ class AgreementResult:
     """Token-level agreement of a candidate continuation vs its baseline.
 
     Attributes:
-        total: Number of compared token positions (``min`` of the two lengths).
-        matched: Positions where the token ids are equal, counted only up to the
-            first divergence (a greedy run's context forks at the first mismatch,
-            so positions after it are no longer a same-context comparison).
+        total: The denominator — the ``max`` of the two stream lengths. An
+            unequal length is itself a divergence (premature EOS), so the longer
+            stream sets the scale and the missing suffix positions count as
+            disagreement.
+        matched: Leading run of equal token ids (the greedy context forks at the
+            first mismatch, so positions after it are not a same-context
+            comparison and are not counted as matches).
         rate: ``matched / total`` (``1.0`` for two empty streams — vacuously
             equal).
-        first_divergence_index: Index of the first mismatching position, or
-            ``None`` when the streams agree over the whole compared length.
+        first_divergence_index: Index of the first mismatching position, or —
+            when the prefixes all match but the lengths differ — the overlap
+            boundary where the shorter stream ended. ``None`` only when the
+            streams are identical.
     """
 
     total: int
@@ -86,33 +91,46 @@ class AgreementResult:
 def greedy_agreement_rate(
     baseline_tokens: Sequence[int], candidate_tokens: Sequence[int]
 ) -> AgreementResult:
-    """Prefix token-agreement of two greedy continuations.
+    """Token-agreement of two greedy continuations, penalizing length mismatch.
 
-    Compares position by position up to ``min(len(baseline), len(candidate))``.
-    ``matched`` counts the leading run of equal tokens; the first mismatch sets
-    ``first_divergence_index`` and stops the count (after a divergence the two
-    runs feed different tokens back, so later positions are not comparable). The
-    reported ``rate`` is the fraction of the compared length that matched before
-    diverging — a clean 0..1 quantization-drift signal.
+    ``matched`` counts the leading run of equal tokens; the first mismatch stops
+    the count (after a divergence the two runs feed different tokens back, so
+    later positions are not comparable). The denominator is the LONGER stream's
+    length, so a candidate that ends early after an all-matching prefix — the
+    premature-EOS degradation this gate is built to catch — scores below ``1.0``
+    instead of a misleading perfect score. ``rate`` is a clean 0..1
+    quantization-drift signal.
 
-    Two empty streams agree vacuously (``rate=1.0``). An empty vs non-empty pair
-    has ``total=0`` and also ``rate=1.0`` (nothing to disagree on) — the caller
-    decides whether zero-length generations are interesting.
+    Two empty streams agree vacuously (``total=0``, ``rate=1.0``). An empty vs
+    non-empty pair scores ``rate=0.0`` (the whole non-empty stream is missing).
     """
-    total = min(len(baseline_tokens), len(candidate_tokens))
+    # Denominator is the LONGER of the two streams — an unequal continuation
+    # length is itself a divergence, not something to average away. A quantized
+    # candidate that terminates early (premature EOS — a core failure mode this
+    # gate exists to catch) must score BELOW 1.0, so the missing suffix positions
+    # count against it. Using ``min`` here would score an early-EOS candidate that
+    # matched its short prefix at a perfect 1.0 and hide the regression.
+    total = max(len(baseline_tokens), len(candidate_tokens))
     if total == 0:
         return AgreementResult(
             total=0, matched=0, rate=1.0, first_divergence_index=None
         )
 
+    overlap = min(len(baseline_tokens), len(candidate_tokens))
     matched = 0
     first_divergence: int | None = None
-    for i in range(total):
+    for i in range(overlap):
         if baseline_tokens[i] == candidate_tokens[i]:
             matched += 1
         else:
             first_divergence = i
             break
+    else:
+        # No token mismatch within the overlapping prefix. If the streams are
+        # different lengths the shorter one ended first — that boundary IS the
+        # divergence point (e.g. premature EOS under quantization).
+        if len(baseline_tokens) != len(candidate_tokens):
+            first_divergence = overlap
 
     rate = matched / total
     return AgreementResult(
@@ -246,15 +264,33 @@ def extract_json_candidate(text: str) -> str:
 
 
 def is_valid_json(text: str) -> bool:
-    """True iff ``text`` (or its embedded JSON span) parses as JSON."""
+    """True iff ``text`` contains a parseable JSON value.
+
+    First tries the whole extracted candidate span (fenced block or bracket
+    span). If that fails, scans each opening ``{`` / ``[`` delimiter and attempts
+    an incremental ``json.JSONDecoder().raw_decode()`` from there — so a valid
+    embedded object survives even when other bracketed fragments in the
+    surrounding prose would break a naive "first-brace-to-last-bracket" span
+    (e.g. ``"see [x] then {\\"a\\": 1}"``).
+    """
+    if not text:
+        return False
     candidate = extract_json_candidate(text)
-    if not candidate:
-        return False
-    try:
-        json.loads(candidate)
-        return True
-    except (ValueError, TypeError):
-        return False
+    if candidate:
+        try:
+            json.loads(candidate)
+            return True
+        except (ValueError, TypeError):
+            pass
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            try:
+                decoder.raw_decode(text, i)
+                return True
+            except ValueError:
+                continue
+    return False
 
 
 @dataclass(frozen=True)

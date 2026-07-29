@@ -71,11 +71,33 @@ def test_greedy_agreement_empty_streams():
     assert r.first_divergence_index is None
 
 
-def test_greedy_agreement_different_lengths_uses_min():
-    r = greedy_agreement_rate([1, 2, 3], [1, 2])
-    assert r.total == 2
+def test_greedy_agreement_premature_eos_scores_below_one():
+    """RED-GREEN: a candidate that ends early after an all-matching prefix must
+    NOT score 1.0. With the old ``min`` denominator this returned 1.0, hiding the
+    premature-EOS degradation the gate exists to catch; the ``max`` denominator
+    counts the missing suffix positions as disagreement.
+    """
+    # baseline 5 tokens, candidate terminated at 3 (premature EOS), prefix matches
+    r = greedy_agreement_rate([1, 2, 3, 4, 5], [1, 2, 3])
+    assert r.total == 5  # denominator is the LONGER stream, not the shorter
+    assert r.matched == 3
+    assert r.rate == 0.6
+    assert r.first_divergence_index == 3  # boundary where the short stream ended
+
+
+def test_greedy_agreement_candidate_longer_also_penalized():
+    r = greedy_agreement_rate([1, 2], [1, 2, 3, 4])
+    assert r.total == 4
     assert r.matched == 2
-    assert r.rate == 1.0
+    assert r.rate == 0.5
+    assert r.first_divergence_index == 2
+
+
+def test_greedy_agreement_empty_vs_nonempty_scores_zero():
+    r = greedy_agreement_rate([], [1, 2, 3])
+    assert r.total == 3
+    assert r.matched == 0
+    assert r.rate == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +166,18 @@ def test_is_valid_json_plain_and_fenced_and_embedded():
 def test_extract_json_candidate_prefers_fence():
     assert extract_json_candidate('```json\n{"x": 1}\n```') == '{"x": 1}'
     assert extract_json_candidate('prefix {"x": 1} suffix') == '{"x": 1}'
+
+
+def test_is_valid_json_embedded_despite_other_brackets():
+    """RED-GREEN: a valid object survives even when another bracketed fragment in
+    the prose would break a naive first-brace-through-last-bracket span. The old
+    span logic yielded ``[x] then {"a": 1}`` / ``[1, 2] and {"ok": true}`` (both
+    unparseable); the raw_decode scan recovers the real JSON value.
+    """
+    assert is_valid_json('see [x] then {"a": 1}')
+    assert is_valid_json('result: [1, 2] and {"ok": true}')
+    # A genuinely JSON-free string still returns False.
+    assert not is_valid_json("no brackets, no json here")
 
 
 def test_retention_both_valid():
@@ -370,6 +404,119 @@ def test_human_summary_renders():
 
 
 # ---------------------------------------------------------------------------
+# Harness guards (hermetic — no model load; the guards run before any import).
+# ---------------------------------------------------------------------------
+def _run_gate_kwargs(**overrides):
+    base = dict(
+        model_arg="dummy",
+        candidate_dtypes=["int8"],
+        prompts=[{"kind": "text", "prompt": "hi"}],
+        max_tokens=8,
+        mem_tokens=16,
+        kv_group_size=64,
+        advisory=True,
+        run_niah=False,
+        json_out=None,
+    )
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"max_tokens": 0},
+        {"max_tokens": -1},
+        {"mem_tokens": 0},
+        {"kv_group_size": 0},
+        {"prompts": []},
+    ],
+)
+def test_run_gate_rejects_bad_config_before_load(override):
+    """RED-GREEN: non-positive token budgets / empty prompts raise up front.
+
+    A zero/negative budget yields empty generations that would score a vacuous
+    1.0 agreement — an enforced gate must never 'pass' without measuring. The
+    guard runs before any mlx_lm import, so this is hermetic (no model load).
+    """
+    from scripts.kv_quant_quality_gate import run_gate
+
+    with pytest.raises(ValueError):
+        run_gate(**_run_gate_kwargs(**override))
+
+
+def test_positive_int_argparse_type_rejects_nonpositive():
+    import argparse
+
+    from scripts.kv_quant_quality_gate import _positive_int
+
+    assert _positive_int("48") == 48
+    for bad in ("0", "-3"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _positive_int(bad)
+
+
+def test_niah_fail_closed_on_unknown_ram():
+    """RED-GREEN: when RAM is undetected (None) NIAH must SKIP, not run.
+
+    The chip qualifies (M3 Ultra) so the RAM guard is the deciding factor;
+    unknown capacity must fail closed rather than assume headroom.
+    """
+    from scripts.kv_quant_quality_gate import _maybe_run_niah
+    from vllm_mlx.chip_tier import classify_chip_tier
+
+    chip = classify_chip_tier("Apple M3 Ultra")
+    assert chip.is_m3_or_newer  # precondition — RAM guard is what decides
+    result = _maybe_run_niah(
+        None,
+        None,
+        chip,
+        enabled=True,
+        max_tokens=8,
+        kv_bits=8,
+        kv_group_size=64,
+        eos_ids=set(),
+        total_ram_gb=None,
+    )
+    assert result["status"] == "skipped"
+    assert "undetected" in result["reason"] or "fail-closed" in result["reason"]
+
+
+def test_niah_skips_when_not_requested_and_sub_m3():
+    from scripts.kv_quant_quality_gate import _maybe_run_niah
+    from vllm_mlx.chip_tier import classify_chip_tier
+
+    m3 = classify_chip_tier("Apple M3 Ultra")
+    m1 = classify_chip_tier("Apple M1")
+    # Not requested -> skipped regardless of chip.
+    r1 = _maybe_run_niah(
+        None,
+        None,
+        m3,
+        enabled=False,
+        max_tokens=8,
+        kv_bits=8,
+        kv_group_size=64,
+        eos_ids=set(),
+        total_ram_gb=256.0,
+    )
+    assert r1["status"] == "skipped" and "not requested" in r1["reason"]
+    # Sub-M3 chip -> skipped even when requested with ample RAM.
+    r2 = _maybe_run_niah(
+        None,
+        None,
+        m1,
+        enabled=True,
+        max_tokens=8,
+        kv_bits=8,
+        kv_group_size=64,
+        eos_ids=set(),
+        total_ram_gb=256.0,
+    )
+    assert r2["status"] == "skipped" and "below M3" in r2["reason"]
+
+
+# ---------------------------------------------------------------------------
 # Gated end-to-end smoke — real harness, cached small model only.
 # ---------------------------------------------------------------------------
 # Small, quantizable (dense, non-sliding-window) text models to try, smallest
@@ -382,37 +529,66 @@ _SMOKE_MODEL_CANDIDATES = [
 ]
 
 
-def _first_cached_model() -> str | None:
-    """Return the first candidate whose config.json is in the local HF cache."""
+# A COMPLETE snapshot needs config + tokenizer + at least one weights artifact.
+# Probing only ``config.json`` would let ``mlx_lm.load`` fetch a missing shard /
+# tokenizer over the network — violating the cache-only (no-download) contract.
+_REQUIRED_CACHE_FILES = ("config.json", "tokenizer_config.json")
+_WEIGHT_CANDIDATE_FILES = ("model.safetensors", "model.safetensors.index.json")
+
+
+def _model_fully_cached(repo: str) -> bool:
+    """True iff a COMPLETE local snapshot of ``repo`` is in the HF cache.
+
+    Deterministic cache probe (``try_to_load_from_cache`` — a real ``str`` path
+    means present) for config + tokenizer + a weights artifact. No network, no
+    exception-message classification (the flaky pattern the gemma4 tests warned
+    against).
+    """
     try:
         from huggingface_hub import try_to_load_from_cache
     except Exception:
-        return None
-    for repo in _SMOKE_MODEL_CANDIDATES:
+        return False
+
+    def cached(filename: str) -> bool:
         try:
-            path = try_to_load_from_cache(repo, "config.json")
+            return isinstance(try_to_load_from_cache(repo, filename), str)
         except Exception:
-            continue
-        if isinstance(path, str):
+            return False
+
+    if not all(cached(f) for f in _REQUIRED_CACHE_FILES):
+        return False
+    return any(cached(f) for f in _WEIGHT_CANDIDATE_FILES)
+
+
+def _first_cached_model() -> str | None:
+    """Return the first candidate with a COMPLETE local snapshot, else None."""
+    for repo in _SMOKE_MODEL_CANDIDATES:
+        if _model_fully_cached(repo):
             return repo
     return None
 
 
 @pytest.mark.slow
-def test_smoke_real_harness_on_cached_model(tmp_path):
+def test_smoke_real_harness_on_cached_model(tmp_path, monkeypatch):
     """End-to-end: load a real cached small model, run the gate, assert the report.
 
-    Cache-only (never downloads): skips when no candidate model is cached. Run
-    with ``pytest --run-slow -m slow tests/test_kv_quant_gate.py``.
+    Cache-only (never downloads): skips unless a COMPLETE snapshot is cached, and
+    forces HF offline mode so the load can NEVER reach the network. Run with
+    ``pytest --run-slow -m slow tests/test_kv_quant_gate.py``.
     """
     pytest.importorskip("mlx_lm")
     repo = _first_cached_model()
     if repo is None:
         pytest.skip(
-            "no small quantizable model in the local HF cache — smoke is "
+            "no COMPLETE small-model snapshot in the local HF cache — smoke is "
             "cache-only (no download). Pre-cache one of: "
             + ", ".join(_SMOKE_MODEL_CANDIDATES)
         )
+
+    # Belt-and-suspenders: even though the snapshot is complete, force offline so
+    # a stray fetch is impossible (raises instead of downloading).
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
 
     from scripts.kv_quant_quality_gate import run_gate
 

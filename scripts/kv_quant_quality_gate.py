@@ -266,7 +266,15 @@ def _maybe_run_niah(
             "status": "skipped",
             "reason": f"chip tier below M3 (gen={chip.generation}) — NIAH gated off",
         }
-    if total_ram_gb is not None and total_ram_gb < _NIAH_MIN_RAM_GB:
+    # Fail-closed on RAM: run the expensive long-context pass ONLY when RAM was
+    # successfully detected AND meets the minimum. An unknown (``None``) capacity
+    # must SKIP — never assume enough headroom on a host we couldn't measure.
+    if total_ram_gb is None:
+        return {
+            "status": "skipped",
+            "reason": "RAM capacity undetected — NIAH gated off (fail-closed)",
+        }
+    if total_ram_gb < _NIAH_MIN_RAM_GB:
         return {
             "status": "skipped",
             "reason": f"RAM {total_ram_gb:.0f}GB < {_NIAH_MIN_RAM_GB:.0f}GB gate",
@@ -336,7 +344,23 @@ def run_gate(
 
     Returns a process exit code. Advisory runs always return 0; enforced runs
     return 1 if any candidate's overall verdict is FAIL.
+
+    Raises:
+        ValueError: If ``max_tokens`` / ``mem_tokens`` / ``kv_group_size`` are not
+            strictly positive, or if ``prompts`` is empty. A non-positive token
+            budget yields empty generations that would score a vacuous ``1.0``
+            agreement — an enforced gate must never "pass" without measuring
+            anything. Validated up front, before any model load.
     """
+    if max_tokens <= 0 or mem_tokens <= 0 or kv_group_size <= 0:
+        raise ValueError(
+            "max_tokens, mem_tokens, and group_size must be strictly positive "
+            f"(got max_tokens={max_tokens}, mem_tokens={mem_tokens}, "
+            f"group_size={kv_group_size})"
+        )
+    if not prompts:
+        raise ValueError("prompts must be a non-empty list")
+
     from mlx_lm import load
 
     from vllm_mlx.model_aliases import resolve_model
@@ -491,6 +515,14 @@ def _load_prompts(path: Path | None) -> list[dict[str, str]]:
     return prompts
 
 
+def _positive_int(value: str) -> int:
+    """argparse type: accept only strictly-positive integers."""
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return ivalue
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     p.add_argument("model", help="alias or HF path (e.g. qwen3.5-4b-4bit)")
@@ -501,14 +533,14 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["int8", "int4"],
         help="candidate KV dtype(s) to test against the bf16 baseline",
     )
-    p.add_argument("--max-tokens", type=int, default=48)
+    p.add_argument("--max-tokens", type=_positive_int, default=48)
     p.add_argument(
         "--mem-tokens",
-        type=int,
+        type=_positive_int,
         default=128,
         help="fixed generation length for the memory-delta measurement",
     )
-    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--group-size", type=_positive_int, default=64)
     p.add_argument("--prompts-file", type=Path, default=None)
     p.add_argument(
         "--niah",

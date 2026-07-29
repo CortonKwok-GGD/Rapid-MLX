@@ -49,6 +49,9 @@ _CASES = [
     ("", False, None, VARIANT_UNKNOWN, False),
     (None, False, None, VARIANT_UNKNOWN, False),
     ("Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz", False, None, VARIANT_UNKNOWN, False),
+    # Incidental M<n> in an unrelated (non-Apple, not-leading) string -> unknown.
+    ("BMW M3", False, None, VARIANT_UNKNOWN, False),
+    ("BMW M3 Competition", False, None, VARIANT_UNKNOWN, False),
 ]
 
 

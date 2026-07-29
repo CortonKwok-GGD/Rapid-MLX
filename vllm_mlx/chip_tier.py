@@ -98,7 +98,10 @@ def classify_chip_tier(chip_name: str | None) -> ChipTier:
 
     Matching is case-insensitive and token-based (whitespace-delimited), so a
     substring like ``"Max"`` inside ``"Maximum"`` cannot spuriously set the
-    variant. Only the *first* ``M<n>`` token drives the generation.
+    variant. Only the *first* ``M<n>`` token drives the generation, and it is
+    accepted as an Apple chip only when the string is Apple-branded OR that token
+    leads the string (the bare ``HARDWARE_PROFILES`` key form) — so an incidental
+    ``M<n>`` (``"BMW M3"``) is NOT misread as Apple silicon.
 
     Args:
         chip_name: The chip string from ``detect_hardware().chip_name`` or
@@ -111,17 +114,26 @@ def classify_chip_tier(chip_name: str | None) -> ChipTier:
     """
     raw = chip_name or ""
     tokens = raw.lower().split()
+    has_apple = "apple" in tokens
 
     generation: int | None = None
-    for token in tokens:
+    gen_index: int | None = None
+    for idx, token in enumerate(tokens):
         match = _M_TOKEN_RE.match(token)
         if match:
             generation = int(match.group(1))
+            gen_index = idx
             break
 
-    if generation is None:
-        # Not a recognizable Apple ``M<n>`` chip — Intel, empty, or a fallback
-        # string. Explicit unknown tier; never crash.
+    # Accept the ``M<n>`` token as an Apple chip ONLY when the string is
+    # Apple-branded (``"Apple M3 Ultra"``) OR the token LEADS the string (the
+    # bare ``HARDWARE_PROFILES`` key form ``"M3 Ultra"`` / ``"M1"``). This rejects
+    # an incidental ``M<n>`` in an unrelated string — ``"BMW M3"`` (gen token not
+    # first, no "apple") stays the unknown tier, honoring the documented
+    # non-Apple fallback (same lenient-substring lesson as the variant tokens).
+    if generation is None or not (has_apple or gen_index == 0):
+        # Not a recognizable Apple ``M<n>`` chip — Intel, empty, a fallback
+        # string, or an incidental M-token. Explicit unknown tier; never crash.
         return ChipTier(
             raw=raw,
             is_apple_silicon=False,
