@@ -10,6 +10,7 @@ from types import ModuleType
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 
 from vllm_mlx.model_aliases import resolve_profile
 from vllm_mlx.routes import video
@@ -54,6 +55,8 @@ def test_video_engine_calls_mlx_native_pipeline(
     monkeypatch.setattr("shutil.which", lambda _: "/opt/homebrew/bin/ffmpeg")
 
     output = tmp_path / "result.mp4"
+    reference = tmp_path / "reference.png"
+    Image.new("RGB", (64, 64), "blue").save(reference)
     engine = VideoEngine("notapalindrome/ltx23-mlx-av-q4")
     engine.generate(
         prompt="A fox runs through snow",
@@ -63,13 +66,13 @@ def test_video_engine_calls_mlx_native_pipeline(
         num_frames=97,
         fps=24,
         seed=7,
-        image=None,
+        image=reference,
     )
 
     assert output.read_bytes() == b"mp4"
     assert captured["model_repo"] == "notapalindrome/ltx23-mlx-av-q4"
     assert captured["num_frames"] == 97
-    assert captured["image"] is None
+    assert captured["image"] == str(reference)
 
 
 def test_video_parameter_validation() -> None:

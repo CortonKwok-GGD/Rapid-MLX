@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 _MAX_REFERENCE_BYTES = 20 * 1024 * 1024
 _MAX_JOBS = 100
 _MAX_PIXEL_FRAMES = 768 * 512 * 97
+_MAX_REFERENCE_PIXELS = 16_777_216
 _jobs_lock = threading.Lock()
 _jobs_root = Path(tempfile.mkdtemp(prefix="rapid-mlx-videos-"))
 
@@ -111,6 +113,32 @@ def _parse_size(value: str) -> tuple[int, int]:
 def _frame_count(seconds: int, fps: int = 24) -> int:
     requested = seconds * fps
     return max(9, round((requested - 1) / 8) * 8 + 1)
+
+
+def _validate_reference_image(path: Path) -> None:
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="image-to-video requires `pip install 'rapid-mlx[video]'`",
+        ) from exc
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                width, height = image.size
+                image_format = image.format
+                if width <= 0 or height <= 0 or width * height > _MAX_REFERENCE_PIXELS:
+                    raise ValueError("reference image exceeds 16 megapixels")
+                if image_format not in {"JPEG", "PNG", "WEBP"}:
+                    raise ValueError("reference image must be JPEG, PNG, or WebP")
+                image.verify()
+    except (OSError, ValueError, Image.DecompressionBombError, Warning) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid input_reference: {exc}"
+        ) from exc
 
 
 async def _run_job(
@@ -242,6 +270,7 @@ async def create_video(
                             status_code=413, detail="input_reference exceeds 20 MB"
                         )
                     target.write(chunk)
+            _validate_reference_image(image_path)
 
         job = _VideoJob(
             id=job_id,
