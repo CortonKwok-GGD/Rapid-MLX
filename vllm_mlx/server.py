@@ -1726,7 +1726,16 @@ def load_model(
     # already-resolved alias profile so the same call (alias-name or
     # full HF path) lands on the right lane without re-resolving.
     _profile_modality = _profile.modality if _profile is not None else "text"
-    if _profile_modality == "text-diffusion":
+    if _profile_modality == "video-gen":
+        from .runtime.video_lane import VideoEngine
+
+        _video_hf_path = _profile.hf_path if _profile is not None else model_name
+        logger.info(
+            f"Loading model with VideoEngine (modality=video-gen): {_video_hf_path}"
+        )
+        _engine = VideoEngine(model_name=_video_hf_path)
+        logger.info(f"Video model ready for lazy generation: {model_name}")
+    elif _profile_modality == "text-diffusion":
         from .runtime.diffusion_lane import DiffusionEngine
 
         # ``python -m vllm_mlx.server --model <alias>`` bypasses
@@ -2022,6 +2031,7 @@ from .routes.mcp_routes import router as _mcp_router
 from .routes.metrics import router as _metrics_router
 from .routes.models import router as _models_router
 from .routes.responses import router as _responses_router
+from .routes.video import router as _video_router
 
 app.include_router(_probe_router)
 app.include_router(_health_router)
@@ -2034,6 +2044,7 @@ app.include_router(_chat_router)
 app.include_router(_completions_router)
 app.include_router(_anthropic_router)
 app.include_router(_responses_router)
+app.include_router(_video_router)
 app.include_router(_embeddings_router)
 app.include_router(_mcp_router)
 # Task #292: ``_audio_router`` is registered LAZILY (after model load) by
