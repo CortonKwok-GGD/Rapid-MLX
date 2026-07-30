@@ -45,19 +45,29 @@ async def run_to_completion(func, /, *args):
     worker's resources. A thread-owned event cannot be cancelled, so it is
     the only signal that actually tracks the thread.
 
+    A cancel that lands before the pool picks up the job is handled by
+    ``started``: without it, draining on ``done`` alone would wait on a
+    worker that never ran and hang at shutdown.
+
     NOTE on test coverage: the two-cancel path IS covered (see the route
-    tests), but this specific inner-task-cancellation scenario is not. I
-    could not build a test that reliably reproduces it — the inner task is
-    created inside this coroutine and did not become visible to
+    tests), but the inner-task-cancellation scenario is not. I could not
+    build a test that reliably reproduces it — the inner task is created
+    inside this coroutine and never became visible to
     ``asyncio.all_tasks()`` sweeps in time, so every attempt passed against
     the buggy task-state version too. Rather than keep a test that proves
-    nothing, the reasoning is recorded here: the event-based drain is
-    strictly safer than task state regardless, since a thread's own
-    completion signal cannot be cancelled out from under it.
+    nothing, the reasoning is recorded here: a thread's own completion
+    signal cannot be cancelled out from under it, so it is strictly safer
+    than task state either way.
     """
+    # ``started`` distinguishes "the executor never ran our job" from "the
+    # job is running": ``to_thread`` submits to a pool, so a cancel that
+    # lands before a worker picks it up means ``_wrapped`` never executes —
+    # and waiting on ``done`` alone would then hang forever at shutdown.
+    started = threading.Event()
     done = threading.Event()
 
     def _wrapped():
+        started.set()
         try:
             return func(*args)
         finally:
@@ -67,16 +77,16 @@ async def run_to_completion(func, /, *args):
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        # Drain on the worker's own signal, absorbing repeated cancels. A
-        # bare ``await task`` would be cancellable, so a second cancel —
-        # shutdown, a supervisor giving up — would interrupt the drain and
-        # hand control back mid-render. Waiting on the event in the default
-        # executor keeps this a coroutine-level wait.
-        loop = asyncio.get_running_loop()
-        while not done.is_set():
+        # Drain only if a worker actually began. Poll with ``asyncio.sleep``
+        # rather than blocking on ``done.wait()`` in the executor: that would
+        # occupy a second pool thread for up to the render ceiling, adding to
+        # the very starvation this helper exists to avoid.
+        while started.is_set() and not done.is_set():
             try:
-                await asyncio.shield(loop.run_in_executor(None, done.wait, 1.0))
+                await asyncio.sleep(0.05)
             except asyncio.CancelledError:
+                # Absorb repeated cancels — a bare await here would let a
+                # second cancel end the drain mid-render.
                 logger.debug("Ignoring cancellation while draining an abandoned worker")
         # Retrieve the outcome so asyncio doesn't log "Task exception was
         # never retrieved" at GC time, which would also lose the reason the

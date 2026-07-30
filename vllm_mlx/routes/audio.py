@@ -2298,10 +2298,17 @@ async def create_music(request: AudioMusicRequest = Body(...)):
                 _generate_music_blocking, dit, decoder, tmp_path, request
             )
 
-        audio_bytes = b""
-        if os.path.exists(tmp_path):
+        # Read off the loop: a completed render can be several MB, and
+        # copying that on the event-loop thread briefly stalls every other
+        # request. Same helper as the render, so a cancel here also can't
+        # tear the directory down mid-read.
+        def _read_output() -> bytes:
+            if not os.path.exists(tmp_path):
+                return b""
             with open(tmp_path, "rb") as fh:
-                audio_bytes = fh.read()
+                return fh.read()
+
+        audio_bytes = await run_to_completion(_read_output)
 
         # The SA3 CLI can exit 0 having written nothing, a 0-byte
         # placeholder, or a valid RIFF header with zero sample frames —

@@ -948,3 +948,55 @@ class TestPerLoopLockDoesNotLeakLoops:
                 assert audio_route._get_music_lock() is lock
 
         asyncio.run(_check())
+
+
+class TestDrainDoesNotHangOnUnstartedWork:
+    """A cancel before the pool picks up the job must not wedge shutdown.
+
+    `to_thread` submits to a bounded pool, so a cancel can land while the job
+    is still queued — `_wrapped` never runs and never sets its completion
+    event. Draining on that event alone would wait forever.
+    """
+
+    def test_cancel_before_the_worker_starts_returns_promptly(self):
+        import asyncio
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from vllm_mlx.routes._async_utils import run_to_completion
+
+        hog_release = threading.Event()
+        ran = threading.Event()
+
+        def _blocker():
+            hog_release.wait(timeout=10)
+
+        def _never_runs():
+            ran.set()
+            return "should not happen"
+
+        async def _drive():
+            loop = asyncio.get_running_loop()
+            # A single-thread executor with that thread already occupied, so
+            # our job cannot start.
+            pool = ThreadPoolExecutor(max_workers=1)
+            loop.set_default_executor(pool)
+            try:
+                pool.submit(_blocker)
+                await asyncio.sleep(0.05)
+
+                task = asyncio.ensure_future(run_to_completion(_never_runs))
+                await asyncio.sleep(0.05)
+                task.cancel()
+
+                # Must settle quickly rather than waiting on an event the
+                # queued job will never set.
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True), timeout=3
+                )
+                assert not ran.is_set(), "the job unexpectedly started"
+            finally:
+                hog_release.set()
+                pool.shutdown(wait=False)
+
+        asyncio.run(_drive())
