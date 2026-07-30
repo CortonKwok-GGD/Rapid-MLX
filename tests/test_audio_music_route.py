@@ -875,16 +875,19 @@ class TestTempFilePermissions:
 class TestPerLoopLockDoesNotLeakLoops:
     """The weak-keyed lock map must not retain retired event loops.
 
-    Reviewed concern: an `asyncio.Lock` that has bound to a loop could hold a
-    strong reference to it, making the map's value retain its own weak key and
-    defeating the point. Measured, and it does not — a contended lock does not
-    keep the loop alive once the loop is closed and dropped. Pinned here so a
-    future asyncio change (or a switch to a primitive that DOES retain the
-    loop) surfaces as a test failure rather than a slow leak across in-process
-    restarts.
+    A `WeakKeyDictionary` only drops an entry while nothing else references
+    the key — and a CONTENDED `asyncio.Lock` holds its waiters' futures, which
+    reference the loop. So storing the lock as a strong value made the value
+    retain its own weak key.
+
+    The distinction matters and my first version of this test missed it: an
+    UNCONTENDED `async with` never binds the lock to the loop, so it leaked
+    nothing and the test passed against the buggy code. Measured: 3 retired
+    loops retained after 3 contended cycles, 0 after uncontended ones. The
+    test below therefore creates a real waiter.
     """
 
-    def test_retired_loops_are_released(self):
+    def test_retired_loops_are_released_even_after_contention(self):
         import asyncio
         import gc
 
@@ -894,8 +897,17 @@ class TestPerLoopLockDoesNotLeakLoops:
 
         async def _contend():
             lock = audio_route._get_music_lock()
-            async with lock:  # bind it to this loop
-                pass
+
+            async def _waiter():
+                async with lock:
+                    pass
+
+            async with lock:
+                # A REAL second waiter: this is what binds the lock to the
+                # loop. Without it the test proves nothing.
+                w = asyncio.ensure_future(_waiter())
+                await asyncio.sleep(0)
+            await w
 
         for _ in range(3):
             asyncio.run(_contend())
@@ -904,5 +916,26 @@ class TestPerLoopLockDoesNotLeakLoops:
         gc.collect()
         assert len(audio_route._music_locks) == 0, (
             f"{len(audio_route._music_locks)} retired loop(s) still retained — "
-            f"the lock is keeping its own weak key alive"
+            f"a contended lock is keeping its own weak key alive"
         )
+
+    def test_the_lock_survives_while_a_request_holds_it(self):
+        """A weak value must not be collected mid-render.
+
+        The handler's `async with` owns a strong reference for the duration,
+        so the entry can only go once no request is using that loop's lock.
+        """
+        import asyncio
+        import gc
+
+        from vllm_mlx.routes import audio as audio_route
+
+        async def _check():
+            lock = audio_route._get_music_lock()
+            async with lock:
+                gc.collect()
+                gc.collect()
+                # Same object still handed out while held.
+                assert audio_route._get_music_lock() is lock
+
+        asyncio.run(_check())

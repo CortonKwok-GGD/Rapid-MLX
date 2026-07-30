@@ -2099,9 +2099,22 @@ DEFAULT_MUSIC_DIT_DECODER: tuple[str, str] = ("medium", "same-l")
 #: binds to the loop that first awaits on it, so one process-global lock
 #: raises ``RuntimeError`` as soon as a second loop contends on it — which
 #: happens with repeated ``asyncio.run()`` (the tests do exactly that) and
-#: after an in-process app/loop restart. Weakly keyed so a finished loop's
-#: entry doesn't keep it alive.
-_music_locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = (
+#: after an in-process app/loop restart.
+#:
+#: The VALUE is a weak reference too, and that is load-bearing. A
+#: ``WeakKeyDictionary`` only drops an entry when nothing else references the
+#: key — but a CONTENDED ``asyncio.Lock`` holds its waiters' futures, which
+#: reference the loop. Storing the lock strongly therefore made the value
+#: retain its own weak key: measured at 3 retired loops leaked after 3
+#: contended cycles, versus 0 when the lock was never contended. Since only
+#: contended locks matter here, storing them strongly leaked exactly the
+#: cases that arise in production.
+#:
+#: The lock is kept alive for as long as it is in use by the request holding
+#: it (the ``async with`` in the handler owns a strong reference), so a weak
+#: value cannot vanish mid-render; it can only be collected once no request
+#: is using that loop's lock, which is precisely when it should be.
+_music_locks: "weakref.WeakKeyDictionary[Any, weakref.ReferenceType]" = (
     weakref.WeakKeyDictionary()
 )
 
@@ -2131,10 +2144,11 @@ def _get_music_lock() -> asyncio.Lock:
     actually guarantees one render at a time. See its comment.
     """
     loop = asyncio.get_running_loop()
-    lock = _music_locks.get(loop)
+    ref = _music_locks.get(loop)
+    lock = ref() if ref is not None else None
     if lock is None:
         lock = asyncio.Lock()
-        _music_locks[loop] = lock
+        _music_locks[loop] = weakref.ref(lock)
     return lock
 
 
