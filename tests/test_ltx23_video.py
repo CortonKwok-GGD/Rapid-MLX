@@ -321,9 +321,9 @@ def test_video_engine_calls_mlx_native_pipeline(
         image,
         verbose,
         enhance_prompt,
-        negative_prompt,
-        cfg_scale,
-        image_strength,
+        negative_prompt=None,
+        cfg_scale=3.0,
+        image_strength=1.0,
     ) -> None:
         captured.update(locals())
         Path(output_path).write_bytes(b"mp4")
