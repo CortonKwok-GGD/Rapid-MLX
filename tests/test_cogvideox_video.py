@@ -236,6 +236,18 @@ async def test_cogvideox_frame_budget_uses_actual_generation_size(
     assert captured["num_frames"] == 145
     await video.delete_video(created["id"])
 
+    with pytest.raises(HTTPException, match="safe CogVideoX-Fun workload") as exc:
+        await video.create_video(
+            prompt="too many frames",
+            model="cogvideox-fun-5b-q4",
+            seconds="1",
+            size="672x384",
+            seed=2,
+            frames=149,
+            input_reference=None,
+        )
+    assert exc.value.status_code == 400
+
 
 @pytest.mark.asyncio
 async def test_cogvideox_mvp_rejects_unsupported_shape(monkeypatch) -> None:
