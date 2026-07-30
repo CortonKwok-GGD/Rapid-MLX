@@ -497,7 +497,7 @@ async def test_video_route_threads_motion_controls(
     created = await video.create_video(
         prompt="a fast camera move",
         model="ltx-2.3-mlx-q4",
-        seconds="2",
+        seconds="ignored when frames is explicit",
         size="512x512",
         seed=3,
         fps=12,
@@ -514,6 +514,7 @@ async def test_video_route_threads_motion_controls(
         await asyncio.sleep(0.01)
 
     assert current["status"] == "completed"
+    assert current["seconds"] == "2"
     assert captured["fps"] == 12
     assert captured["num_frames"] == 17
     assert captured["guidance_scale"] == 4.25

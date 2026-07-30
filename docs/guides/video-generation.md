@@ -14,7 +14,8 @@ text and audio features continue to support Python 3.10.
 - `fps` selects the output frame rate for LTX and CogVideoX-Fun. Wan uses the
   checkpoint's native frame rate and rejects a different value.
 - `frames` overrides the frame count derived from `seconds`. LTX requires
-  `8n+1`; Wan and CogVideoX-Fun require `4n+1`.
+  `8n+1` with a minimum of 9; Wan and CogVideoX-Fun require `4n+1` with a
+  minimum of 5.
 - `guidance_scale` (1–30) and `negative_prompt` are passed to the served
   backend's classifier-free guidance implementation.
 - `conditioning_strength` (0–1) controls how closely LTX image-to-video follows

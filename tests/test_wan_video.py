@@ -318,6 +318,29 @@ async def test_wan_route_rejects_non_native_fps(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_wan_route_rejects_invalid_explicit_frame_shape(monkeypatch) -> None:
+    class FakeWanEngine:
+        model_name = "Anes1032/Wan2.2-TI2V-5B-mlx-q8"
+        video_family = "wan"
+        native_fps = 24
+        _wan_engine = None
+
+    engine = FakeWanEngine()
+    engine._wan_engine = engine
+    monkeypatch.setattr(video, "_video_engine", lambda: engine)
+    with pytest.raises(HTTPException, match=r"Wan frames must be 4n\+1"):
+        await video.create_video(
+            prompt="test",
+            model="wan2.2-ti2v-5b-q8",
+            seconds="ignored",
+            size="832x512",
+            seed=1,
+            frames=6,
+            input_reference=None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_wan_route_returns_model_validation_as_400(monkeypatch) -> None:
     class FakeWanEngine:
         model_name = "Anes1032/Wan2.2-TI2V-5B-mlx-q8"

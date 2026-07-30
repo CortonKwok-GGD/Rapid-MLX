@@ -515,19 +515,26 @@ async def create_video(
             status_code=400,
             detail=f"model must match the served video model ({engine.model_name})",
         )
-    try:
-        seconds_int = int(seconds)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail="seconds must be an integer"
-        ) from exc
-    if is_cogvideox and seconds_int != 1:
-        raise HTTPException(
-            status_code=400,
-            detail="CogVideoX-Fun MVP currently supports seconds=1 only",
-        )
-    if not 1 <= seconds_int <= 20:
-        raise HTTPException(status_code=400, detail="seconds must be between 1 and 20")
+    if frames is None:
+        try:
+            seconds_int = int(seconds)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="seconds must be an integer"
+            ) from exc
+        if is_cogvideox and seconds_int != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="CogVideoX-Fun MVP currently supports seconds=1 only",
+            )
+        if not 1 <= seconds_int <= 20:
+            raise HTTPException(
+                status_code=400, detail="seconds must be between 1 and 20"
+            )
+    else:
+        # An explicit frame count is the temporal source of truth. Derive the
+        # public duration after request FPS validation below.
+        seconds_int = 1
     if is_cogvideox:
         if size != "672x384":
             raise HTTPException(
@@ -548,6 +555,8 @@ async def create_video(
         )
     if frames is not None and not 1 <= frames <= 1201:
         raise HTTPException(status_code=400, detail="frames must be between 1 and 1201")
+    if frames is not None:
+        seconds_int = max(1, (frames + request_fps - 1) // request_fps)
     if guidance_scale is not None and not 1.0 <= guidance_scale <= 30.0:
         raise HTTPException(
             status_code=400,
@@ -592,6 +601,11 @@ async def create_video(
         raise HTTPException(
             status_code=400,
             detail="CogVideoX-Fun frames must be 4n+1 (for example 5, 9, 13)",
+        )
+    if is_wan and (request_frames < 5 or request_frames % 4 != 1):
+        raise HTTPException(
+            status_code=400,
+            detail="Wan frames must be 4n+1 and at least 5 (for example 5, 9, 13)",
         )
     if not (is_cogvideox or is_wan):
         if request_frames < 9 or request_frames % 8 != 1:
