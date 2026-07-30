@@ -2364,11 +2364,16 @@ async def create_music(request: AudioMusicRequest = Body(...)):
                     exc_info[1] if isinstance(exc_info, tuple) else exc_info,
                 )
 
+            # Outer guard covers BOTH spellings: an exception from the
+            # ``onerror`` fallback would otherwise be raised inside the
+            # ``except TypeError`` suite and escape, masking the request's
+            # own outcome — which this block explicitly must not do.
             try:
-                shutil.rmtree(tmp_dir, onexc=_on_error)
-            except TypeError:
-                # onexc is 3.12+; onerror is the older spelling.
-                shutil.rmtree(tmp_dir, onerror=_on_error)
+                try:
+                    shutil.rmtree(tmp_dir, onexc=_on_error)
+                except TypeError:
+                    # onexc is 3.12+; onerror is the older spelling.
+                    shutil.rmtree(tmp_dir, onerror=_on_error)
             except Exception as cleanup_err:  # noqa: BLE001 — never mask the response
                 logger.warning(
                     "Failed to remove temp music dir %s: %s", tmp_dir, cleanup_err
