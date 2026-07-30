@@ -330,7 +330,11 @@ class TestMusicEmptyOutputDetection:
 
         class _SilentEngine(_FakeMusicEngine):
             def generate(self, prompt, out_path, **kwargs):  # noqa: D102
-                # Exits "successfully" but leaves the temp file at 0 bytes.
+                # CREATE the file, empty. The route no longer pre-creates
+                # out.wav (it owns a private directory instead), so simply
+                # returning would exercise the missing-file branch and this
+                # test would pass even if 0-byte files were accepted.
+                open(out_path, "wb").close()
                 return out_path
 
         r = self._post_with_engine(monkeypatch, _SilentEngine)
@@ -347,7 +351,12 @@ class TestMusicEmptyOutputDetection:
 
         class _UnlinkingEngine(_FakeMusicEngine):
             def generate(self, prompt, out_path, **kwargs):  # noqa: D102
-                os.unlink(out_path)
+                # Return normally with no file present. An unconditional
+                # os.unlink() here raised FileNotFoundError (the route does
+                # not pre-create the path), so the 500 came from the
+                # exception rather than from the missing-output check.
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
                 return out_path
 
         r = self._post_with_engine(monkeypatch, _UnlinkingEngine)

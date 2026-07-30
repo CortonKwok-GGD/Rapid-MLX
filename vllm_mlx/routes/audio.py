@@ -2353,7 +2353,26 @@ async def create_music(request: AudioMusicRequest = Body(...)):
         # rmtree, not unlink: we own the whole directory, and the SA3 CLI may
         # leave sidecars beside the wav that would make rmdir raise.
         if tmp_dir is not None:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            # Log rather than swallow: ignore_errors would leave generated
+            # audio and a directory on disk with no operator signal. Never
+            # raise from here — the request's own outcome must not be masked
+            # by a cleanup failure.
+            def _on_error(func, path, exc_info):
+                logger.warning(
+                    "Failed to remove temp music dir entry %s: %s",
+                    path,
+                    exc_info[1] if isinstance(exc_info, tuple) else exc_info,
+                )
+
+            try:
+                shutil.rmtree(tmp_dir, onexc=_on_error)
+            except TypeError:
+                # onexc is 3.12+; onerror is the older spelling.
+                shutil.rmtree(tmp_dir, onerror=_on_error)
+            except Exception as cleanup_err:  # noqa: BLE001 — never mask the response
+                logger.warning(
+                    "Failed to remove temp music dir %s: %s", tmp_dir, cleanup_err
+                )
 
 
 @router.get("/v1/audio/voices", dependencies=[Depends(verify_api_key)])
