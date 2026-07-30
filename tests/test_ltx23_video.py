@@ -321,6 +321,9 @@ def test_video_engine_calls_mlx_native_pipeline(
         image,
         verbose,
         enhance_prompt,
+        negative_prompt,
+        cfg_scale,
+        image_strength,
     ) -> None:
         captured.update(locals())
         Path(output_path).write_bytes(b"mp4")
@@ -342,12 +345,18 @@ def test_video_engine_calls_mlx_native_pipeline(
         fps=24,
         seed=7,
         image=reference,
+        negative_prompt="static",
+        guidance_scale=4.5,
+        conditioning_strength=0.25,
     )
 
     assert output.read_bytes() == b"mp4"
     assert captured["model_repo"] == "notapalindrome/ltx23-mlx-av-q4"
     assert captured["num_frames"] == 97
     assert captured["image"] == str(reference)
+    assert captured["negative_prompt"] == "static"
+    assert captured["cfg_scale"] == 4.5
+    assert captured["image_strength"] == 0.25
 
 
 def test_video_engines_share_process_generation_lock() -> None:
@@ -456,6 +465,73 @@ async def test_openai_720p_size_is_aligned_then_cropped(
     assert captured["output_width"] == 1280
     assert captured["output_height"] == 720
     await video.delete_video(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_video_route_threads_motion_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    class FakeEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+        def generate(self, *, output_path: Path, **kwargs) -> None:
+            captured.update(kwargs)
+            output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    created = await video.create_video(
+        prompt="a fast camera move",
+        model="ltx-2.3-mlx-q4",
+        seconds="2",
+        size="512x512",
+        seed=3,
+        fps=12,
+        frames=17,
+        guidance_scale=4.25,
+        negative_prompt="static camera",
+        input_reference=None,
+    )
+    for _ in range(100):
+        current = await video.retrieve_video(created["id"])
+        if current["status"] == "completed":
+            break
+        await asyncio.sleep(0.01)
+
+    assert current["status"] == "completed"
+    assert captured["fps"] == 12
+    assert captured["num_frames"] == 17
+    assert captured["guidance_scale"] == 4.25
+    assert captured["negative_prompt"] == "static camera"
+    assert captured["conditioning_strength"] is None
+    await video.delete_video(created["id"])
+
+
+@pytest.mark.asyncio
+async def test_video_route_validates_motion_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        model_name = "notapalindrome/ltx23-mlx-av-q4"
+
+    monkeypatch.setattr(video, "_video_engine", lambda: FakeEngine())
+    base = {
+        "prompt": "test",
+        "model": "ltx-2.3-mlx-q4",
+        "seconds": "1",
+        "size": "512x512",
+        "seed": 1,
+        "input_reference": None,
+    }
+    with pytest.raises(HTTPException, match="fps must be between"):
+        await video.create_video(**base, fps=0)
+    with pytest.raises(HTTPException, match="LTX frames must be 8n"):
+        await video.create_video(**base, frames=16)
+    with pytest.raises(HTTPException, match="guidance_scale must be between"):
+        await video.create_video(**base, guidance_scale=0.5)
+    with pytest.raises(HTTPException, match="requires input_reference"):
+        await video.create_video(**base, conditioning_strength=0.5)
 
 
 @pytest.mark.asyncio

@@ -138,6 +138,9 @@ class VideoEngine:
         fps: int,
         seed: int,
         image: Path | None,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
+        conditioning_strength: float | None = None,
         output_width: int | None = None,
         output_height: int | None = None,
     ) -> None:
@@ -154,6 +157,8 @@ class VideoEngine:
                         num_frames=num_frames,
                         seed=seed,
                         image=image,
+                        negative_prompt=negative_prompt,
+                        guidance_scale=guidance_scale,
                     )
             except WanBackendError as exc:
                 raise VideoRuntimeError(str(exc)) from exc
@@ -180,6 +185,8 @@ class VideoEngine:
                     frames=num_frames,
                     fps=fps,
                     seed=seed,
+                    negative_prompt=negative_prompt or "",
+                    guidance_scale=(6.0 if guidance_scale is None else guidance_scale),
                 )
             return
         if shutil.which("ffmpeg") is None:
@@ -209,6 +216,11 @@ class VideoEngine:
                 fps=fps,
                 output_path=str(output_path),
                 image=str(image) if image is not None else None,
+                negative_prompt=negative_prompt,
+                cfg_scale=3.0 if guidance_scale is None else guidance_scale,
+                image_strength=(
+                    1.0 if conditioning_strength is None else conditioning_strength
+                ),
                 verbose=False,
                 enhance_prompt=False,
             )

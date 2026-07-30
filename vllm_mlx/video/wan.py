@@ -236,6 +236,8 @@ class WanVideoEngine:
         num_frames: int,
         seed: int,
         image: Path | None,
+        negative_prompt: str | None = None,
+        guidance_scale: float | None = None,
     ) -> None:
         self.validate_request(
             width=width, height=height, num_frames=num_frames, image=image
@@ -251,11 +253,13 @@ class WanVideoEngine:
         generate_video(
             model_dir=str(self.model_path),
             prompt=prompt,
+            negative_prompt=negative_prompt,
             image=str(image) if image is not None else None,
             width=width,
             height=height,
             num_frames=num_frames,
             steps=self.steps,
+            guide_scale=guidance_scale,
             seed=seed,
             output_path=str(output_path),
             scheduler=self.scheduler,
