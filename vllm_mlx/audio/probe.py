@@ -522,16 +522,17 @@ def _discover_system_espeak() -> list[tuple[str, str]]:
                 out.append(item)
         return out
 
-    libs = _dedup(libs)
+    # Cap the number of DISTINCT libraries probed — that (not the raw pair
+    # count) is the meaningful bound, since each library is one real init
+    # attempt and there are only ever a handful on a real host. Dedup keeps
+    # best-first order. Capping libraries rather than pairs means a single
+    # library's several data-dir variants can never exhaust the budget and
+    # hide a later, valid install (codex MAJOR).
+    libs = _dedup(libs)[:_MAX_ESPEAK_CANDIDATES]
     data_parents = _dedup(data_parents)
-    # Data-major (data outer, library inner): the first ``len(libs)`` pairs
-    # cover EVERY distinct library against the best-first data dir. The
-    # readiness sweep caps how many pairs it self-tests, and a library-major
-    # cross-product would spend that whole budget on one library's data
-    # variants — hiding a later, valid library behind them and 503'ing a
-    # host that actually has a working espeak-ng (codex MAJOR). Data-major
-    # guarantees each distinct library is tried before any (library, alt-data)
-    # combo, so the cap trims only redundant pairings, never real installs.
+    # Data-major (data outer, library inner) so each capped library is paired
+    # with the best-first data dir first; the sweep self-tests the whole
+    # (now bounded) product, trying every library against every data dir.
     return [(lib, data) for data in data_parents for lib in libs]
 
 
@@ -558,9 +559,11 @@ def _probe_espeak_readiness() -> tuple[bool, str | None]:
     Bundled espeak first — preserves existing behaviour on platforms where
     the shipped dylib loads correctly (no override, no repair). If bundled
     is broken, self-tests each discovered system espeak-ng candidate in a
-    subprocess (capped at :data:`_MAX_ESPEAK_CANDIDATES` so a badly-broken
-    host can't spin through an unbounded sweep) and repairs this worker to
-    the first that initializes. No candidate works → not ready.
+    subprocess and repairs this worker to the first that initializes. No
+    candidate works → not ready. Discovery already bounds the sweep to at
+    most :data:`_MAX_ESPEAK_CANDIDATES` distinct libraries (each tried against
+    every data dir), so a badly-broken host can't spin through an unbounded
+    number of installs.
 
     Discovery (filesystem walks) and repair (``import misaki.espeak`` +
     ``EspeakWrapper`` mutation) can raise unexpectedly on a torn install.
@@ -573,7 +576,7 @@ def _probe_espeak_readiness() -> tuple[bool, str | None]:
         if _espeak_selftest_subprocess():
             return True, None
 
-        for lib, data in _discover_system_espeak()[:_MAX_ESPEAK_CANDIDATES]:
+        for lib, data in _discover_system_espeak():
             if _espeak_selftest_subprocess(lib=lib, data=data):
                 _apply_system_espeak(lib, data)
                 return True, None
