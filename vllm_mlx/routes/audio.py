@@ -2158,7 +2158,21 @@ def _wav_has_audio_frames(payload: bytes) -> bool:
     """
     try:
         with wave.open(io.BytesIO(payload), "rb") as w:
-            return w.getnframes() > 0
+            declared = w.getnframes()
+            if declared <= 0:
+                return False
+            # ``getnframes()`` is read straight out of the header's ``data``
+            # chunk size — it is a CLAIM, not a measurement. A file whose
+            # header says 44100 frames but carries 100 bytes of samples opens
+            # cleanly and reports 44100, so a frame-count check alone would
+            # return a 144-byte truncation as a successful one-second clip
+            # (verified against CPython's ``wave``). Read the samples and
+            # compare against what the header promised.
+            frame_size = w.getnchannels() * w.getsampwidth()
+            if frame_size <= 0:
+                return False
+            actual = len(w.readframes(declared))
+            return actual >= declared * frame_size
     except (wave.Error, EOFError, OSError):
         return False
 

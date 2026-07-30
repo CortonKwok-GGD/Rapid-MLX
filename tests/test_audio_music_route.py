@@ -511,3 +511,87 @@ class TestMusicConcurrencyShape:
             return finished.is_set()
 
         assert asyncio.run(_drive()) is True
+
+
+def _wav_with_lying_header(declared_frames: int, actual_data_bytes: int) -> bytes:
+    """A WAV whose header claims more frames than the file carries."""
+    import struct
+
+    channels, sampwidth, rate = 2, 2, 44100
+    datasize = declared_frames * channels * sampwidth  # the claim
+    header = (
+        b"RIFF"
+        + struct.pack("<I", 36 + datasize)
+        + b"WAVEfmt "
+        + struct.pack(
+            "<IHHIIHH",
+            16,
+            1,
+            channels,
+            rate,
+            rate * channels * sampwidth,
+            channels * sampwidth,
+            sampwidth * 8,
+        )
+        + b"data"
+        + struct.pack("<I", datasize)
+    )
+    return header + b"\x00" * actual_data_bytes
+
+
+class TestTruncatedWavIsNotSuccess:
+    """A header's frame count is a claim, not a measurement.
+
+    `wave.getnframes()` is read straight out of the `data` chunk size, so a
+    file declaring 44100 frames while carrying 100 bytes of samples opens
+    cleanly and reports 44100. A frame-count check alone therefore returned a
+    144-byte truncation as a successful one-second clip.
+    """
+
+    def test_header_frame_count_alone_is_not_trusted(self):
+        # Sanity: the shape really does fool a naive check.
+        import io
+        import wave
+
+        from vllm_mlx.routes.audio import _wav_has_audio_frames
+
+        truncated = _wav_with_lying_header(44100, 100)
+        with wave.open(io.BytesIO(truncated), "rb") as w:
+            assert w.getnframes() == 44100, "fixture no longer reproduces the trap"
+
+        assert _wav_has_audio_frames(truncated) is False
+
+    def test_a_complete_wav_is_accepted(self):
+        from vllm_mlx.routes.audio import _wav_has_audio_frames
+
+        assert _wav_has_audio_frames(_make_tone_wav()) is True
+        # Declared == carried.
+        assert _wav_has_audio_frames(_wav_with_lying_header(50, 50 * 2 * 2)) is True
+
+    def test_truncated_output_surfaces_as_500(self, monkeypatch):
+        """End to end: the route must not hand this back as audio/wav."""
+        from vllm_mlx.routes import audio as audio_route
+
+        class _TruncatingEngine(_FakeMusicEngine):
+            def generate(self, prompt, out_path, **kwargs):  # noqa: D102
+                with open(out_path, "wb") as fh:
+                    fh.write(_wav_with_lying_header(44100, 100))
+                return out_path
+
+        monkeypatch.setattr(
+            "vllm_mlx.audio.music.MusicEngine", _TruncatingEngine, raising=False
+        )
+        music_mod = sys.modules.get("vllm_mlx.audio.music")
+        if music_mod is not None:
+            monkeypatch.setattr(music_mod, "MusicEngine", _TruncatingEngine)
+        audio_route._music_engine = None
+
+        client, restore = _mount_audio_app()
+        try:
+            r = client.post("/v1/audio/music", json={"input": "x", "seconds": 5})
+        finally:
+            restore()
+            audio_route._music_engine = None
+
+        assert r.status_code == 500, r.text
+        assert r.json()["detail"]["error"]["code"] == "music_generation_failed"
