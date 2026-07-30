@@ -39,8 +39,11 @@ import require_mlx_audio_tts`` without crashing.
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -521,7 +524,15 @@ def _discover_system_espeak() -> list[tuple[str, str]]:
 
     libs = _dedup(libs)
     data_parents = _dedup(data_parents)
-    return [(lib, data) for lib in libs for data in data_parents]
+    # Data-major (data outer, library inner): the first ``len(libs)`` pairs
+    # cover EVERY distinct library against the best-first data dir. The
+    # readiness sweep caps how many pairs it self-tests, and a library-major
+    # cross-product would spend that whole budget on one library's data
+    # variants — hiding a later, valid library behind them and 503'ing a
+    # host that actually has a working espeak-ng (codex MAJOR). Data-major
+    # guarantees each distinct library is tried before any (library, alt-data)
+    # combo, so the cap trims only redundant pairings, never real installs.
+    return [(lib, data) for data in data_parents for lib in libs]
 
 
 def _apply_system_espeak(lib: str, data: str) -> None:
@@ -550,14 +561,25 @@ def _probe_espeak_readiness() -> tuple[bool, str | None]:
     subprocess (capped at :data:`_MAX_ESPEAK_CANDIDATES` so a badly-broken
     host can't spin through an unbounded sweep) and repairs this worker to
     the first that initializes. No candidate works → not ready.
-    """
-    if _espeak_selftest_subprocess():
-        return True, None
 
-    for lib, data in _discover_system_espeak()[:_MAX_ESPEAK_CANDIDATES]:
-        if _espeak_selftest_subprocess(lib=lib, data=data):
-            _apply_system_espeak(lib, data)
+    Discovery (filesystem walks) and repair (``import misaki.espeak`` +
+    ``EspeakWrapper`` mutation) can raise unexpectedly on a torn install.
+    Any such error is contained to a not-ready verdict so the caller still
+    returns a clean 503 and the result is cached — an escaping exception
+    would surface as a 500 AND leave the verdict unresolved, re-probing
+    (and re-spawning subprocesses) on every subsequent request (codex MAJOR).
+    """
+    try:
+        if _espeak_selftest_subprocess():
             return True, None
+
+        for lib, data in _discover_system_espeak()[:_MAX_ESPEAK_CANDIDATES]:
+            if _espeak_selftest_subprocess(lib=lib, data=data):
+                _apply_system_espeak(lib, data)
+                return True, None
+    except Exception:
+        logger.warning("espeak readiness probe failed unexpectedly", exc_info=True)
+        return False, _ESPEAK_BROKEN_HINT
 
     return False, _ESPEAK_BROKEN_HINT
 

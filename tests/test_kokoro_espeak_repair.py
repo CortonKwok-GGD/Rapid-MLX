@@ -282,3 +282,69 @@ def test_discover_system_espeak_finds_real_install():
     for lib, data in pairs:
         assert os.path.exists(lib), lib
         assert os.path.exists(os.path.join(data, "espeak-ng-data", "phontab")), data
+
+
+def test_unexpected_probe_exception_is_contained_as_503(monkeypatch):
+    """Discovery/repair blowing up → cached clean 503, not an escaping 500.
+
+    A torn install can make ``_discover_system_espeak`` (filesystem walks)
+    or ``_apply_system_espeak`` (``import misaki.espeak``) raise. That must
+    degrade to the same 503 as "no working espeak" AND cache the verdict,
+    or every request re-probes and re-spawns subprocesses.
+    """
+    discover_calls = {"n": 0}
+
+    def _boom():
+        discover_calls["n"] += 1
+        raise RuntimeError("filesystem exploded mid-probe")
+
+    monkeypatch.setattr(probe, "_espeak_selftest_subprocess", lambda *a, **k: False)
+    monkeypatch.setattr(probe, "_discover_system_espeak", _boom)
+
+    with pytest.raises(HTTPException) as exc:
+        probe._ensure_kokoro_g2p_ready()
+    assert exc.value.status_code == 503  # not a bare RuntimeError → 500
+    assert "espeak-ng" in str(exc.value.detail)
+    assert probe._ESPEAK_READY is False
+
+    # Cached: the second request must not re-run the (throwing) probe.
+    with pytest.raises(HTTPException):
+        probe._ensure_kokoro_g2p_ready()
+    assert discover_calls["n"] == 1
+
+
+def test_discovery_tries_every_distinct_library_before_data_variants(monkeypatch):
+    """Cross-product is data-major so the cap can't crowd out a real install.
+
+    Two libraries in two prefixes, each prefix carrying its own data dir.
+    A library-major product would emit both of lib-A's data variants before
+    lib-B is ever paired, so a small self-test cap could exhaust its budget
+    on lib-A and never reach a valid lib-B. Data-major must place every
+    distinct library within the first ``len(libs)`` pairs.
+    """
+    import ctypes.util
+    import os
+    import shutil
+
+    lib_a = "/opt/homebrew/lib/libespeak-ng.1.dylib"
+    lib_b = "/usr/local/lib/libespeak-ng.1.dylib"
+    phontab_a = "/opt/homebrew/share/espeak-ng-data/phontab"
+    phontab_b = "/usr/local/share/espeak-ng-data/phontab"
+    present = {lib_a, lib_b, phontab_a, phontab_b}
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+    monkeypatch.setattr(os.path, "exists", lambda p: p in present)
+
+    pairs = probe._discover_system_espeak()
+
+    # Best-first, data-major: lib-A/lib-B against data-A, then against data-B.
+    assert pairs == [
+        (lib_a, "/opt/homebrew/share"),
+        (lib_b, "/opt/homebrew/share"),
+        (lib_a, "/usr/local/share"),
+        (lib_b, "/usr/local/share"),
+    ]
+    # The first len(libs) pairs cover every distinct library.
+    first_round_libs = {lib for lib, _ in pairs[:2]}
+    assert first_round_libs == {lib_a, lib_b}
