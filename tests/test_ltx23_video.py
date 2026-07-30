@@ -403,6 +403,7 @@ def test_video_parameter_validation() -> None:
     assert video._parse_size("1280x720") == (1280, 720)
     assert video._parse_size("720x1280") == (720, 1280)
     assert video._frame_count(4) == 97
+    assert video._frame_count(1, 26) == 25
     with pytest.raises(HTTPException, match="divisible by 64") as exc:
         video._parse_size("700x512")
     assert exc.value.status_code == 400
@@ -542,6 +543,8 @@ async def test_video_route_validates_motion_controls(
         await video.create_video(**base, fps=0)
     with pytest.raises(HTTPException, match="LTX frames must be 8n"):
         await video.create_video(**base, frames=16)
+    with pytest.raises(HTTPException, match="at least 9"):
+        await video.create_video(**base, frames=1)
     with pytest.raises(HTTPException, match="guidance_scale must be between"):
         await video.create_video(**base, guidance_scale=0.5)
     with pytest.raises(HTTPException, match="requires input_reference"):

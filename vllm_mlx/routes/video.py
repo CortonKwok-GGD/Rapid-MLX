@@ -573,15 +573,17 @@ async def create_video(
         negative_prompt = negative_prompt.strip()
     generation_width = ((width + 63) // 64) * 64
     generation_height = ((height + 63) // 64) * 64
-    request_frames = (
-        frames
-        if frames is not None
-        else (
-            5
-            if is_cogvideox
-            else _frame_count(seconds_int, native_fps if is_wan else request_fps)
+    if frames is not None:
+        request_frames = frames
+    elif is_cogvideox:
+        request_frames = 5
+    else:
+        # Normalize seconds × fps to the temporal shape the diffusion
+        # backends require. Only an explicitly supplied frame count should
+        # ever reach the validation below unnormalized.
+        request_frames = _frame_count(
+            seconds_int, native_fps if is_wan else request_fps
         )
-    )
     if is_cogvideox and request_frames < 5:
         raise HTTPException(
             status_code=400, detail="CogVideoX-Fun frames must be at least 5"
@@ -591,10 +593,12 @@ async def create_video(
             status_code=400,
             detail="CogVideoX-Fun frames must be 4n+1 (for example 5, 9, 13)",
         )
-    if not (is_cogvideox or is_wan) and request_frames % 8 != 1:
-        raise HTTPException(
-            status_code=400, detail="LTX frames must be 8n+1 (for example 9, 17, 25)"
-        )
+    if not (is_cogvideox or is_wan):
+        if request_frames < 9 or request_frames % 8 != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="LTX frames must be 8n+1 and at least 9 (for example 9, 17, 25)",
+            )
     workload_width = width if is_cogvideox else generation_width
     workload_height = height if is_cogvideox else generation_height
     if workload_width * workload_height * request_frames > _MAX_PIXEL_FRAMES:
