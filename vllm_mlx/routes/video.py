@@ -595,7 +595,9 @@ async def create_video(
         raise HTTPException(
             status_code=400, detail="LTX frames must be 8n+1 (for example 9, 17, 25)"
         )
-    if generation_width * generation_height * request_frames > _MAX_PIXEL_FRAMES:
+    workload_width = width if is_cogvideox else generation_width
+    workload_height = height if is_cogvideox else generation_height
+    if workload_width * workload_height * request_frames > _MAX_PIXEL_FRAMES:
         family = (
             "CogVideoX-Fun" if is_cogvideox else ("Wan" if is_wan else "LTX-2.3 Q4")
         )
@@ -636,7 +638,7 @@ async def create_video(
                 await asyncio.to_thread(target.close)
             await asyncio.to_thread(_validate_reference_image, image_path)
 
-        num_frames = 5 if is_cogvideox else request_frames
+        num_frames = request_frames
         if is_wan:
             from ..runtime.video_lane import validate_video_request
 
