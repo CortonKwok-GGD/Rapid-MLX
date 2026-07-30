@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import wave
 import weakref
 from typing import Any
@@ -2104,8 +2105,30 @@ _music_locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = (
 )
 
 
+#: The actual mutual-exclusion primitive, held INSIDE the worker thread.
+#:
+#: The per-loop ``asyncio.Lock`` above cannot provide it: two event loops in
+#: one process each get their own, so both could admit a render and race the
+#: shared ``_music_engine`` — two multi-GB SA3 subprocesses, which is exactly
+#: what the serialisation exists to prevent. A ``threading.Lock`` is
+#: loop-agnostic and therefore the only thing that can hold across loops.
+#:
+#: The two are complementary, not redundant. The async lock keeps *queueing*
+#: cheap: without it every waiter would sit on this thread lock inside the
+#: shared default executor, pinning one executor thread each for up to the
+#: 900 s render ceiling and starving other ``to_thread`` users. With it,
+#: same-loop waiters queue as coroutines and only the request that actually
+#: runs occupies an executor slot — this lock then makes the guarantee real
+#: for the cross-loop case the async one can't see.
+_music_render_lock = threading.Lock()
+
+
 def _get_music_lock() -> asyncio.Lock:
-    """Return the music lock for the RUNNING loop, creating it on demand."""
+    """Return the music admission lock for the RUNNING loop.
+
+    This is the cheap-queueing half; :data:`_music_render_lock` is what
+    actually guarantees one render at a time. See its comment.
+    """
     loop = asyncio.get_running_loop()
     lock = _music_locks.get(loop)
     if lock is None:
@@ -2137,12 +2160,23 @@ def _generate_music_blocking(
 
     from ..audio.music import MusicEngine
 
+    # Held for the engine-cache check AND the render: this is the primitive
+    # that makes "one SA3 subprocess at a time" true even across event loops,
+    # where the per-loop admission lock can't reach. See _music_render_lock.
+    with _music_render_lock:
+        _generate_music_locked(dit, decoder, out_path, request, MusicEngine)
+
+
+def _generate_music_locked(dit, decoder, out_path, request, engine_cls) -> None:
+    """Body of the render, with :data:`_music_render_lock` already held."""
+    global _music_engine
+
     if (
         _music_engine is None
         or _music_engine.dit != dit
         or _music_engine.decoder != decoder
     ):
-        _music_engine = MusicEngine(dit=dit, decoder=decoder)
+        _music_engine = engine_cls(dit=dit, decoder=decoder)
 
     _music_engine.generate(
         request.input,

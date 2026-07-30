@@ -700,3 +700,83 @@ class TestRealRequestCancellation:
             asyncio.run(_drive())
         finally:
             audio_route._music_engine = None
+
+
+class TestCrossLoopMutualExclusion:
+    """Two event loops in one process must still get one render at a time.
+
+    The per-loop `asyncio.Lock` fixes the "bound to a different event loop"
+    RuntimeError, but each loop gets its OWN — so on its own it would let two
+    loops both admit a render and race the shared `_music_engine`, i.e. two
+    multi-GB SA3 subprocesses. `_music_render_lock` is a plain
+    `threading.Lock` held inside the worker, which is loop-agnostic and
+    therefore the only thing that can hold across loops.
+    """
+
+    def test_render_lock_is_loop_agnostic(self):
+        """A `threading.Lock`, not an `asyncio` primitive."""
+        import threading
+
+        from vllm_mlx.routes import audio as audio_route
+
+        assert isinstance(audio_route._music_render_lock, type(threading.Lock())), type(
+            audio_route._music_render_lock
+        )
+
+    def test_two_loops_do_not_render_concurrently(self, monkeypatch):
+        """Behavioural: drive two loops in two threads and count overlap."""
+        import asyncio
+        import threading
+
+        from vllm_mlx.api.models import AudioMusicRequest
+        from vllm_mlx.routes import audio as audio_route
+
+        concurrent = 0
+        peak = 0
+        counter_lock = threading.Lock()
+
+        class _OverlapDetectingEngine(_FakeMusicEngine):
+            def generate(self, prompt, out_path, **kwargs):  # noqa: D102
+                nonlocal concurrent, peak
+                with counter_lock:
+                    concurrent += 1
+                    peak = max(peak, concurrent)
+                try:
+                    # Long enough that a second loop would overlap if allowed.
+                    threading.Event().wait(0.15)
+                    with open(out_path, "wb") as fh:
+                        fh.write(_make_tone_wav())
+                    return out_path
+                finally:
+                    with counter_lock:
+                        concurrent -= 1
+
+        monkeypatch.setattr(
+            "vllm_mlx.audio.music.MusicEngine", _OverlapDetectingEngine, raising=False
+        )
+        music_mod = sys.modules.get("vllm_mlx.audio.music")
+        if music_mod is not None:
+            monkeypatch.setattr(music_mod, "MusicEngine", _OverlapDetectingEngine)
+        audio_route._music_engine = None
+
+        def _run_one():
+            async def _go():
+                return await audio_route.create_music(
+                    AudioMusicRequest(input="x", seconds=5)
+                )
+
+            asyncio.run(_go())  # its OWN loop
+
+        threads = [threading.Thread(target=_run_one) for _ in range(3)]
+        try:
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=15)
+        finally:
+            audio_route._music_engine = None
+
+        assert peak == 1, (
+            f"{peak} renders ran concurrently across event loops — the "
+            f"cross-loop guarantee is not being enforced"
+        )
