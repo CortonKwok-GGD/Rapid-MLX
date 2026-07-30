@@ -196,15 +196,13 @@ _ESPEAK_READY: bool | None = None
 _ESPEAK_REASON: str | None = None
 _ESPEAK_LOCK = threading.Lock()
 
-# Hard bounds on the readiness sweep so a badly-broken host can't spin through
-# an unbounded number of subprocess self-tests. Discovery caps DISTINCT
-# libraries and DISTINCT data dirs separately, then self-tests their full
-# (best-first) product — so the worst-case self-test count is exactly the
-# product of these two, while every retained data dir is still paired with
-# every retained library (no crowd-out). Kept small because a real host has
-# only a handful of each; a truncated tail only drops unlikely candidates.
-_MAX_ESPEAK_LIB_CANDIDATES = 4
-_MAX_ESPEAK_DATA_CANDIDATES = 2
+# Hard bound on the readiness sweep: at most this many system (library,
+# data-dir) self-tests, so a badly-broken host can't spin through an unbounded
+# number of subprocesses. This is a TOTAL pair budget (not a per-axis cap):
+# discovery schedules candidates fairly (anti-diagonal over the library x data
+# grid) so the budget still samples multiple libraries AND multiple data dirs
+# before exhausting either axis, then truncates the tail.
+_MAX_ESPEAK_CANDIDATES = 8
 
 
 # F-K-CAPABILITIES-OMIT-AUDIO: D-CAPABILITIES-DETECTION's existing
@@ -530,19 +528,23 @@ def _discover_system_espeak() -> list[tuple[str, str]]:
                 out.append(item)
         return out
 
-    # Cap EACH dimension (best-first order preserved by dedup). Capping the two
-    # axes independently — rather than slicing the flattened pair list — means
-    # (a) the total self-test count is hard-bounded at LIB x DATA, so a broken
-    # host can't storm subprocesses, and (b) no library's several data-dir
-    # variants can crowd out another library, and no library monopolises the
-    # budget so a later data dir is never reached: every retained data dir is
-    # paired with every retained library (codex MAJOR, both directions).
-    libs = _dedup(libs)[:_MAX_ESPEAK_LIB_CANDIDATES]
-    data_parents = _dedup(data_parents)[:_MAX_ESPEAK_DATA_CANDIDATES]
-    # Data-major (data outer, library inner) so the first round pairs every
-    # retained library with the best-first data dir before any alternate-data
-    # retry — the most likely install is found with the fewest subprocesses.
-    return [(lib, data) for data in data_parents for lib in libs]
+    libs = _dedup(libs)
+    data_parents = _dedup(data_parents)
+    # Fair (anti-diagonal) schedule over the library x data-dir grid: order
+    # pairs by ``library_rank + data_rank`` so the total budget samples several
+    # libraries AND several data dirs before exhausting either axis. A
+    # library-major or data-major flatten would spend the whole budget on one
+    # axis and hide a valid pairing on the other — e.g. every probe against a
+    # single wrong data dir, or against a single broken library (codex, both
+    # directions). Best-first within each diagonal (lower ranks first); the
+    # caller truncates the tail to :data:`_MAX_ESPEAK_CANDIDATES`.
+    pairs: list[tuple[str, str]] = []
+    for diag in range(len(libs) + len(data_parents)):
+        for i, lib in enumerate(libs):
+            j = diag - i
+            if 0 <= j < len(data_parents):
+                pairs.append((lib, data_parents[j]))
+    return pairs[:_MAX_ESPEAK_CANDIDATES]
 
 
 def _apply_system_espeak(lib: str, data: str) -> None:
@@ -566,32 +568,42 @@ def _probe_espeak_readiness() -> tuple[bool, str | None]:
     """Run the (blocking) espeak readiness sweep. Returns ``(ready, reason)``.
 
     Bundled espeak first — preserves existing behaviour on platforms where
-    the shipped dylib loads correctly (no override, no repair). If bundled
-    is broken, self-tests each discovered system espeak-ng candidate in a
+    the shipped dylib loads correctly (no override, no repair). If bundled is
+    broken, self-tests each discovered system espeak-ng candidate in a
     subprocess and repairs this worker to the first that initializes. No
-    candidate works → not ready. Discovery already bounds the sweep to at most
-    :data:`_MAX_ESPEAK_LIB_CANDIDATES` x :data:`_MAX_ESPEAK_DATA_CANDIDATES`
-    self-tests, so a badly-broken host can't spin through an unbounded number
-    of installs.
+    candidate works → not ready. Discovery bounds the sweep to at most
+    :data:`_MAX_ESPEAK_CANDIDATES` self-tests, so a badly-broken host can't
+    spin through an unbounded number of installs.
 
-    Discovery (filesystem walks) and repair (``import misaki.espeak`` +
-    ``EspeakWrapper`` mutation) can raise unexpectedly on a torn install.
-    Any such error is contained to a not-ready verdict so the caller still
-    returns a clean 503 and the result is cached — an escaping exception
-    would surface as a 500 AND leave the verdict unresolved, re-probing
-    (and re-spawning subprocesses) on every subsequent request (codex MAJOR).
+    Errors are contained so the caller always returns a clean 503 (never a
+    500) and the verdict is cached — an escaping exception would leave
+    ``_ESPEAK_READY`` unresolved, re-probing (and re-spawning subprocesses) on
+    every request (codex). Containment is per-candidate: one malformed
+    candidate (e.g. ``_apply_system_espeak`` raising) is skipped, never
+    aborting the sweep while a later candidate could still work (codex).
     """
     try:
         if _espeak_selftest_subprocess():
             return True, None
+    except Exception:
+        logger.warning("bundled espeak self-test failed unexpectedly", exc_info=True)
 
-        for lib, data in _discover_system_espeak():
+    try:
+        candidates = _discover_system_espeak()
+    except Exception:
+        logger.warning("espeak discovery failed unexpectedly", exc_info=True)
+        return False, _ESPEAK_BROKEN_HINT
+
+    for lib, data in candidates:
+        try:
             if _espeak_selftest_subprocess(lib=lib, data=data):
                 _apply_system_espeak(lib, data)
                 return True, None
-    except Exception:
-        logger.warning("espeak readiness probe failed unexpectedly", exc_info=True)
-        return False, _ESPEAK_BROKEN_HINT
+        except Exception:
+            logger.warning(
+                "espeak candidate %s / %s failed unexpectedly", lib, data, exc_info=True
+            )
+            continue
 
     return False, _ESPEAK_BROKEN_HINT
 
