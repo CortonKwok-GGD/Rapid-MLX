@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import subprocess
 import sys
 import threading
@@ -473,6 +474,17 @@ async def test_video_route_threads_motion_controls(
 ) -> None:
     captured = {}
 
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (64, 64), "blue").save(image_bytes, format="PNG")
+
+    class ReferenceUpload:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        async def read(self, size: int) -> bytes:
+            payload, self._payload = self._payload[:size], self._payload[size:]
+            return payload
+
     class FakeEngine:
         model_name = "notapalindrome/ltx23-mlx-av-q4"
 
@@ -490,8 +502,9 @@ async def test_video_route_threads_motion_controls(
         fps=12,
         frames=17,
         guidance_scale=4.25,
+        conditioning_strength=0.35,
         negative_prompt="static camera",
-        input_reference=None,
+        input_reference=ReferenceUpload(image_bytes.getvalue()),
     )
     for _ in range(100):
         current = await video.retrieve_video(created["id"])
@@ -504,7 +517,8 @@ async def test_video_route_threads_motion_controls(
     assert captured["num_frames"] == 17
     assert captured["guidance_scale"] == 4.25
     assert captured["negative_prompt"] == "static camera"
-    assert captured["conditioning_strength"] is None
+    assert captured["conditioning_strength"] == 0.35
+    assert captured["image"].is_file()
     await video.delete_video(created["id"])
 
 
