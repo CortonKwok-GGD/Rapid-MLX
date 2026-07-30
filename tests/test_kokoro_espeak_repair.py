@@ -353,17 +353,15 @@ def test_discovery_tries_every_distinct_library_before_data_variants(monkeypatch
 def test_sweep_tries_all_discovered_candidates_no_pair_slice(monkeypatch):
     """The sweep self-tests every discovered pair — no pair-level cap slice.
 
-    Guards against re-introducing a ``[:_MAX_ESPEAK_CANDIDATES]`` slice over
-    the pair list: with the cap pinned to 1 and the ONLY working library
-    sitting second in discovery, a pair slice would stop at the first
-    (broken) candidate and 503 a host that actually has a usable espeak-ng.
-    The bound now lives in discovery (distinct libraries), so the sweep must
-    iterate the whole returned product.
+    Guards against re-introducing a pair-list slice in the sweep: the ONLY
+    working library sits second in discovery, so a slice that stopped at the
+    first (broken) candidate would 503 a host that actually has a usable
+    espeak-ng. The bound now lives in discovery (per-axis caps), so the sweep
+    must iterate the whole returned product.
     """
     applied: list = []
     good = "/usr/local/lib/libespeak-ng.1.dylib"
 
-    monkeypatch.setattr(probe, "_MAX_ESPEAK_CANDIDATES", 1)
     monkeypatch.setattr(
         probe,
         "_espeak_selftest_subprocess",
@@ -384,7 +382,7 @@ def test_sweep_tries_all_discovered_candidates_no_pair_slice(monkeypatch):
 
 
 def test_discovery_caps_number_of_distinct_libraries(monkeypatch):
-    """Discovery bounds DISTINCT libraries to _MAX_ESPEAK_CANDIDATES.
+    """Discovery bounds DISTINCT libraries to _MAX_ESPEAK_LIB_CANDIDATES.
 
     Three libraries exist across prefixes but the cap is 2 → the third is
     dropped, so the sweep can never spin through an unbounded set of installs.
@@ -393,7 +391,7 @@ def test_discovery_caps_number_of_distinct_libraries(monkeypatch):
     import os
     import shutil
 
-    monkeypatch.setattr(probe, "_MAX_ESPEAK_CANDIDATES", 2)
+    monkeypatch.setattr(probe, "_MAX_ESPEAK_LIB_CANDIDATES", 2)
     monkeypatch.setattr(shutil, "which", lambda name: None)
     monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
 
@@ -409,3 +407,33 @@ def test_discovery_caps_number_of_distinct_libraries(monkeypatch):
     distinct_libs = {lib for lib, _ in pairs}
     assert len(distinct_libs) == 2  # capped from 3 discovered
     assert "/usr/lib/libespeak-ng.1.dylib" not in distinct_libs  # best-first kept
+
+
+def test_discovery_caps_number_of_distinct_data_dirs(monkeypatch):
+    """Discovery bounds DISTINCT data dirs too, so total self-tests stay
+    hard-bounded at ``_MAX_ESPEAK_LIB_CANDIDATES * _MAX_ESPEAK_DATA_CANDIDATES``.
+
+    Three prefixes carry valid espeak data but the data cap is 2 → the third
+    data dir is dropped, capping the (library, data) product a broken host
+    can spin through.
+    """
+    import ctypes.util
+    import os
+    import shutil
+
+    monkeypatch.setattr(probe, "_MAX_ESPEAK_DATA_CANDIDATES", 2)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
+
+    lib_file = "/opt/homebrew/lib/libespeak-ng.1.dylib"
+    phontabs = {
+        "/opt/homebrew/share/espeak-ng-data/phontab",
+        "/usr/local/share/espeak-ng-data/phontab",
+        "/usr/share/espeak-ng-data/phontab",
+    }
+    monkeypatch.setattr(os.path, "exists", lambda p: p == lib_file or p in phontabs)
+
+    pairs = probe._discover_system_espeak()
+    distinct_data = {data for _, data in pairs}
+    assert len(distinct_data) == 2  # capped from 3 discovered
+    assert "/usr/share" not in distinct_data  # best-first kept (hb, usr/local)

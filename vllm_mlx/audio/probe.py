@@ -191,12 +191,20 @@ _ESPEAK_SELFTEST_SRC = (
 # Per-process espeak readiness cache: None = not yet probed, True = ready
 # (bundled works or repaired to system), False = unfixable (clean 503).
 # The lock coalesces concurrent first-request probes (two Kokoro requests
-# racing on a cold worker must not both spawn the subprocess sweep). The
-# candidate cap bounds the worst-case sweep on a badly-broken host.
+# racing on a cold worker must not both spawn the subprocess sweep).
 _ESPEAK_READY: bool | None = None
 _ESPEAK_REASON: str | None = None
 _ESPEAK_LOCK = threading.Lock()
-_MAX_ESPEAK_CANDIDATES = 8
+
+# Hard bounds on the readiness sweep so a badly-broken host can't spin through
+# an unbounded number of subprocess self-tests. Discovery caps DISTINCT
+# libraries and DISTINCT data dirs separately, then self-tests their full
+# (best-first) product — so the worst-case self-test count is exactly the
+# product of these two, while every retained data dir is still paired with
+# every retained library (no crowd-out). Kept small because a real host has
+# only a handful of each; a truncated tail only drops unlikely candidates.
+_MAX_ESPEAK_LIB_CANDIDATES = 4
+_MAX_ESPEAK_DATA_CANDIDATES = 2
 
 
 # F-K-CAPABILITIES-OMIT-AUDIO: D-CAPABILITIES-DETECTION's existing
@@ -522,17 +530,18 @@ def _discover_system_espeak() -> list[tuple[str, str]]:
                 out.append(item)
         return out
 
-    # Cap the number of DISTINCT libraries probed — that (not the raw pair
-    # count) is the meaningful bound, since each library is one real init
-    # attempt and there are only ever a handful on a real host. Dedup keeps
-    # best-first order. Capping libraries rather than pairs means a single
-    # library's several data-dir variants can never exhaust the budget and
-    # hide a later, valid install (codex MAJOR).
-    libs = _dedup(libs)[:_MAX_ESPEAK_CANDIDATES]
-    data_parents = _dedup(data_parents)
-    # Data-major (data outer, library inner) so each capped library is paired
-    # with the best-first data dir first; the sweep self-tests the whole
-    # (now bounded) product, trying every library against every data dir.
+    # Cap EACH dimension (best-first order preserved by dedup). Capping the two
+    # axes independently — rather than slicing the flattened pair list — means
+    # (a) the total self-test count is hard-bounded at LIB x DATA, so a broken
+    # host can't storm subprocesses, and (b) no library's several data-dir
+    # variants can crowd out another library, and no library monopolises the
+    # budget so a later data dir is never reached: every retained data dir is
+    # paired with every retained library (codex MAJOR, both directions).
+    libs = _dedup(libs)[:_MAX_ESPEAK_LIB_CANDIDATES]
+    data_parents = _dedup(data_parents)[:_MAX_ESPEAK_DATA_CANDIDATES]
+    # Data-major (data outer, library inner) so the first round pairs every
+    # retained library with the best-first data dir before any alternate-data
+    # retry — the most likely install is found with the fewest subprocesses.
     return [(lib, data) for data in data_parents for lib in libs]
 
 
@@ -560,10 +569,10 @@ def _probe_espeak_readiness() -> tuple[bool, str | None]:
     the shipped dylib loads correctly (no override, no repair). If bundled
     is broken, self-tests each discovered system espeak-ng candidate in a
     subprocess and repairs this worker to the first that initializes. No
-    candidate works → not ready. Discovery already bounds the sweep to at
-    most :data:`_MAX_ESPEAK_CANDIDATES` distinct libraries (each tried against
-    every data dir), so a badly-broken host can't spin through an unbounded
-    number of installs.
+    candidate works → not ready. Discovery already bounds the sweep to at most
+    :data:`_MAX_ESPEAK_LIB_CANDIDATES` x :data:`_MAX_ESPEAK_DATA_CANDIDATES`
+    self-tests, so a badly-broken host can't spin through an unbounded number
+    of installs.
 
     Discovery (filesystem walks) and repair (``import misaki.espeak`` +
     ``EspeakWrapper`` mutation) can raise unexpectedly on a torn install.
