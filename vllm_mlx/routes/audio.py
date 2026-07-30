@@ -10,6 +10,8 @@ import os
 import re
 import tempfile
 import wave
+import weakref
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query, UploadFile
 from starlette.responses import PlainTextResponse, Response
@@ -2091,15 +2093,25 @@ DEFAULT_MUSIC_DIT_DECODER: tuple[str, str] = ("medium", "same-l")
 #:
 #: Lazily created because the module imports before any event loop exists
 #: and an ``asyncio.Lock`` must be bound to the running loop.
-_music_lock: asyncio.Lock | None = None
+#: Keyed by running loop, not a single module global. An ``asyncio.Lock``
+#: binds to the loop that first awaits on it, so one process-global lock
+#: raises ``RuntimeError`` as soon as a second loop contends on it — which
+#: happens with repeated ``asyncio.run()`` (the tests do exactly that) and
+#: after an in-process app/loop restart. Weakly keyed so a finished loop's
+#: entry doesn't keep it alive.
+_music_locks: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _get_music_lock() -> asyncio.Lock:
-    """Return the process-wide music lock, creating it on first use."""
-    global _music_lock
-    if _music_lock is None:
-        _music_lock = asyncio.Lock()
-    return _music_lock
+    """Return the music lock for the RUNNING loop, creating it on demand."""
+    loop = asyncio.get_running_loop()
+    lock = _music_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _music_locks[loop] = lock
+    return lock
 
 
 def _generate_music_blocking(

@@ -66,4 +66,15 @@ async def run_to_completion(func, /, *args):
             except Exception:
                 logger.debug("Abandoned worker finished with an error", exc_info=True)
                 break
+        # Retrieve the outcome even when the loop never ran (the worker had
+        # already finished when cancellation arrived). Without this the
+        # exception stays unretrieved and asyncio logs "Task exception was
+        # never retrieved" at GC time — noise that also loses the reason the
+        # abandoned work failed.
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.debug(
+                    "Abandoned worker finished with an error: %r", exc, exc_info=exc
+                )
         raise

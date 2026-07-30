@@ -466,13 +466,35 @@ class TestMusicConcurrencyShape:
         async def _get():
             return audio_route._get_music_lock()
 
-        saved = audio_route._music_lock
-        try:
-            audio_route._music_lock = None
-            lock = asyncio.run(_get())
-            assert isinstance(lock, asyncio.Lock), type(lock)
-        finally:
-            audio_route._music_lock = saved
+        lock = asyncio.run(_get())
+        assert isinstance(lock, asyncio.Lock), type(lock)
+
+    def test_each_event_loop_gets_its_own_lock(self):
+        """One process-global lock breaks across loops.
+
+        An ``asyncio.Lock`` binds to the loop that first awaits on it, so a
+        single module global raises ``RuntimeError`` once a second loop
+        contends on it — repeated ``asyncio.run()`` (this file does that a
+        lot) and in-process app restarts both hit it.
+        """
+        import asyncio
+
+        from vllm_mlx.routes import audio as audio_route
+
+        held: list[asyncio.Lock] = []
+
+        async def _take():
+            lock = audio_route._get_music_lock()
+            async with lock:  # actually bind it to this loop
+                held.append(lock)
+
+        # Keep a strong reference to the first loop's lock so it can't be
+        # garbage-collected — otherwise a fresh object may land at the same
+        # address and an identity check silently proves nothing.
+        asyncio.run(_take())
+        first = held[0]
+        asyncio.run(_take())  # the real assertion: this must not raise
+        assert held[1] is not first, "the same lock was reused across two loops"
 
     def test_cancellation_drains_the_worker_before_unwinding(self):
         """A client disconnect must not free the lock / temp file early.
@@ -595,3 +617,86 @@ class TestTruncatedWavIsNotSuccess:
 
         assert r.status_code == 500, r.text
         assert r.json()["detail"]["error"]["code"] == "music_generation_failed"
+
+
+class TestRealRequestCancellation:
+    """Cancel the ACTUAL route, not just the helper in isolation.
+
+    The existing drain test exercises `run_to_completion` directly, so it
+    stays green if `create_music` stops using the helper or releases its lock
+    and temp file before the worker finishes. This drives the real handler.
+    """
+
+    def test_cancelling_create_music_holds_lock_and_file_until_done(self, monkeypatch):
+        import asyncio
+        import threading
+        from pathlib import Path
+
+        from vllm_mlx.api.models import AudioMusicRequest
+        from vllm_mlx.routes import audio as audio_route
+
+        entered = threading.Event()
+        may_finish = threading.Event()
+        observed: dict = {}
+
+        class _ParkingEngine(_FakeMusicEngine):
+            def generate(self, prompt, out_path, **kwargs):  # noqa: D102
+                observed["out_path"] = str(out_path)
+                entered.set()
+                may_finish.wait(timeout=5)
+                # Write real audio so the success path would work if allowed.
+                with open(out_path, "wb") as fh:
+                    fh.write(_make_tone_wav())
+                observed["worker_done"] = True
+                return out_path
+
+        monkeypatch.setattr(
+            "vllm_mlx.audio.music.MusicEngine", _ParkingEngine, raising=False
+        )
+        music_mod = sys.modules.get("vllm_mlx.audio.music")
+        if music_mod is not None:
+            monkeypatch.setattr(music_mod, "MusicEngine", _ParkingEngine)
+        audio_route._music_engine = None
+
+        async def _drive():
+            task = asyncio.ensure_future(
+                audio_route.create_music(AudioMusicRequest(input="x", seconds=5))
+            )
+            # Wait until the worker is genuinely inside generate().
+            await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+            lock = audio_route._get_music_lock()
+            assert lock.locked(), "the render should hold the music lock"
+
+            task.cancel()
+            await asyncio.sleep(0)
+            # A SECOND cancel is the case a single-shield drain misses: with
+            # a bare `await task` the second signal interrupts the drain and
+            # hands control back while the subprocess is still running. One
+            # cancel alone passes either way, so this test would prove
+            # nothing about the drain without it.
+            task.cancel()
+            for _ in range(20):
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
+
+            # The worker is still parked, so nothing may have been released.
+            assert not observed.get("worker_done")
+            assert lock.locked(), (
+                "the lock was released while the render was still running"
+            )
+            assert Path(observed["out_path"]).exists(), (
+                "the temp file was unlinked while the render was still running"
+            )
+
+            may_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert observed.get("worker_done"), "worker never completed"
+            # Cleanup happened only after the worker finished.
+            assert not Path(observed["out_path"]).exists()
+            assert not lock.locked()
+
+        try:
+            asyncio.run(_drive())
+        finally:
+            audio_route._music_engine = None
