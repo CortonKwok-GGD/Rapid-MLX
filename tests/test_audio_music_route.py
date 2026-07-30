@@ -684,8 +684,12 @@ class TestRealRequestCancellation:
             assert lock.locked(), (
                 "the lock was released while the render was still running"
             )
-            assert Path(observed["out_path"]).exists(), (
-                "the temp file was unlinked while the render was still running"
+            # The DIRECTORY is what we own and must not remove early. The
+            # file itself only appears once the engine writes it — and the
+            # real engine unlinks and recreates it, which is why the route
+            # owns a private directory rather than a single temp file.
+            assert Path(observed["out_path"]).parent.is_dir(), (
+                "the temp directory was removed while the render was still running"
             )
 
             may_finish.set()
@@ -693,7 +697,7 @@ class TestRealRequestCancellation:
                 await task
             assert observed.get("worker_done"), "worker never completed"
             # Cleanup happened only after the worker finished.
-            assert not Path(observed["out_path"]).exists()
+            assert not Path(observed["out_path"]).parent.exists()
             assert not lock.locked()
 
         try:
@@ -759,13 +763,22 @@ class TestCrossLoopMutualExclusion:
             monkeypatch.setattr(music_mod, "MusicEngine", _OverlapDetectingEngine)
         audio_route._music_engine = None
 
+        # Collect per-thread outcomes: `peak == 1` is ALSO true when every
+        # request crashed before rendering, so the concurrency assertion is
+        # meaningless without proving all three actually ran.
+        results: list[object] = []
+        errors: list[BaseException] = []
+
         def _run_one():
             async def _go():
                 return await audio_route.create_music(
                     AudioMusicRequest(input="x", seconds=5)
                 )
 
-            asyncio.run(_go())  # its OWN loop
+            try:
+                results.append(asyncio.run(_go()))  # its OWN loop
+            except BaseException as e:  # noqa: BLE001 — reported below
+                errors.append(e)
 
         threads = [threading.Thread(target=_run_one) for _ in range(3)]
         try:
@@ -773,10 +786,123 @@ class TestCrossLoopMutualExclusion:
                 th.start()
             for th in threads:
                 th.join(timeout=15)
+            assert not any(th.is_alive() for th in threads), "a thread hung"
         finally:
             audio_route._music_engine = None
 
+        assert not errors, f"requests failed instead of rendering: {errors!r}"
+        assert len(results) == 3, f"only {len(results)}/3 requests completed"
+        for resp in results:
+            assert getattr(resp, "body", b"")[:4] == b"RIFF", (
+                "a request returned something other than WAV bytes"
+            )
         assert peak == 1, (
             f"{peak} renders ran concurrently across event loops — the "
             f"cross-loop guarantee is not being enforced"
+        )
+
+
+class TestTempFilePermissions:
+    """The render directory must be private, because the file can't be.
+
+    `MusicEngine.generate` unlinks the path it is given and lets the SA3 CLI
+    recreate it via `wave.open(path, "wb")`. So a `NamedTemporaryFile`'s 0600
+    mode does not survive — the new file lands at the process umask (commonly
+    0644, world-readable) and the unlink/recreate gap is a symlink-race window
+    in a shared /tmp. Owning the directory makes the file's mode irrelevant.
+    """
+
+    def test_render_happens_inside_a_0700_directory(self, monkeypatch):
+        import os
+        import stat
+
+        from vllm_mlx.routes import audio as audio_route
+
+        seen: dict = {}
+
+        class _ModeInspectingEngine(_FakeMusicEngine):
+            def generate(self, prompt, out_path, **kwargs):  # noqa: D102
+                parent = os.path.dirname(str(out_path))
+                seen["dir"] = parent
+                seen["dir_mode"] = stat.S_IMODE(os.stat(parent).st_mode)
+                # Reproduce what the real engine does: unlink, then recreate.
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
+                with open(out_path, "wb") as fh:
+                    fh.write(_make_tone_wav())
+                seen["file_mode"] = stat.S_IMODE(os.stat(out_path).st_mode)
+                return out_path
+
+        monkeypatch.setattr(
+            "vllm_mlx.audio.music.MusicEngine", _ModeInspectingEngine, raising=False
+        )
+        music_mod = sys.modules.get("vllm_mlx.audio.music")
+        if music_mod is not None:
+            monkeypatch.setattr(music_mod, "MusicEngine", _ModeInspectingEngine)
+        audio_route._music_engine = None
+
+        client, restore = _mount_audio_app()
+        try:
+            r = client.post("/v1/audio/music", json={"input": "x", "seconds": 5})
+        finally:
+            restore()
+            audio_route._music_engine = None
+
+        assert r.status_code == 200, r.text
+        assert seen["dir_mode"] == 0o700, (
+            f"render directory is {oct(seen['dir_mode'])}, not 0o700 — other "
+            f"users can traverse into it"
+        )
+        # The point: the file's own mode is NOT relied upon. Recorded so the
+        # reasoning is visible if someone later "tightens" the file instead.
+        assert "file_mode" in seen
+
+    def test_the_directory_is_removed_afterwards(self, _stub_music_engine):
+        import os
+
+        client, restore = _mount_audio_app()
+        try:
+            r = client.post("/v1/audio/music", json={"input": "x", "seconds": 5})
+        finally:
+            restore()
+        assert r.status_code == 200, r.text
+        out_path = _FakeMusicEngine.last_call["out_path"]
+        assert not os.path.exists(os.path.dirname(out_path)), (
+            "the render directory outlived the request"
+        )
+
+
+class TestPerLoopLockDoesNotLeakLoops:
+    """The weak-keyed lock map must not retain retired event loops.
+
+    Reviewed concern: an `asyncio.Lock` that has bound to a loop could hold a
+    strong reference to it, making the map's value retain its own weak key and
+    defeating the point. Measured, and it does not — a contended lock does not
+    keep the loop alive once the loop is closed and dropped. Pinned here so a
+    future asyncio change (or a switch to a primitive that DOES retain the
+    loop) surfaces as a test failure rather than a slow leak across in-process
+    restarts.
+    """
+
+    def test_retired_loops_are_released(self):
+        import asyncio
+        import gc
+
+        from vllm_mlx.routes import audio as audio_route
+
+        audio_route._music_locks.clear()
+
+        async def _contend():
+            lock = audio_route._get_music_lock()
+            async with lock:  # bind it to this loop
+                pass
+
+        for _ in range(3):
+            asyncio.run(_contend())
+
+        gc.collect()
+        gc.collect()
+        assert len(audio_route._music_locks) == 0, (
+            f"{len(audio_route._music_locks)} retired loop(s) still retained — "
+            f"the lock is keeping its own weak key alive"
         )

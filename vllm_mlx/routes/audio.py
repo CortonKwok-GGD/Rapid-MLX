@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import wave
@@ -2257,10 +2258,22 @@ async def create_music(request: AudioMusicRequest = Body(...)):
     """
     dit, decoder = _resolve_music_model(request.model)
 
+    # Render inside a PRIVATE 0700 directory rather than handing the engine a
+    # NamedTemporaryFile path.
+    #
+    # ``MusicEngine.generate`` unlinks the path it is given and lets the SA3
+    # CLI recreate it via ``wave.open(path, "wb")`` — so a
+    # ``NamedTemporaryFile``'s 0600 mode does not survive: the new file lands
+    # at the process umask, commonly 0644 (world-readable), and the
+    # unlink/recreate gap is a symlink-race window in a shared /tmp. Owning
+    # the directory instead means the final file's mode no longer matters —
+    # nothing else can traverse into it.
+    tmp_dir: str | None = None
     tmp_path: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp_path = tmp.name
+        tmp_dir = tempfile.mkdtemp(prefix="rapidmlx-music-")
+        os.chmod(tmp_dir, 0o700)
+        tmp_path = os.path.join(tmp_dir, "out.wav")
 
         # Engine load + render are blocking (a subprocess, up to 900 s) —
         # off the event loop. Serialised on the loop before offloading so
@@ -2323,15 +2336,10 @@ async def create_music(request: AudioMusicRequest = Body(...)):
             },
         )
     finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-            except OSError as cleanup_err:
-                logger.warning(
-                    "Failed to unlink temp music file %s: %s", tmp_path, cleanup_err
-                )
+        # rmtree, not unlink: we own the whole directory, and the SA3 CLI may
+        # leave sidecars beside the wav that would make rmdir raise.
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @router.get("/v1/audio/voices", dependencies=[Depends(verify_api_key)])
