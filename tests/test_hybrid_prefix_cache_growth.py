@@ -386,15 +386,34 @@ def test_hybrid_store_retained_when_enabled(reuse_cache):
     assert reuse_cache.get_stats()["non_trimmable_entries"] == 1
 
 
-def test_hybrid_exact_match_hit_when_enabled(reuse_cache):
-    """Exact match is trim-free — a retained hybrid entry must serve it."""
+def test_hybrid_exact_match_without_shorter_snapshot_misses(reuse_cache):
+    """An exact recurrent-state entry cannot kick off generation.
+
+    BatchGenerator re-forwards the final prompt token, so the cached state
+    would first need to trim one token.  With no shorter snapshot available,
+    correctness requires a clean miss/full prefill.
+    """
     prompt = list(range(1000, 1100))
     reuse_cache.store(prompt, _hybrid_cache())
 
     result, remaining = reuse_cache.fetch(prompt)
 
-    assert result is not None, "Exact match needs no trim — hybrid entry must hit"
-    assert remaining == []
+    assert result is None
+    assert remaining == prompt
+
+
+def test_hybrid_exact_match_falls_back_to_longest_strict_prefix(reuse_cache):
+    """An unusable exact hit must not mask a resumable boundary snapshot."""
+    prompt = list(range(1000, 1100))
+    boundary = prompt[:-7]
+    reuse_cache.store(boundary, _hybrid_cache(), evict_prefixes=False)
+    reuse_cache.store(prompt, _hybrid_cache(), evict_prefixes=False)
+
+    result, remaining = reuse_cache.fetch(prompt)
+
+    assert result is not None
+    assert remaining == prompt[-7:]
+    assert reuse_cache._last_match_type == "prefix"
 
 
 def test_hybrid_prefix_extension_hit_when_enabled(reuse_cache):
@@ -461,13 +480,13 @@ def test_hybrid_bound_is_enforced(reuse_cache):
 
 
 def test_hybrid_bound_evicts_by_recency_not_insertion_order(reuse_cache):
-    """#1103 codex NIT-3: the bound is LRU, not FIFO — a cache HIT must
+    """#1103 codex NIT-3: the bound is LRU, not FIFO — a cache fetch must
     refresh an entry's recency so it survives a later eviction.
 
     ``test_hybrid_bound_is_enforced`` only ever stores (never fetches), so
     insertion order == recency order there and it can't distinguish LRU from
-    FIFO. Here we store chain_a then chain_b, then FETCH chain_a (an exact
-    trim-free hit that must bump it to most-recent), then store chain_c. Under
+    FIFO. Here we store chain_a then chain_b, then FETCH chain_a (an unusable
+    exact entry that still bumps recency), then store chain_c. Under
     LRU the least-recently-used is now chain_b, so chain_b — NOT the
     first-inserted chain_a — must be the one evicted.
     """
@@ -478,11 +497,12 @@ def test_hybrid_bound_evicts_by_recency_not_insertion_order(reuse_cache):
     reuse_cache.store(chain_a, _hybrid_cache())
     reuse_cache.store(chain_b, _hybrid_cache())
 
-    # Exact-match hit on chain_a — trim-free, so a retained hybrid entry
-    # serves it AND its recency is refreshed to most-recently-used.
+    # BatchGenerator cannot consume this exact non-trimmable state because it
+    # re-forwards the final prompt token.  The lookup is therefore a miss, but
+    # touching the retained entry still refreshes its LRU recency.
     result, remaining = reuse_cache.fetch(chain_a)
-    assert result is not None, "Exact match on chain_a must hit (trim-free)"
-    assert remaining == []
+    assert result is None
+    assert remaining == chain_a
 
     # Now the LRU order is [chain_b (oldest), chain_a (newest)]. Storing
     # chain_c pushes the count to 3 > bound 2, so the OLDEST (chain_b) goes.

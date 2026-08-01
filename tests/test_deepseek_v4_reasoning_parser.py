@@ -49,6 +49,33 @@ def test_thinking_mode_routes_reasoning_then_content() -> None:
     assert answer.reasoning is None
 
 
+def test_thinking_mode_keeps_implicit_reasoning_across_many_chunks() -> None:
+    """DeepSeek V4 omits the opener; no heuristic may flip it to content."""
+    parser = DeepSeekV4ReasoningParser()
+    parser.configure_request(enable_thinking=True)
+
+    chunks = [
+        "We need answer. Need solve classic chickens rabbits. Need show",
+        " reasoning. Need be careful: chickens 2 legs, rabbits 4 legs.",
+        " c+r=35, 2c+4r=94.",
+        "</think>There are 23 chickens and 12 rabbits.",
+    ]
+    reasoning = []
+    content = []
+    previous = ""
+    for chunk in chunks:
+        current = previous + chunk
+        parsed = parser.extract_reasoning_streaming(previous, current, chunk)
+        if parsed is not None:
+            reasoning.append(parsed.reasoning or "")
+            content.append(parsed.content or "")
+        previous = current
+
+    assert "Need be careful" in "".join(reasoning)
+    assert "Need be careful" not in "".join(content)
+    assert "".join(content) == "There are 23 chickens and 12 rabbits."
+
+
 def test_dsml_tool_start_implicitly_closes_reasoning() -> None:
     parser = DeepSeekV4ReasoningParser()
     parser.configure_request(enable_thinking=True)

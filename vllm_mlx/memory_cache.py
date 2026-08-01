@@ -1638,8 +1638,25 @@ class MemoryAwarePrefixCache:
         self, tokens: list[int], tokens_key: tuple[int, ...]
     ) -> tuple[list[Any] | None, list[int]]:
         # --- O(1) exact match ---
-        if tokens_key in self._entries:
-            entry = self._entries[tokens_key]
+        #
+        # The scheduler starts generation by forwarding the final prompt token
+        # once more.  A cache captured at the full N-token boundary therefore
+        # has to be trimmed to N-1 before it can be consumed.  Recurrent and
+        # DeepSeek-V4 pooling caches cannot do that.  Treat their exact entry as
+        # unusable here and continue looking for a strict stored prefix (the
+        # N-1 snapshot or a message boundary); returning the exact entry only
+        # makes the scheduler discard it and full-prefill the request.
+        exact_entry = self._entries.get(tokens_key)
+        unusable_non_trimmable_exact = bool(
+            exact_entry is not None and exact_entry.non_trimmable
+        )
+        if unusable_non_trimmable_exact:
+            # The entry is still live and was requested, so preserve ordinary
+            # LRU recency even though this execution path cannot consume it.
+            # A strict-prefix fallback below records the actual cache hit.
+            self._entries.move_to_end(tokens_key)
+        if exact_entry is not None and not unusable_non_trimmable_exact:
+            entry = exact_entry
             self._entries.move_to_end(tokens_key)
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
@@ -1675,7 +1692,11 @@ class MemoryAwarePrefixCache:
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning(f"[radix] longest_prefix failed: {exc}")
                 matched_key = None
-            if matched_key is not None and matched_key in self._entries:
+            if (
+                matched_key is not None
+                and matched_key in self._entries
+                and not (unusable_non_trimmable_exact and matched_key == tokens_key)
+            ):
                 # An exact match would have been caught by the O(1) dict
                 # lookup above, so any terminal we find here is strictly
                 # shorter than the query — i.e. a prefix match.
@@ -1721,6 +1742,8 @@ class MemoryAwarePrefixCache:
             for i in range(idx, len(sorted_keys)):
                 cached_key = sorted_keys[i]
                 cached_len = len(cached_key)
+                if unusable_non_trimmable_exact and cached_key == tokens_key:
+                    continue
                 if cached_len < len(tokens_key):
                     continue
                 # Check if tokens_key is a prefix of cached_key
