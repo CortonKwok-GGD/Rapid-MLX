@@ -358,10 +358,16 @@ class SchedulerConfig:
     # SchedulerConfig purely so the CLI plumbs it through the same
     # construction sites as every other cache knob.
     #
-    # Keep this field last: positional ``SchedulerConfig(...)`` construction
-    # binds by position, so appending new fields at the end avoids shifting
-    # the position of any existing field.
+    # Keep newly-added fields below the historical configuration surface:
+    # positional ``SchedulerConfig(...)`` construction binds by position, so
+    # appending avoids shifting the position of any existing field.
     response_cache_entries: int = 0
+
+    # Enables the N-1 snapshot strategy for models whose cache state can be
+    # continued at an exact prefix but cannot safely trim an exact full-prompt
+    # hit by one token. Kept separate from ``hybrid_cache_entries`` because
+    # that retention bound is also useful to callers with ordinary caches.
+    non_trimmable_exact_prefix_reuse: bool = False
 
     def __post_init__(self) -> None:
         if self.response_cache_entries < 0:
@@ -2722,7 +2728,7 @@ class Scheduler:
             # priority, fail trim-one kickoff on non-trimmable caches, and mask
             # the reusable N-1 prefix. The boundary snapshot is the prompt
             # cache for this path; completion still stores prompt + output.
-            if getattr(request, "_cache_snapshot_boundary", 0) > 0:
+            if getattr(request, "_cache_snapshot_stored", False):
                 return
 
             prompt_tokens = list(request.prompt_token_ids)
@@ -2929,6 +2935,7 @@ class Scheduler:
             # busy — retrying every step would be pure waste. DeepSeek
             # finding #2 on PR #435.
             request._boundary_snapshot_taken = True
+            request._cache_snapshot_stored = stored
 
             if stored:
                 logger.info(
@@ -5059,6 +5066,7 @@ class Scheduler:
                 snapshot_boundary <= 0
                 and self.memory_aware_cache is not None
                 and getattr(self.config, "hybrid_cache_entries", 0) > 0
+                and getattr(self.config, "non_trimmable_exact_prefix_reuse", False)
                 and not request.prompt_cache
                 and len(request.prompt_token_ids) > 1
             ):

@@ -2198,14 +2198,7 @@ def _resolve_hybrid_cache_entries(
     if not enable_prefix_cache or explicit_value != 0 or user_set_explicit:
         return explicit_value
 
-    from .model_aliases import resolve_profile as _resolve_alias
-
-    profile = _resolve_alias(model_name)
-    from .utils.deepseek_v4_0731 import is_deepseek_v4_0731
-
-    needs_bounded_reuse = (profile is not None and profile.is_hybrid) or (
-        is_deepseek_v4_0731(model_name)
-    )
+    needs_bounded_reuse = _needs_bounded_trim_free_reuse(model_name)
     if needs_bounded_reuse:
         _logging.getLogger(__name__).info(
             "Non-trimmable model cache detected with --enable-prefix-cache: "
@@ -2215,6 +2208,17 @@ def _resolve_hybrid_cache_entries(
         )
         return _DEFAULT_HYBRID_CACHE_ENTRIES
     return explicit_value
+
+
+def _needs_bounded_trim_free_reuse(model_name: str) -> bool:
+    """Whether this model's cache can reuse prefixes but not trim exact hits."""
+    from .model_aliases import resolve_profile as _resolve_alias
+    from .utils.deepseek_v4_0731 import is_deepseek_v4_0731
+
+    profile = _resolve_alias(model_name)
+    return (profile is not None and profile.is_hybrid) or is_deepseek_v4_0731(
+        model_name
+    )
 
 
 def _serve_will_run_on_mllm_lane(args) -> bool:
@@ -3310,6 +3314,12 @@ def serve_command(args):
         # #1103/#1122: bounded trim-free hybrid (recurrent-state) prefix reuse.
         # Auto-defaulted to 8 for hybrid models when prefix cache is enabled.
         hybrid_cache_entries=_hybrid_cache_entries,
+        non_trimmable_exact_prefix_reuse=(
+            _hybrid_cache_entries > 0
+            and _needs_bounded_trim_free_reuse(
+                getattr(args, "_original_alias", None) or args.model
+            )
+        ),
         # Opt-in prompt-deterministic response cache (exact-match short-circuit).
         response_cache_entries=getattr(args, "response_cache_entries", 0),
         # Paged cache options

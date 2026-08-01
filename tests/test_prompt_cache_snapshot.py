@@ -88,15 +88,33 @@ class TestPromptCacheSnapshot:
     def test_prompt_only_snapshot_does_not_mask_internal_n_minus_one_boundary(self):
         scheduler = _make_scheduler_with_cache()
         scheduler.config.hybrid_cache_entries = 8
+        scheduler.config.non_trimmable_exact_prefix_reuse = True
         request = _register(
             scheduler, "req-boundary", uid=102, prompt_tokens=[10, 20, 30, 40]
         )
         request._cache_snapshot_boundary = 3
+        request._cache_snapshot_stored = True
         scheduler.memory_aware_cache.store = MagicMock(return_value=True)
 
         scheduler._prompt_cache_save_cb(102, [object()])
 
         scheduler.memory_aware_cache.store.assert_not_called()
+
+    def test_failed_internal_boundary_falls_back_to_prompt_snapshot(self):
+        scheduler = _make_scheduler_with_cache()
+        request = _register(
+            scheduler, "req-failed-boundary", uid=104, prompt_tokens=[10, 20]
+        )
+        request._cache_snapshot_boundary = 1
+        request._cache_snapshot_stored = False
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        cache_layers = [object()]
+        scheduler._prompt_cache_save_cb(104, cache_layers)
+
+        scheduler.memory_aware_cache.store.assert_called_once_with(
+            [10, 20], cache_layers, evict_prefixes=False
+        )
 
     def test_prompt_only_snapshot_still_saves_without_internal_boundary(self):
         """A bounded cache must preserve the normal path for tiny prompts."""
@@ -335,6 +353,9 @@ class TestBoundarySnapshot:
 
         stored_tokens = scheduler.memory_aware_cache.store.call_args.args[0]
         assert stored_tokens == prompt_tokens[:-1]
+        assert scheduler.memory_aware_cache.store.call_args.args[1] == [
+            "reconstructed-cache"
+        ]
 
     def test_snapshot_skips_end_of_prompt_responses(self):
         """end_of_prompt is the whole-prompt promotion — handled by the
