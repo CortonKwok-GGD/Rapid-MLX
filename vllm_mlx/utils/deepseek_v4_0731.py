@@ -29,7 +29,14 @@ def _json(value: Any) -> str:
 
 def _tool_schemas(tools: list[dict]) -> str:
     definitions = [t.get("function", t) for t in tools]
-    schemas = "\n".join(_json(t) for t in definitions)
+    # Agent clients may reorder otherwise-identical tools (and JSON object
+    # keys) between turns.  Since the schemas live in the system prefix, that
+    # turns a harmless wire-order change into a 30K-token prefix-cache miss.
+    # Tool order has no semantic meaning, so canonicalise both levels.
+    definitions.sort(key=lambda item: str(item.get("name", "")))
+    schemas = "\n".join(
+        json.dumps(item, ensure_ascii=False, sort_keys=True) for item in definitions
+    )
     return f"""## Tools
 
 You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{DSML}tool_calls>" block like the following:

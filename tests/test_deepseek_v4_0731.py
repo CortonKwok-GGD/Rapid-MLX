@@ -122,6 +122,58 @@ def test_dsml_tool_schema_and_tool_result_are_encoded():
     assert "<tool_result>sunny</tool_result>" in prompt
 
 
+def test_dsml_tool_schema_order_is_canonical_for_prefix_cache():
+    messages = [
+        {"role": "system", "content": "stable instructions"},
+        {"role": "user", "content": "do work"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "parameters": {"properties": {"z": {"type": "string"}}},
+                "name": "zeta",
+                "description": "last",
+            },
+        },
+        {
+            "function": {
+                "description": "first",
+                "name": "alpha",
+                "parameters": {"type": "object"},
+            },
+            "type": "function",
+        },
+    ]
+    reordered = [
+        {
+            "type": "function",
+            "function": {
+                "name": "alpha",
+                "parameters": {"type": "object"},
+                "description": "first",
+            },
+        },
+        tools[0],
+    ]
+
+    first = apply_chat_template(
+        _TokenizerWithoutTemplate(),
+        messages,
+        tools=tools,
+        enable_thinking=False,
+        model_name="deepseek-v4-flash-0731-mxfp4",
+    )
+    second = apply_chat_template(
+        _TokenizerWithoutTemplate(),
+        messages,
+        tools=reordered,
+        enable_thinking=False,
+        model_name="deepseek-v4-flash-0731-mxfp4",
+    )
+    assert first == second
+
+
 def test_dsml_parser_returns_openai_tool_call():
     parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
     output = (

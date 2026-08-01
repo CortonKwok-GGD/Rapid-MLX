@@ -15,6 +15,7 @@ history every turn in ``input``.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -3558,3 +3559,30 @@ def _log_request(req: ResponsesRequest) -> None:
         f"input_items={n_items} total_chars={total_chars} "
         f"instructions_chars={instr_chars} tools={n_tools}"
     )
+    if logger.isEnabledFor(logging.DEBUG) and req.tools:
+        fingerprints = []
+        for tool in req.tools:
+            canonical = json.dumps(
+                tool, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            name = tool.get("name") or tool.get("function", {}).get("name") or "?"
+            digest = hashlib.sha256(canonical.encode()).hexdigest()[:10]
+            fingerprints.append(f"{name}:{digest}")
+            if name == "_add_comment_to_issue":
+                field_fingerprints = {
+                    key: hashlib.sha256(
+                        json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()[:10]
+                    for key, value in tool.items()
+                }
+                logger.debug(
+                    "[REQUEST] diagnostic tool fields %s: %s",
+                    name,
+                    field_fingerprints,
+                )
+        logger.debug("[REQUEST] tool fingerprints: %s", ",".join(fingerprints))
