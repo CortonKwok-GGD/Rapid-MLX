@@ -1650,11 +1650,6 @@ class MemoryAwarePrefixCache:
         unusable_non_trimmable_exact = bool(
             exact_entry is not None and exact_entry.non_trimmable
         )
-        if unusable_non_trimmable_exact:
-            # The entry is still live and was requested, so preserve ordinary
-            # LRU recency even though this execution path cannot consume it.
-            # A strict-prefix fallback below records the actual cache hit.
-            self._entries.move_to_end(tokens_key)
         if exact_entry is not None and not unusable_non_trimmable_exact:
             entry = exact_entry
             self._entries.move_to_end(tokens_key)

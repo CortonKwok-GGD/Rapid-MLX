@@ -499,16 +499,12 @@ def test_hybrid_bound_is_enforced(reuse_cache):
     assert stats["evictions"] >= 1
 
 
-def test_hybrid_bound_evicts_by_recency_not_insertion_order(reuse_cache):
-    """#1103 codex NIT-3: the bound is LRU, not FIFO — a cache fetch must
-    refresh an entry's recency so it survives a later eviction.
+def test_hybrid_bound_does_not_promote_unusable_exact_entry(reuse_cache):
+    """An exact snapshot that serves no tokens must not gain LRU priority.
 
-    ``test_hybrid_bound_is_enforced`` only ever stores (never fetches), so
-    insertion order == recency order there and it can't distinguish LRU from
-    FIFO. Here we store chain_a then chain_b, then FETCH chain_a (an unusable
-    exact entry that still bumps recency), then store chain_c. Under
-    LRU the least-recently-used is now chain_b, so chain_b — NOT the
-    first-inserted chain_a — must be the one evicted.
+    Otherwise repeated exact requests can protect an unusable full-prompt
+    snapshot while evicting the older message-boundary snapshot that actually
+    avoids full prefill.
     """
     chain_a = list(range(1000, 1100))
     chain_b = list(range(2000, 2100))
@@ -518,24 +514,19 @@ def test_hybrid_bound_evicts_by_recency_not_insertion_order(reuse_cache):
     reuse_cache.store(chain_b, _hybrid_cache())
 
     # BatchGenerator cannot consume this exact non-trimmable state because it
-    # re-forwards the final prompt token.  The lookup is therefore a miss, but
-    # touching the retained entry still refreshes its LRU recency.
+    # re-forwards the final prompt token. The miss must not refresh recency.
     result, remaining = reuse_cache.fetch(chain_a)
     assert result is None
     assert remaining == chain_a
 
-    # Now the LRU order is [chain_b (oldest), chain_a (newest)]. Storing
-    # chain_c pushes the count to 3 > bound 2, so the OLDEST (chain_b) goes.
+    # The LRU order remains [chain_a (oldest), chain_b (newest)]. Storing
+    # chain_c pushes the count to 3 > bound 2, so chain_a must be evicted.
     reuse_cache.store(chain_c, _hybrid_cache())
 
     stats = reuse_cache.get_stats()
     assert stats["non_trimmable_entries"] == 2, "Bound of 2 must hold"
-    assert tuple(chain_b) not in reuse_cache._entries, (
-        "chain_b was least-recently-used and must be evicted (LRU, not FIFO)"
-    )
-    assert tuple(chain_a) in reuse_cache._entries, (
-        "chain_a was refreshed by its fetch hit and must survive"
-    )
+    assert tuple(chain_a) not in reuse_cache._entries
+    assert tuple(chain_b) in reuse_cache._entries
     assert tuple(chain_c) in reuse_cache._entries
 
 
