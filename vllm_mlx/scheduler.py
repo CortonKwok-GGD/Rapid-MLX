@@ -2722,7 +2722,7 @@ class Scheduler:
             # priority, fail trim-one kickoff on non-trimmable caches, and mask
             # the reusable N-1 prefix. The boundary snapshot is the prompt
             # cache for this path; completion still stores prompt + output.
-            if getattr(self.config, "hybrid_cache_entries", 0) > 0:
+            if getattr(request, "_cache_snapshot_boundary", 0) > 0:
                 return
 
             prompt_tokens = list(request.prompt_token_ids)
@@ -3227,6 +3227,12 @@ class Scheduler:
                             )
                         }
                         names, nested_meta = meta_state
+                        if not (len(state) == len(names) == len(nested_meta)):
+                            raise ValueError(
+                                "CacheList state/metadata length mismatch: "
+                                f"state={len(state)}, names={len(names)}, "
+                                f"metadata={len(nested_meta)}"
+                            )
                         nested = []
                         for nested_state, name, nested_m in zip(
                             state, names, nested_meta

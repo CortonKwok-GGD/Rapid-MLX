@@ -247,6 +247,26 @@ def test_scheduler_reconstructs_vendored_cache_list_at_prefill_boundary():
     assert restored[0].caches[1].remainder == pooling.remainder
 
 
+def test_scheduler_rejects_mismatched_vendored_cache_list_metadata():
+    pytest.importorskip("mlx.core")
+
+    from mlx_lm.models.cache import CacheList
+
+    from vllm_mlx.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    states = [
+        {
+            "class_name": "CacheList",
+            "class_ref": CacheList,
+            "state": [([], None)],
+            "meta_state": (["KVCache", "DeepseekV4PoolingCache"], [None]),
+        }
+    ]
+
+    assert scheduler._reconstruct_cache_from_states(states) is None
+
+
 def test_tiny_model_forward_pass():
     """Smoke test the full forward path on a CPU-sized synthetic config.
 
