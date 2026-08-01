@@ -1,3 +1,5 @@
+import pytest
+
 from vllm_mlx.config import ServerConfig
 from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.reasoning.deepseek_v4_parser import DeepSeekV4ReasoningParser
@@ -33,6 +35,19 @@ def test_split_bare_close_never_leaks_to_content() -> None:
         previous = current
 
     assert "".join(emitted) == "donenext"
+
+
+def test_disabled_thinking_absorbs_opener_without_creating_reasoning() -> None:
+    parser = DeepSeekV4ReasoningParser()
+    parser.configure_request(enable_thinking=False)
+
+    parsed = parser.extract_reasoning_streaming(
+        "", "before<think>inside</think>after", "before<think>inside</think>after"
+    )
+
+    assert parsed is not None
+    assert parsed.reasoning is None
+    assert parsed.content == "beforeinsideafter"
 
 
 def test_thinking_mode_routes_reasoning_then_content() -> None:
@@ -145,3 +160,20 @@ def test_chat_postprocessor_keeps_sanitizer_active_when_thinking_disabled() -> N
 
     assert "".join(visible) == "ruff passed\nnext"
     assert "</think>" not in "".join(visible)
+
+
+def test_chat_postprocessor_fails_closed_on_request_config_error(monkeypatch) -> None:
+    class BrokenParser:
+        def configure_request(self, *, enable_thinking=None):
+            raise RuntimeError("cannot establish reasoning state")
+
+    cfg = ServerConfig()
+    cfg.reasoning_parser_name = "deepseek_v4"
+    monkeypatch.setattr(
+        StreamingPostProcessor,
+        "_create_reasoning_parser",
+        lambda self, _cfg: BrokenParser(),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot establish reasoning state"):
+        StreamingPostProcessor(cfg, enable_thinking=None)

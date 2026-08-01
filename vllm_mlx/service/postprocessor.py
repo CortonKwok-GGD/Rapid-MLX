@@ -312,10 +312,10 @@ class StreamingPostProcessor:
         if self.reasoning_parser is not None:
             _configure = getattr(self.reasoning_parser, "configure_request", None)
             if callable(_configure):
-                try:
-                    _configure(enable_thinking=enable_thinking)
-                except Exception:
-                    pass
+                # Request-aware parser configuration is a safety boundary:
+                # continuing after failure can route implicit scratch text to
+                # content using the parser's constructor defaults.
+                _configure(enable_thinking=enable_thinking)
             _set = getattr(self.reasoning_parser, "set_enable_thinking", None)
             if callable(_set):
                 try:

@@ -27,16 +27,27 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
         super().__init__(tokenizer)
         self.reset_state()
 
-    def reset_state(self, *, start_in_thinking: bool = False):
+    def reset_state(
+        self,
+        *,
+        start_in_thinking: bool = False,
+        thinking_enabled: bool | None = None,
+    ):
         super().reset_state()
         self._in_reasoning = start_in_thinking
+        self._thinking_enabled = (
+            start_in_thinking if thinking_enabled is None else thinking_enabled
+        )
         self._buffer = ""
 
     def configure_request(self, *, enable_thinking: bool | None = None) -> None:
         # DeepSeek V4 emits implicit scratch reasoning without an opening
         # marker.  Treat an unspecified request like the model's default
         # thinking mode; only an explicit False starts in visible content.
-        self.reset_state(start_in_thinking=enable_thinking is not False)
+        self.reset_state(
+            start_in_thinking=enable_thinking is not False,
+            thinking_enabled=enable_thinking is not False,
+        )
 
     @staticmethod
     def _partial_control_suffix(text: str) -> int:
@@ -75,8 +86,11 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
             emit(pending[:index])
             pending = pending[index + len(token) :]
             if token == _THINK_START:
-                # vLLM absorbs duplicate openers while already reasoning.
-                self._in_reasoning = True
+                # With thinking explicitly disabled both markers are only
+                # sanitizers; never create a reasoning channel the request
+                # opted out of. Otherwise absorb duplicate openers while
+                # remaining in reasoning mode.
+                self._in_reasoning = self._thinking_enabled
             elif token == _THINK_END:
                 # vLLM also absorbs a bare closer in CONTENT state.
                 self._in_reasoning = False
@@ -106,7 +120,10 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
         model_output: str,
         enable_thinking: bool | None = None,
     ) -> tuple[str | None, str | None]:
-        self.reset_state(start_in_thinking=enable_thinking is not False)
+        self.reset_state(
+            start_in_thinking=enable_thinking is not False,
+            thinking_enabled=enable_thinking is not False,
+        )
         parsed = self._consume(model_output, final=True)
         if parsed is None:
             return None, None
