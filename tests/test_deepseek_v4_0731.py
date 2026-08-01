@@ -214,9 +214,7 @@ def test_dsml_ignores_plugin_inserted_sentence_delimiter_for_prefix_cache():
         },
     }
     activated = copy.deepcopy(base)
-    activated["function"]["description"] += (
-        ". This tool is part of plugin `GitHub`."
-    )
+    activated["function"]["description"] += ". This tool is part of plugin `GitHub`."
     messages = [{"role": "user", "content": "inspect"}]
     kwargs = {
         "enable_thinking": False,

@@ -891,9 +891,7 @@ def _convert_input_item(
     """Translate one Responses-API input item to 0+ Chat messages."""
     if item.type == "message":
         return [
-            _message_item_to_chat(
-                item, preserve_developer_role=preserve_developer_role
-            )
+            _message_item_to_chat(item, preserve_developer_role=preserve_developer_role)
         ]
     if item.type == "function_call":
         return [_function_call_to_chat(item)]

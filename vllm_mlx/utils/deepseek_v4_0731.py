@@ -45,7 +45,10 @@ def _tool_schemas(tools: list[dict]) -> str:
         description = definition.get("description")
         if isinstance(description, str):
             paragraphs = description.split("\n\n")
-            if paragraphs and "Required for some features such as Codex" in paragraphs[0]:
+            if (
+                paragraphs
+                and "Required for some features such as Codex" in paragraphs[0]
+            ):
                 description = "\n\n".join(paragraphs[1:])
             # Codex decorates connector tools with this redundant suffix after
             # the connector is activated.  Removing it keeps the otherwise

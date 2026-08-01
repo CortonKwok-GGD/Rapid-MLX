@@ -2206,9 +2206,9 @@ class BatchedEngine(BaseEngine):
         if self._is_hybrid_model():
             return True
         try:
-            return int(
-                getattr(self._scheduler_config, "hybrid_cache_entries", 0) or 0
-            ) > 0
+            return (
+                int(getattr(self._scheduler_config, "hybrid_cache_entries", 0) or 0) > 0
+            )
         except (TypeError, ValueError):
             return False
 
