@@ -1955,10 +1955,18 @@ async def _stream_responses(
                 reasoning_parser = get_parser(cfg.reasoning_parser_name)()
             except Exception:
                 pass
-        if chat_kwargs.get("enable_thinking") is False:
+        if (
+            chat_kwargs.get("enable_thinking") is False
+            and getattr(reasoning_parser, "sanitize_when_thinking_disabled", False)
+            is not True
+        ):
             reasoning_parser = None
         if reasoning_parser:
-            reasoning_parser.reset_state()
+            configure_request = getattr(reasoning_parser, "configure_request", None)
+            if callable(configure_request):
+                configure_request(enable_thinking=chat_kwargs.get("enable_thinking"))
+            else:
+                reasoning_parser.reset_state()
 
         # Per-request reasoning cap (upstream vLLM PR #20859 backport).
         # Responses SSE drops reasoning to the floor (Codex doesn't read
