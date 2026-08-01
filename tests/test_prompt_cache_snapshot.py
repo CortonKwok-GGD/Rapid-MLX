@@ -93,6 +93,7 @@ class TestPromptCacheSnapshot:
             scheduler, "req-boundary", uid=102, prompt_tokens=[10, 20, 30, 40]
         )
         request._cache_snapshot_boundary = 3
+        request._cache_snapshot_is_internal = True
         request._cache_snapshot_stored = True
         scheduler.memory_aware_cache.store = MagicMock(return_value=True)
 
@@ -106,6 +107,7 @@ class TestPromptCacheSnapshot:
             scheduler, "req-failed-boundary", uid=104, prompt_tokens=[10, 20]
         )
         request._cache_snapshot_boundary = 1
+        request._cache_snapshot_is_internal = True
         request._cache_snapshot_stored = False
         scheduler.memory_aware_cache.store = MagicMock(return_value=True)
 
@@ -114,6 +116,23 @@ class TestPromptCacheSnapshot:
 
         scheduler.memory_aware_cache.store.assert_called_once_with(
             [10, 20], cache_layers, evict_prefixes=False
+        )
+
+    def test_semantic_boundary_does_not_suppress_full_prompt_snapshot(self):
+        scheduler = _make_scheduler_with_cache()
+        scheduler.config.non_trimmable_exact_prefix_reuse = True
+        request = _register(
+            scheduler, "req-semantic-boundary", uid=105, prompt_tokens=[10, 20, 30]
+        )
+        request.prefix_boundary = 2
+        request._cache_snapshot_stored = True
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        cache_layers = [object()]
+        scheduler._prompt_cache_save_cb(105, cache_layers)
+
+        scheduler.memory_aware_cache.store.assert_called_once_with(
+            [10, 20, 30], cache_layers, evict_prefixes=False
         )
 
     def test_prompt_only_snapshot_still_saves_without_internal_boundary(self):
@@ -334,6 +353,7 @@ class TestBoundarySnapshot:
             prefix_boundary=0,
         )
         request._cache_snapshot_boundary = 9
+        request._cache_snapshot_is_internal = True
 
         bg = MagicMock()
         bg.extract_cache.return_value = {102: (["raw-cache"], prompt_tokens[:9])}
@@ -345,7 +365,10 @@ class TestBoundarySnapshot:
                 SimpleNamespace(
                     uid=102,
                     progress=(9, 10),
-                    end_of_segment=True,
+                    # A regular prefill chunk can end exactly at N-1 without
+                    # being an explicit segment boundary. This must still
+                    # trigger the internal snapshot.
+                    end_of_segment=False,
                     end_of_prompt=False,
                 )
             ]

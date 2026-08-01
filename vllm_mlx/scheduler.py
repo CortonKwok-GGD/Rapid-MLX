@@ -2728,7 +2728,11 @@ class Scheduler:
             # priority, fail trim-one kickoff on non-trimmable caches, and mask
             # the reusable N-1 prefix. The boundary snapshot is the prompt
             # cache for this path; completion still stores prompt + output.
-            if getattr(request, "_cache_snapshot_stored", False):
+            if (
+                getattr(self.config, "non_trimmable_exact_prefix_reuse", False)
+                and getattr(request, "_cache_snapshot_is_internal", False)
+                and getattr(request, "_cache_snapshot_stored", False)
+            ):
                 return
 
             prompt_tokens = list(request.prompt_token_ids)
@@ -2825,8 +2829,6 @@ class Scheduler:
 
         boundary_uids: list[int] = []
         for resp in prompt_responses:
-            if not getattr(resp, "end_of_segment", False):
-                continue
             # end_of_prompt promotions are handled by
             # _snapshot_promoted_prompts (whole-prompt entry, issue #163).
             # We only want the *inter*-segment boundary here.
@@ -2855,6 +2857,15 @@ class Scheduler:
             # second fire, but this progress check skips it deterministically.
             progress = getattr(resp, "progress", None)
             expected_offset = snapshot_boundary - (request.cached_tokens or 0)
+            aligned_internal_chunk = (
+                getattr(request, "_cache_snapshot_is_internal", False)
+                and progress is not None
+                and isinstance(progress, tuple)
+                and len(progress) >= 1
+                and progress[0] == expected_offset
+            )
+            if not (getattr(resp, "end_of_segment", False) or aligned_internal_chunk):
+                continue
             if (
                 progress is not None
                 and isinstance(progress, tuple)
@@ -5072,6 +5083,7 @@ class Scheduler:
             ):
                 snapshot_boundary = len(request.prompt_token_ids) - 1
                 request._cache_snapshot_boundary = snapshot_boundary
+                request._cache_snapshot_is_internal = True
             if (
                 self.memory_aware_cache is not None
                 and snapshot_boundary > 0
