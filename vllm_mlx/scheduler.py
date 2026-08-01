@@ -1381,6 +1381,20 @@ def _config_vetted_mtp_supports_spec_decode(model_type: str | None) -> bool:
     return model_type in {"qwen3_5", "qwen3_5_moe", "hy_v3"}
 
 
+def _replay_dspark_committed(
+    model: Any,
+    cache_snapshot: list[Any],
+    verify_input: mx.array,
+    token_count: int,
+) -> list[Any]:
+    """Replay only committed target tokens into a pre-verify cache snapshot."""
+
+    committed = verify_input[:, :token_count]
+    replay_logits = model(committed, cache=cache_snapshot)
+    mx.eval(replay_logits, model._last_dspark_hidden)
+    return cache_snapshot
+
+
 def _install_dspark(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -1508,10 +1522,15 @@ def _install_dspark(
         except Exception as exc:  # noqa: BLE001
             logger.warning("[DSpark] verify failed; falling back: %r", exc)
             _stats["errors"] += 1
+            # Verification may have advanced a non-trimmable target cache
+            # before raising.  Baseline decoding must resume from the exact
+            # pre-verify state, never from speculative state.
+            gb.prompt_cache = target_cache_snapshot
             for cache, old_offset in zip(dspark_cache, offsets_before):
                 delta = cache.offset - old_offset
                 if delta > 0 and cache.is_trimmable():
                     cache.trim(delta)
+            _caches.pop(uid, None)
             return _orig_step()
 
         accepted = 0
@@ -1609,6 +1628,18 @@ def _install_dspark(
             return responses
         for response in responses:
             if response.finish_reason is not None:
+                replay_state = _pending_replay.get(response.uid)
+                if replay_state is not None:
+                    snapshot, verify_input = replay_state
+                    # ``GenerationBatch.next`` has already extracted the
+                    # finishing row and filtered it out of the live batch.
+                    # Rebuild the response-owned cache with only the primary
+                    # token that was actually surfaced, excluding queued
+                    # accepted draft tokens.
+                    restored = _replay_dspark_committed(
+                        model, snapshot, verify_input, 1
+                    )
+                    response.prompt_cache = [cache.extract(0) for cache in restored]
                 _finish_uid(response.uid)
         if not _pending:
             return responses
