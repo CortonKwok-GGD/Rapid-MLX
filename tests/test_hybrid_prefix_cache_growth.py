@@ -416,6 +416,26 @@ def test_hybrid_exact_match_falls_back_to_longest_strict_prefix(reuse_cache):
     assert reuse_cache._last_match_type == "prefix"
 
 
+def test_radix_hybrid_exact_match_falls_back_to_longest_strict_prefix():
+    """The radix fast path must walk past an unusable exact terminal."""
+    from vllm_mlx.runtime.radix_index import RadixPrefixIndex
+
+    config = MemoryCacheConfig(
+        max_memory_mb=10, max_entries=64, hybrid_reuse_max_entries=2
+    )
+    cache = MemoryAwarePrefixCache(MagicMock(), config, RadixPrefixIndex())
+    prompt = list(range(1000, 1100))
+    boundary = prompt[:-7]
+    cache.store(boundary, _hybrid_cache(), evict_prefixes=False)
+    cache.store(prompt, _hybrid_cache(), evict_prefixes=False)
+
+    result, remaining = cache.fetch(prompt)
+
+    assert result is not None
+    assert remaining == prompt[-7:]
+    assert cache._last_match_type == "prefix"
+
+
 def test_hybrid_prefix_extension_hit_when_enabled(reuse_cache):
     """The #214 growing-conversation shape works again under the opt-in:
     stored ``[P + R1]`` serves turn-2's ``[P + R1 + M2]`` as a prefix match

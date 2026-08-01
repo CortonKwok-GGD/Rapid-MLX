@@ -76,6 +76,35 @@ def test_thinking_mode_keeps_implicit_reasoning_across_many_chunks() -> None:
     assert "".join(content) == "There are 23 chickens and 12 rabbits."
 
 
+def test_unspecified_thinking_defaults_to_implicit_reasoning_streaming() -> None:
+    parser = DeepSeekV4ReasoningParser()
+    parser.configure_request(enable_thinking=None)
+
+    thought = parser.extract_reasoning_streaming(
+        "", "private scratch", "private scratch"
+    )
+    answer = parser.extract_reasoning_streaming(
+        "private scratch",
+        "private scratch</think>public answer",
+        "</think>public answer",
+    )
+
+    assert thought is not None and thought.reasoning == "private scratch"
+    assert thought.content is None
+    assert answer is not None and answer.content == "public answer"
+
+
+def test_unspecified_thinking_defaults_to_implicit_reasoning_nonstreaming() -> None:
+    parser = DeepSeekV4ReasoningParser()
+
+    reasoning, content = parser.extract_reasoning(
+        "private scratch</think>public answer", enable_thinking=None
+    )
+
+    assert reasoning == "private scratch"
+    assert content == "public answer"
+
+
 def test_dsml_tool_start_implicitly_closes_reasoning() -> None:
     parser = DeepSeekV4ReasoningParser()
     parser.configure_request(enable_thinking=True)

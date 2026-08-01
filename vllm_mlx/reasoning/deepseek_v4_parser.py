@@ -33,7 +33,10 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
         self._buffer = ""
 
     def configure_request(self, *, enable_thinking: bool | None = None) -> None:
-        self.reset_state(start_in_thinking=enable_thinking is True)
+        # DeepSeek V4 emits implicit scratch reasoning without an opening
+        # marker.  Treat an unspecified request like the model's default
+        # thinking mode; only an explicit False starts in visible content.
+        self.reset_state(start_in_thinking=enable_thinking is not False)
 
     @staticmethod
     def _partial_control_suffix(text: str) -> int:
@@ -103,7 +106,7 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
         model_output: str,
         enable_thinking: bool | None = None,
     ) -> tuple[str | None, str | None]:
-        self.reset_state(start_in_thinking=enable_thinking is True)
+        self.reset_state(start_in_thinking=enable_thinking is not False)
         parsed = self._consume(model_output, final=True)
         if parsed is None:
             return None, None

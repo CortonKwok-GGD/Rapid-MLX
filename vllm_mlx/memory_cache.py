@@ -1686,8 +1686,15 @@ class MemoryAwarePrefixCache:
         # on shared-system-prompt workloads.
         if self._radix_index is not None:
             try:
+                # A non-trimmable exact entry cannot seed generation because
+                # the scheduler re-forwards the final prompt token. Ask the
+                # radix directly for a strict prefix instead of accepting its
+                # unusable exact terminal and relying on the sorted fallback.
+                radix_query = (
+                    tokens_key[:-1] if unusable_non_trimmable_exact else tokens_key
+                )
                 matched_tokens, matched_key = self._radix_index.longest_prefix(
-                    tokens_key
+                    radix_query
                 )
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning(f"[radix] longest_prefix failed: {exc}")
