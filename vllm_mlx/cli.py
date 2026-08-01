@@ -2201,9 +2201,14 @@ def _resolve_hybrid_cache_entries(
     from .model_aliases import resolve_profile as _resolve_alias
 
     profile = _resolve_alias(model_name)
-    if profile is not None and profile.is_hybrid:
+    from .utils.deepseek_v4_0731 import is_deepseek_v4_0731
+
+    needs_bounded_reuse = (profile is not None and profile.is_hybrid) or (
+        is_deepseek_v4_0731(model_name)
+    )
+    if needs_bounded_reuse:
         _logging.getLogger(__name__).info(
-            "Hybrid model detected with --enable-prefix-cache: "
+            "Non-trimmable model cache detected with --enable-prefix-cache: "
             "auto-setting --hybrid-cache-entries=%d "
             "(pass --hybrid-cache-entries 0 to disable)",
             _DEFAULT_HYBRID_CACHE_ENTRIES,

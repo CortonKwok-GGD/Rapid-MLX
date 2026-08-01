@@ -85,6 +85,19 @@ class TestPromptCacheSnapshot:
         assert stored_tokens == prompt_tokens
         assert stored_cache is fake_cache_layers
 
+    def test_prompt_only_snapshot_does_not_mask_internal_n_minus_one_boundary(self):
+        scheduler = _make_scheduler_with_cache()
+        scheduler.config.hybrid_cache_entries = 8
+        request = _register(
+            scheduler, "req-boundary", uid=102, prompt_tokens=[10, 20, 30, 40]
+        )
+        request._cache_snapshot_boundary = 3
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        scheduler._prompt_cache_save_cb(102, [object()])
+
+        scheduler.memory_aware_cache.store.assert_not_called()
+
     def test_snapshot_skips_mid_prompt_chunks(self):
         scheduler = _make_scheduler_with_cache()
         _register(scheduler, "req-1", uid=101, prompt_tokens=[1, 2, 3])
@@ -272,6 +285,42 @@ class TestBoundarySnapshot:
             scheduler.memory_aware_cache.store.call_args.kwargs.get("evict_prefixes")
             is False
         )
+
+    def test_snapshot_stores_at_internal_exact_hit_boundary(self):
+        """N-1 snapshots make non-trimmable exact repeats prefix extensions."""
+        scheduler = _make_scheduler_with_cache()
+        scheduler._extract_cache_states = MagicMock(return_value=[{"k": "v"}])
+        scheduler._reconstruct_cache_from_states = MagicMock(
+            return_value=["reconstructed-cache"]
+        )
+        prompt_tokens = list(range(10))
+        request = self._register_with_boundary(
+            scheduler,
+            "req-exact",
+            uid=102,
+            prompt_tokens=prompt_tokens,
+            prefix_boundary=0,
+        )
+        request._cache_snapshot_boundary = 9
+
+        bg = MagicMock()
+        bg.extract_cache.return_value = {102: (["raw-cache"], prompt_tokens[:9])}
+        scheduler.batch_generator = bg
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+
+        scheduler._snapshot_boundary_segments(
+            [
+                SimpleNamespace(
+                    uid=102,
+                    progress=(9, 10),
+                    end_of_segment=True,
+                    end_of_prompt=False,
+                )
+            ]
+        )
+
+        stored_tokens = scheduler.memory_aware_cache.store.call_args.args[0]
+        assert stored_tokens == prompt_tokens[:-1]
 
     def test_snapshot_skips_end_of_prompt_responses(self):
         """end_of_prompt is the whole-prompt promotion — handled by the
