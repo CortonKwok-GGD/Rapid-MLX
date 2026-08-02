@@ -94,6 +94,7 @@ from ..service.helpers import (
     _resolve_max_tokens,
     _resolve_temperature,
     _resolve_top_p,
+    _uses_deepseek_v4_reasoning,
     _validate_model_name,
     _wait_with_disconnect,
     build_extended_sampling_kwargs,
@@ -397,7 +398,13 @@ async def create_response(request: Request):
         # it through the sanitized 400 envelope — no more ``str(e)``
         # echo that leaked the model class name and pydantic version.
         try:
-            openai_request = responses_to_openai(responses_request)
+            cfg_for_adapter = get_config()
+            openai_request = responses_to_openai(
+                responses_request,
+                preserve_developer_role=(
+                    cfg_for_adapter.tool_call_parser == "deepseek_v4_0731"
+                ),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -1503,6 +1510,7 @@ async def _non_stream(
         reasoning_text,
         tool_calls,
         finish_reason,
+        include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
     )
 
     openai_response = ChatCompletionResponse(
@@ -1949,10 +1957,18 @@ async def _stream_responses(
                 reasoning_parser = get_parser(cfg.reasoning_parser_name)()
             except Exception:
                 pass
-        if chat_kwargs.get("enable_thinking") is False:
+        if (
+            chat_kwargs.get("enable_thinking") is False
+            and getattr(reasoning_parser, "sanitize_when_thinking_disabled", False)
+            is not True
+        ):
             reasoning_parser = None
         if reasoning_parser:
-            reasoning_parser.reset_state()
+            configure_request = getattr(reasoning_parser, "configure_request", None)
+            if callable(configure_request):
+                configure_request(enable_thinking=chat_kwargs.get("enable_thinking"))
+            else:
+                reasoning_parser.reset_state()
 
         # Per-request reasoning cap (upstream vLLM PR #20859 backport).
         # Responses SSE drops reasoning to the floor (Codex doesn't read
@@ -3200,6 +3216,7 @@ async def _stream_responses(
                 reasoning_text=accumulated_reasoning_text,
                 tool_calls=None,
                 finish_reason=last_finish_reason,
+                include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
             )
             if rescue_text:
                 rescue_output_index = len(completed_output)
