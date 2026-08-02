@@ -1288,6 +1288,23 @@ def _apply_reasoning_cutoff_notice(
     return _build_reasoning_rescue_payload(reasoning_text)
 
 
+def _uses_deepseek_v4_reasoning(cfg, parser=None) -> bool:
+    """Resolve DeepSeek V4 across explicit, auto-config, and runtime forms."""
+    if getattr(cfg, "reasoning_parser_name", None) == "deepseek_v4":
+        return True
+    candidates = (parser, getattr(cfg, "reasoning_parser", None))
+    if any(
+        candidate is not None
+        and candidate.__class__.__name__ == "DeepSeekV4ReasoningParser"
+        for candidate in candidates
+    ):
+        return True
+    model_ref = str(
+        getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None) or ""
+    ).lower()
+    return "deepseek-v4" in model_ref or "deepseek_v4" in model_ref
+
+
 # OpenAI-spec closed enum for ``response_format.type``. Any value outside
 # this set used to be silently accepted (defaulted to "text" by
 # ``build_json_system_prompt``) so a client typo like ``"xml"`` or an

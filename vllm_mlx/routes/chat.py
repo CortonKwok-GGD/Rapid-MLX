@@ -98,6 +98,7 @@ from ..service.helpers import (
     _scan_messages_for_lone_surrogates,
     _should_start_in_thinking,
     _tool_use_required_named_suffix,
+    _uses_deepseek_v4_reasoning,
     _validate_model_name,
     _validate_response_format,
     _validate_tool_call_params,
@@ -117,23 +118,6 @@ logger = logging.getLogger(__name__)
 _SAFE_DEEPSEEK_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 router = APIRouter()
-
-
-def _uses_deepseek_v4_reasoning(cfg, parser=None) -> bool:
-    """Resolve the active parser across CLI auto-config/runtime forms."""
-    if getattr(cfg, "reasoning_parser_name", None) == "deepseek_v4":
-        return True
-    candidates = (parser, getattr(cfg, "reasoning_parser", None))
-    if any(
-        candidate is not None
-        and candidate.__class__.__name__ == "DeepSeekV4ReasoningParser"
-        for candidate in candidates
-    ):
-        return True
-    model_ref = str(
-        getattr(cfg, "model_path", None) or getattr(cfg, "model_name", None) or ""
-    ).lower()
-    return "deepseek-v4" in model_ref or "deepseek_v4" in model_ref
 
 
 def _degenerate_signal(

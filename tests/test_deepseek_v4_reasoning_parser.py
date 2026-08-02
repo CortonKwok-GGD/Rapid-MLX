@@ -6,8 +6,10 @@ from vllm_mlx.api.constants import REASONING_CUTOFF_SENTINEL
 from vllm_mlx.config import ServerConfig
 from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.reasoning.deepseek_v4_parser import DeepSeekV4ReasoningParser
-from vllm_mlx.routes.chat import _uses_deepseek_v4_reasoning
-from vllm_mlx.service.helpers import _apply_reasoning_cutoff_notice
+from vllm_mlx.service.helpers import (
+    _apply_reasoning_cutoff_notice,
+    _uses_deepseek_v4_reasoning,
+)
 from vllm_mlx.service.postprocessor import StreamingPostProcessor
 
 
@@ -52,7 +54,7 @@ def test_disabled_thinking_absorbs_opener_without_creating_reasoning() -> None:
 
     assert parsed is not None
     assert parsed.reasoning is None
-    assert parsed.content == "beforeinsideafter"
+    assert parsed.content == "beforeafter"
 
 
 def test_thinking_mode_routes_reasoning_then_content() -> None:

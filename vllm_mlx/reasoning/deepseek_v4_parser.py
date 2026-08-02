@@ -38,6 +38,7 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
         self._thinking_enabled = (
             start_in_thinking if thinking_enabled is None else thinking_enabled
         )
+        self._suppress_reasoning = False
         self._buffer = ""
 
     def configure_request(self, *, enable_thinking: bool | None = None) -> None:
@@ -65,7 +66,7 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
         reasoning: list[str] = []
 
         def emit(value: str) -> None:
-            if not value:
+            if not value or self._suppress_reasoning:
                 return
             (reasoning if self._in_reasoning else content).append(value)
 
@@ -90,13 +91,16 @@ class DeepSeekV4ReasoningParser(ReasoningParser):
                 # sanitizers; never create a reasoning channel the request
                 # opted out of. Otherwise absorb duplicate openers while
                 # remaining in reasoning mode.
+                self._suppress_reasoning = not self._thinking_enabled
                 self._in_reasoning = self._thinking_enabled
             elif token == _THINK_END:
                 # vLLM also absorbs a bare closer in CONTENT state.
+                self._suppress_reasoning = False
                 self._in_reasoning = False
             else:
                 # A DSML tool call is always outside reasoning. Preserve its
                 # opener for the downstream DeepSeek V4 tool parser.
+                self._suppress_reasoning = False
                 self._in_reasoning = False
                 content.append(token)
 

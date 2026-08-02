@@ -55,6 +55,7 @@ from ..service.helpers import (
     _resolve_temperature,
     _resolve_top_p,
     _tool_use_required_named_suffix,
+    _uses_deepseek_v4_reasoning,
     _validate_model_name,
     _validate_tool_call_params,
     _wait_with_disconnect,
@@ -1036,7 +1037,7 @@ async def create_anthropic_message(
             reasoning_text,
             tool_calls,
             finish_reason,
-            include_reasoning_tail=(cfg.reasoning_parser_name != "deepseek_v4"),
+            include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
         )
 
         openai_response = ChatCompletionResponse(
