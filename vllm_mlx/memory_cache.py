@@ -112,6 +112,119 @@ _TOKENS_FORMAT_VERSION_IN_INDEX = 3  # bumped from 2
 _TOKEN_STRUCT_FMT = "<i"
 _TOKEN_BYTES = 4
 
+# mlx-lm's prompt-cache serializer forwards the flattened cache state directly
+# to ``mx.save_safetensors``.  Safetensors cannot represent ``None`` or a
+# zero-element MLX array: the former currently raises ``std::bad_cast`` and the
+# latter raises ``Cannot serialize an empty array``.  DeepSeek V4 legitimately
+# uses both shapes for optional pooling/remainder/overlap state, so encode those
+# leaves as one-element sentinels and describe the original value in embedded
+# metadata.  The transformation is persistence-only; live cache objects are
+# never mutated.
+_OPTIONAL_STATE_METADATA = "__rapid_mlx_optional_state_v1"
+
+
+def _save_prompt_cache_compat(path: str, cache: list[Any], metadata: dict[str, str]):
+    """Save an mlx-lm cache, losslessly encoding optional/empty state leaves."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    cache_data = [c.state for c in cache]
+    flat_data = list(tree_flatten(cache_data))
+    optional: dict[str, dict[str, Any]] = {}
+    encoded: dict[str, Any] = {}
+    for key, value in flat_data:
+        if value is None:
+            optional[key] = {"kind": "none"}
+            encoded[key] = mx.array([0], dtype=mx.uint8)
+        elif hasattr(value, "size") and int(value.size) == 0:
+            optional[key] = {"kind": "empty", "shape": list(value.shape)}
+            # Preserve dtype in the sentinel itself; the loader uses it when
+            # recreating the original zero-element shape.
+            encoded[key] = mx.zeros((1,), dtype=value.dtype)
+        else:
+            encoded[key] = value
+
+    if not optional:
+        from mlx_lm.models.cache import save_prompt_cache
+
+        return save_prompt_cache(path, cache, metadata=metadata)
+
+    cache_info = [c.meta_state for c in cache]
+    cache_classes = [type(c).__name__ for c in cache]
+    embedded = dict(metadata)
+    embedded[_OPTIONAL_STATE_METADATA] = json.dumps(optional, separators=(",", ":"))
+    cache_metadata = dict(tree_flatten([cache_info, embedded, cache_classes]))
+    mx.save_safetensors(path, encoded, cache_metadata)
+
+
+def _load_prompt_cache_compat(path: str) -> list[Any]:
+    """Load prompt caches written by either mlx-lm or the optional-state codec."""
+    import mlx.core as mx
+    from mlx.utils import tree_unflatten
+
+    arrays, flat_metadata = mx.load(path, return_metadata=True)
+    metadata_tree = tree_unflatten(list(flat_metadata.items()))
+    info, metadata, classes = metadata_tree
+    marker = metadata.get(_OPTIONAL_STATE_METADATA) if metadata else None
+    if not marker:
+        from mlx_lm.models.cache import load_prompt_cache
+
+        return load_prompt_cache(path)
+
+    optional = json.loads(marker)
+    flat_arrays = dict(arrays.items())
+    for key, spec in optional.items():
+        sentinel = flat_arrays.get(key)
+        if sentinel is None:
+            raise ValueError(f"optional-state sentinel {key!r} is missing")
+        kind = spec.get("kind")
+        if kind == "none":
+            flat_arrays[key] = None
+        elif kind == "empty":
+            shape = tuple(int(dim) for dim in spec.get("shape", ()))
+            if not shape or all(dim > 0 for dim in shape):
+                raise ValueError(f"invalid empty-array shape for {key!r}: {shape!r}")
+            flat_arrays[key] = mx.zeros(shape, dtype=sentinel.dtype)
+        else:
+            raise ValueError(f"unknown optional-state kind for {key!r}: {kind!r}")
+    states = tree_unflatten(list(flat_arrays.items()))
+
+    # CacheList.from_state resolves nested class names through the globals of
+    # mlx_lm.models.cache.  Register our vendored DeepSeek classes only for the
+    # reconstruction call and restore the upstream module immediately after.
+    import mlx_lm.models.cache as mlx_cache
+
+    from vllm_mlx.models.deepseek_v4_cache import (
+        BatchDeepseekV4PoolingCache,
+        BatchPoolingCache,
+        DeepseekV4PoolingCache,
+        PoolingCache,
+    )
+
+    vendored = (
+        PoolingCache,
+        BatchPoolingCache,
+        DeepseekV4PoolingCache,
+        BatchDeepseekV4PoolingCache,
+    )
+    previous = {
+        cls.__name__: getattr(mlx_cache, cls.__name__, None) for cls in vendored
+    }
+    try:
+        for cls in vendored:
+            setattr(mlx_cache, cls.__name__, cls)
+        return [
+            getattr(mlx_cache, name).from_state(state, meta_state)
+            for name, state, meta_state in zip(classes, states, info)
+        ]
+    finally:
+        for cls in vendored:
+            old = previous[cls.__name__]
+            if old is None:
+                delattr(mlx_cache, cls.__name__)
+            else:
+                setattr(mlx_cache, cls.__name__, old)
+
 
 def _write_tokens_bin_v3(path: str, tokens: list[int], save_uuid: str) -> None:
     """Write tokens.bin with magic + length + save_uuid + int32 LE tokens.
@@ -2386,7 +2499,7 @@ class MemoryAwarePrefixCache:
         t0 = _time.monotonic()
 
         try:
-            from mlx_lm.models.cache import save_prompt_cache
+            import mlx_lm.models.cache  # noqa: F401
         except ImportError:
             logger.warning("[cache_persist] mlx_lm not available, cannot save")
             return False
@@ -2544,7 +2657,7 @@ class MemoryAwarePrefixCache:
                     if any(isinstance(c, QuantizedKVCache) for c in entry.cache)
                     else entry.cache
                 )
-                save_prompt_cache(
+                _save_prompt_cache_compat(
                     entry_path,
                     persist_cache,
                     metadata={"num_tokens": str(len(tokens_key))},
@@ -3097,7 +3210,7 @@ class MemoryAwarePrefixCache:
         t0 = _time.monotonic()
 
         try:
-            from mlx_lm.models.cache import load_prompt_cache
+            import mlx_lm.models.cache  # noqa: F401
         except ImportError:
             logger.warning("[cache_persist] mlx_lm not available, cannot load")
             return 0
@@ -3371,7 +3484,7 @@ class MemoryAwarePrefixCache:
                     continue
 
                 # Load KV cache (header completeness already validated above).
-                cache = load_prompt_cache(entry_path)
+                cache = _load_prompt_cache_compat(entry_path)
 
                 # Invariant: a well-formed entry has cache.offset == len(tokens).
                 # Any deviation means BUG A poisoning slipped through earlier
