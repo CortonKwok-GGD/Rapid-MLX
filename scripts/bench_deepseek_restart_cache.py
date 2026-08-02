@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -167,6 +168,7 @@ def main() -> int:
     if not model.is_dir():
         parser.error(f"model directory does not exist: {model}")
     args.model = str(model)
+    auto_work_dir = args.work_dir is None
     work = Path(args.work_dir).resolve() if args.work_dir else Path(tempfile.mkdtemp())
     home = work / "home"
     home.mkdir(parents=True, exist_ok=True)
@@ -212,11 +214,13 @@ def main() -> int:
         "restart_cache_hit": hit,
         "restart_cache_ratio": cache_ratio,
         "ttft_speedup": speedup,
-        "work_dir": str(work),
+        "work_dir": None if auto_work_dir else str(work),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     if not identical or not hit:
         return 1
+    if auto_work_dir:
+        shutil.rmtree(work)
     return 0
 
 

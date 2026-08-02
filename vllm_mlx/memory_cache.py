@@ -121,6 +121,7 @@ _TOKEN_BYTES = 4
 # metadata.  The transformation is persistence-only; live cache objects are
 # never mutated.
 _OPTIONAL_STATE_METADATA = "__rapid_mlx_optional_state_v1"
+_PROMPT_CACHE_CLASS_REGISTRY_LOCK = threading.RLock()
 
 
 def _save_prompt_cache_compat(path: str, cache: list[Any], metadata: dict[str, str]):
@@ -207,23 +208,24 @@ def _load_prompt_cache_compat(path: str) -> list[Any]:
         DeepseekV4PoolingCache,
         BatchDeepseekV4PoolingCache,
     )
-    previous = {
-        cls.__name__: getattr(mlx_cache, cls.__name__, None) for cls in vendored
-    }
-    try:
-        for cls in vendored:
-            setattr(mlx_cache, cls.__name__, cls)
-        return [
-            getattr(mlx_cache, name).from_state(state, meta_state)
-            for name, state, meta_state in zip(classes, states, info)
-        ]
-    finally:
-        for cls in vendored:
-            old = previous[cls.__name__]
-            if old is None:
-                delattr(mlx_cache, cls.__name__)
-            else:
-                setattr(mlx_cache, cls.__name__, old)
+    with _PROMPT_CACHE_CLASS_REGISTRY_LOCK:
+        previous = {
+            cls.__name__: getattr(mlx_cache, cls.__name__, None) for cls in vendored
+        }
+        try:
+            for cls in vendored:
+                setattr(mlx_cache, cls.__name__, cls)
+            return [
+                getattr(mlx_cache, name).from_state(state, meta_state)
+                for name, state, meta_state in zip(classes, states, info)
+            ]
+        finally:
+            for cls in vendored:
+                old = previous[cls.__name__]
+                if old is None:
+                    delattr(mlx_cache, cls.__name__)
+                else:
+                    setattr(mlx_cache, cls.__name__, old)
 
 
 def _write_tokens_bin_v3(path: str, tokens: list[int], save_uuid: str) -> None:

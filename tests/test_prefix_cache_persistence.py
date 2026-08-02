@@ -207,10 +207,18 @@ def test_deepseek_v4_prefix_cache_survives_real_process_restart(tmp_path):
     )
 
     first = subprocess.run(
-        [sys.executable, "-c", writer], capture_output=True, text=True, check=True
+        [sys.executable, "-c", writer],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
     )
     second = subprocess.run(
-        [sys.executable, "-c", reader], capture_output=True, text=True, check=True
+        [sys.executable, "-c", reader],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
     )
     assert json.loads(first.stdout.strip()) == {"saved": 1}
     assert json.loads(second.stdout.strip()) == {
