@@ -165,9 +165,14 @@ def test_deepseek_v4_populated_cache_uses_vendored_class_on_load(tmp_path):
     rotating.update_and_fetch(values, -values)
     pooling = DeepseekV4PoolingCache(ratio=4)
     pooling.update_and_fetch(values.squeeze(axis=1))
+    pooling.buf_kv = mx.ones((1, 4, 4), dtype=mx.float32)
+    pooling.buf_gate = mx.ones((1, 4, 4), dtype=mx.float32)
+    pooling.remainder = 1
+    pooling.overlap_kv = mx.ones((1, 1, 2), dtype=mx.float32)
+    pooling.overlap_gate = mx.ones((1, 1, 2), dtype=mx.float32)
 
     path = str(tmp_path / "deepseek-populated.safetensors")
-    _save_prompt_cache_compat(path, [CacheList(rotating, pooling)], {})
+    save_prompt_cache(path, [CacheList(rotating, pooling)], metadata={})
     restored = _load_prompt_cache_compat(path)
 
     restored_pooling = restored[0].caches[1]

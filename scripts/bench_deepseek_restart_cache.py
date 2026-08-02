@@ -173,6 +173,7 @@ def main() -> int:
     parser.add_argument("--prompt-repetitions", type=int, default=1200)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--min-cache-ratio", type=float, default=0.9)
+    parser.add_argument("--min-ttft-speedup", type=float, default=1.1)
     parser.add_argument("--work-dir", help="Keep logs/cache here instead of a temp dir")
     args = parser.parse_args()
 
@@ -219,14 +220,29 @@ def main() -> int:
             if cold["ttft_s"] and restart["ttft_s"]
             else None
         )
-        succeeded = identical and hit
+        expected_output = (
+            cold["content"].strip() == "CACHE_RESTART_OK"
+            and restart["content"].strip() == "CACHE_RESTART_OK"
+        )
+        no_reasoning_leak = not cold["reasoning"] and not restart["reasoning"]
+        ttft_verified = speedup is not None and speedup >= args.min_ttft_speedup
+        succeeded = (
+            identical
+            and expected_output
+            and no_reasoning_leak
+            and hit
+            and ttft_verified
+        )
         summary = {
             "cold": cold,
             "restart": restart,
             "output_identical": identical,
+            "expected_output": expected_output,
+            "no_reasoning_leak": no_reasoning_leak,
             "restart_cache_hit": hit,
             "restart_cache_ratio": cache_ratio,
             "ttft_speedup": speedup,
+            "ttft_verified": ttft_verified,
             "work_dir": None if auto_work_dir else str(work),
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
