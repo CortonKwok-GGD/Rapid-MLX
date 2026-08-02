@@ -1509,6 +1509,7 @@ async def _non_stream(
         reasoning_text,
         tool_calls,
         finish_reason,
+        include_reasoning_tail=(cfg.reasoning_parser_name != "deepseek_v4"),
     )
 
     openai_response = ChatCompletionResponse(
@@ -3214,6 +3215,7 @@ async def _stream_responses(
                 reasoning_text=accumulated_reasoning_text,
                 tool_calls=None,
                 finish_reason=last_finish_reason,
+                include_reasoning_tail=(cfg.reasoning_parser_name != "deepseek_v4"),
             )
             if rescue_text:
                 rescue_output_index = len(completed_output)

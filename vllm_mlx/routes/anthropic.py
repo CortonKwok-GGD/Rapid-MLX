@@ -1036,6 +1036,7 @@ async def create_anthropic_message(
             reasoning_text,
             tool_calls,
             finish_reason,
+            include_reasoning_tail=(cfg.reasoning_parser_name != "deepseek_v4"),
         )
 
         openai_response = ChatCompletionResponse(

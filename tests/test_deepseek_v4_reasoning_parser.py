@@ -1,8 +1,13 @@
+from types import SimpleNamespace
+
 import pytest
 
+from vllm_mlx.api.constants import REASONING_CUTOFF_SENTINEL
 from vllm_mlx.config import ServerConfig
 from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.reasoning.deepseek_v4_parser import DeepSeekV4ReasoningParser
+from vllm_mlx.routes.chat import _uses_deepseek_v4_reasoning
+from vllm_mlx.service.helpers import _apply_reasoning_cutoff_notice
 from vllm_mlx.service.postprocessor import StreamingPostProcessor
 
 
@@ -177,3 +182,34 @@ def test_chat_postprocessor_fails_closed_on_request_config_error(monkeypatch) ->
 
     with pytest.raises(RuntimeError, match="cannot establish reasoning state"):
         StreamingPostProcessor(cfg, enable_thinking=None)
+
+
+def test_truncated_deepseek_reasoning_notice_never_copies_reasoning_tail() -> None:
+    content = _apply_reasoning_cutoff_notice(
+        None,
+        "private scratch that must remain reasoning-only",
+        None,
+        "length",
+        include_reasoning_tail=False,
+    )
+
+    assert content == REASONING_CUTOFF_SENTINEL
+    assert "private scratch" not in content
+
+
+def test_runtime_deepseek_detection_covers_auto_config_forms() -> None:
+    empty_cfg = SimpleNamespace(
+        reasoning_parser_name=None,
+        reasoning_parser=None,
+        model_path="/models/DeepSeek-V4-Flash-0731-MXFP4-MLX",
+        model_name=None,
+    )
+    assert _uses_deepseek_v4_reasoning(empty_cfg)
+
+    generic_cfg = SimpleNamespace(
+        reasoning_parser_name=None,
+        reasoning_parser=None,
+        model_path="/models/other",
+        model_name=None,
+    )
+    assert _uses_deepseek_v4_reasoning(generic_cfg, DeepSeekV4ReasoningParser())

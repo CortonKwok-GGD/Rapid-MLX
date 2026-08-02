@@ -1211,6 +1211,8 @@ def _apply_reasoning_cutoff_notice(
     reasoning_text: str | None,
     tool_calls: list | None,
     finish_reason: str | None,
+    *,
+    include_reasoning_tail: bool = True,
 ) -> str | None:
     """R12-8 / H-01: rescue ``content`` when generation was cut short
     mid-think and the strict rescue path left it empty.
@@ -1281,6 +1283,8 @@ def _apply_reasoning_cutoff_notice(
         return final_content
     if not reasoning_text or not reasoning_text.strip():
         return final_content
+    if not include_reasoning_tail:
+        return REASONING_CUTOFF_SENTINEL
     return _build_reasoning_rescue_payload(reasoning_text)
 
 
