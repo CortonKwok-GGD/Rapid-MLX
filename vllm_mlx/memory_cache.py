@@ -167,12 +167,7 @@ def _load_prompt_cache_compat(path: str) -> list[Any]:
     metadata_tree = tree_unflatten(list(flat_metadata.items()))
     info, metadata, classes = metadata_tree
     marker = metadata.get(_OPTIONAL_STATE_METADATA) if metadata else None
-    if not marker:
-        from mlx_lm.models.cache import load_prompt_cache
-
-        return load_prompt_cache(path)
-
-    optional = json.loads(marker)
+    optional = json.loads(marker) if marker else {}
     flat_arrays = dict(arrays.items())
     for key, spec in optional.items():
         sentinel = flat_arrays.get(key)

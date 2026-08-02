@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,15 @@ def _get_json(url: str, timeout: float = 2.0) -> dict:
         return json.load(response)
 
 
+def _assert_port_available(port: int) -> None:
+    """Reject a benchmark port already owned by an unrelated server."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError as exc:
+            raise RuntimeError(f"benchmark port {port} is already in use") from exc
+
+
 def _wait_ready(base_url: str, process: subprocess.Popen, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -36,7 +46,8 @@ def _wait_ready(base_url: str, process: subprocess.Popen, timeout: float) -> Non
                 f"server exited before readiness (rc={process.returncode})"
             )
         try:
-            if _get_json(f"{base_url}/v1/models").get("data"):
+            models = _get_json(f"{base_url}/v1/models").get("data") or []
+            if any(model.get("id") == "deepseek-restart-bench" for model in models):
                 return
         except (OSError, urllib.error.URLError, json.JSONDecodeError):
             pass
@@ -183,6 +194,7 @@ def main() -> int:
     try:
         for cycle in ("cold", "restart"):
             log_path = work / f"server-{cycle}.log"
+            _assert_port_available(args.port)
             process = _start_server(args, str(home), log_path)
             try:
                 _wait_ready(base_url, process, args.ready_timeout)

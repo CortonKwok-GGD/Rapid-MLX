@@ -154,6 +154,27 @@ def test_deepseek_v4_cachelist_optional_state_roundtrip(tmp_path, optional_shape
         assert restored_pooling.pooled.dtype == mx.float16
 
 
+def test_deepseek_v4_populated_cache_uses_vendored_class_on_load(tmp_path):
+    """Unmarked upstream-format files still restore vendored cache classes."""
+    from mlx_lm.models.cache import CacheList, RotatingKVCache
+
+    from vllm_mlx.models.deepseek_v4_cache import DeepseekV4PoolingCache
+
+    rotating = RotatingKVCache(max_size=128)
+    values = mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4)
+    rotating.update_and_fetch(values, -values)
+    pooling = DeepseekV4PoolingCache(ratio=4)
+    pooling.update_and_fetch(values.squeeze(axis=1))
+
+    path = str(tmp_path / "deepseek-populated.safetensors")
+    _save_prompt_cache_compat(path, [CacheList(rotating, pooling)], {})
+    restored = _load_prompt_cache_compat(path)
+
+    restored_pooling = restored[0].caches[1]
+    assert isinstance(restored_pooling, DeepseekV4PoolingCache)
+    mx.eval(restored_pooling.state)
+
+
 def test_deepseek_v4_prefix_cache_survives_real_process_restart(tmp_path):
     """Process A saves; fresh process B loads and serves a strict-prefix hit."""
     cache_dir = str(tmp_path / "deepseek-restart")
@@ -191,7 +212,7 @@ def test_deepseek_v4_prefix_cache_survives_real_process_restart(tmp_path):
     reader = common + textwrap.dedent(
         f"""
         restored = fresh()
-        loaded = restored.load_from_disk({cache_dir!r}, protected_import=False)
+        loaded = restored.load_from_disk({cache_dir!r})
         hit, remaining = restored.fetch([10, 20, 30, 40])
         layer = hit[0].caches[0]
         mx.eval(layer.state)
