@@ -21,6 +21,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 
@@ -181,7 +182,9 @@ def main() -> int:
     args.model = str(model)
     auto_work_dir = args.work_dir is None
     work = Path(args.work_dir).resolve() if args.work_dir else Path(tempfile.mkdtemp())
-    home = work / "home"
+    # A unique HOME guarantees the cold cycle cannot inherit a prefix cache
+    # from an earlier run, even when the caller intentionally reuses work-dir.
+    home = work / f"home-{uuid.uuid4().hex}"
     home.mkdir(parents=True, exist_ok=True)
     base_url = f"http://127.0.0.1:{args.port}"
     context = (
@@ -191,6 +194,7 @@ def main() -> int:
     )
 
     results = []
+    succeeded = False
     try:
         for cycle in ("cold", "restart"):
             log_path = work / f"server-{cycle}.log"
@@ -203,37 +207,35 @@ def main() -> int:
                 results.append(result)
             finally:
                 _stop_server(process, args.shutdown_budget + 30)
-    except Exception:
-        print(f"benchmark artifacts retained at {work}", file=sys.stderr)
-        raise
-
-    cold, restart = results
-    identical = (cold["content"], cold["reasoning"]) == (
-        restart["content"],
-        restart["reasoning"],
-    )
-    cache_ratio = restart["cached_tokens"] / max(restart["prompt_tokens"], 1)
-    hit = cache_ratio >= args.min_cache_ratio
-    speedup = (
-        cold["ttft_s"] / restart["ttft_s"]
-        if cold["ttft_s"] and restart["ttft_s"]
-        else None
-    )
-    summary = {
-        "cold": cold,
-        "restart": restart,
-        "output_identical": identical,
-        "restart_cache_hit": hit,
-        "restart_cache_ratio": cache_ratio,
-        "ttft_speedup": speedup,
-        "work_dir": None if auto_work_dir else str(work),
-    }
-    print(json.dumps(summary, indent=2, sort_keys=True))
-    if not identical or not hit:
-        return 1
-    if auto_work_dir:
-        shutil.rmtree(work)
-    return 0
+        cold, restart = results
+        identical = (cold["content"], cold["reasoning"]) == (
+            restart["content"],
+            restart["reasoning"],
+        )
+        cache_ratio = restart["cached_tokens"] / max(restart["prompt_tokens"], 1)
+        hit = cache_ratio >= args.min_cache_ratio
+        speedup = (
+            cold["ttft_s"] / restart["ttft_s"]
+            if cold["ttft_s"] and restart["ttft_s"]
+            else None
+        )
+        succeeded = identical and hit
+        summary = {
+            "cold": cold,
+            "restart": restart,
+            "output_identical": identical,
+            "restart_cache_hit": hit,
+            "restart_cache_ratio": cache_ratio,
+            "ttft_speedup": speedup,
+            "work_dir": None if auto_work_dir else str(work),
+        }
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if succeeded else 1
+    finally:
+        if auto_work_dir:
+            shutil.rmtree(work, ignore_errors=True)
+        elif not succeeded:
+            print(f"benchmark artifacts retained at {work}", file=sys.stderr)
 
 
 if __name__ == "__main__":

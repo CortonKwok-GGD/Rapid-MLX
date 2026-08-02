@@ -121,7 +121,19 @@ _TOKEN_BYTES = 4
 # metadata.  The transformation is persistence-only; live cache objects are
 # never mutated.
 _OPTIONAL_STATE_METADATA = "__rapid_mlx_optional_state_v1"
-_PROMPT_CACHE_CLASS_REGISTRY_LOCK = threading.RLock()
+_VENDORED_STATE_METADATA = "__rapid_mlx_vendored_cache_classes_v1"
+
+
+def _vendored_cache_class_names(cache: list[Any]) -> set[str]:
+    """Return vendored cache types present in a possibly nested cache list."""
+    found: set[str] = set()
+    pending = list(cache)
+    while pending:
+        item = pending.pop()
+        if type(item).__module__ == "vllm_mlx.models.deepseek_v4_cache":
+            found.add(type(item).__name__)
+        pending.extend(getattr(item, "caches", ()))
+    return found
 
 
 def _save_prompt_cache_compat(path: str, cache: list[Any], metadata: dict[str, str]):
@@ -145,7 +157,8 @@ def _save_prompt_cache_compat(path: str, cache: list[Any], metadata: dict[str, s
         else:
             encoded[key] = value
 
-    if not optional:
+    vendored = _vendored_cache_class_names(cache)
+    if not optional and not vendored:
         from mlx_lm.models.cache import save_prompt_cache
 
         return save_prompt_cache(path, cache, metadata=metadata)
@@ -153,7 +166,9 @@ def _save_prompt_cache_compat(path: str, cache: list[Any], metadata: dict[str, s
     cache_info = [c.meta_state for c in cache]
     cache_classes = [type(c).__name__ for c in cache]
     embedded = dict(metadata)
-    embedded[_OPTIONAL_STATE_METADATA] = json.dumps(optional, separators=(",", ":"))
+    if optional:
+        embedded[_OPTIONAL_STATE_METADATA] = json.dumps(optional, separators=(",", ":"))
+    embedded[_VENDORED_STATE_METADATA] = json.dumps(sorted(vendored))
     cache_metadata = dict(tree_flatten([cache_info, embedded, cache_classes]))
     mx.save_safetensors(path, encoded, cache_metadata)
 
@@ -185,9 +200,11 @@ def _load_prompt_cache_compat(path: str) -> list[Any]:
             raise ValueError(f"unknown optional-state kind for {key!r}: {kind!r}")
     states = tree_unflatten(list(flat_arrays.items()))
 
-    # CacheList.from_state resolves nested class names through the globals of
-    # mlx_lm.models.cache.  Register our vendored DeepSeek classes only for the
-    # reconstruction call and restore the upstream module immediately after.
+    # Reconstruct nested CacheList objects through a per-call registry.  Do not
+    # patch mlx-lm module globals: another thread may be loading an ordinary
+    # upstream cache at the same time.  New files carry an explicit vendored
+    # type discriminator.  For legacy files, fall back to a vendored class only
+    # when mlx-lm has no class by that name.
     import mlx_lm.models.cache as mlx_cache
 
     from vllm_mlx.models.deepseek_v4_cache import (
@@ -197,30 +214,42 @@ def _load_prompt_cache_compat(path: str) -> list[Any]:
         PoolingCache,
     )
 
-    vendored = (
-        PoolingCache,
-        BatchPoolingCache,
-        DeepseekV4PoolingCache,
-        BatchDeepseekV4PoolingCache,
-    )
-    with _PROMPT_CACHE_CLASS_REGISTRY_LOCK:
-        previous = {
-            cls.__name__: getattr(mlx_cache, cls.__name__, None) for cls in vendored
-        }
-        try:
-            for cls in vendored:
-                setattr(mlx_cache, cls.__name__, cls)
-            return [
-                getattr(mlx_cache, name).from_state(state, meta_state)
-                for name, state, meta_state in zip(classes, states, info)
+    registry = {
+        cls.__name__: cls
+        for cls in (
+            PoolingCache,
+            BatchPoolingCache,
+            DeepseekV4PoolingCache,
+            BatchDeepseekV4PoolingCache,
+        )
+    }
+    declared_vendored = set(json.loads(metadata.get(_VENDORED_STATE_METADATA, "[]")))
+
+    def restore(name, state, meta_state):
+        if name == "CacheList":
+            obj = mlx_cache.CacheList.__new__(mlx_cache.CacheList)
+            nested_classes, nested_meta = meta_state
+            obj.caches = [
+                restore(nested_name, nested_state, nested_meta_state)
+                for nested_name, nested_state, nested_meta_state in zip(
+                    nested_classes, state, nested_meta
+                )
             ]
-        finally:
-            for cls in vendored:
-                old = previous[cls.__name__]
-                if old is None:
-                    delattr(mlx_cache, cls.__name__)
-                else:
-                    setattr(mlx_cache, cls.__name__, old)
+            return obj
+        upstream = getattr(mlx_cache, name, None)
+        cls = (
+            registry[name]
+            if name in registry and (name in declared_vendored or upstream is None)
+            else upstream
+        )
+        if cls is None:
+            raise ValueError(f"unknown prompt-cache class {name!r}")
+        return cls.from_state(state, meta_state)
+
+    return [
+        restore(name, state, meta_state)
+        for name, state, meta_state in zip(classes, states, info)
+    ]
 
 
 def _write_tokens_bin_v3(path: str, tokens: list[int], save_uuid: str) -> None:
