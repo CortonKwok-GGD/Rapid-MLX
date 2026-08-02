@@ -35,7 +35,7 @@ echo "== 1. real history: the notes describe exactly the tagged tree =="
 cd "$REPO_ROOT"
 if git rev-parse --verify --quiet v0.11.6 >/dev/null && \
    git rev-parse --verify --quiet v0.11.5 >/dev/null; then
-  SHA=$(git rev-parse v0.11.6^{commit})
+  SHA=$(git rev-parse "v0.11.6^{commit}")
   BODY=$(VERSION=0.11.6 RELEASE_SHA="$SHA" SKIP_CONTRIBUTORS=1 bash "$SCRIPT" 2>"$TMP/err")
 
   contains "$(cat "$TMP/err")" "baseline: v0.11.5" "baseline is the nearest ANCESTOR tag (v0.11.5)"
@@ -54,6 +54,7 @@ if git rev-parse --verify --quiet v0.11.6 >/dev/null && \
   check "every cited SHA is an ancestor of v0.11.6" "$BAD" "0"
 
   contains "$BODY" "## What's new in v0.11.6" "heading preserved"
+  # shellcheck disable=SC2016  # the backticks are literal markdown, not a subshell
   contains "$BODY" 'Install: `brew upgrade rapid-mlx`' "Install: line preserved"
   lacks "$BODY" "<details>" "no <details> when there are no highlights"
 else

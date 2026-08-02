@@ -16,6 +16,11 @@ name: Auto-release on version bump
 # ``force_version`` set — that BYPASSES the gate and releases anyway. It is
 # audited (actor + reason are logged and stamped into the release notes). See
 # RELEASE.md § "Studio down / emergency release".
+#
+# RELEASE NOTES: built by ``scripts/build_release_notes.sh`` (extracted so it can
+# be tested offline — ``tests/release/test_build_release_notes.sh``). It prepends
+# ``docs/release-notes/vX.Y.Z.md`` from the release commit when that file exists,
+# and otherwise emits the plain commit list. See ``docs/release-notes/README.md``.
 
 on:
   push:
