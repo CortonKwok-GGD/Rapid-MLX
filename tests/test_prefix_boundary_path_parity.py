@@ -291,3 +291,30 @@ def test_prefix_boundary_falls_back_when_no_generation_form_is_not_prefix(
     ]
 
     assert engine._compute_prefix_boundary(messages) == len("shared-history|")
+
+
+def test_prefix_boundary_rejects_last_user_rewrite_on_next_turn(monkeypatch):
+    engine, _ = _build_engine(monkeypatch)
+    engine._compute_prefix_boundary = BatchedEngine._compute_prefix_boundary.__get__(
+        engine, BatchedEngine
+    )
+    engine._tokenizer = _CharacterTokenizer()
+
+    def render(messages, tools=None, *, add_generation_prompt=True, **kwargs):
+        parts = []
+        for index, message in enumerate(messages):
+            content = str(message.get("content", ""))
+            is_final_user = index == len(messages) - 1 and message.get("role") == "user"
+            parts.append(f"LAST:{content}" if is_final_user else f"TURN:{content}")
+        body = "shared|" + "|".join(parts)
+        return body + ("|GEN" if add_generation_prompt else "")
+
+    monkeypatch.setattr(engine, "_apply_chat_template", render)
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "latest"},
+    ]
+
+    boundary = engine._compute_prefix_boundary(messages)
+    assert boundary < len(render(messages, add_generation_prompt=False))
+    assert boundary == len("shared|TURN:system|")

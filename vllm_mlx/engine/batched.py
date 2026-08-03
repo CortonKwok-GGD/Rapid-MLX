@@ -2246,6 +2246,17 @@ class BatchedEngine(BaseEngine):
             stable_prompt = self._apply_chat_template(
                 messages, template_tools, add_generation_prompt=False
             )
+            next_turn_prompt = self._apply_chat_template(
+                [
+                    *messages,
+                    {
+                        "role": "assistant",
+                        "content": "__rapid_mlx_boundary_probe__",
+                    },
+                ],
+                template_tools,
+                add_generation_prompt=False,
+            )
 
             tokenizer = self.tokenizer
             if hasattr(tokenizer, "tokenizer"):
@@ -2253,6 +2264,7 @@ class BatchedEngine(BaseEngine):
 
             real_tokens = tokenizer.encode(real_prompt)
             stable_tokens = tokenizer.encode(stable_prompt)
+            next_turn_tokens = tokenizer.encode(next_turn_prompt)
             stable_lcp = 0
             for real_token, stable_token in zip(real_tokens, stable_tokens):
                 if real_token != stable_token:
@@ -2261,7 +2273,16 @@ class BatchedEngine(BaseEngine):
 
             # A useful snapshot must be strictly inside the generation prompt;
             # equality produces no inter-segment boundary in BatchGenerator.
-            if stable_lcp == len(stable_tokens) and stable_lcp < len(real_tokens):
+            next_turn_lcp = 0
+            for real_token, next_token in zip(real_tokens, next_turn_tokens):
+                if real_token != next_token:
+                    break
+                next_turn_lcp += 1
+            if (
+                stable_lcp == len(stable_tokens)
+                and next_turn_lcp >= len(stable_tokens)
+                and stable_lcp < len(real_tokens)
+            ):
                 return stable_lcp
 
             # Conservative fallback for templates whose no-generation form is
@@ -2282,7 +2303,7 @@ class BatchedEngine(BaseEngine):
                     break
                 lcp = j + 1
 
-            return lcp
+            return min(lcp, next_turn_lcp) if stable_lcp else lcp
         except Exception:
             return 0
 
