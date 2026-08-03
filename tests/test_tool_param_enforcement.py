@@ -290,13 +290,12 @@ class TestDeferredPassThrough:
     F-141a (PR following #736) flipped ``pattern`` / ``format`` /
     ``multipleOf`` / ``uniqueItems`` to enforcement — those have moved
     to ``tests/test_tool_param_enforcement_f141a.py``. The remaining
-    deferred set (``required``, ``oneOf``, ``anyOf``, ``allOf``,
+    deferred set (``oneOf``, ``anyOf``, ``allOf``,
     ``additionalProperties``) still pass-through.
     """
 
-    def test_required_missing_key_does_not_raise(self):
-        """``required`` violation: schema requires ``"x"`` but the model
-        emitted ``{}``. Compound semantics — deferred for now."""
+    def test_required_missing_key_raises(self):
+        """Required properties are enforced before a tool reaches an agent."""
         from vllm_mlx.service.helpers import _validate_tool_call_params
 
         tools = [
@@ -307,7 +306,10 @@ class TestDeferredPassThrough:
         ]
         # Inject ``required`` into the parameters block.
         tools[0]["function"]["parameters"]["required"] = ["x"]
-        _validate_tool_call_params([_call("f", "{}")], tools)
+        with pytest.raises(HTTPException, match="missing required argument"):
+            _validate_tool_call_params(
+                [_call("f", "{}")], tools, enforce_required=True
+            )
 
     def test_one_of_violation_does_not_raise(self):
         """``oneOf`` (and ``anyOf`` / ``allOf``) violations remain

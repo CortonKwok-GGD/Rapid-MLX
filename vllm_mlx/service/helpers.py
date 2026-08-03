@@ -2846,7 +2846,9 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
-def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
+def _validate_tool_call_params(
+    tool_calls: list, tools: list, *, enforce_required: bool = False
+) -> None:
     """Validate tool call parameter values against their schemas (post-generation).
 
     F-141 scoped fix: enforce JSON-schema constraints on the model's
@@ -2859,7 +2861,8 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
     are expected to satisfy the declared parameter schema.
 
     Enforced today (intentionally narrow, see ``validate_param_value``):
-    ``type``, ``enum``, ``minimum``/``maximum``, ``minLength``/``maxLength``.
+    required object properties, ``type``, ``enum``,
+    ``minimum``/``maximum``, ``minLength``/``maxLength``.
     Deferred (TODO(F-141-followup)): ``pattern``, ``format``,
     ``multipleOf``, ``uniqueItems``. Non-JSON ``arguments`` and non-dict
     parsed args remain warn-only because they indicate a model/parser
@@ -2890,7 +2893,7 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
     # one place. Strip the ``<name>.`` prefix from the keys so the
     # per-call inner loop only does a ``param_name`` lookup against
     # the tool we actually matched.
-    tool_by_name: dict[str, dict] = {}
+    tool_by_name: dict[str, tuple[dict, set[str]]] = {}
     for tool in tool_defs:
         if not isinstance(tool, dict):
             continue
@@ -2901,7 +2904,15 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
         if not name:
             continue
         scoped = _extract_param_schemas([tool])
-        tool_by_name[name] = {k.split(".", 1)[1]: v for k, v in scoped.items()}
+        parameters = func.get("parameters")
+        required = parameters.get("required", []) if isinstance(parameters, dict) else []
+        required_names = {
+            item for item in required if isinstance(item, str) and item
+        } if isinstance(required, list) else set()
+        tool_by_name[name] = (
+            {k.split(".", 1)[1]: v for k, v in scoped.items()},
+            required_names,
+        )
 
     for tc in tool_calls:
         func = tc.function if hasattr(tc, "function") else tc.get("function", {})
@@ -2916,9 +2927,10 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
         # in ``tools`` (parser hallucination), skip — the upstream
         # tool_choice / parser layers own that case; we have no schema
         # to validate against here.
-        called_tool_schemas = tool_by_name.get(func_name)
-        if called_tool_schemas is None:
+        called_tool_definition = tool_by_name.get(func_name)
+        if called_tool_definition is None:
             continue
+        called_tool_schemas, required_names = called_tool_definition
 
         try:
             args = json.loads(args_str)
@@ -2930,6 +2942,17 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
 
         if not isinstance(args, dict):
             continue
+
+        missing = sorted(required_names - args.keys()) if enforce_required else []
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Tool call '{func_name}' is missing required argument(s): "
+                    f"{', '.join(missing)}. The model produced an incomplete "
+                    "tool call; retry the request."
+                ),
+            )
 
         for param_name, param_value in args.items():
             schema = called_tool_schemas.get(param_name)
