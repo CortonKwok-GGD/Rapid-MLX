@@ -514,6 +514,24 @@ class TestQwen3ThinkRouting:
             "<think>Plain</think></｜DSML｜parameter>"
         )
 
+    def test_dsml_parameter_state_survives_long_patch_payload(self):
+        router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
+        assert router is not None
+
+        assert router.feed(248069) is None
+        assert router.feed(5) is not None
+        for _ in range(100):
+            assert router.feed(4) is not None
+
+        literal = router.feed(248068)
+        assert literal is not None
+        assert literal.channel == Channel.CONTENT
+        assert literal.text == "<think>"
+
+        assert router.feed(6) is not None
+        assert router.feed(248068) is None
+        assert router.state == RouterState.THINKING
+
 
 class TestDeepSeekR1ThinkRouting:
     """Test DeepSeek R1 <think> routing."""

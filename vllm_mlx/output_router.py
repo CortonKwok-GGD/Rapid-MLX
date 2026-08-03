@@ -175,10 +175,21 @@ class OutputRouter:
 
     def _track_visible_payload(self, text: str) -> None:
         """Track whether visible DeepSeek DSML is inside a parameter value."""
-        self._visible_tail = (self._visible_tail + text)[-256:]
-        opener = self._visible_tail.rfind("<｜DSML｜parameter ")
-        closer = self._visible_tail.rfind("</｜DSML｜parameter>")
-        self._inside_dsml_parameter = opener > closer
+        opener = "<｜DSML｜parameter "
+        closer = "</｜DSML｜parameter>"
+        probe = self._visible_tail + text
+        if self._inside_dsml_parameter:
+            close_at = probe.find(closer)
+            if close_at >= 0:
+                self._inside_dsml_parameter = False
+                probe = probe[close_at + len(closer) :]
+        if not self._inside_dsml_parameter and opener in probe:
+            self._inside_dsml_parameter = True
+        # Retain only enough boundary text to recognize a delimiter split
+        # across decoded tokens. Parameter state itself is incremental and
+        # therefore survives arbitrarily large patch/tool arguments.
+        boundary = max(len(opener), len(closer)) - 1
+        self._visible_tail = probe[-boundary:]
 
     def _drain_pending_init_word(self, current_token_id: int) -> RouterEvent | None:
         """If a bare-INIT channel word is buffered, decide based on the
@@ -379,13 +390,10 @@ class OutputRouter:
             return None
 
         # === Think tags (Qwen / DeepSeek style) ===
-        # Once the model has entered the visible CONTENT channel, these token
-        # IDs may be literal data inside code, JSON, or tool-call arguments.
-        # Treating a literal ``<think>`` there as a fresh channel transition
-        # corrupts the payload (and a following ``</think>`` silently drops
-        # everything between them).  INIT remains structural because some
-        # templates open reasoning in the prompt and generate only the closing
-        # tag; THINKING remains structural for the normal tagged-reasoning path.
+        # DeepSeek DSML parameter values can contain literal source bytes such
+        # as ``<think>``. Preserve them only inside that structured payload;
+        # everywhere else a think token remains a real channel transition so
+        # late hidden reasoning cannot leak into visible content.
         if token_id == m.think_start:
             if self.state == RouterState.CONTENT and self._inside_dsml_parameter:
                 text = self.tokenizer.decode([token_id])

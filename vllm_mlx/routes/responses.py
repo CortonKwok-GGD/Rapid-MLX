@@ -2339,7 +2339,6 @@ async def _stream_responses(
         # misclassified as a downstream-output completion. This flag
         # plus ``tool_calls`` is the precise signal.
         reasoning_block_closed = False
-        public_output_closed_before_late_reasoning = False
 
         # Lazy message-item state. We do NOT emit the message
         # output_item.added until we have actual user-facing text to stream
@@ -2843,12 +2842,6 @@ async def _stream_responses(
                     # ``<think>``".
                     reasoning_block_closed = True
                 elif output_channel == "reasoning":
-                    if accumulated_text.strip():
-                        # Record the explicit content -> reasoning channel
-                        # boundary while it happens. A terminal stop can then
-                        # distinguish a closed public segment followed by a
-                        # stray hidden tail from ambiguous mixed output.
-                        public_output_closed_before_late_reasoning = True
                     # R11-B (R11-M-F1): accumulate reasoning text for the
                     # post-loop ``reasoning`` output-item emitter so
                     # ``max_output_tokens`` cut-offs during the think
@@ -3693,13 +3686,11 @@ async def _stream_responses(
             and (no_final_answer_generated_signal or bool(responses_request.tools))
         )
 
-        # A model can occasionally return to its reasoning channel after public
-        # content has already completed (observed with DeepSeek V4 after a valid
-        # Codex final answer).  Responses item ordering cannot represent a new
-        # reasoning ladder after the message item.  The public answer/tool call
-        # is nevertheless complete and usable, so discard only the late hidden
-        # tail instead of turning a successful engineering turn into a client
-        # reconnect loop.
+        # A reasoning parser that returns to the reasoning channel after
+        # public content has started violates the Responses item ordering
+        # contract. The reasoning item is already closed at that point and
+        # Codex cannot accept another summary ladder after the message item.
+        # Fail explicitly instead of silently dropping the late bytes.
         emitted_reasoning = ""
         if reasoning_item_payload_done is not None:
             emitted_reasoning = "".join(
@@ -3708,35 +3699,23 @@ async def _stream_responses(
                 if isinstance(part, dict)
             )
         if reasoning_item_finalized and emitted_reasoning != accumulated_reasoning_text:
-            if (
-                last_finish_reason == "stop"
-                and consumable_output_seen
-                and public_output_closed_before_late_reasoning
-            ):
-                logger.warning(
-                    "Responses (stream): discarded %d chars of reasoning emitted "
-                    "after terminal public content was finalized",
-                    max(0, len(accumulated_reasoning_text) - len(emitted_reasoning)),
-                )
-                accumulated_reasoning_text = emitted_reasoning
-            else:
-                yield _emit(
-                    "response.failed",
-                    {
-                        "type": "response.failed",
-                        "response": _stream_response_payload(
-                            "failed",
-                            error={
-                                "code": "invalid_reasoning_event_order",
-                                "message": (
-                                    "The model emitted reasoning after incomplete "
-                                    "public content; retry the request."
-                                ),
-                            },
-                        ),
-                    },
-                )
-                return
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": _stream_response_payload(
+                        "failed",
+                        error={
+                            "code": "invalid_reasoning_event_order",
+                            "message": (
+                                "The model emitted reasoning after public content; "
+                                "retry the request."
+                            ),
+                        },
+                    ),
+                },
+            )
+            return
 
         if no_final_answer_stop:
             reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (
