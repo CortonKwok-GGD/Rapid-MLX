@@ -156,12 +156,16 @@ enum DevSnapshot {
         log("wrote PNGs to \(dir)")
 
         // LIVE mode: when RAPID_DEV_SERVE_ALIAS is set, actually start the
-        // sidecar (via RAPID_BIN), send one chat turn, and snapshot the
+        // sidecar (resolved by ServerLocator — the bundled engine unless
+        // RAPID_BIN overrides it), send one chat turn, and snapshot the
         // REAL streamed output — the runtime path static renders can't
         // reach. Then the normal terminate exercises clean teardown.
         if let liveAlias = ProcessInfo.processInfo.environment["RAPID_DEV_SERVE_ALIAS"],
            !liveAlias.isEmpty {
-            await runLiveChat(alias: liveAlias, server: server, chat: chat, dir: dir)
+            await runLiveChat(
+                alias: liveAlias, server: server, chat: chat,
+                downloads: downloads, quickstart: quickstart, dir: dir
+            )
         }
 
         // One-shot: quit so the dogfood harness gets a clean exit.
@@ -170,7 +174,8 @@ enum DevSnapshot {
 
     @MainActor
     private static func runLiveChat(
-        alias: String, server: ServerManager, chat: ChatViewModel, dir: String
+        alias: String, server: ServerManager, chat: ChatViewModel,
+        downloads: DownloadManager, quickstart: QuickstartCoordinator, dir: String
     ) async {
         log("live: starting sidecar for \(alias)…")
         await server.start(alias: alias)
@@ -198,13 +203,27 @@ enum DevSnapshot {
         } else {
             log("live: no assistant message (isStreaming=\(chat.isStreaming), lastError=\(chat.lastError ?? "-"))")
         }
-        render(liveContentView(server: server, chat: chat), to: "\(dir)/content-chat-live.png")
+        render(
+            liveContentView(
+                server: server, chat: chat,
+                downloads: downloads, quickstart: quickstart
+            ),
+            to: "\(dir)/content-chat-live.png"
+        )
         log("live: wrote content-chat-live.png; stopping sidecar")
         await server.stop()
     }
 
     @MainActor
-    private static func liveContentView(server: ServerManager, chat: ChatViewModel) -> AnyView {
+    private static func liveContentView(
+        server: ServerManager, chat: ChatViewModel,
+        downloads: DownloadManager, quickstart: QuickstartCoordinator
+    ) -> AnyView {
+        // ChatView reads DownloadManager + QuickstartCoordinator from the
+        // environment (the Ollama-layout composer/quickstart affordances);
+        // inject both or ImageRenderer traps with "No Observable object of
+        // type DownloadManager found". The real app supplies them from
+        // RapidApp's scene — this render path must mirror that.
         AnyView(
             ChatView(
                 viewModel: chat,
@@ -212,6 +231,8 @@ enum DevSnapshot {
                 alias: .constant(server.servingAlias ?? ""),
                 serverReady: true
             )
+            .environment(downloads)
+            .environment(quickstart)
             .frame(width: 900, height: 640)
             .tint(RapidTheme.brand)
             .background(RapidTheme.canvas)
