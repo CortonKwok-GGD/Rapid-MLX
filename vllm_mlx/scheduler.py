@@ -391,7 +391,6 @@ class SchedulerConfig:
     # with growing KV state and the current forward's transient allocations.
     # Temporarily cap it, then restore the device-scaled default when prefill
     # completes. Zero disables only this cache-limit guard.
-    adaptive_prefill_cache_limit_bytes: int = 4 * 1024 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if self.response_cache_entries < 0:
@@ -2655,8 +2654,6 @@ class Scheduler:
         self._last_adaptive_prefill_size = self.config.prefill_step_size
         self._adaptive_prefill_protected_chunks = 0
         self._adaptive_prefill_reduced_chunks = 0
-        self._adaptive_prefill_cache_clamped = False
-        self._adaptive_prefill_cache_clamps = 0
         # D-METAL-CAP / D-METAL-PFX: cached hard cap in bytes for fast
         # admission checks. Computed lazily on first use so unit tests
         # that build a Scheduler against a fake model with no Metal
@@ -3907,7 +3904,6 @@ class Scheduler:
         minimum_prompt = int(
             getattr(self.config, "adaptive_prefill_min_tokens", 32_768)
         )
-        self._apply_adaptive_prefill_cache_limit(prompt_tokens >= minimum_prompt)
         if prompt_tokens >= minimum_prompt:
             # Pressure samples can wobble around a threshold as allocator
             # slabs are materialized and released. Growing the chunk again in
@@ -3937,53 +3933,6 @@ class Scheduler:
             )
             self._last_adaptive_prefill_size = selected
         return selected
-
-    def _default_metal_cache_limit(self) -> int:
-        """Mirror the engine's device-scaled free-cache policy."""
-        cap = self._resolve_metal_cap_bytes()
-        if cap <= 0:
-            return 32 * 1024 * 1024 * 1024
-        return min(
-            cap,
-            max(2 * 1024 * 1024 * 1024, min(32 * 1024 * 1024 * 1024, cap // 4)),
-        )
-
-    def _apply_adaptive_prefill_cache_limit(self, long_prefill: bool) -> None:
-        """Reserve transient headroom without penalising ordinary decode.
-
-        ``mx.clear_cache`` alone only drops buffers that happen to be free at
-        that instant; the allocator can immediately grow back to its normal
-        32 GiB ceiling on the next prompt chunk. Lowering the ceiling for the
-        lifetime of a long prefill makes that headroom durable. The transition
-        is edge-triggered, so neither ``set_cache_limit`` nor ``clear_cache``
-        lands in the per-token decode hot path.
-        """
-        requested = max(
-            0, int(getattr(self.config, "adaptive_prefill_cache_limit_bytes", 0))
-        )
-        should_clamp = (
-            bool(getattr(self.config, "adaptive_prefill", True))
-            and long_prefill
-            and requested > 0
-        )
-        clamped = bool(getattr(self, "_adaptive_prefill_cache_clamped", False))
-        if should_clamp == clamped:
-            return
-        limit = (
-            min(requested, self._default_metal_cache_limit())
-            if should_clamp
-            else self._default_metal_cache_limit()
-        )
-        mx.set_cache_limit(limit)
-        if should_clamp:
-            mx.clear_cache()
-            self._adaptive_prefill_cache_clamps += 1
-        self._adaptive_prefill_cache_clamped = should_clamp
-        logger.info(
-            "[adaptive_prefill] Metal cache limit %s %.1fGB",
-            "clamped to" if should_clamp else "restored to",
-            limit / 1e9,
-        )
 
     def _infer_kv_dtype_bytes(self, model_config: Any) -> int:
         """Best-effort KV-cache dtype-bytes inference.
@@ -6937,12 +6886,6 @@ class Scheduler:
             ),
             "adaptive_prefill_reduced_chunks": getattr(
                 self, "_adaptive_prefill_reduced_chunks", 0
-            ),
-            "adaptive_prefill_cache_clamped": getattr(
-                self, "_adaptive_prefill_cache_clamped", False
-            ),
-            "adaptive_prefill_cache_clamps": getattr(
-                self, "_adaptive_prefill_cache_clamps", 0
             ),
         }
         # R15-P1 (task #296): disk-backed KV checkpoint counters.

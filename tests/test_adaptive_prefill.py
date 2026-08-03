@@ -1,7 +1,6 @@
 """Long-context adaptive prefill policy regression tests."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 
@@ -26,8 +25,6 @@ def _scheduler(*, prompt_tokens=100_000, active=0, rss=0, cap=100_000):
     scheduler._last_adaptive_prefill_size = 2048
     scheduler._adaptive_prefill_protected_chunks = 0
     scheduler._adaptive_prefill_reduced_chunks = 0
-    scheduler._adaptive_prefill_cache_clamped = False
-    scheduler._adaptive_prefill_cache_clamps = 0
     scheduler.running = {}
     return scheduler
 
@@ -101,34 +98,3 @@ def test_disabled_policy_is_exact_noop():
     scheduler = _scheduler(active=99_000)
     scheduler.config.adaptive_prefill = False
     assert scheduler._select_adaptive_prefill_size() == 2048
-
-
-def test_long_prefill_clamps_cache_once_and_restores_for_decode():
-    scheduler = _scheduler(active=82_000)
-    scheduler._resolve_metal_cap_bytes = lambda: 100 * 1024**3
-    with (
-        patch("vllm_mlx.scheduler.mx.set_cache_limit") as set_limit,
-        patch("vllm_mlx.scheduler.mx.clear_cache") as clear_cache,
-    ):
-        scheduler._apply_adaptive_prefill_size()
-        scheduler._apply_adaptive_prefill_size()
-        assert set_limit.call_count == 1
-        assert set_limit.call_args.args[0] == 4 * 1024**3
-        clear_cache.assert_called_once_with()
-        assert scheduler._adaptive_prefill_cache_clamps == 1
-
-        scheduler.batch_generator._currently_processing = []
-        scheduler.batch_generator._prompt_batch.tokens = []
-        scheduler._apply_adaptive_prefill_size()
-        assert set_limit.call_count == 2
-        assert set_limit.call_args.args[0] == 25 * 1024**3
-        assert clear_cache.call_count == 1
-        assert scheduler._adaptive_prefill_cache_clamped is False
-
-
-def test_cache_clamp_can_be_disabled_independently():
-    scheduler = _scheduler(active=82_000)
-    scheduler.config.adaptive_prefill_cache_limit_bytes = 0
-    with patch("vllm_mlx.scheduler.mx.set_cache_limit") as set_limit:
-        scheduler._apply_adaptive_prefill_size()
-    set_limit.assert_not_called()

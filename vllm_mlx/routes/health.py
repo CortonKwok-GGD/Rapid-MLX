@@ -297,8 +297,6 @@ async def status():
             "chunk_size": stats.get("adaptive_prefill_chunk_size"),
             "protected_chunks": stats.get("adaptive_prefill_protected_chunks", 0),
             "reduced_chunks": stats.get("adaptive_prefill_reduced_chunks", 0),
-            "cache_clamped": stats.get("adaptive_prefill_cache_clamped", False),
-            "cache_clamps": stats.get("adaptive_prefill_cache_clamps", 0),
         },
         "metal": {
             "active_memory_gb": stats.get("metal_active_memory_gb"),
