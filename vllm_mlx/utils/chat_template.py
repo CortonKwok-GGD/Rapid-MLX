@@ -49,6 +49,14 @@ _CHAT_TEMPLATE_ROLE_MARKERS = (
     "<｜User｜>",
     "<｜Assistant｜>",
     "<｜latest_reminder｜>",
+    # Reasoning-channel sentinels.  These can occur as literal source text in
+    # user/tool messages (for example while Codex edits a parser).  If left
+    # intact, tokenizers with added-token entries for them turn repository data
+    # into channel-control IDs before the model sees it.
+    "<think>",
+    "</think>",
+    "<reasoning>",
+    "</reasoning>",
     # Mistral / Anthropic-style
     "[INST]",
     "[/INST]",

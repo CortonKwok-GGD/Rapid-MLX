@@ -368,11 +368,24 @@ class OutputRouter:
             return None
 
         # === Think tags (Qwen / DeepSeek style) ===
+        # Once the model has entered the visible CONTENT channel, these token
+        # IDs may be literal data inside code, JSON, or tool-call arguments.
+        # Treating a literal ``<think>`` there as a fresh channel transition
+        # corrupts the payload (and a following ``</think>`` silently drops
+        # everything between them).  INIT remains structural because some
+        # templates open reasoning in the prompt and generate only the closing
+        # tag; THINKING remains structural for the normal tagged-reasoning path.
         if token_id == m.think_start:
+            if self.state == RouterState.CONTENT:
+                text = self.tokenizer.decode([token_id])
+                return RouterEvent(Channel.CONTENT, token_id, text)
             self.state = RouterState.THINKING
             return None
 
         if token_id == m.think_end:
+            if self.state == RouterState.CONTENT:
+                text = self.tokenizer.decode([token_id])
+                return RouterEvent(Channel.CONTENT, token_id, text)
             self.state = RouterState.CONTENT
             return None
 

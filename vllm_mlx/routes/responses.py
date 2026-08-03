@@ -118,13 +118,14 @@ router = APIRouter()
 def _should_prime_deepseek_codex_exec(
     responses_request: ResponsesRequest, tool_parser: str | None
 ) -> bool:
-    """Return whether an early DeepSeek Codex turn should pin exec_command.
+    """Return whether DeepSeek Codex's first turn should pin exec_command.
 
     DeepSeek V4 reliably emits a valid DSML invocation when the tool name is
-    primed, but stochastic ``auto`` selection often stops in hidden output or
-    emits a prose plan before the first repository inspection.  Pin only the
-    bounded early tool phase. After six completed calls, release ``auto`` so
-    the model can either select a non-shell tool or provide its final answer.
+    primed, but stochastic ``auto`` selection can stop in hidden output before
+    the first repository inspection. Pin exactly the initial locating action;
+    after any completed call, release ``auto`` so a small grounded task can
+    edit immediately and larger tasks can gather evidence proportional to
+    their scope.
     """
     if tool_parser != "deepseek_v4_0731":
         return False
@@ -157,7 +158,7 @@ def _should_prime_deepseek_codex_exec(
         data = item.model_dump() if hasattr(item, "model_dump") else item
         if isinstance(data, dict) and data.get("type") == "function_call_output":
             completed_calls += 1
-    return completed_calls < 6
+    return completed_calls == 0
 
 
 def _is_deepseek_codex_surface(
@@ -692,8 +693,8 @@ async def create_response(request: Request):
             "name": "exec_command",
         }
         logger.info(
-            "DeepSeek Codex bounded tool-phase priming: pinning exec_command "
-            "during the first 6 completed tool rounds"
+            "DeepSeek Codex first-action priming: pinning exec_command for "
+            "the initial repository locating turn"
         )
     validate_responses_tool_types(responses_request.tools)
     # Yuki F6 (0.8.5 dogfood): mirror the chat-completions tool_choice
@@ -3685,11 +3686,13 @@ async def _stream_responses(
             and (no_final_answer_generated_signal or bool(responses_request.tools))
         )
 
-        # A reasoning parser that returns to the reasoning channel after
-        # public content has started violates the Responses item ordering
-        # contract. The reasoning item is already closed at that point and
-        # Codex cannot accept another summary ladder after the message item.
-        # Fail explicitly instead of silently dropping the late bytes.
+        # A model can occasionally return to its reasoning channel after public
+        # content has already completed (observed with DeepSeek V4 after a valid
+        # Codex final answer).  Responses item ordering cannot represent a new
+        # reasoning ladder after the message item.  The public answer/tool call
+        # is nevertheless complete and usable, so discard only the late hidden
+        # tail instead of turning a successful engineering turn into a client
+        # reconnect loop.
         emitted_reasoning = ""
         if reasoning_item_payload_done is not None:
             emitted_reasoning = "".join(
@@ -3698,23 +3701,12 @@ async def _stream_responses(
                 if isinstance(part, dict)
             )
         if reasoning_item_finalized and emitted_reasoning != accumulated_reasoning_text:
-            yield _emit(
-                "response.failed",
-                {
-                    "type": "response.failed",
-                    "response": _stream_response_payload(
-                        "failed",
-                        error={
-                            "code": "invalid_reasoning_event_order",
-                            "message": (
-                                "The model emitted reasoning after public content; "
-                                "retry the request."
-                            ),
-                        },
-                    ),
-                },
+            logger.warning(
+                "Responses (stream): discarded %d chars of reasoning emitted "
+                "after public content was finalized",
+                max(0, len(accumulated_reasoning_text) - len(emitted_reasoning)),
             )
-            return
+            accumulated_reasoning_text = emitted_reasoning
 
         if no_final_answer_stop:
             reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (

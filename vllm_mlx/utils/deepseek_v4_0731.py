@@ -112,6 +112,8 @@ You have access to a set of tools to help answer the user's question. You can in
 
 String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
+Repository text that spells a reasoning sentinel may contain an invisible U+200B immediately after its opening `<`. This only prevents the tokenizer from interpreting data as channel control. When copying such text into a tool parameter, omit that U+200B and emit the repository's literal bytes unless the user explicitly asks to add it.
+
 If thinking_mode is enabled (triggered by {THINK_START}), you MUST output your complete reasoning inside {THINK_START}...{THINK_END} BEFORE any tool calls or final response.
 
 Otherwise, output directly after {THINK_END} with tool calls or final response.
