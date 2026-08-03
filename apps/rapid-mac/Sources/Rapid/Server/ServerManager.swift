@@ -49,6 +49,14 @@ final class ServerManager {
     /// Current lifecycle phase. Drives all UI state controls.
     private(set) var state: ServerState
 
+    /// Set when ``start`` declines a load because the model's footprint
+    /// on top of live memory use would risk exhausting RAM (#324). A
+    /// top-level view binds a confirmation alert to this; the user
+    /// either acknowledges the risk (``confirmPendingMemoryLoad``) or
+    /// backs out (``cancelPendingMemoryLoad``). ``nil`` when no load is
+    /// being held for confirmation.
+    var pendingMemoryWarning: ModelSizing.MemoryWarning?
+
     /// Alias the child is currently serving once `/healthz` answered 200,
     /// else `nil`. Authoritative source of truth for which model id any
     /// outgoing chat request should put in `model:` — picker bar state
@@ -684,7 +692,35 @@ final class ServerManager {
     /// transition (the bug Bug A removed), which incidentally also
     /// covered manual restarts. The default is ``false`` to make the
     /// behavior obvious at every public call site.
-    func start(alias: String, hfPath: String? = nil, isAutoRespawn: Bool = false) async {
+    /// The user acknowledged the memory warning and wants to load
+    /// anyway. Takes the ``warning`` by value (not off ``pendingMemory-
+    /// Warning``) because the alert's dismissal clears that property on
+    /// the same run-loop turn the button fires — reading it here would
+    /// race to nil and silently drop the load. Re-enters ``start`` with
+    /// the guard bypassed.
+    func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) async {
+        pendingMemoryWarning = nil
+        await start(
+            alias: warning.alias,
+            hfPath: warning.hfPath,
+            isAutoRespawn: warning.isAutoRespawn,
+            bypassMemoryGuard: true
+        )
+    }
+
+    /// The user backed out of a memory-risky load. Just drops the
+    /// held request; ``state`` is untouched (it never left idle/stopped
+    /// because ``start`` returned before spawning).
+    func cancelPendingMemoryLoad() {
+        pendingMemoryWarning = nil
+    }
+
+    func start(
+        alias: String,
+        hfPath: String? = nil,
+        isAutoRespawn: Bool = false,
+        bypassMemoryGuard: Bool = false
+    ) async {
         // Issue #278: a manual restart is the user taking over the
         // lifecycle — reset the budget at entry so a previously
         // exhausted counter doesn't make a quick post-restart crash
@@ -714,6 +750,47 @@ final class ServerManager {
                 message: "That model name isn't valid. Pick a model from the bar at the top."
             )
             return
+        }
+
+        // Pre-load memory guard (#324). Loading a model whose footprint,
+        // stacked on top of what is ALREADY resident, would push unified
+        // memory past ~90% of total can freeze or kernel-panic the whole
+        // Mac — a far worse outcome than declining to load. This is the
+        // single choke point every start path funnels through (picker,
+        // first message, auto-restart, quickstart), so the check + the
+        // confirmation prompt live here once instead of at each call site.
+        // Unlike the picker's static ``ModelSizing.classify`` (bands vs
+        // 80% of TOTAL), this projects the footprint onto LIVE used memory,
+        // catching the reported near-crash where a "fits the Mac" model
+        // still exhausts the RAM other apps left free. ``bypassMemoryGuard``
+        // is set only by the explicit "Load anyway" path, after the user
+        // acknowledged the risk in the prompt.
+        //
+        // Auto-respawn is exempt (``!isAutoRespawn``): the watchdog re-fires
+        // ``start(isAutoRespawn: true)`` on a fixed schedule, so returning
+        // early here would spin — set-warning → return → watchdog re-fires →
+        // repeat, forever, with a modal stuck on screen and no model serving.
+        // Respawn is also recovering a model that ALREADY fit when it first
+        // started; a genuine free-RAM drop is bounded by the respawn-attempt
+        // budget, and the user's manual restart still routes through the guard.
+        if !bypassMemoryGuard, !isAutoRespawn, let snapshot = MemoryProbe.snapshot() {
+            let footprint = ModelSizing.estimate(alias: trimmedAlias)
+            let safety = ModelSizing.memorySafety(
+                footprint: footprint,
+                usedBytes: snapshot.usedBytes,
+                totalBytes: snapshot.totalBytes
+            )
+            if safety != .safe {
+                pendingMemoryWarning = ModelSizing.MemoryWarning(
+                    alias: trimmedAlias,
+                    hfPath: hfPath,
+                    isAutoRespawn: isAutoRespawn,
+                    severity: safety,
+                    footprintGB: footprint.totalGB,
+                    freeGB: Double(snapshot.freeBytes) / Double(1 << 30)
+                )
+                return
+            }
         }
 
         // Issue #253: if a background ``rapid-mlx pull`` is already

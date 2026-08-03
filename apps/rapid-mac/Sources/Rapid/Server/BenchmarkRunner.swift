@@ -49,6 +49,22 @@ final class BenchmarkRunner {
             phase = .failed("Pick a model first.")
             return
         }
+        // Pre-load memory guard (#324). `rapid-mlx bench` spawns its own
+        // process that loads the full model — a *second* resident copy
+        // if the app's sidecar already has this alias loaded. Projecting
+        // the footprint onto live `usedBytes` (which already includes the
+        // first copy) catches that 2× case, so we refuse to spawn a bench
+        // that would push unified memory past the kernel-panic line.
+        if let snapshot = MemoryProbe.snapshot(),
+           ModelSizing.memorySafety(
+               footprint: ModelSizing.estimate(alias: alias),
+               usedBytes: snapshot.usedBytes,
+               totalBytes: snapshot.totalBytes
+           ) == .unsafe {
+            phase = .failed(
+                "Not enough free memory to benchmark \(alias) right now — it loads a second copy of the model on top of what's already running. Close some apps or restart the model, then try again.")
+            return
+        }
         phase = .running
         let output = await Self.runProcess(
             binary: binary, args: ["bench", alias], stdinLine: nil

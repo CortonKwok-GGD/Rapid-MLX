@@ -174,6 +174,24 @@ struct ContentView: View {
                 )
             )
         }
+        .alert(
+            server.pendingMemoryWarning?.title ?? "",
+            isPresented: Binding(
+                get: { server.pendingMemoryWarning != nil },
+                set: { if !$0 { server.cancelPendingMemoryLoad() } }
+            ),
+            presenting: server.pendingMemoryWarning
+        ) { warning in
+            Button("Cancel", role: .cancel) {
+                if let running = runningAlias { alias = running }
+                server.cancelPendingMemoryLoad()
+            }
+            Button(warning.confirmTitle, role: .destructive) {
+                Task { await server.confirmPendingMemoryLoad(warning) }
+            }
+        } message: { warning in
+            Text(warning.message)
+        }
         .sheet(isPresented: firstRunSheetPresented) {
             firstRunSheet
         }
