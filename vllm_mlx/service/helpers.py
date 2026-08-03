@@ -2871,9 +2871,8 @@ def _validate_tool_call_params(
     ``minimum``/``maximum``, ``minLength``/``maxLength``.
     Deferred (TODO(F-141-followup)): ``pattern``, ``format``,
     ``multipleOf``, ``uniqueItems``. Non-JSON ``arguments`` and non-dict
-    parsed args remain warn-only because they indicate a model/parser
-    issue rather than a schema violation, and the upstream parser layer
-    already surfaces them.
+    parsed args remain warn-only by default; callers using
+    ``enforce_required=True`` reject those shapes before agent execution.
 
     H-05 scope refactor: the iteration is strictly **per emitted call**.
     For each ``tc`` we look up the tool spec by its ``function.name``

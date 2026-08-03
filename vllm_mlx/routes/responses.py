@@ -1551,14 +1551,43 @@ async def _non_stream(
     # synthesis to honour the OpenAI ``tool_call guaranteed`` contract.
     # Without this, both shapes silently degraded to ``auto`` and Yuki
     # F6 saw zero tool_calls on the wire.
-    tool_calls = _enforce_responses_tool_choice(
-        tool_calls, responses_request, openai_request
-    )
-    if tool_calls and openai_request.tools:
-        _reject_immediate_repeated_tool_call(tool_calls, responses_request.input)
-        _validate_tool_call_params(
-            tool_calls, openai_request.tools, enforce_required=True
+    try:
+        tool_calls = _enforce_responses_tool_choice(
+            tool_calls, responses_request, openai_request
         )
+        if tool_calls and openai_request.tools:
+            _reject_immediate_repeated_tool_call(tool_calls, responses_request.input)
+            _validate_tool_call_params(
+                tool_calls, openai_request.tools, enforce_required=True
+            )
+    except HTTPException as tool_error:
+        detail = tool_error.detail
+        classified_code = getattr(tool_error, "rapid_mlx_error_code", None)
+        if classified_code is None:
+            raise
+        if isinstance(detail, dict):
+            envelope = detail.get("error", {})
+            code = envelope.get("code", "tool_choice_unfulfilled")
+            message = envelope.get("message", "tool choice could not be fulfilled")
+        else:
+            code = classified_code
+            message = str(detail)
+        failed_payload = ResponsesResponse(
+            id=f"resp_{uuid.uuid4().hex[:24]}",
+            created_at=created_at,
+            model=cfg.model_name or responses_request.model,
+            status="failed",
+            output=[],
+            usage=ResponsesUsage(
+                input_tokens=output.prompt_tokens or 0,
+                output_tokens=output.completion_tokens or 0,
+                total_tokens=(output.prompt_tokens or 0)
+                + (output.completion_tokens or 0),
+            ),
+        )
+        payload = failed_payload.model_dump(exclude_none=True)
+        payload["error"] = {"code": code, "message": message}
+        return Response(content=json.dumps(payload), media_type="application/json")
 
     cleaned_text, reasoning_text = _finalize_content_and_reasoning(
         raw_text=output.raw_text or output.text,

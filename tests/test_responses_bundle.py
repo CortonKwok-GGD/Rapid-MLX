@@ -466,7 +466,12 @@ class TestDeepSeekV4ResponsesStreaming:
     ):
         import vllm_mlx.tool_parsers.deepseek_v4_0731_tool_parser  # noqa: F401
 
+        wire = (
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="exec_command">'
+            "</｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
         state = make_responses_client(
+            text=wire,
             stream_chunks=[
                 "<｜DSML｜tool_calls>\n",
                 '<｜DSML｜invoke name="exec_command">\n',
@@ -509,6 +514,51 @@ class TestDeepSeekV4ResponsesStreaming:
             and data.get("item", {}).get("type") == "function_call"
             for name, data in events
         )
+
+    def test_non_stream_empty_required_tool_call_returns_failed_envelope(
+        self, make_responses_client
+    ):
+        import vllm_mlx.tool_parsers.deepseek_v4_0731_tool_parser  # noqa: F401
+
+        wire = (
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="exec_command">'
+            "</｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
+        state = make_responses_client(
+            text=wire,
+            stream_chunks=[
+                "<｜DSML｜tool_calls>",
+                '<｜DSML｜invoke name="exec_command"></｜DSML｜invoke>',
+                "</｜DSML｜tool_calls>",
+            ],
+            finish_reason="tool_calls",
+        )
+        state.cfg.enable_auto_tool_choice = True
+        state.cfg.tool_call_parser = "deepseek_v4_0731"
+
+        response = state.client.post(
+            "/v1/responses",
+            json=_payload(
+                stream=False,
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"],
+                        },
+                    }
+                ],
+            ),
+            headers=_AUTH,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed"
+        assert body["error"]["code"] == "invalid_tool_arguments"
 
 
 class TestF6ToolChoiceEnforcement:
