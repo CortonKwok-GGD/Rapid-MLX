@@ -1631,9 +1631,9 @@ def _install_dspark(
 
         output_ids, _ = proposal
         draft = [int(v) for v in output_ids[0, 1 : current_k + 1].tolist()]
-        uid_stats["draft_ms"] = float(uid_stats["draft_ms"]) + (
-            time.perf_counter() - phase_t0
-        ) * 1000
+        uid_stats["draft_ms"] = (
+            float(uid_stats["draft_ms"]) + (time.perf_counter() - phase_t0) * 1000
+        )
         K = len(draft)
         _stats["verify_steps"] += 1
         _stats["draft_tokens_proposed"] += K
@@ -1683,8 +1683,7 @@ def _install_dspark(
             logprobs = (
                 _dspark_sampling_logprobs(sample_logits, params)
                 if stochastic
-                else sample_logits
-                - mx.logsumexp(sample_logits, axis=-1, keepdims=True)
+                else sample_logits - mx.logsumexp(sample_logits, axis=-1, keepdims=True)
             )
             if stochastic:
                 processed_logprobs.append(logprobs[0])
@@ -1733,9 +1732,9 @@ def _install_dspark(
             accepted = next((idx for idx, flag in enumerate(flags) if not flag), K)
             bonus = resolved[K + accepted] if accepted < K else resolved[-1]
             preds_list = draft[:accepted] + [bonus]
-        uid_stats["sample_ms"] = float(uid_stats["sample_ms"]) + (
-            time.perf_counter() - phase_t0
-        ) * 1000
+        uid_stats["sample_ms"] = (
+            float(uid_stats["sample_ms"]) + (time.perf_counter() - phase_t0) * 1000
+        )
         rejected = K - accepted
         if accepted == K:
             _stats["full_accept_rounds"] += 1
@@ -1757,9 +1756,10 @@ def _install_dspark(
                 replay_hidden = model._last_dspark_hidden
                 mx.eval(replay_logits, replay_hidden)
                 verify_hidden = replay_hidden
-            uid_stats["rollback_ms"] = float(uid_stats["rollback_ms"]) + (
-                time.perf_counter() - phase_t0
-            ) * 1000
+            uid_stats["rollback_ms"] = (
+                float(uid_stats["rollback_ms"])
+                + (time.perf_counter() - phase_t0) * 1000
+            )
 
         # Only target states for committed inputs may seed the next proposal.
         model._last_dspark_hidden = verify_hidden[:, : accepted + 1]
