@@ -639,5 +639,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopStream()
         shutdownServer()
         shutdownDownloads()
+        // Drain any queued conversation-history write so the last turn /
+        // edit / deletion isn't lost when the process exits before the
+        // async save lands.
+        ConversationStore.flush()
     }
 }

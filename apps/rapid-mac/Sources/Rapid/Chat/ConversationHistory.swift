@@ -33,21 +33,25 @@ enum ConversationStore {
 
     static func load() -> [ChatConversation] {
         let url = fileURL()
-        // A MISSING file is a normal first run → empty history. A file that
-        // EXISTS but fails to decode (schema change, corruption) must NOT be
-        // silently discarded — the next save would atomically overwrite the
-        // user's whole history with a single new conversation. Side it to
-        // `.corrupt-<t>` so it's recoverable, then start empty.
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        if let decoded = try? JSONDecoder().decode([ChatConversation].self, from: data) {
-            return decoded
-        }
-        let backup = url.deletingLastPathComponent()
-            .appendingPathComponent(
+        let fm = FileManager.default
+        // A genuinely MISSING file is a normal first run → empty history.
+        guard fm.fileExists(atPath: url.path) else { return [] }
+        // A file that EXISTS but can't be read (I/O / permissions) or can't
+        // be decoded (schema change, corruption) must NOT be silently
+        // treated as empty — the next save would atomically overwrite the
+        // user's whole history. Side it to `.corrupt-<t>` so it's
+        // recoverable AND so the next save writes to a fresh path instead of
+        // clobbering the original, then start empty.
+        guard let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode([ChatConversation].self, from: data)
+        else {
+            let backup = url.deletingLastPathComponent().appendingPathComponent(
                 "conversations.corrupt-\(Int(Date().timeIntervalSince1970)).json"
             )
-        try? FileManager.default.moveItem(at: url, to: backup)
-        return []
+            try? fm.moveItem(at: url, to: backup)
+            return []
+        }
+        return decoded
     }
 
     /// Serial queue for history writes: every save re-encodes the whole
@@ -71,6 +75,13 @@ enum ConversationStore {
             guard let data = try? JSONEncoder().encode(conversations) else { return }
             try? data.write(to: fileURL(), options: .atomic)
         }
+    }
+
+    /// Block until every queued write has committed. Call from app
+    /// termination so the last turn / edit / deletion isn't lost when the
+    /// process exits before the async ``save`` lands.
+    static func flush() {
+        writeQueue.sync {}
     }
 
     /// Derive a one-line title from the transcript — the first user
