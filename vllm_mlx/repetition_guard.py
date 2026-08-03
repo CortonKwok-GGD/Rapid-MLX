@@ -32,23 +32,6 @@ class RepetitionIntervention:
     blocked_token_id: int
 
 
-def detect_degenerate_text_suffix(
-    text: str, *, min_chars: int = 512, max_window_chars: int = 2048
-) -> str | None:
-    """Return a reason for an unmistakably degenerate decoded suffix.
-
-    Token-period detection can miss a visually exact word loop when the
-    tokenizer alternates equivalent whitespace-bearing tokenizations.  This
-    secondary guard is restricted to long tool-bearing output by its caller.
-    """
-    if len(text) < min_chars:
-        return None
-    from .coherence import looks_like_garbage
-
-    degenerate, reason = looks_like_garbage(text[-max_window_chars:])
-    return reason if degenerate else None
-
-
 def detect_repeated_token_suffix(
     token_ids: Sequence[int],
     *,

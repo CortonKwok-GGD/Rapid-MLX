@@ -52,7 +52,6 @@ from .pflash import PFlashConfig, compress_request_tokens
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .repetition_guard import (
     AgentRepetitionLogitsProcessor,
-    detect_degenerate_text_suffix,
     detect_repeated_token_suffix,
 )
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -5785,27 +5784,6 @@ class Scheduler:
                         repetition_match.repeats,
                         request.num_output_tokens,
                     )
-                if repetition_match is None:
-                    # The detector reads only a bounded character suffix; do
-                    # not repeatedly materialize the entire completion here.
-                    decoded_output = self._decode_tokens(
-                        request.output_token_ids[-2048:]
-                    )
-                    semantic_reason = detect_degenerate_text_suffix(decoded_output)
-                    if semantic_reason is not None:
-                        finish_reason = "abort"
-                        repetition_error = (
-                            "Model generation aborted: semantic repetition loop "
-                            f"detected ({semantic_reason})"
-                        )
-                        self.num_repetition_loop_stops += 1
-                        logger.warning(
-                            "Stopping agent request %s after semantic output "
-                            "degeneration (%s, completion_tokens=%d)",
-                            request_id,
-                            semantic_reason,
-                            request.num_output_tokens,
-                        )
             stop_params = request.sampling_params.stop or []
             if finish_reason is None and stop_params:
                 decoder = getattr(request, "_decoder", None)
