@@ -96,5 +96,21 @@ def test_apply_updates_future_and_in_progress_prompt_batches():
 
 def test_disabled_policy_is_exact_noop():
     scheduler = _scheduler(active=99_000)
+    scheduler._last_adaptive_prefill_size = 256
+    scheduler.batch_generator.prefill_step_size = 256
+    scheduler.batch_generator._prompt_batch.prefill_step_size = 256
     scheduler.config.adaptive_prefill = False
     assert scheduler._select_adaptive_prefill_size() == 2048
+    assert scheduler._apply_adaptive_prefill_size() == 2048
+    assert scheduler.batch_generator.prefill_step_size == 2048
+    assert scheduler.batch_generator._prompt_batch.prefill_step_size == 2048
+    assert scheduler._adaptive_prefill_protected_chunks == 0
+
+
+def test_zero_minimum_threshold_restores_on_idle():
+    scheduler = _scheduler(active=82_000)
+    scheduler.config.adaptive_prefill_min_tokens = 0
+    assert scheduler._apply_adaptive_prefill_size() == 512
+    scheduler.batch_generator._currently_processing = []
+    scheduler.batch_generator._prompt_batch.tokens = []
+    assert scheduler._apply_adaptive_prefill_size() == 2048

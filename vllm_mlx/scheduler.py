@@ -3898,11 +3898,18 @@ class Scheduler:
         bg = getattr(self, "batch_generator", None)
         if bg is None:
             return 0
+        configured = max(1, int(getattr(self.config, "prefill_step_size", 2048)))
+        if not getattr(self.config, "adaptive_prefill", True):
+            bg.prefill_step_size = configured
+            prompt_batch = getattr(bg, "_prompt_batch", None)
+            if prompt_batch is not None:
+                prompt_batch.prefill_step_size = configured
+            self._last_adaptive_prefill_size = configured
+            return configured
         selected = self._select_adaptive_prefill_size()
         prompt_tokens = self._active_prefill_token_count()
-        configured = max(1, int(getattr(self.config, "prefill_step_size", 2048)))
-        minimum_prompt = int(
-            getattr(self.config, "adaptive_prefill_min_tokens", 32_768)
+        minimum_prompt = max(
+            1, int(getattr(self.config, "adaptive_prefill_min_tokens", 32_768))
         )
         if prompt_tokens >= minimum_prompt:
             # Pressure samples can wobble around a threshold as allocator
