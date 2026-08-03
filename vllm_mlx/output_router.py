@@ -30,6 +30,7 @@ defining their token mappings in MODEL_TOKEN_MAPS.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
@@ -159,6 +160,8 @@ class OutputRouter:
         # Drained at the top of subsequent feed() calls and by finalize().
         self._redo_queue: list[int] = []
         self._visible_tail = ""
+        self._inside_dsml_tool_calls = False
+        self._inside_dsml_invoke = False
         self._inside_dsml_parameter = False
 
     def reset(self):
@@ -171,25 +174,68 @@ class OutputRouter:
         self._pending_init_word = None
         self._redo_queue = []
         self._visible_tail = ""
+        self._inside_dsml_tool_calls = False
+        self._inside_dsml_invoke = False
         self._inside_dsml_parameter = False
 
     def _track_visible_payload(self, text: str) -> None:
         """Track whether visible DeepSeek DSML is inside a parameter value."""
-        opener = "<｜DSML｜parameter "
-        closer = "</｜DSML｜parameter>"
         probe = self._visible_tail + text
-        if self._inside_dsml_parameter:
-            close_at = probe.find(closer)
-            if close_at >= 0:
+        tool_start = "<｜DSML｜tool_calls>"
+        tool_end = "</｜DSML｜tool_calls>"
+        invoke_end = "</｜DSML｜invoke>"
+        parameter_end = "</｜DSML｜parameter>"
+        invoke_start = re.compile(r'<｜DSML｜invoke\s+name="[^"]+">')
+        parameter_start = re.compile(
+            r'<｜DSML｜parameter\s+name="[^"]+"\s+string="(?:true|false)">'
+        )
+
+        while probe:
+            if self._inside_dsml_parameter:
+                index = probe.find(parameter_end)
+                if index < 0:
+                    break
                 self._inside_dsml_parameter = False
-                probe = probe[close_at + len(closer) :]
-        if not self._inside_dsml_parameter and opener in probe:
-            self._inside_dsml_parameter = True
-        # Retain only enough boundary text to recognize a delimiter split
-        # across decoded tokens. Parameter state itself is incremental and
-        # therefore survives arbitrarily large patch/tool arguments.
-        boundary = max(len(opener), len(closer)) - 1
-        self._visible_tail = probe[-boundary:]
+                probe = probe[index + len(parameter_end) :]
+                continue
+            if self._inside_dsml_invoke:
+                parameter_match = parameter_start.search(probe)
+                invoke_close = probe.find(invoke_end)
+                if parameter_match and (
+                    invoke_close < 0 or parameter_match.start() < invoke_close
+                ):
+                    self._inside_dsml_parameter = True
+                    probe = probe[parameter_match.end() :]
+                    continue
+                if invoke_close >= 0:
+                    self._inside_dsml_invoke = False
+                    probe = probe[invoke_close + len(invoke_end) :]
+                    continue
+                break
+            if self._inside_dsml_tool_calls:
+                invoke_match = invoke_start.search(probe)
+                tool_close = probe.find(tool_end)
+                if invoke_match and (
+                    tool_close < 0 or invoke_match.start() < tool_close
+                ):
+                    self._inside_dsml_invoke = True
+                    probe = probe[invoke_match.end() :]
+                    continue
+                if tool_close >= 0:
+                    self._inside_dsml_tool_calls = False
+                    probe = probe[tool_close + len(tool_end) :]
+                    continue
+                break
+            index = probe.find(tool_start)
+            if index < 0:
+                break
+            self._inside_dsml_tool_calls = True
+            probe = probe[index + len(tool_start) :]
+
+        # Only delimiter fragments need to survive across token boundaries;
+        # the three structural booleans carry state across arbitrarily long
+        # argument values.
+        self._visible_tail = probe[-512:]
 
     def _drain_pending_init_word(self, current_token_id: int) -> RouterEvent | None:
         """If a bare-INIT channel word is buffered, decide based on the

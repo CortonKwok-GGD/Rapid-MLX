@@ -64,7 +64,9 @@ _CHAT_TEMPLATE_ROLE_MARKERS = (
 _REASONING_SENTINELS = {"<think>", "</think>", "<reasoning>", "</reasoning>"}
 
 
-def _collect_role_markers(template_applicator) -> set[str]:
+def _collect_role_markers(
+    template_applicator, *, include_reasoning_sentinels: bool = False
+) -> set[str]:
     """Return the set of chat-template role markers that must be neutralized
     in user-supplied content for ``template_applicator``.
 
@@ -83,7 +85,10 @@ def _collect_role_markers(template_applicator) -> set[str]:
     # which are not role markers but ARE still untrusted-input vectors,
     # so we include them too.
     if hasattr(tokenizer, "tokenizer"):
-        markers |= _collect_role_markers(tokenizer.tokenizer)
+        markers |= _collect_role_markers(
+            tokenizer.tokenizer,
+            include_reasoning_sentinels=include_reasoning_sentinels,
+        )
 
     candidates: list[str] = []
     for attr in ("all_special_tokens", "additional_special_tokens"):
@@ -101,9 +106,7 @@ def _collect_role_markers(template_applicator) -> set[str]:
     # neutralising U+200B when copying repository bytes into a tool argument.
     # Do not mutate reasoning-tag text for unrelated model families which do
     # not receive that restoration contract.
-    if {"<｜User｜>", "<｜Assistant｜>"} & set(
-        candidates
-    ) and _REASONING_SENTINELS & set(candidates):
+    if include_reasoning_sentinels:
         markers.update(_REASONING_SENTINELS)
     # Only treat sequences that LOOK like a template delimiter as
     # neutralisation targets — picking up every special token would
@@ -191,7 +194,10 @@ def _sanitize_message_content(
 
 
 def _sanitize_messages_for_template(
-    messages: list[dict], template_applicator
+    messages: list[dict],
+    template_applicator,
+    *,
+    include_reasoning_sentinels: bool = False,
 ) -> list[dict]:
     """Strip / neutralize chat-template control tokens from user-supplied
     message content.
@@ -218,7 +224,10 @@ def _sanitize_messages_for_template(
     interpretation is neutralised. See ``_neutralize_in_string`` for
     the rationale.
     """
-    markers = _collect_role_markers(template_applicator)
+    markers = _collect_role_markers(
+        template_applicator,
+        include_reasoning_sentinels=include_reasoning_sentinels,
+    )
     pattern = _build_marker_pattern(markers)
     if pattern is None:
         return messages
@@ -739,7 +748,9 @@ def _baseline_sanitize_tools(tools):
     return _walk_tools_iter(tools, lambda s: _neutralize_in_string(s, baseline_pattern))
 
 
-def _sanitize_tools_for_template(tools, template_applicator):
+def _sanitize_tools_for_template(
+    tools, template_applicator, *, include_reasoning_sentinels: bool = False
+):
     """Neutralise chat-template role markers in user-supplied tool
     definitions (names, descriptions, parameter schemas).
 
@@ -766,7 +777,10 @@ def _sanitize_tools_for_template(tools, template_applicator):
     """
     if not tools:
         return tools
-    markers = _collect_role_markers(template_applicator)
+    markers = _collect_role_markers(
+        template_applicator,
+        include_reasoning_sentinels=include_reasoning_sentinels,
+    )
     pattern = _build_marker_pattern(markers)
     if pattern is None:
         return tools
@@ -985,6 +999,10 @@ def apply_chat_template(
         ``role: content`` format if the applicator has no
         ``apply_chat_template`` method.
     """
+    from .deepseek_v4_0731 import encode_messages, is_deepseek_v4_0731
+
+    is_deepseek_v4 = is_deepseek_v4_0731(model_name)
+
     # F-111: flatten text-only OpenAI-o1+ content arrays
     # (``content: [{"type":"text","text":"X"}]``) into the plain string
     # the HF chat templates expect. Runs FIRST so the sanitiser and the
@@ -1024,7 +1042,11 @@ def apply_chat_template(
     # vector this PR closes (codex r7 BLOCKING — same fallback shape as
     # ``vllm_mlx/models/mllm.py::_apply_native_video_template``).
     try:
-        messages = _sanitize_messages_for_template(messages, template_applicator)
+        messages = _sanitize_messages_for_template(
+            messages,
+            template_applicator,
+            include_reasoning_sentinels=is_deepseek_v4,
+        )
     except Exception as e:
         logger.debug(
             "Chat-template marker sanitisation failed (%s); applying "
@@ -1037,7 +1059,11 @@ def apply_chat_template(
     # template's ``tools=`` kwarg or the system-prompt injection
     # fallback (``_inject_tools_into_messages``).
     try:
-        tools = _sanitize_tools_for_template(tools, template_applicator)
+        tools = _sanitize_tools_for_template(
+            tools,
+            template_applicator,
+            include_reasoning_sentinels=is_deepseek_v4,
+        )
     except Exception as e:
         logger.debug(
             "Chat-template tool-marker sanitisation failed (%s); applying "
@@ -1049,9 +1075,7 @@ def apply_chat_template(
     # DeepSeek-V4-Flash-0731 intentionally ships a Python encoder instead of
     # a Jinja template.  Route by model identity before the generic tokenizer
     # fallback (which would otherwise silently apply ChatML).
-    from .deepseek_v4_0731 import encode_messages, is_deepseek_v4_0731
-
-    if is_deepseek_v4_0731(model_name):
+    if is_deepseek_v4:
         return encode_messages(
             messages,
             tools=tools,
