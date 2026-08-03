@@ -3701,12 +3701,31 @@ async def _stream_responses(
                 if isinstance(part, dict)
             )
         if reasoning_item_finalized and emitted_reasoning != accumulated_reasoning_text:
-            logger.warning(
-                "Responses (stream): discarded %d chars of reasoning emitted "
-                "after public content was finalized",
-                max(0, len(accumulated_reasoning_text) - len(emitted_reasoning)),
-            )
-            accumulated_reasoning_text = emitted_reasoning
+            if last_finish_reason == "stop" and consumable_output_seen:
+                logger.warning(
+                    "Responses (stream): discarded %d chars of reasoning emitted "
+                    "after terminal public content was finalized",
+                    max(0, len(accumulated_reasoning_text) - len(emitted_reasoning)),
+                )
+                accumulated_reasoning_text = emitted_reasoning
+            else:
+                yield _emit(
+                    "response.failed",
+                    {
+                        "type": "response.failed",
+                        "response": _stream_response_payload(
+                            "failed",
+                            error={
+                                "code": "invalid_reasoning_event_order",
+                                "message": (
+                                    "The model emitted reasoning after incomplete "
+                                    "public content; retry the request."
+                                ),
+                            },
+                        ),
+                    },
+                )
+                return
 
         if no_final_answer_stop:
             reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (

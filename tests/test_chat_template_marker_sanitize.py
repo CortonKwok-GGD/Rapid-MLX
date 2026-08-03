@@ -43,13 +43,13 @@ def test_collect_role_markers_includes_baseline_chatml():
 
 
 def test_collect_role_markers_includes_reasoning_sentinels():
-    tok = _fake_tokenizer()
+    tok = _fake_tokenizer(["<｜Assistant｜>", "<think>", "</think>"])
     markers = _collect_role_markers(tok)
     assert {"<think>", "</think>", "<reasoning>", "</reasoning>"} <= markers
 
 
 def test_sanitize_neutralizes_literal_reasoning_tags_in_tool_output():
-    tok = _fake_tokenizer()
+    tok = _fake_tokenizer(["<｜Assistant｜>", "<think>", "</think>"])
     messages = [
         {
             "role": "tool",
@@ -62,6 +62,15 @@ def test_sanitize_neutralizes_literal_reasoning_tags_in_tool_output():
     assert sanitized[0]["content"] == (
         'THINK_MARKERS = ("<\u200bthink>", "<\u200b/think>")'
     )
+
+
+def test_sanitize_preserves_reasoning_tags_for_uninstructed_models():
+    tok = _fake_tokenizer(["<think>", "</think>"])
+    messages = [{"role": "tool", "content": 'MARKER = "<think>"'}]
+
+    sanitized = _sanitize_messages_for_template(messages, tok)
+
+    assert sanitized[0]["content"] == 'MARKER = "<think>"'
 
 
 def test_collect_role_markers_picks_up_tokenizer_specials():

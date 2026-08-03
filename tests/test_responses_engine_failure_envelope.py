@@ -248,6 +248,16 @@ class _ReasoningAfterPublicContentEngine:
         )
 
 
+class _ReasoningAfterIncompletePublicContentEngine(_ReasoningAfterPublicContentEngine):
+    """A late reasoning return after a length cutoff remains retryable."""
+
+    async def stream_chat(self, messages, **kwargs):
+        async for output in super().stream_chat(messages, **kwargs):
+            if output.finished:
+                output.finish_reason = "length"
+            yield output
+
+
 class _ToolIntentOnlyStopEngine:
     """Codex semantic stall: promises a repository action, calls no tool."""
 
@@ -608,6 +618,13 @@ def reasoning_after_public_content_client(monkeypatch):
 
 
 @pytest.fixture
+def reasoning_after_incomplete_public_content_client(monkeypatch):
+    holder = _build_client(monkeypatch, _ReasoningAfterIncompletePublicContentEngine)
+    yield holder
+    holder.cleanup()
+
+
+@pytest.fixture
 def tool_intent_only_stop_client(monkeypatch):
     holder = _build_client(monkeypatch, _ToolIntentOnlyStopEngine)
     yield holder
@@ -841,6 +858,24 @@ class TestResponsesStreamFailureEnvelope:
             for part in item.get("summary", [])
         ]
         assert "".join(summaries) == "initial plan"
+
+    def test_late_reasoning_after_incomplete_content_remains_retryable(
+        self, reasoning_after_incomplete_public_content_client
+    ):
+        with reasoning_after_incomplete_public_content_client.client.stream(
+            "POST",
+            "/v1/responses",
+            json={**PAYLOAD, "stream": True},
+            headers=HEADERS,
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        events = _parse_sse(body)
+        assert events[-1][0] == "response.failed"
+        assert events[-1][1]["response"]["error"]["code"] == (
+            "invalid_reasoning_event_order"
+        )
+        assert not any(name == "response.completed" for name, _ in events)
 
     def test_stream_emits_response_failed_on_engine_no_output(self, failing_client):
         """When the stream produces no text deltas AND zero completion

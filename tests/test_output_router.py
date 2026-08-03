@@ -492,9 +492,7 @@ class TestQwen3ThinkRouting:
         router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
         assert router is not None
 
-        result = router.feed_sequence(
-            [248068, 1, 248069, 3, 248068, 4, 248069, 3]
-        )
+        result = router.feed_sequence([248068, 1, 248069, 3, 248068, 4, 248069, 3])
 
         assert result["reasoning"] == "Reason"
         assert result["content"] == "Answer<think>Plain</think>Answer"
@@ -570,9 +568,7 @@ class TestDeepSeekR1ThinkRouting:
         router = OutputRouter.from_tokenizer(DEEPSEEK_R1_TOKENIZER)
         assert router is not None
 
-        result = router.feed_sequence(
-            [151648, 1, 151649, 3, 151648, 4, 151649, 3]
-        )
+        result = router.feed_sequence([151648, 1, 151649, 3, 151648, 4, 151649, 3])
 
         assert result["reasoning"] == "Step"
         assert result["content"] == "Answer<think>Plain</think>Answer"

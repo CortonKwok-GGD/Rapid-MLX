@@ -49,14 +49,6 @@ _CHAT_TEMPLATE_ROLE_MARKERS = (
     "<｜User｜>",
     "<｜Assistant｜>",
     "<｜latest_reminder｜>",
-    # Reasoning-channel sentinels.  These can occur as literal source text in
-    # user/tool messages (for example while Codex edits a parser).  If left
-    # intact, tokenizers with added-token entries for them turn repository data
-    # into channel-control IDs before the model sees it.
-    "<think>",
-    "</think>",
-    "<reasoning>",
-    "</reasoning>",
     # Mistral / Anthropic-style
     "[INST]",
     "[/INST]",
@@ -68,6 +60,8 @@ _CHAT_TEMPLATE_ROLE_MARKERS = (
     "<|channel|>",
     "<|return|>",
 )
+
+_REASONING_SENTINELS = {"<think>", "</think>", "<reasoning>", "</reasoning>"}
 
 
 def _collect_role_markers(template_applicator) -> set[str]:
@@ -103,6 +97,14 @@ def _collect_role_markers(template_applicator) -> set[str]:
                 candidates.append(v)
             elif isinstance(v, (list, tuple)):
                 candidates.extend(str(x) for x in v)
+    # DeepSeek V4's tool prompt explicitly teaches the model to remove the
+    # neutralising U+200B when copying repository bytes into a tool argument.
+    # Do not mutate reasoning-tag text for unrelated model families which do
+    # not receive that restoration contract.
+    if {"<｜User｜>", "<｜Assistant｜>"} & set(
+        candidates
+    ) and _REASONING_SENTINELS & set(candidates):
+        markers.update(_REASONING_SENTINELS)
     # Only treat sequences that LOOK like a template delimiter as
     # neutralisation targets — picking up every special token would
     # also strip ``<pad>`` / ``<unk>`` etc. from user text, which is
