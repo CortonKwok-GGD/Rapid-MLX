@@ -83,6 +83,7 @@ def run_turn(
     first_token_at = None
     output_parts: list[str] = []
     usage = (0, 0)
+    completed = False
     with client.stream(
         "POST", f"{url}/responses", json=payload, timeout=timeout
     ) as resp:
@@ -91,6 +92,11 @@ def run_turn(
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
             event = json.loads(line[6:])
+            event_type = event.get("type")
+            if event_type in {"response.failed", "error"}:
+                raise RuntimeError(f"response stream failed: {event!r}")
+            if event_type == "response.completed":
+                completed = True
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
                 if first_token_at is None:
@@ -99,6 +105,10 @@ def run_turn(
             found_usage = _extract_usage(event)
             if found_usage is not None:
                 usage = found_usage
+    if not completed:
+        raise RuntimeError("response stream ended without response.completed")
+    if usage[0] <= 0:
+        raise RuntimeError(f"response completed without valid input usage: {usage!r}")
     end = time.perf_counter()
     text = "".join(output_parts)
     return (
@@ -127,7 +137,11 @@ def main() -> int:
     args = parser.parse_args()
 
     stages = [int(x) for x in args.stages.split(",") if x.strip()]
-    if not stages or stages != sorted(stages) or stages[0] <= 0:
+    if (
+        not stages
+        or stages[0] <= 0
+        or any(current <= previous for previous, current in zip(stages, stages[1:]))
+    ):
         parser.error("--stages must be positive, ascending comma-separated integers")
 
     items: list[dict] = [
@@ -184,7 +198,7 @@ def main() -> int:
                     ),
                 }
             ]
-            compact_result, _ = run_turn(
+            compact_result, compact_output = run_turn(
                 client,
                 url=args.url,
                 model=args.model,
@@ -195,6 +209,11 @@ def main() -> int:
             compact_result.target_tokens = 0
             results.append(compact_result)
             print(json.dumps({"compact": asdict(compact_result)}, sort_keys=True))
+            normalized = compact_output.strip().rstrip(".! ").casefold()
+            if normalized != "ok":
+                raise RuntimeError(
+                    f"compact/resume returned unexpected output: {compact_output!r}"
+                )
 
     report = {
         "results": [asdict(r) for r in results],
@@ -205,7 +224,7 @@ def main() -> int:
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True)
-    return 0
+    return 0 if report["passed"] else 1
 
 
 if __name__ == "__main__":
