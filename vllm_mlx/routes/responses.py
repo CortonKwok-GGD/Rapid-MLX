@@ -2921,7 +2921,11 @@ async def _stream_responses(
             tool_calls = _enforce_responses_tool_choice(
                 parsed_tool_calls, responses_request, openai_request
             )
-            if tool_calls and openai_request.tools:
+            if (
+                tool_calls
+                and openai_request.tools
+                and cfg.tool_call_parser == "deepseek_v4_0731"
+            ):
                 _validate_tool_call_params(
                     tool_calls, openai_request.tools, enforce_required=True
                 )
@@ -3346,6 +3350,38 @@ async def _stream_responses(
             # empty turn as success instead of retrying.
             and (no_final_answer_generated_signal or bool(responses_request.tools))
         )
+
+        # A reasoning parser that returns to the reasoning channel after
+        # public content has started violates the Responses item ordering
+        # contract. The reasoning item is already closed at that point and
+        # Codex cannot accept another summary ladder after the message item.
+        # Fail explicitly instead of silently dropping the late bytes.
+        emitted_reasoning = ""
+        if reasoning_item_payload_done is not None:
+            emitted_reasoning = "".join(
+                str(part.get("text") or "")
+                for part in reasoning_item_payload_done.get("summary", [])
+                if isinstance(part, dict)
+            )
+        if reasoning_item_finalized and emitted_reasoning != accumulated_reasoning_text:
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": _stream_response_payload(
+                        "failed",
+                        error={
+                            "code": "invalid_reasoning_event_order",
+                            "message": (
+                                "The model emitted reasoning after public content; "
+                                "retry the request."
+                            ),
+                        },
+                    ),
+                },
+            )
+            return
+
         if no_final_answer_stop:
             reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (
                 _finalize_reasoning_item_events()
