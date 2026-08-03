@@ -739,6 +739,29 @@ class TestResponsesNonStreamFailureEnvelope:
         )
         assert "error" not in body, body
 
+    def test_immediate_stop_with_tools_is_retryable_failure(
+        self, immediate_stop_client
+    ):
+        resp = immediate_stop_client.client.post(
+            "/v1/responses",
+            json={
+                **PAYLOAD,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            },
+            headers=HEADERS,
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "failed"
+        assert body["error"]["code"] == "model_no_final_answer"
+
 
 # =============================================================================
 # Stream — engine wedge → response.failed instead of response.completed

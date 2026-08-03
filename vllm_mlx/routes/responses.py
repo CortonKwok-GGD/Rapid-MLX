@@ -1622,6 +1622,35 @@ async def _non_stream(
         include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
     )
 
+    if (
+        output.finish_reason == "stop"
+        and responses_request.tools
+        and not tool_calls
+        and not (final_content or "").strip()
+    ):
+        failed_payload = ResponsesResponse(
+            id=f"resp_{uuid.uuid4().hex[:24]}",
+            created_at=created_at,
+            model=cfg.model_name or responses_request.model,
+            status="failed",
+            output=[],
+            usage=ResponsesUsage(
+                input_tokens=output.prompt_tokens or 0,
+                output_tokens=output.completion_tokens or 0,
+                total_tokens=(output.prompt_tokens or 0)
+                + (output.completion_tokens or 0),
+            ),
+        )
+        payload = failed_payload.model_dump(exclude_none=True)
+        payload["error"] = {
+            "code": "model_no_final_answer",
+            "message": (
+                "The model stopped without producing a final answer or tool "
+                "call. Retry the request."
+            ),
+        }
+        return Response(content=json.dumps(payload), media_type="application/json")
+
     openai_response = ChatCompletionResponse(
         model=cfg.model_name or openai_request.model,
         choices=[
