@@ -147,18 +147,22 @@ final class ChatViewModel {
     /// Delete a saved conversation. If it was the open one, drop to a fresh
     /// empty transcript.
     func deleteConversation(_ id: UUID) {
-        conversations.removeAll { $0.id == id }
-        ConversationStore.save(conversations)
+        // If deleting the OPEN conversation, tear down the live transcript
+        // FIRST — otherwise the `isStreaming = false` below fires
+        // persistActive() via didSet while the deleted messages + id are
+        // still active, re-inserting the conversation we just removed.
         if id == activeConversationID {
             inflight?.cancel()
             inflight = nil
             conversationEpoch &+= 1
-            isStreaming = false
             messages.removeAll()
             activeConversationID = UUID()
+            isStreaming = false          // messages now empty → persistActive no-ops
             lastError = nil
             lastFailureKind = nil
         }
+        conversations.removeAll { $0.id == id }
+        ConversationStore.save(conversations)
     }
 
     // MARK: - In-memory message storage

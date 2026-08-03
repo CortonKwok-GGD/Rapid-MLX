@@ -50,13 +50,24 @@ enum ConversationStore {
         return []
     }
 
+    /// Serial queue for history writes: every save re-encodes the whole
+    /// history, so a CONCURRENT queue could let an older snapshot's write
+    /// land after a newer one's — overwriting recent turns or resurrecting
+    /// a deleted conversation. A serial queue guarantees writes commit in
+    /// submission order.
+    private static let writeQueue = DispatchQueue(
+        label: "com.rapidmlx.rapid.conversation-history-write",
+        qos: .utility
+    )
+
     /// Persist off the main actor — the caller (``ChatViewModel``) is
     /// ``@MainActor`` and every save re-encodes the whole history, so
     /// encoding + disk I/O must not run on the main thread or history
     /// growth would stall the UI. The snapshot is passed by value (Codable
-    /// value types), so the background write sees a stable copy.
+    /// value types), so the background write sees a stable copy, and the
+    /// serial ``writeQueue`` keeps ordering.
     static func save(_ conversations: [ChatConversation]) {
-        DispatchQueue.global(qos: .utility).async {
+        writeQueue.async {
             guard let data = try? JSONEncoder().encode(conversations) else { return }
             try? data.write(to: fileURL(), options: .atomic)
         }
