@@ -750,7 +750,11 @@ def _stage_rotating_verify_view(cache, kv: mx.array) -> Optional[_RotatingVerify
     if hasattr(cache, "_offset"):
         fields += ("left_padding", "_offset", "rotated")
     snapshot = {
-        name: (getattr(cache, name) + 0 if isinstance(getattr(cache, name), mx.array) else getattr(cache, name))
+        name: (
+            getattr(cache, name) + 0
+            if isinstance(getattr(cache, name), mx.array)
+            else getattr(cache, name)
+        )
         for name in fields
     }
     empty = mx.zeros((*kv.shape[:-1], 0), dtype=kv.dtype)
@@ -1194,9 +1198,7 @@ class SparseCompressedAttention(nn.Module):
                     scores = mx.maximum(scores, 0) * self.indexer.scale
                     weights = index_weights[:, idx : idx + 1]
                     weights = weights * (self.indexer.n_heads**-0.5)
-                    scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(
-                        axis=1
-                    )
+                    scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
                     k = min(self.indexer.index_topk, index_pooled.shape[1])
                     topk = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
                     if ring_view is not None:
@@ -1221,7 +1223,9 @@ class SparseCompressedAttention(nn.Module):
             # independent single-row launches.
             while sparse_rows:
                 pooled_length = int(sparse_rows[0][2].shape[1])
-                group = [row for row in sparse_rows if int(row[2].shape[1]) == pooled_length]
+                group = [
+                    row for row in sparse_rows if int(row[2].shape[1]) == pooled_length
+                ]
                 sparse_rows = [
                     row for row in sparse_rows if int(row[2].shape[1]) != pooled_length
                 ]
@@ -1264,7 +1268,13 @@ class SparseCompressedAttention(nn.Module):
             sinks = self.attn_sink.astype(q.dtype)
             if pooled.shape[1] == 0:
                 out = scaled_dot_product_attention(
-                    q, kv, kv, cache=local_cache, scale=self.scale, mask=mask, sinks=sinks
+                    q,
+                    kv,
+                    kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
                 )
             elif pooled.shape[1] <= self.indexer.index_topk:
                 full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
@@ -1540,7 +1550,7 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.mtp = [DSparkBlock(config, idx) for idx in range(config.dspark_num_layers)]
         self._last_dspark_hidden: mx.array | None = None
-        self._dspark_prime_ctx: dict[int, tuple[list, int]] = {}
+        self._dspark_prime_ctx: dict[int, tuple[object, list, int]] = {}
 
     @staticmethod
     def _target_cache_offset(cache) -> int | None:
@@ -1578,12 +1588,12 @@ class Model(nn.Module):
             if start != 0:
                 return
             caches = self.make_dspark_cache()
-            ctx = (caches, start)
-        elif ctx[1] != start:
+            ctx = (target_cache, caches, start)
+        elif ctx[0] is not target_cache or ctx[2] != start:
             if isinstance(contexts, dict):
                 contexts.pop(cache_key, None)
             return
-        caches = ctx[0]
+        caches = ctx[1]
         first = self.mtp[0]
         main_x = first.main_norm(first.main_proj(hidden))
         for block, layer_cache in zip(self.mtp, caches):
@@ -1591,7 +1601,10 @@ class Model(nn.Module):
         if not isinstance(contexts, dict):
             contexts = {}
             self._dspark_prime_ctx = contexts
-        contexts[cache_key] = (caches, offset_after)
+        # Retain and verify the cache object itself.  A bounded strong
+        # reference prevents Python from reusing its id for a later request
+        # while stale priming state is still present.
+        contexts[cache_key] = (target_cache, caches, offset_after)
         while len(contexts) > 32:
             contexts.pop(next(iter(contexts)))
         mx.async_eval([cache.keys for cache in caches if cache.keys is not None])
@@ -1599,16 +1612,14 @@ class Model(nn.Module):
     def take_dspark_primed(self, target_cache):
         contexts = getattr(self, "_dspark_prime_ctx", None)
         ctx = (
-            contexts.pop(id(target_cache), None)
-            if isinstance(contexts, dict)
-            else None
+            contexts.pop(id(target_cache), None) if isinstance(contexts, dict) else None
         )
         if ctx is None:
             return None
         offset = self._target_cache_offset(target_cache)
-        if offset is None or ctx[1] != offset - 1:
+        if offset is None or ctx[0] is not target_cache or ctx[2] != offset - 1:
             return None
-        return ctx[0]
+        return ctx[1]
 
     def __call__(
         self,

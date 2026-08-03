@@ -1741,12 +1741,20 @@ def _install_dspark(
             from .models.deepseek_v4_rollback import trim_all
 
             phase_t0 = time.perf_counter()
-            if not trim_all(gb.prompt_cache, rejected):
+            rollback_error = None
+            try:
+                rollback_ok = trim_all(gb.prompt_cache, rejected)
+            except Exception as exc:  # noqa: BLE001
+                rollback_error = exc
+                rollback_ok = False
+            if not rollback_ok:
                 # Compatibility fallback for an unknown/new cache class. It
                 # is exact but expensive; supported DeepSeek caches use their
                 # short-window undo records and never replay the backbone.
                 logger.warning(
-                    "[DSpark] cache rollback unsupported; replaying committed prefix"
+                    "[DSpark] cache rollback %s; replaying committed prefix%s",
+                    "failed" if rollback_error is not None else "unsupported",
+                    f": {rollback_error!r}" if rollback_error is not None else "",
                 )
                 gb.prompt_cache = target_cache_snapshot
                 committed_input = verify_input[:, : accepted + 1]
