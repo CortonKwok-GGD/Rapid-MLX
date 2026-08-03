@@ -1438,16 +1438,53 @@ def test_codex_progress_reminder_switches_from_edit_to_test():
     assert "every explicit acceptance constraint" in reminded[-1]["content"]
     assert "do not rerun the same failing test unchanged" in reminded[-1]["content"]
 
-    request.input.append(
-        {
-            "type": "function_call_output",
-            "call_id": "tests",
-            "output": "21 passed in 1.00s",
-        }
+    request.input.extend(
+        [
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "tests",
+                "arguments": '{"cmd":"python -m pytest tests/test_x.py"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "tests",
+                "output": "21 passed in 1.00s",
+            },
+        ]
     )
     reminded = _inject_codex_progress_reminder([], request)
     assert "Do not rerun the same tests" in reminded[-1]["content"]
     assert "provide the final answer" in reminded[-1]["content"]
+
+
+def test_codex_progress_does_not_mistake_prose_passed_for_test_success():
+    from vllm_mlx.api.responses_models import ResponsesRequest
+    from vllm_mlx.routes.responses import _inject_codex_progress_reminder
+
+    request = ResponsesRequest(
+        model="deepseek-v4",
+        input=[
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "edit",
+                "arguments": '{"cmd":"apply_patch <<PATCH"}',
+            },
+            *[
+                {
+                    "type": "function_call_output",
+                    "call_id": f"read_{index}",
+                    "output": "argument passed to function",
+                }
+                for index in range(5)
+            ],
+        ],
+    )
+
+    reminded = _inject_codex_progress_reminder([], request)
+    assert "running focused tests" in reminded[-1]["content"]
+    assert "provide the final answer" not in reminded[-1]["content"]
 
 
 def test_codex_action_prefix_breaks_post_edit_search_loop():

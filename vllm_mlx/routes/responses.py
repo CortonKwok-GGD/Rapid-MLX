@@ -17,6 +17,7 @@ history every turn in ``input``.
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
@@ -221,6 +222,10 @@ def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) 
         if hasattr(function, "arguments")
         else function.get("arguments", "{}")
     )
+    # Repeating a continuation/poll is normal while a PTY command is still
+    # running. Only shell actions are candidates for semantic-loop rejection.
+    if str(name) != "exec_command":
+        return
     if (str(name), str(arguments)) == previous:
         raise HTTPException(
             status_code=400,
@@ -243,6 +248,7 @@ def _inject_codex_progress_reminder(
     has_edited = False
     has_test_passed = False
     has_test_failed = False
+    calls: dict[str, str] = {}
     for item in items:
         data = item.model_dump() if hasattr(item, "model_dump") else item
         if not isinstance(data, dict):
@@ -250,13 +256,21 @@ def _inject_codex_progress_reminder(
         if data.get("type") == "function_call_output":
             completed += 1
             output = str(data.get("output") or "")
-            if " passed" in output:
+            command = calls.get(str(data.get("call_id") or ""), "")
+            is_test = any(
+                marker in command
+                for marker in ("pytest", "unittest", "tox", "nox", "ruff", "mypy")
+            )
+            if is_test and re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output):
                 # Pytest summaries have shapes such as ``21 passed in 1.0s``.
                 has_test_passed = True
-            if any(marker in output for marker in ("FAILED ", " FAILURES ", " ERROR ")):
+            if is_test and any(
+                marker in output for marker in ("FAILED ", " FAILURES ", " ERROR ")
+            ):
                 has_test_failed = True
         if data.get("type") == "function_call":
             arguments = str(data.get("arguments") or "")
+            calls[str(data.get("call_id") or "")] = arguments
             if "apply_patch" in arguments:
                 has_edited = True
                 has_test_passed = False
@@ -303,6 +317,7 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
     has_unresolved_failure = False
     has_successful_test = False
     commands_after_edit: list[str] = []
+    calls: dict[str, str] = {}
     for item in items:
         data = item.model_dump() if hasattr(item, "model_dump") else item
         if not isinstance(data, dict):
@@ -311,20 +326,36 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
             completed += 1
             if has_edited:
                 output = str(data.get("output") or "")
-                has_unresolved_failure = has_unresolved_failure or any(
-                    marker in output
+                command = calls.get(str(data.get("call_id") or ""), "")
+                is_test = any(
+                    marker in command
                     for marker in (
-                        "FAILED ",
-                        " FAILURES ",
-                        "Traceback (most recent call last)",
-                        " ERROR ",
+                        "pytest",
+                        "unittest",
+                        "tox",
+                        "nox",
+                        "ruff",
+                        "mypy",
                     )
                 )
-                has_successful_test = has_successful_test or (
-                    " passed" in output and not has_unresolved_failure
-                )
+                if is_test:
+                    has_unresolved_failure = has_unresolved_failure or any(
+                        marker in output
+                        for marker in (
+                            "FAILED ",
+                            " FAILURES ",
+                            "Traceback (most recent call last)",
+                            " ERROR ",
+                        )
+                    )
+                    has_successful_test = (
+                        has_successful_test
+                        or bool(re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output))
+                        and not has_unresolved_failure
+                    )
         if data.get("type") == "function_call":
             arguments = str(data.get("arguments") or "")
+            calls[str(data.get("call_id") or "")] = arguments
             if "apply_patch" in arguments:
                 has_edited = True
                 has_test_edit = has_test_edit or any(
@@ -1232,7 +1263,9 @@ async def _non_stream(
     created_at = int(time.time())
 
     messages = _prepare_messages_for_engine(engine, openai_request)
-    messages = _inject_codex_progress_reminder(messages, responses_request)
+    codex_surface = _is_deepseek_codex_surface(responses_request, cfg.tool_call_parser)
+    if codex_surface:
+        messages = _inject_codex_progress_reminder(messages, responses_request)
 
     # r5-B C-10 / C-11: tool-coupled UI-TARS sysprompt injection. PR
     # #817 wired ``computer_20251022`` → ``computer`` tool translation
@@ -1272,7 +1305,10 @@ async def _non_stream(
         from .chat import _compute_forced_tool_prefix
 
         forced_prefix = _compute_forced_tool_prefix(cfg, openai_request)
-        forced_prefix = _codex_action_command_prefix(responses_request) or forced_prefix
+        if codex_surface:
+            forced_prefix = (
+                _codex_action_command_prefix(responses_request) or forced_prefix
+            )
         if forced_prefix:
             chat_kwargs["forced_assistant_prefix"] = forced_prefix
 
@@ -2189,7 +2225,11 @@ async def _stream_responses(
     )
     try:
         messages = _prepare_messages_for_engine(engine, openai_request)
-        messages = _inject_codex_progress_reminder(messages, responses_request)
+        codex_surface = _is_deepseek_codex_surface(
+            responses_request, cfg.tool_call_parser
+        )
+        if codex_surface:
+            messages = _inject_codex_progress_reminder(messages, responses_request)
 
         # r5-B C-10 / C-11: tool-coupled UI-TARS sysprompt injection on
         # the streaming responses lane. Same gate as the non-stream
@@ -2222,9 +2262,10 @@ async def _stream_responses(
             from .chat import _compute_forced_tool_prefix
 
             forced_prefix = _compute_forced_tool_prefix(cfg, openai_request)
-            forced_prefix = (
-                _codex_action_command_prefix(responses_request) or forced_prefix
-            )
+            if codex_surface:
+                forced_prefix = (
+                    _codex_action_command_prefix(responses_request) or forced_prefix
+                )
             if forced_prefix:
                 chat_kwargs["forced_assistant_prefix"] = forced_prefix
         resolved_thinking = _resolve_enable_thinking(openai_request)
@@ -3249,10 +3290,6 @@ async def _stream_responses(
                 and openai_request.tools
                 and cfg.tool_call_parser == "deepseek_v4_0731"
             ):
-                if _is_deepseek_codex_surface(responses_request, cfg.tool_call_parser):
-                    _reject_immediate_repeated_tool_call(
-                        tool_calls, responses_request.input
-                    )
                 _validate_tool_call_params(
                     tool_calls, openai_request.tools, enforce_required=True
                 )
