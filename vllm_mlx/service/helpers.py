@@ -2958,6 +2958,24 @@ def _validate_tool_call_params(
             schema = called_tool_schemas.get(param_name)
             if not schema:
                 continue
+            if isinstance(param_value, str) and len(param_value) >= 128:
+                # Tool arguments are executable inputs, not harmless visible
+                # prose. A decode can reach EOS immediately after a repeated
+                # suffix and evade the scheduler's periodic online check;
+                # never hand an obviously collapsed command or patch payload
+                # to an agent client for execution.
+                from ..coherence import looks_like_garbage
+
+                degenerate, reason = looks_like_garbage(param_value)
+                if degenerate:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Tool call '{func_name}' parameter '{param_name}' "
+                            f"contains degenerate repeated output ({reason}); "
+                            "refusing to execute it. Retry the request."
+                        ),
+                    )
             is_valid, error = validate_param_value(json.dumps(param_value), schema)
             if not is_valid:
                 raise HTTPException(

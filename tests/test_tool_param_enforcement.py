@@ -32,6 +32,8 @@ regress real-world tool schemas that ship loose ``pattern`` /
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -273,6 +275,27 @@ class TestValidPasses:
         ]
         _validate_tool_call_params([_call("set_score", '{"score": 0}')], tools)
         _validate_tool_call_params([_call("set_score", '{"score": 100}')], tools)
+
+    def test_degenerate_repeated_string_argument_is_rejected(self):
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("exec_command", {"cmd": {"type": "string"}})]
+        repeated = "grep -rn get_stats " + ("metrics " * 200)
+        calls = [_call("exec_command", json.dumps({"cmd": repeated}))]
+
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_tool_call_params(calls, tools)
+        assert exc_info.value.status_code == 400
+        assert "degenerate repeated output" in exc_info.value.detail
+
+    def test_long_diverse_string_argument_is_allowed(self):
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("apply_patch", {"patch": {"type": "string"}})]
+        diverse = " ".join(f"line_{index}" for index in range(200))
+        _validate_tool_call_params(
+            [_call("apply_patch", json.dumps({"patch": diverse}))], tools
+        )
 
 
 # ---------------------------------------------------------------------------

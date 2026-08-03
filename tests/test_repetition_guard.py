@@ -7,9 +7,22 @@ import mlx.core as mx
 
 from vllm_mlx.repetition_guard import (
     AgentRepetitionLogitsProcessor,
+    detect_degenerate_text_suffix,
     detect_repeated_token_suffix,
     predict_repeated_token_suffix,
 )
+
+
+def test_detects_semantic_word_loop_with_nonperiodic_tokenization():
+    text = "grep -rn get_stats " + ("metrics " * 200)
+    reason = detect_degenerate_text_suffix(text)
+    assert reason is not None
+    assert "distinct-word ratio" in reason or "single word" in reason
+
+
+def test_semantic_guard_allows_long_diverse_engineering_text():
+    text = " ".join(f"identifier_{index}" for index in range(200))
+    assert detect_degenerate_text_suffix(text) is None
 from vllm_mlx.request import Request, RequestStatus, SamplingParams
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 
