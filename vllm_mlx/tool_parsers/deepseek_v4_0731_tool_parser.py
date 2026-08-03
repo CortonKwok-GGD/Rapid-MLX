@@ -16,6 +16,15 @@ from .abstract_tool_parser import (
     ToolParserManager,
 )
 
+_ESCAPED_CONTROL_LITERAL = re.compile(
+    r"<\u200b(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))"
+)
+
+
+def _restore_string_parameter(value: str) -> str:
+    """Decode DSML's U+200B escape for literal control-looking text."""
+    return _ESCAPED_CONTROL_LITERAL.sub("<", value)
+
 
 @ToolParserManager.register_module(["deepseek_v4_0731"])
 class DeepSeekV40731ToolParser(ToolParser):
@@ -67,7 +76,7 @@ class DeepSeekV40731ToolParser(ToolParser):
             for param in self.PARAM.finditer(match.group("body")):
                 raw = param.group("value")
                 if param.group("string") == "true":
-                    value: Any = raw
+                    value: Any = _restore_string_parameter(raw)
                 else:
                     try:
                         value = json.loads(raw)

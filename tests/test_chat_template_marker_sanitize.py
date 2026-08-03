@@ -53,7 +53,10 @@ def test_sanitize_neutralizes_literal_reasoning_tags_in_tool_output():
     messages = [
         {
             "role": "tool",
-            "content": 'THINK_MARKERS = ("<think>", "</think>")',
+            "content": (
+                'THINK_MARKERS = ("<think>", "</think>")\n'
+                'CLOSE = "</｜DSML｜parameter>"'
+            ),
         }
     ]
 
@@ -62,7 +65,8 @@ def test_sanitize_neutralizes_literal_reasoning_tags_in_tool_output():
     )
 
     assert sanitized[0]["content"] == (
-        'THINK_MARKERS = ("<\u200bthink>", "<\u200b/think>")'
+        'THINK_MARKERS = ("<\u200bthink>", "<\u200b/think>")\n'
+        'CLOSE = "<\u200b/｜DSML｜parameter>"'
     )
 
 

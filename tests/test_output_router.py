@@ -93,12 +93,6 @@ QWEN3_VOCAB = {
     "ing": 2,
     "Answer": 3,
     "Plain": 4,
-    '<｜DSML｜parameter name="patch" string="true">': 5,
-    "</｜DSML｜parameter>": 6,
-    "<｜DSML｜tool_calls>": 7,
-    '<｜DSML｜invoke name="apply_patch">': 8,
-    "</｜DSML｜invoke>": 9,
-    "</｜DSML｜tool_calls>": 10,
 }
 
 QWEN3_TOKENIZER = FakeTokenizer(QWEN3_VOCAB)
@@ -113,12 +107,6 @@ DEEPSEEK_R1_VOCAB = {
     " one": 2,
     "Answer": 3,
     "Plain": 4,
-    '<｜DSML｜parameter name="patch" string="true">': 5,
-    "</｜DSML｜parameter>": 6,
-    "<｜DSML｜tool_calls>": 7,
-    '<｜DSML｜invoke name="apply_patch">': 8,
-    "</｜DSML｜invoke>": 9,
-    "</｜DSML｜tool_calls>": 10,
 }
 
 DEEPSEEK_R1_TOKENIZER = FakeTokenizer(DEEPSEEK_R1_VOCAB)
@@ -510,52 +498,6 @@ class TestQwen3ThinkRouting:
         assert result["content"] == "AnswerAnswer"
         assert result["tool_calls"] is None
 
-    def test_literal_think_tags_in_dsml_parameter_are_preserved(self):
-        router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
-        assert router is not None
-
-        result = router.feed_sequence([248069, 7, 8, 5, 248068, 4, 248069, 6, 9, 10])
-
-        assert result["reasoning"] is None
-        assert result["content"] == (
-            "<｜DSML｜tool_calls>"
-            '<｜DSML｜invoke name="apply_patch">'
-            '<｜DSML｜parameter name="patch" string="true">'
-            "<think>Plain</think></｜DSML｜parameter>"
-            "</｜DSML｜invoke></｜DSML｜tool_calls>"
-        )
-
-    def test_dsml_parameter_state_survives_long_patch_payload(self):
-        router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
-        assert router is not None
-
-        assert router.feed(248069) is None
-        assert router.feed(7) is not None
-        assert router.feed(8) is not None
-        assert router.feed(5) is not None
-        for _ in range(100):
-            assert router.feed(4) is not None
-
-        literal = router.feed(248068)
-        assert literal is not None
-        assert literal.channel == Channel.CONTENT
-        assert literal.text == "<think>"
-
-        assert router.feed(6) is not None
-        assert router.feed(9) is not None
-        assert router.feed(10) is not None
-        assert router.feed(248068) is None
-        assert router.state == RouterState.THINKING
-
-    def test_quoted_dsml_parameter_without_envelope_does_not_hide_reasoning(self):
-        router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
-        assert router is not None
-
-        assert router.feed(248069) is None
-        assert router.feed(5) is not None
-        assert router.feed(248068) is None
-        assert router.state == RouterState.THINKING
-
 
 class TestDeepSeekR1ThinkRouting:
     """Test DeepSeek R1 <think> routing."""
@@ -619,23 +561,6 @@ class TestDeepSeekR1ThinkRouting:
         result = router.feed_sequence([151648, 1, 2, 151649, 3])
         assert result["reasoning"] == "Step one"
         assert result["content"] == "Answer"
-        assert result["tool_calls"] is None
-
-    def test_literal_think_tags_in_dsml_parameter_are_preserved(self):
-        """A patch/tool argument may legitimately contain reasoning-tag text."""
-        router = OutputRouter.from_tokenizer(DEEPSEEK_R1_TOKENIZER)
-        assert router is not None
-
-        result = router.feed_sequence([151649, 7, 8, 5, 151648, 4, 151649, 6, 9, 10])
-
-        assert result["reasoning"] is None
-        assert result["content"] == (
-            "<｜DSML｜tool_calls>"
-            '<｜DSML｜invoke name="apply_patch">'
-            '<｜DSML｜parameter name="patch" string="true">'
-            "<think>Plain</think></｜DSML｜parameter>"
-            "</｜DSML｜invoke></｜DSML｜tool_calls>"
-        )
         assert result["tool_calls"] is None
 
 

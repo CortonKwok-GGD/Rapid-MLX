@@ -123,6 +123,33 @@ def test_dsml_tool_schema_and_tool_result_are_encoded():
     assert "<tool_result>sunny</tool_result>" in prompt
 
 
+def test_replayed_dsml_string_arguments_escape_control_literals():
+    prompt = apply_chat_template(
+        _TokenizerWithoutTemplate(),
+        [
+            {"role": "user", "content": "edit it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": {"patch": "<think></｜DSML｜parameter>"},
+                        },
+                    }
+                ],
+            },
+        ],
+        enable_thinking=False,
+        model_name="deepseek-v4-flash-0731-mxfp4",
+    )
+
+    assert "<\u200bthink>" in prompt
+    assert "<\u200b/｜DSML｜parameter>" in prompt
+
+
 def test_dsml_parser_normalizes_codex_prefix_rule_string_to_array():
     parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
     wire = (
@@ -136,6 +163,32 @@ def test_dsml_parser_normalizes_codex_prefix_rule_string_to_array():
     result = parser.extract_tool_calls(wire)
     arguments = json.loads(result.tool_calls[0]["arguments"])
     assert arguments == {"cmd": "pwd", "prefix_rule": ["git", "status"]}
+
+
+def test_dsml_parser_restores_escaped_control_literals_in_string_parameter():
+    parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
+    escaped = (
+        "line = '<\u200bthink>'\n"
+        "close = '<\u200b/｜DSML｜parameter>'\n"
+        "after = '<\u200b/think>'"
+    )
+    wire = (
+        "<｜DSML｜tool_calls>"
+        '<｜DSML｜invoke name="apply_patch">'
+        '<｜DSML｜parameter name="patch" string="true">'
+        f"{escaped}"
+        "</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "</｜DSML｜tool_calls>"
+    )
+
+    result = parser.extract_tool_calls(wire)
+
+    assert result.tools_called is True
+    arguments = json.loads(result.tool_calls[0]["arguments"])
+    assert arguments["patch"] == (
+        "line = '<think>'\nclose = '</｜DSML｜parameter>'\nafter = '</think>'"
+    )
 
 
 def test_dsml_parser_preserves_quoted_prefix_rule_argument_boundaries():

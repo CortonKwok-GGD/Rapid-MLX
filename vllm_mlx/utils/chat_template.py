@@ -61,7 +61,14 @@ _CHAT_TEMPLATE_ROLE_MARKERS = (
     "<|return|>",
 )
 
-_REASONING_SENTINELS = {"<think>", "</think>", "<reasoning>", "</reasoning>"}
+_REASONING_SENTINELS = {
+    "<think>",
+    "</think>",
+    "<reasoning>",
+    "</reasoning>",
+    "<｜DSML｜",
+    "</｜DSML｜",
+}
 
 
 def _collect_role_markers(

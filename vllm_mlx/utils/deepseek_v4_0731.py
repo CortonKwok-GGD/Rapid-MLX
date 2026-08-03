@@ -21,6 +21,13 @@ LATEST_REMINDER = "<｜latest_reminder｜>"
 THINK_START = "<think>"
 THINK_END = "</think>"
 DSML = "｜DSML｜"
+_CONTROL_LITERAL_START = re.compile(r"<(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))")
+
+
+def _escape_string_parameter(value: str) -> str:
+    """Frame control-looking source text safely inside a DSML string value."""
+    return _CONTROL_LITERAL_START.sub("<\u200b", value)
+
 
 # Keep the small, universal engineering surface near the beginning of large
 # agent tool catalogs.  Codex can submit well over one hundred connector and
@@ -112,7 +119,7 @@ You have access to a set of tools to help answer the user's question. You can in
 
 String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
-Repository text that spells a reasoning sentinel may contain an invisible U+200B immediately after its opening `<`. This only prevents the tokenizer from interpreting data as channel control. When copying such text into a tool parameter, omit that U+200B and emit the repository's literal bytes unless the user explicitly asks to add it.
+Inside a `string="true"` parameter, escape literal control-looking text by inserting an invisible U+200B immediately after its opening `<`. This applies to `<think>`, `</think>`, `<reasoning>`, `</reasoning>`, and any literal `<｜DSML｜...>` or `</｜DSML｜...>` text in the parameter value. Preserve this U+200B when it is already present in repository text. Never escape the structural DSML wrapper tags themselves. The tool parser removes this escape before invoking the tool, so the tool receives the repository's exact literal bytes.
 
 If thinking_mode is enabled (triggered by {THINK_START}), you MUST output your complete reasoning inside {THINK_START}...{THINK_END} BEFORE any tool calls or final response.
 
@@ -139,7 +146,7 @@ def _encode_call(call: dict) -> str:
     params = []
     for key, value in arguments.items():
         is_string = isinstance(value, str)
-        rendered = value if is_string else _json(value)
+        rendered = _escape_string_parameter(value) if is_string else _json(value)
         params.append(
             f'<{DSML}parameter name="{key}" string="{str(is_string).lower()}">'
             f"{rendered}</{DSML}parameter>"
