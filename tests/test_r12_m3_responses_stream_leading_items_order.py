@@ -297,6 +297,40 @@ def _assert_leading_items_before_message(events):
 
 
 class TestLeadingItemOrdering:
+    def test_reasoning_item_is_finalized_before_message_item_opens(self, make_client):
+        """Codex keeps a single active Responses output item.
+
+        A reasoning summary event emitted after the message item has opened is
+        rejected as ``ReasoningSummaryPartAdded without active item``.  Keep
+        each output item's event ladder contiguous: reasoning added/summary/
+        done, then message added/content/done.
+        """
+        client = make_client.set(_EngineWithReasoning())
+        events = _stream_and_parse(client, _stream_payload())
+
+        active_item: tuple[str, str] | None = None
+        for name, data in events:
+            if name == "response.output_item.added":
+                item = data["item"]
+                assert active_item is None, (
+                    f"opened {item['type']} before closing active "
+                    f"{active_item}; event={data}"
+                )
+                active_item = (item["id"], item["type"])
+            elif name.startswith("response.reasoning_summary_"):
+                assert active_item == (data["item_id"], "reasoning"), (
+                    f"{name} must target the active reasoning item; "
+                    f"active={active_item}, event={data}"
+                )
+            elif name == "response.output_item.done":
+                item = data["item"]
+                assert active_item == (item["id"], item["type"]), (
+                    f"closed {item['type']} while active={active_item}"
+                )
+                active_item = None
+
+        assert active_item is None
+
     def test_empty_reasoning_still_emits_reasoning_before_message(self, make_client):
         """M-3 root case: model produces NO reasoning bytes. The fix must
         still emit an empty ``reasoning`` item BEFORE the message item,
