@@ -952,9 +952,7 @@ async def list_models() -> ModelsResponse:
         _append(_build_model_info(locked))
 
     codex_models = [
-        _build_codex_model_info(info)
-        for info in models
-        if "text" in info.capabilities
+        _build_codex_model_info(info) for info in models if "text" in info.capabilities
     ]
     return ModelsResponse(data=models, models=codex_models)
 

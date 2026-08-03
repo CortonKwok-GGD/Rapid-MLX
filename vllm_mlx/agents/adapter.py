@@ -127,9 +127,7 @@ def setup_agent_config(
             rendered = rendered.replace(
                 "{model_catalog_path}", str(catalog_path.resolve())
             )
-            catalog = {
-                "models": [build_codex_model_info(model_id, context_length)]
-            }
+            catalog = {"models": [build_codex_model_info(model_id, context_length)]}
             try:
                 _atomic_write(
                     catalog_path,

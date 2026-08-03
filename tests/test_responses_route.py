@@ -1294,6 +1294,8 @@ class TestResponsesStreamR10C3:
         for fld in ("id", "created_at", "status", "model", "output", "usage"):
             assert fld in resp_obj, f"completed.response is missing `{fld}`"
         assert resp_obj["status"] == "completed"
+
+
 def test_deepseek_codex_exec_priming_is_bounded_to_early_tool_phase():
     from vllm_mlx.api.responses_models import ResponsesRequest
     from vllm_mlx.routes.responses import _should_prime_deepseek_codex_exec
@@ -1437,7 +1439,11 @@ def test_codex_progress_reminder_switches_from_edit_to_test():
     assert "do not rerun the same failing test unchanged" in reminded[-1]["content"]
 
     request.input.append(
-        {"type": "function_call_output", "call_id": "tests", "output": "21 passed in 1.00s"}
+        {
+            "type": "function_call_output",
+            "call_id": "tests",
+            "output": "21 passed in 1.00s",
+        }
     )
     reminded = _inject_codex_progress_reminder([], request)
     assert "Do not rerun the same tests" in reminded[-1]["content"]
@@ -1453,26 +1459,51 @@ def test_codex_action_prefix_breaks_post_edit_search_loop():
         for index in range(5)
     ]
     items.append(
-        {"type": "function_call", "name": "exec_command", "call_id": "edit", "arguments": '{"cmd":"apply_patch <<PATCH\\n*** Update File: vllm_mlx/x.py"}'}
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "edit",
+            "arguments": '{"cmd":"apply_patch <<PATCH\\n*** Update File: vllm_mlx/x.py"}',
+        }
     )
     for command in ("git diff", "grep -rn symbol vllm_mlx", "rg symbol vllm_mlx"):
         items.extend(
             [
-                {"type": "function_call_output", "call_id": f"out_{command}", "output": "ok"},
-                {"type": "function_call", "name": "exec_command", "call_id": f"call_{command}", "arguments": f'{{"cmd":"{command}"}}'},
+                {
+                    "type": "function_call_output",
+                    "call_id": f"out_{command}",
+                    "output": "ok",
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": f"call_{command}",
+                    "arguments": f'{{"cmd":"{command}"}}',
+                },
             ]
         )
     request = ResponsesRequest(model="m", input=items)
     assert _codex_action_command_prefix(request).endswith(">apply_patch")
 
-    items[5]["arguments"] = '{"cmd":"apply_patch <<PATCH\\n*** Update File: tests/test_x.py"}'
+    items[5]["arguments"] = (
+        '{"cmd":"apply_patch <<PATCH\\n*** Update File: tests/test_x.py"}'
+    )
     request = ResponsesRequest(model="m", input=items)
     assert _codex_action_command_prefix(request).endswith(">python -m pytest")
 
     items.extend(
         [
-            {"type": "function_call", "name": "exec_command", "call_id": "test", "arguments": '{"cmd":"python -m pytest tests/test_x.py"}'},
-            {"type": "function_call_output", "call_id": "test", "output": "FAILED tests/test_x.py::test_x"},
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "test",
+                "arguments": '{"cmd":"python -m pytest tests/test_x.py"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "test",
+                "output": "FAILED tests/test_x.py::test_x",
+            },
         ]
     )
     request = ResponsesRequest(model="m", input=items)
@@ -1485,14 +1516,30 @@ def test_deepseek_codex_implicit_temperature_uses_low_entropy_default(monkeypatc
     from vllm_mlx.routes.responses import _resolved_responses_sampling_kwargs
 
     tools = [
-        {"type": "function", "name": name, "description": name, "parameters": {"type": "object", "properties": {}}}
+        {
+            "type": "function",
+            "name": name,
+            "description": name,
+            "parameters": {"type": "object", "properties": {}},
+        }
         for name in ("exec_command", "write_stdin")
     ]
-    responses = ResponsesRequest(model="deepseek-v4-flash-0731", input="fix it", tools=tools)
-    chat = ChatCompletionRequest(model="deepseek-v4-flash-0731", messages=[{"role": "user", "content": "fix it"}])
-    monkeypatch.setattr("vllm_mlx.routes.responses._resolve_temperature", lambda value: 1.0 if value is None else value)
-    assert _resolved_responses_sampling_kwargs(chat, responses, None)["temperature"] == 0.2
+    responses = ResponsesRequest(
+        model="deepseek-v4-flash-0731", input="fix it", tools=tools
+    )
+    chat = ChatCompletionRequest(
+        model="deepseek-v4-flash-0731", messages=[{"role": "user", "content": "fix it"}]
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.routes.responses._resolve_temperature",
+        lambda value: 1.0 if value is None else value,
+    )
+    assert (
+        _resolved_responses_sampling_kwargs(chat, responses, None)["temperature"] == 0.2
+    )
 
     responses.temperature = 0.7
     chat.temperature = 0.7
-    assert _resolved_responses_sampling_kwargs(chat, responses, None)["temperature"] == 0.7
+    assert (
+        _resolved_responses_sampling_kwargs(chat, responses, None)["temperature"] == 0.7
+    )

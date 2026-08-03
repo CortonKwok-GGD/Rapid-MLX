@@ -163,9 +163,10 @@ def _is_deepseek_codex_surface(
     responses_request: ResponsesRequest, tool_parser: str | None
 ) -> bool:
     """Identify the DeepSeek DSML + Codex PTY tool combination."""
-    if tool_parser is None and "deepseek-v4-flash-0731" in (
-        responses_request.model or ""
-    ).lower():
+    if (
+        tool_parser is None
+        and "deepseek-v4-flash-0731" in (responses_request.model or "").lower()
+    ):
         tool_parser = "deepseek_v4_0731"
     if tool_parser != "deepseek_v4_0731":
         return False
@@ -183,9 +184,7 @@ def _is_deepseek_codex_surface(
     return {"exec_command", "write_stdin"}.issubset(names)
 
 
-def _reject_immediate_repeated_tool_call(
-    tool_calls: list, input_items: object
-) -> None:
+def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) -> None:
     """Reject a model call identical to the most recent agent call.
 
     Re-running an unchanged shell search is a semantic loop even when each
@@ -211,8 +210,10 @@ def _reject_immediate_repeated_tool_call(
         return
 
     current = tool_calls[0]
-    function = current.function if hasattr(current, "function") else current.get(
-        "function", current
+    function = (
+        current.function
+        if hasattr(current, "function")
+        else current.get("function", current)
     )
     name = function.name if hasattr(function, "name") else function.get("name", "")
     arguments = (
@@ -312,7 +313,12 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
                 output = str(data.get("output") or "")
                 has_unresolved_failure = has_unresolved_failure or any(
                     marker in output
-                    for marker in ("FAILED ", " FAILURES ", "Traceback (most recent call last)", " ERROR ")
+                    for marker in (
+                        "FAILED ",
+                        " FAILURES ",
+                        "Traceback (most recent call last)",
+                        " ERROR ",
+                    )
                 )
                 has_successful_test = has_successful_test or (
                     " passed" in output and not has_unresolved_failure
@@ -408,9 +414,8 @@ def _resolved_responses_sampling_kwargs(
 ) -> dict:
     """Apply Responses/Codex defaults without changing the base helper contract."""
     out = _resolved_sampling_kwargs(openai_request)
-    if (
-        responses_request.temperature is None
-        and _is_deepseek_codex_surface(responses_request, tool_parser)
+    if responses_request.temperature is None and _is_deepseek_codex_surface(
+        responses_request, tool_parser
     ):
         # The 0731 checkpoint ships temperature=1 in generation_config.
         # That is useful for chat, but in long Codex tool loops it causes
@@ -676,9 +681,7 @@ async def create_response(request: Request):
             # recognize this checkpoint directly when the CLI did not receive
             # an explicit --tool-call-parser value.
             priming_tool_parser = "deepseek_v4_0731"
-    if _should_prime_deepseek_codex_exec(
-        responses_request, priming_tool_parser
-    ):
+    if _should_prime_deepseek_codex_exec(responses_request, priming_tool_parser):
         responses_request.tool_choice = {
             "type": "function",
             "name": "exec_command",
@@ -1798,9 +1801,7 @@ async def _non_stream(
             tool_calls, responses_request, openai_request
         )
         if tool_calls and openai_request.tools:
-            if _is_deepseek_codex_surface(
-                responses_request, cfg.tool_call_parser
-            ):
+            if _is_deepseek_codex_surface(responses_request, cfg.tool_call_parser):
                 _reject_immediate_repeated_tool_call(
                     tool_calls, responses_request.input
                 )
@@ -3248,9 +3249,7 @@ async def _stream_responses(
                 and openai_request.tools
                 and cfg.tool_call_parser == "deepseek_v4_0731"
             ):
-                if _is_deepseek_codex_surface(
-                    responses_request, cfg.tool_call_parser
-                ):
+                if _is_deepseek_codex_surface(responses_request, cfg.tool_call_parser):
                     _reject_immediate_repeated_tool_call(
                         tool_calls, responses_request.input
                     )
