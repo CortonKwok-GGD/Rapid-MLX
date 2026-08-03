@@ -3969,7 +3969,11 @@ class Scheduler:
         clamped = bool(getattr(self, "_adaptive_prefill_cache_clamped", False))
         if should_clamp == clamped:
             return
-        limit = min(requested, self._default_metal_cache_limit()) if should_clamp else self._default_metal_cache_limit()
+        limit = (
+            min(requested, self._default_metal_cache_limit())
+            if should_clamp
+            else self._default_metal_cache_limit()
+        )
         mx.set_cache_limit(limit)
         if should_clamp:
             mx.clear_cache()
