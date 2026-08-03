@@ -33,7 +33,9 @@ class TurnResult:
     repetition_period: int | None
 
 
-def repetition_period(text: str, *, repeats: int = 3, max_period: int = 512) -> int | None:
+def repetition_period(
+    text: str, *, repeats: int = 3, max_period: int = 512
+) -> int | None:
     """Return a repeated tail period, matching the failure Codex reconnects on."""
     if not text:
         return None
@@ -81,7 +83,9 @@ def run_turn(
     first_token_at = None
     output_parts: list[str] = []
     usage = (0, 0)
-    with client.stream("POST", f"{url}/responses", json=payload, timeout=timeout) as resp:
+    with client.stream(
+        "POST", f"{url}/responses", json=payload, timeout=timeout
+    ) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -115,9 +119,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--model", default="deepseek-v4-flash-0731")
-    parser.add_argument(
-        "--stages", default="32000,64000,128000,200000,300000"
-    )
+    parser.add_argument("--stages", default="32000,64000,128000,200000,300000")
     parser.add_argument("--max-output-tokens", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--compact", action="store_true")
@@ -145,7 +147,8 @@ def main() -> int:
             items.append(
                 {
                     "role": "user",
-                    "content": "Append-only project evidence:\n" + padding_for_tokens(needed),
+                    "content": "Append-only project evidence:\n"
+                    + padding_for_tokens(needed),
                 }
             )
             result, output = run_turn(
