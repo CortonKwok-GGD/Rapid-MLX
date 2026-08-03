@@ -4404,7 +4404,14 @@ def bench_command(args):
         print(f"Loading model: {args.model}")
         try:
             validate_local_model_file(args.model)
-            model, tokenizer = load(args.model)
+            # Load the weights ON the mlx-step worker (created + explained at
+            # the ``bench_command`` call site below) and reuse that worker for
+            # AsyncEngineCore. mlx-lm 0.31.3+ binds the generation stream to
+            # whichever thread first touches MLX, so loading here — on the same
+            # worker the engine later steps on — is what keeps the first batch
+            # step from raising "There is no Stream(gpu, N) in current thread"
+            # (which aborts every request and reports 0.00 tok/s).
+            model, tokenizer = model_load_executor.submit(load, args.model).result()
         except Exception as e:
             # Opt-in telemetry (Phase 2.2 error wiring): mirror the
             # ``serve`` path — record a bucketed model-load failure
@@ -4523,7 +4530,12 @@ def bench_command(args):
         total_prompt_tokens = 0
         total_completion_tokens = 0
 
-        async with AsyncEngineCore(model, tokenizer, engine_config) as engine:
+        # Reuse the model-load worker as the engine's mlx-step thread so
+        # weights + forward passes + cache state stay on one owning thread
+        # (see the load-executor comment above).
+        async with AsyncEngineCore(
+            model, tokenizer, engine_config, executor=model_load_executor
+        ) as engine:
             await asyncio.sleep(0.1)  # Warm up
 
             start_time = time.perf_counter()
@@ -4563,7 +4575,34 @@ def bench_command(args):
         print(f"  Tokens/second: {total_completion_tokens / total_time:.2f}")
         print(f"  Throughput: {total_tokens / total_time:.2f} tok/s")
 
-    asyncio.run(run_benchmark())
+    import concurrent.futures
+
+    from .engine_core import _init_mlx_step_thread
+
+    # Create the single mlx-step worker BEFORE loading weights and reuse it
+    # for AsyncEngineCore so weights + forward passes + cache state all live
+    # on one owning thread (#170). mlx-lm 0.31.3+ binds the module-level
+    # generation stream to whichever thread first touches MLX; loading on the
+    # main thread and generating on the engine worker raises "There is no
+    # Stream(gpu, N) in current thread" on the first batch step → every
+    # request aborts → the run silently reports 0.00 tok/s (the app's "Speed
+    # on this Mac" card then shows a confident, wrong zero). Mirrors the
+    # proven ``bench --submit`` path (``_run``) and ``BatchedEngine._start_llm``
+    # — the exact reason ``serve``/``chat`` work and this freeform path did not.
+    model_load_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="mlx-step",
+        initializer=_init_mlx_step_thread,
+    )
+    try:
+        asyncio.run(run_benchmark())
+    finally:
+        # Caller-supplied executors are NOT owned or shut down by
+        # AsyncEngineCore.stop(), so reap the worker here on every exit path
+        # (success, load error → sys.exit, Ctrl-C). The worker is idle by now
+        # — the engine closed its BatchGenerator on it during stop() — so the
+        # join returns immediately.
+        model_load_executor.shutdown(wait=True)
 
 
 def _format_bytes(n: int) -> str:
