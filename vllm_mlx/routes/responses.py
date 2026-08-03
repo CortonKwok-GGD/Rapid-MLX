@@ -114,69 +114,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-class _AgentActionLoopError(HTTPException):
-    rapid_mlx_error_code = "agent_action_loop"
-
-
-def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) -> None:
-    """Reject a model call identical to the most recent agent call."""
-    if not tool_calls or not isinstance(input_items, list):
-        return
-
-    def _canonical_arguments(value: object) -> str:
-        raw = str(value or "{}")
-        try:
-            return json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":"))
-        except (TypeError, ValueError):
-            return raw.strip()
-
-    previous: set[tuple[str, str]] = set()
-    completed_call_ids: set[str] = set()
-    for item in reversed(input_items):
-        data = item.model_dump() if hasattr(item, "model_dump") else item
-        if not isinstance(data, dict):
-            break
-        if data.get("type") == "function_call_output" and not previous:
-            call_id = data.get("call_id")
-            if isinstance(call_id, str):
-                completed_call_ids.add(call_id)
-            continue
-        if data.get("type") != "function_call":
-            break
-        name = data.get("name") or (data.get("function") or {}).get("name")
-        arguments = data.get("arguments")
-        if arguments is None and isinstance(data.get("function"), dict):
-            arguments = data["function"].get("arguments")
-        call_id = data.get("call_id") or data.get("id")
-        if call_id in completed_call_ids:
-            previous.add((str(name or ""), _canonical_arguments(arguments)))
-    if not previous:
-        return
-
-    for current in tool_calls:
-        function = (
-            current.function
-            if hasattr(current, "function")
-            else current.get("function", current)
-        )
-        name = function.name if hasattr(function, "name") else function.get("name", "")
-        arguments = (
-            function.arguments
-            if hasattr(function, "arguments")
-            else function.get("arguments", "{}")
-        )
-        if (str(name), _canonical_arguments(arguments)) in previous:
-            message = (
-                f"Model repeated the immediately preceding tool call '{name}' "
-                "with identical arguments; refusing an agent action loop. "
-                "Retry with a different action."
-            )
-            raise _AgentActionLoopError(
-                status_code=400,
-                detail=message,
-            )
-
-
 def _resolve_context_safe_implicit_responses_max_tokens(
     engine: BaseEngine,
     prompt_tokens: int | None,
@@ -1556,7 +1493,6 @@ async def _non_stream(
             tool_calls, responses_request, openai_request
         )
         if tool_calls and openai_request.tools:
-            _reject_immediate_repeated_tool_call(tool_calls, responses_request.input)
             _validate_tool_call_params(
                 tool_calls, openai_request.tools, enforce_required=True
             )
@@ -2986,9 +2922,6 @@ async def _stream_responses(
                 parsed_tool_calls, responses_request, openai_request
             )
             if tool_calls and openai_request.tools:
-                _reject_immediate_repeated_tool_call(
-                    tool_calls, responses_request.input
-                )
                 _validate_tool_call_params(
                     tool_calls, openai_request.tools, enforce_required=True
                 )
