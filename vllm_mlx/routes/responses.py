@@ -119,41 +119,53 @@ def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) 
     if not tool_calls or not isinstance(input_items, list):
         return
 
-    previous: tuple[str, str] | None = None
+    def _canonical_arguments(value: object) -> str:
+        raw = str(value or "{}")
+        try:
+            return json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return raw.strip()
+
+    previous: set[tuple[str, str]] = set()
+    saw_output = False
     for item in reversed(input_items):
         data = item.model_dump() if hasattr(item, "model_dump") else item
-        if not isinstance(data, dict) or data.get("type") != "function_call":
+        if not isinstance(data, dict):
+            break
+        if data.get("type") == "function_call_output" and not previous:
+            saw_output = True
             continue
+        if data.get("type") != "function_call":
+            break
         name = data.get("name") or (data.get("function") or {}).get("name")
         arguments = data.get("arguments")
         if arguments is None and isinstance(data.get("function"), dict):
             arguments = data["function"].get("arguments")
-        previous = (str(name or ""), str(arguments or "{}"))
-        break
-    if previous is None:
+        previous.add((str(name or ""), _canonical_arguments(arguments)))
+    if not saw_output or not previous:
         return
 
-    current = tool_calls[0]
-    function = (
-        current.function
-        if hasattr(current, "function")
-        else current.get("function", current)
-    )
-    name = function.name if hasattr(function, "name") else function.get("name", "")
-    arguments = (
-        function.arguments
-        if hasattr(function, "arguments")
-        else function.get("arguments", "{}")
-    )
-    if (str(name), str(arguments)) == previous:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Model repeated the immediately preceding tool call '{name}' "
-                "with identical arguments; refusing an agent action loop. "
-                "Retry with a different action."
-            ),
+    for current in tool_calls:
+        function = (
+            current.function
+            if hasattr(current, "function")
+            else current.get("function", current)
         )
+        name = function.name if hasattr(function, "name") else function.get("name", "")
+        arguments = (
+            function.arguments
+            if hasattr(function, "arguments")
+            else function.get("arguments", "{}")
+        )
+        if (str(name), _canonical_arguments(arguments)) in previous:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model repeated the immediately preceding tool call '{name}' "
+                    "with identical arguments; refusing an agent action loop. "
+                    "Retry with a different action."
+                ),
+            )
 
 
 def _resolve_context_safe_implicit_responses_max_tokens(
@@ -3334,37 +3346,7 @@ async def _stream_responses(
             # empty turn as success instead of retrying.
             and (no_final_answer_generated_signal or bool(responses_request.tools))
         )
-        normalized_final = " ".join(accumulated_text.lower().split())
-        # Sampled local models sometimes prefix an otherwise identical
-        # action announcement with punctuation (observed verbatim as
-        # ``: I'll look at ... then implement``).  That punctuation has no
-        # semantic meaning but previously bypassed the prefix guard and made
-        # Codex accept a plan-with-no-tool as a completed engineering turn.
-        normalized_tool_intent = normalized_final.lstrip(" :;-—–•*>")
-        _tool_intent_prefixes = (
-            "let me ",
-            "i'll inspect ",
-            "i'll check ",
-            "i'll search ",
-            "i'll read ",
-            "i'll look ",
-            "i will inspect ",
-            "i will check ",
-            "i will search ",
-            "i will read ",
-            "i will look ",
-        )
-        unfulfilled_tool_intent_stop = bool(
-            last_finish_reason == "stop"
-            and responses_request.tools
-            and not tool_calls
-            and 0 < len(normalized_tool_intent) <= 600
-            and (
-                normalized_tool_intent.startswith(_tool_intent_prefixes)
-                or " let me " in normalized_tool_intent
-            )
-        )
-        if no_final_answer_stop or unfulfilled_tool_intent_stop:
+        if no_final_answer_stop:
             reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (
                 _finalize_reasoning_item_events()
             )
@@ -3377,21 +3359,12 @@ async def _stream_responses(
                     )
                 else:
                     completed_output.append(reasoning_item_payload_done)
-            error_code = (
-                "model_no_tool_progress"
-                if unfulfilled_tool_intent_stop
-                else "model_no_final_answer"
-            )
+            error_code = "model_no_final_answer"
             error_message = (
-                "The model announced an inspection or search but stopped "
-                "before calling a tool. Retry the request."
-                if unfulfilled_tool_intent_stop
-                else (
-                    "The model stopped after generating hidden output but did "
-                    "not produce a final answer or tool call. Retry the "
-                    "request; if it repeats, reduce the prompt or reasoning "
-                    "budget."
-                )
+                "The model stopped after generating hidden output but did "
+                "not produce a final answer or tool call. Retry the "
+                "request; if it repeats, reduce the prompt or reasoning "
+                "budget."
             )
             logger.warning(
                 "Responses (stream): non-progress stop (%s); surfacing as "

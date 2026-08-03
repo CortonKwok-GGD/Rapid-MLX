@@ -5786,11 +5786,10 @@ class Scheduler:
                         request.num_output_tokens,
                     )
                 if repetition_match is None:
-                    decoder = getattr(request, "_decoder", None)
-                    decoded_output = (
-                        decoder.get_full_text()
-                        if decoder is not None
-                        else self._decode_tokens(request.output_token_ids)
+                    # The detector reads only a bounded character suffix; do
+                    # not repeatedly materialize the entire completion here.
+                    decoded_output = self._decode_tokens(
+                        request.output_token_ids[-2048:]
                     )
                     semantic_reason = detect_degenerate_text_suffix(decoded_output)
                     if semantic_reason is not None:

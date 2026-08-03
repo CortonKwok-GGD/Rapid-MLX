@@ -912,7 +912,7 @@ class TestResponsesStreamFailureEnvelope:
         failed = next(data for name, data in events if name == "response.failed")
         assert failed["response"]["error"]["code"] == "model_no_final_answer"
 
-    def test_unfulfilled_tool_intent_emits_retryable_failure(
+    def test_auto_tool_choice_allows_textual_action_language(
         self, tool_intent_only_stop_client
     ):
         payload = {
@@ -922,25 +922,17 @@ class TestResponsesStreamFailureEnvelope:
                 {
                     "type": "function",
                     "name": "shell",
-                    "description": "Run a repository command.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"command": {"type": "string"}},
-                        "required": ["command"],
-                    },
+                    "parameters": {"type": "object"},
                 }
             ],
         }
         with tool_intent_only_stop_client.client.stream(
             "POST", "/v1/responses", json=payload, headers=HEADERS
         ) as resp:
-            body = "".join(resp.iter_text())
-        events = _parse_sse(body)
-        names = [name for name, _ in events]
-        assert "response.failed" in names, names
-        assert "response.completed" not in names, names
-        failed = next(data for name, data in events if name == "response.failed")
-        assert failed["response"]["error"]["code"] == "model_no_tool_progress"
+            events = _parse_sse("".join(resp.iter_text()))
+
+        assert any(name == "response.completed" for name, _ in events)
+        assert not any(name == "response.failed" for name, _ in events)
 
     def test_reasoning_only_stop_does_not_promote_reasoning_to_text(
         self, reasoning_only_stop_client

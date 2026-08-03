@@ -978,12 +978,17 @@ def test_rejects_immediately_repeated_tool_action():
     ]
     repeated = [
         ToolCall(
+            id="call_first",
+            type="function",
+            function=FunctionCall(name="exec_command", arguments='{"cmd":"pwd"}'),
+        ),
+        ToolCall(
             id="call_new",
             type="function",
             function=FunctionCall(
-                name="exec_command", arguments='{"cmd":"rg get_stats"}'
+                name="exec_command", arguments='{ "cmd" : "rg get_stats" }'
             ),
-        )
+        ),
     ]
     with pytest.raises(HTTPException, match="identical arguments"):
         _reject_immediate_repeated_tool_call(repeated, history)
@@ -996,6 +1001,11 @@ def test_rejects_immediately_repeated_tool_action():
         )
     ]
     _reject_immediate_repeated_tool_call(different, history)
+
+    # A newer conversational turn makes the earlier action non-immediate.
+    _reject_immediate_repeated_tool_call(
+        repeated, [*history, {"role": "user", "content": "run it again"}]
+    )
 
 
 class TestResponsesStream:

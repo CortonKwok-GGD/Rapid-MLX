@@ -140,6 +140,27 @@ def test_scheduler_does_not_change_plain_chat_semantics():
     assert scheduler.num_repetition_loop_stops == 0
 
 
+def test_semantic_guard_decodes_only_a_bounded_suffix():
+    scheduler = _scheduler()
+    req = Request("long-agent", "prompt", SamplingParams(max_tokens=10_000))
+    req.status = RequestStatus.RUNNING
+    req.has_tools = True
+    req.output_token_ids = list(range(4095))
+    scheduler.running[req.request_id] = req
+    scheduler.uid_to_request_id[1] = req.request_id
+    scheduler._decode_tokens = MagicMock(
+        return_value=" ".join(f"identifier_{index}" for index in range(512))
+    )
+
+    response = MagicMock(uid=1, token=4095, finish_reason=None, logprobs=None)
+    del response.prompt_cache
+    scheduler._process_batch_responses([response])
+
+    decoded_ids = scheduler._decode_tokens.call_args.args[0]
+    assert len(decoded_ids) == 2048
+    assert decoded_ids[-1] == 4095
+
+
 def test_scheduler_fails_single_token_loop_for_tool_request():
     scheduler = _scheduler()
     req = Request("repeat-short", "prompt", SamplingParams(max_tokens=20_000))
