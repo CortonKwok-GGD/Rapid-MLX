@@ -90,7 +90,7 @@ def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
                 )
     except Exception:
         pass
-    return lhs @ (rhs.swapaxes(-1, -2) if transpose_rhs else rhs)
+    return _metal_rowwise_gemm(lhs, rhs, transpose_rhs)
 
 
 def exact_attention(

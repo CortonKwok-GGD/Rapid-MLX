@@ -8,6 +8,7 @@ pooling caches implement the analogous record in ``deepseek_v4_cache``.
 
 from __future__ import annotations
 
+import copy
 import threading
 from contextlib import contextmanager
 
@@ -58,6 +59,8 @@ def install_rotating_undo() -> None:
                         value = getattr(self, name)
                         if isinstance(value, mx.array):
                             value = value + 0
+                        elif isinstance(value, (dict, list, set, tuple)):
+                            value = copy.deepcopy(value)
                         snapshot[name] = value
                     self._rapid_undo = (snapshot, keys, values)
             else:

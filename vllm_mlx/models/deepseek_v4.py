@@ -1540,7 +1540,7 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.mtp = [DSparkBlock(config, idx) for idx in range(config.dspark_num_layers)]
         self._last_dspark_hidden: mx.array | None = None
-        self._dspark_prime_ctx = None
+        self._dspark_prime_ctx: dict[int, tuple[list, int]] = {}
 
     @staticmethod
     def _target_cache_offset(cache) -> int | None:
@@ -1564,7 +1564,9 @@ class Model(nn.Module):
         if offset_after is None:
             return
         start = offset_after - int(inputs.shape[1])
-        ctx = self._dspark_prime_ctx
+        cache_key = id(target_cache)
+        contexts = getattr(self, "_dspark_prime_ctx", None)
+        ctx = contexts.get(cache_key) if isinstance(contexts, dict) else None
         if ctx is None:
             # A target prefix-cache hit only evaluates the uncached suffix, so
             # the corresponding target-layer hidden history is unavailable.
@@ -1578,19 +1580,29 @@ class Model(nn.Module):
             caches = self.make_dspark_cache()
             ctx = (caches, start)
         elif ctx[1] != start:
-            self._dspark_prime_ctx = None
+            if isinstance(contexts, dict):
+                contexts.pop(cache_key, None)
             return
         caches = ctx[0]
         first = self.mtp[0]
         main_x = first.main_norm(first.main_proj(hidden))
         for block, layer_cache in zip(self.mtp, caches):
             block.attn.update_main(main_x, layer_cache)
-        self._dspark_prime_ctx = (caches, offset_after)
+        if not isinstance(contexts, dict):
+            contexts = {}
+            self._dspark_prime_ctx = contexts
+        contexts[cache_key] = (caches, offset_after)
+        while len(contexts) > 32:
+            contexts.pop(next(iter(contexts)))
         mx.async_eval([cache.keys for cache in caches if cache.keys is not None])
 
     def take_dspark_primed(self, target_cache):
-        ctx = self._dspark_prime_ctx
-        self._dspark_prime_ctx = None
+        contexts = getattr(self, "_dspark_prime_ctx", None)
+        ctx = (
+            contexts.pop(id(target_cache), None)
+            if isinstance(contexts, dict)
+            else None
+        )
         if ctx is None:
             return None
         offset = self._target_cache_offset(target_cache)
