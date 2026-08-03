@@ -1007,6 +1007,29 @@ def test_rejects_immediately_repeated_tool_action():
         repeated, [*history, {"role": "user", "content": "run it again"}]
     )
 
+    # A parallel call without its matching output is not a completed action
+    # and may legitimately be retried.
+    partial_history = [
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call_incomplete",
+            "arguments": '{"cmd":"pwd"}',
+        },
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call_complete",
+            "arguments": '{"cmd":"date"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_complete",
+            "output": "today",
+        },
+    ]
+    _reject_immediate_repeated_tool_call(different, partial_history)
+
 
 class TestResponsesStream:
     def test_stream_emits_codex_required_events(self, responses_client):

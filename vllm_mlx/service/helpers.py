@@ -2846,6 +2846,12 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
+class _InvalidToolArgumentsError(HTTPException):
+    """HTTP 400 carrying a stable Responses error-code classification."""
+
+    rapid_mlx_error_code = "invalid_tool_arguments"
+
+
 def _validate_tool_call_params(
     tool_calls: list, tools: list, *, enforce_required: bool = False
 ) -> None:
@@ -2949,47 +2955,31 @@ def _validate_tool_call_params(
 
         missing = sorted(required_names - args.keys()) if enforce_required else []
         if missing:
-            raise HTTPException(
+            message = (
+                f"Tool call '{func_name}' is missing required argument(s): "
+                f"{', '.join(missing)}. The model produced an incomplete "
+                "tool call; retry the request."
+            )
+            raise _InvalidToolArgumentsError(
                 status_code=400,
-                detail=(
-                    f"Tool call '{func_name}' is missing required argument(s): "
-                    f"{', '.join(missing)}. The model produced an incomplete "
-                    "tool call; retry the request."
-                ),
+                detail=message,
             )
 
         for param_name, param_value in args.items():
             schema = called_tool_schemas.get(param_name)
             if not schema:
                 continue
-            if isinstance(param_value, str) and len(param_value) >= 128:
-                # Tool arguments are executable inputs, not harmless visible
-                # prose. A decode can reach EOS immediately after a repeated
-                # suffix and evade the scheduler's periodic online check;
-                # never hand an obviously collapsed command or patch payload
-                # to an agent client for execution.
-                from ..coherence import looks_like_garbage
-
-                degenerate, reason = looks_like_garbage(param_value)
-                if degenerate:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Tool call '{func_name}' parameter '{param_name}' "
-                            f"contains degenerate repeated output ({reason}); "
-                            "refusing to execute it. Retry the request."
-                        ),
-                    )
             is_valid, error = validate_param_value(json.dumps(param_value), schema)
             if not is_valid:
-                raise HTTPException(
+                message = (
+                    f"Tool call '{func_name}' parameter '{param_name}' "
+                    f"violates declared schema: {error}. The model "
+                    "produced a schema-violating argument value; retry "
+                    "with a more constrained prompt or relax the schema."
+                )
+                raise _InvalidToolArgumentsError(
                     status_code=400,
-                    detail=(
-                        f"Tool call '{func_name}' parameter '{param_name}' "
-                        f"violates declared schema: {error}. The model "
-                        "produced a schema-violating argument value; retry "
-                        "with a more constrained prompt or relax the schema."
-                    ),
+                    detail=message,
                 )
 
 

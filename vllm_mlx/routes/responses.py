@@ -127,13 +127,15 @@ def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) 
             return raw.strip()
 
     previous: set[tuple[str, str]] = set()
-    saw_output = False
+    completed_call_ids: set[str] = set()
     for item in reversed(input_items):
         data = item.model_dump() if hasattr(item, "model_dump") else item
         if not isinstance(data, dict):
             break
         if data.get("type") == "function_call_output" and not previous:
-            saw_output = True
+            call_id = data.get("call_id")
+            if isinstance(call_id, str):
+                completed_call_ids.add(call_id)
             continue
         if data.get("type") != "function_call":
             break
@@ -141,8 +143,10 @@ def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) 
         arguments = data.get("arguments")
         if arguments is None and isinstance(data.get("function"), dict):
             arguments = data["function"].get("arguments")
-        previous.add((str(name or ""), _canonical_arguments(arguments)))
-    if not saw_output or not previous:
+        call_id = data.get("call_id") or data.get("id")
+        if call_id in completed_call_ids:
+            previous.add((str(name or ""), _canonical_arguments(arguments)))
+    if not previous:
         return
 
     for current in tool_calls:
@@ -158,13 +162,19 @@ def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) 
             else function.get("arguments", "{}")
         )
         if (str(name), _canonical_arguments(arguments)) in previous:
+            message = (
+                f"Model repeated the immediately preceding tool call '{name}' "
+                "with identical arguments; refusing an agent action loop. "
+                "Retry with a different action."
+            )
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"Model repeated the immediately preceding tool call '{name}' "
-                    "with identical arguments; refusing an agent action loop. "
-                    "Retry with a different action."
-                ),
+                detail={
+                    "error": {
+                        "code": "agent_action_loop",
+                        "message": message,
+                    }
+                },
             )
 
 
@@ -2938,10 +2948,10 @@ async def _stream_responses(
                     "message", "tool_choice could not be fulfilled"
                 )
             else:
-                err_code = (
-                    "invalid_tool_arguments"
-                    if forced_choice_err.status_code == 400
-                    else "tool_choice_unfulfilled"
+                err_code = getattr(
+                    forced_choice_err,
+                    "rapid_mlx_error_code",
+                    "tool_choice_unfulfilled",
                 )
                 err_msg = str(err_detail)
             yield _emit(

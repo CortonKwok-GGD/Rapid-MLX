@@ -276,17 +276,14 @@ class TestValidPasses:
         _validate_tool_call_params([_call("set_score", '{"score": 0}')], tools)
         _validate_tool_call_params([_call("set_score", '{"score": 100}')], tools)
 
-    def test_degenerate_repeated_string_argument_is_rejected(self):
+    def test_schema_valid_repeated_string_argument_is_allowed(self):
         from vllm_mlx.service.helpers import _validate_tool_call_params
 
         tools = [_tool("exec_command", {"cmd": {"type": "string"}})]
         repeated = "grep -rn get_stats " + ("metrics " * 200)
         calls = [_call("exec_command", json.dumps({"cmd": repeated}))]
 
-        with pytest.raises(HTTPException) as exc_info:
-            _validate_tool_call_params(calls, tools)
-        assert exc_info.value.status_code == 400
-        assert "degenerate repeated output" in exc_info.value.detail
+        _validate_tool_call_params(calls, tools)
 
     def test_long_diverse_string_argument_is_allowed(self):
         from vllm_mlx.service.helpers import _validate_tool_call_params
@@ -331,6 +328,14 @@ class TestDeferredPassThrough:
         tools[0]["function"]["parameters"]["required"] = ["x"]
         with pytest.raises(HTTPException, match="missing required argument"):
             _validate_tool_call_params([_call("f", "{}")], tools, enforce_required=True)
+
+    def test_schema_valid_repetitive_string_is_not_rejected(self):
+        """Repeated patches/test fixtures remain valid executable input."""
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("apply", {"patch": {"type": "string"}})]
+        payload = json.dumps({"patch": "+same line\n" * 200})
+        _validate_tool_call_params([_call("apply", payload)], tools)
 
     def test_one_of_violation_does_not_raise(self):
         """``oneOf`` (and ``anyOf`` / ``allOf``) violations remain
