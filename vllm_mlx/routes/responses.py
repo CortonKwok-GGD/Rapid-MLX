@@ -164,11 +164,19 @@ def _is_deepseek_codex_surface(
     responses_request: ResponsesRequest, tool_parser: str | None
 ) -> bool:
     """Identify the DeepSeek DSML + Codex PTY tool combination."""
-    if (
-        tool_parser is None
-        and "deepseek-v4-flash-0731" in (responses_request.model or "").lower()
-    ):
-        tool_parser = "deepseek_v4_0731"
+    if tool_parser is None:
+        cfg = get_config()
+        configured = " ".join(
+            str(value or "")
+            for value in (
+                responses_request.model,
+                cfg.model_name,
+                cfg.model_alias,
+                cfg.model_path,
+            )
+        ).lower()
+        if "deepseek-v4-flash-0731" in configured:
+            tool_parser = "deepseek_v4_0731"
     if tool_parser != "deepseek_v4_0731":
         return False
     names: set[str] = set()
@@ -183,58 +191,6 @@ def _is_deepseek_codex_surface(
         if isinstance(name, str):
             names.add(name)
     return {"exec_command", "write_stdin"}.issubset(names)
-
-
-def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) -> None:
-    """Reject a model call identical to the most recent agent call.
-
-    Re-running an unchanged shell search is a semantic loop even when each
-    individual generation is token-coherent. Reject it before Codex executes
-    the command; a retry samples from the same grounded history without adding
-    another duplicate tool result.
-    """
-    if not tool_calls or not isinstance(input_items, list):
-        return
-
-    previous: tuple[str, str] | None = None
-    for item in reversed(input_items):
-        data = item.model_dump() if hasattr(item, "model_dump") else item
-        if not isinstance(data, dict) or data.get("type") != "function_call":
-            continue
-        name = data.get("name") or (data.get("function") or {}).get("name")
-        arguments = data.get("arguments")
-        if arguments is None and isinstance(data.get("function"), dict):
-            arguments = data["function"].get("arguments")
-        previous = (str(name or ""), str(arguments or "{}"))
-        break
-    if previous is None:
-        return
-
-    current = tool_calls[0]
-    function = (
-        current.function
-        if hasattr(current, "function")
-        else current.get("function", current)
-    )
-    name = function.name if hasattr(function, "name") else function.get("name", "")
-    arguments = (
-        function.arguments
-        if hasattr(function, "arguments")
-        else function.get("arguments", "{}")
-    )
-    # Repeating a continuation/poll is normal while a PTY command is still
-    # running. Only shell actions are candidates for semantic-loop rejection.
-    if str(name) != "exec_command":
-        return
-    if (str(name), str(arguments)) == previous:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Model repeated the immediately preceding tool call '{name}' "
-                "with identical arguments; refusing an agent action loop. "
-                "Retry with a different action."
-            ),
-        )
 
 
 def _inject_codex_progress_reminder(
@@ -339,7 +295,7 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
                     )
                 )
                 if is_test:
-                    has_unresolved_failure = has_unresolved_failure or any(
+                    failed = any(
                         marker in output
                         for marker in (
                             "FAILED ",
@@ -348,11 +304,13 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
                             " ERROR ",
                         )
                     )
-                    has_successful_test = (
-                        has_successful_test
-                        or bool(re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output))
-                        and not has_unresolved_failure
-                    )
+                    passed = bool(re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output))
+                    if failed:
+                        has_unresolved_failure = True
+                        has_successful_test = False
+                    elif passed:
+                        has_unresolved_failure = False
+                        has_successful_test = True
         if data.get("type") == "function_call":
             arguments = str(data.get("arguments") or "")
             calls[str(data.get("call_id") or "")] = arguments
@@ -362,6 +320,7 @@ def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | N
                     marker in arguments for marker in ("tests/", "test_", "_test.")
                 )
                 has_unresolved_failure = False
+                has_successful_test = False
                 commands_after_edit = []
             elif has_edited:
                 commands_after_edit.append(arguments)
@@ -1837,10 +1796,6 @@ async def _non_stream(
             tool_calls, responses_request, openai_request
         )
         if tool_calls and openai_request.tools:
-            if _is_deepseek_codex_surface(responses_request, cfg.tool_call_parser):
-                _reject_immediate_repeated_tool_call(
-                    tool_calls, responses_request.input
-                )
             _validate_tool_call_params(
                 tool_calls, openai_request.tools, enforce_required=True
             )

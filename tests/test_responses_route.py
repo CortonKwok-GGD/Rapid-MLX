@@ -1362,47 +1362,6 @@ def test_deepseek_codex_exec_priming_is_bounded_to_early_tool_phase():
     assert _should_prime_deepseek_codex_exec(first, "qwen3") is False
 
 
-def test_rejects_immediately_repeated_tool_action():
-    from fastapi import HTTPException
-
-    from vllm_mlx.api.models import FunctionCall, ToolCall
-    from vllm_mlx.routes.responses import _reject_immediate_repeated_tool_call
-
-    history = [
-        {
-            "type": "function_call",
-            "name": "exec_command",
-            "call_id": "call_old",
-            "arguments": '{"cmd":"rg get_stats"}',
-        },
-        {
-            "type": "function_call_output",
-            "call_id": "call_old",
-            "output": "matches",
-        },
-    ]
-    repeated = [
-        ToolCall(
-            id="call_new",
-            type="function",
-            function=FunctionCall(
-                name="exec_command", arguments='{"cmd":"rg get_stats"}'
-            ),
-        )
-    ]
-    with pytest.raises(HTTPException, match="identical arguments"):
-        _reject_immediate_repeated_tool_call(repeated, history)
-
-    different = [
-        ToolCall(
-            id="call_new",
-            type="function",
-            function=FunctionCall(name="exec_command", arguments='{"cmd":"pwd"}'),
-        )
-    ]
-    _reject_immediate_repeated_tool_call(different, history)
-
-
 def test_codex_progress_reminder_switches_from_edit_to_test():
     from vllm_mlx.api.responses_models import ResponsesRequest
     from vllm_mlx.routes.responses import (
