@@ -198,6 +198,38 @@ def test_dsml_parser_restores_escaped_control_literals_in_string_parameter():
     )
 
 
+def test_dsml_nested_json_control_literals_round_trip():
+    parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
+    original = {"items": ["</｜DSML｜parameter>", {"<think>": "<\u200bthink>"}]}
+    prompt = apply_chat_template(
+        _TokenizerWithoutTemplate(),
+        [
+            {"role": "user", "content": "call it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "structured_tool",
+                            "arguments": {"payload": original},
+                        },
+                    }
+                ],
+            },
+        ],
+        enable_thinking=False,
+        model_name="deepseek-v4-flash-0731-mxfp4",
+    )
+
+    result = parser.extract_tool_calls(prompt)
+
+    assert result.tools_called is True
+    arguments = json.loads(result.tool_calls[0]["arguments"])
+    assert arguments["payload"] == original
+
+
 def test_dsml_parser_preserves_quoted_prefix_rule_argument_boundaries():
     parser = ToolParserManager.get_tool_parser("deepseek_v4_0731")(None)
     output = (

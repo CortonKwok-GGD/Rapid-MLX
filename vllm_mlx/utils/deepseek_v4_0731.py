@@ -35,6 +35,22 @@ def _escape_string_parameter(value: str) -> str:
     return _CONTROL_LITERAL_START.sub("<\u200b", value)
 
 
+def _escape_argument_value(value: Any) -> Any:
+    """Recursively frame every string leaf, including JSON object keys."""
+    if isinstance(value, str):
+        return _escape_string_parameter(value)
+    if isinstance(value, list):
+        return [_escape_argument_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _escape_string_parameter(key) if isinstance(key, str) else key: (
+                _escape_argument_value(item)
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
 # Keep the small, universal engineering surface near the beginning of large
 # agent tool catalogs.  Codex can submit well over one hundred connector and
 # plugin tools; sorting every name alphabetically buried ``exec_command`` deep
@@ -152,7 +168,8 @@ def _encode_call(call: dict) -> str:
     params = []
     for key, value in arguments.items():
         is_string = isinstance(value, str)
-        rendered = _escape_string_parameter(value) if is_string else _json(value)
+        escaped_value = _escape_argument_value(value)
+        rendered = escaped_value if is_string else _json(escaped_value)
         params.append(
             f'<{DSML}parameter name="{key}" string="{str(is_string).lower()}">'
             f"{rendered}</{DSML}parameter>"
