@@ -42,13 +42,21 @@ def test_rotating_cache_rolls_back_after_rotation() -> None:
     )
 
     install_rotating_undo()
+    reference = RotatingKVCache(max_size=4)
+    reference.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+    reference.update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
     cache = RotatingKVCache(max_size=4)
     cache.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
     with armed():
         cache.update_and_fetch(mx.ones((1, 1, 4, 2)), mx.ones((1, 1, 4, 2)))
 
     assert trim_all([cache], 3)
-    assert cache.offset == 5
+    assert (cache.offset, cache._idx) == (reference.offset, reference._idx)
+    assert mx.array_equal(cache.keys, reference.keys).item()
+    assert mx.array_equal(cache.values, reference.values).item()
+    assert mx.array_equal(
+        cache._temporal_order(cache.keys), reference._temporal_order(reference.keys)
+    ).item()
 
 
 def test_batch_rotating_cache_rolls_back_after_rotation() -> None:
@@ -61,13 +69,24 @@ def test_batch_rotating_cache_rolls_back_after_rotation() -> None:
     )
 
     install_rotating_undo()
+    reference = BatchRotatingKVCache(max_size=4, left_padding=[0])
+    reference.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+    reference.update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
     cache = BatchRotatingKVCache(max_size=4, left_padding=[0])
     cache.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
     with armed():
         cache.update_and_fetch(mx.ones((1, 1, 4, 2)), mx.ones((1, 1, 4, 2)))
 
     assert trim_all([cache], 3)
-    assert cache._offset == 5
+    assert (cache._offset, cache._idx, cache.rotated) == (
+        reference._offset,
+        reference._idx,
+        reference.rotated,
+    )
+    assert mx.array_equal(cache.offset, reference.offset).item()
+    assert mx.array_equal(cache.left_padding, reference.left_padding).item()
+    assert mx.array_equal(cache.keys, reference.keys).item()
+    assert mx.array_equal(cache.values, reference.values).item()
 
 
 def test_adaptive_depth_shrinks_cools_down_and_recovers() -> None:

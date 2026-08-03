@@ -558,3 +558,11 @@ def test_dspark_verify_matches_sequential_decode_cache_views():
         for entry in verify_cache
     ]
     assert sequential_offsets == verify_offsets
+
+    # Cache equivalence must survive the verify call, not merely produce the
+    # same rows once.  The following ordinary decode observes all cache state.
+    next_token = mx.array([[27]], dtype=mx.int32)
+    sequential_next = model(next_token, cache=sequential_cache)
+    verify_next = model(next_token, cache=verify_cache)
+    mx.eval(sequential_next, verify_next)
+    assert mx.allclose(sequential_next, verify_next, rtol=2e-3, atol=2e-3).item()

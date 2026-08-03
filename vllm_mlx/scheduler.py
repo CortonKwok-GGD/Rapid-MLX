@@ -1497,9 +1497,9 @@ def _install_dspark(
     _pending_replay: dict[int, tuple[Any, mx.array]] = {}
     _depths: dict[int, int] = {}
     _cooldowns: dict[int, int] = {}
-    _supports_variable_depth = (
-        "max_draft_tokens" in inspect.signature(model.dspark_forward).parameters
-    )
+    _dspark_parameters = inspect.signature(model.dspark_forward).parameters
+    _supports_variable_depth = "max_draft_tokens" in _dspark_parameters
+    _supports_draft_sampler = "draft_sampler" in _dspark_parameters
     # The 0731 checkpoint predicts five rows, but the target verify kernel has
     # a measured K=5 shape cliff on Apple Silicon: compared with K=4 it costs
     # ~54% more for only ~6% more committed tokens on a coding workload. Keep
@@ -1611,16 +1611,14 @@ def _install_dspark(
 
         phase_t0 = time.perf_counter()
         try:
+            draft_kwargs: dict[str, Any] = {}
             if _supports_variable_depth:
-                proposal = model.dspark_forward(
-                    inputs[:, None],
-                    hidden,
-                    dspark_cache,
-                    max_draft_tokens=current_k,
-                    draft_sampler=_sample_draft if stochastic else None,
-                )
-            else:
-                proposal = model.dspark_forward(inputs[:, None], hidden, dspark_cache)
+                draft_kwargs["max_draft_tokens"] = current_k
+            if _supports_draft_sampler:
+                draft_kwargs["draft_sampler"] = _sample_draft if stochastic else None
+            proposal = model.dspark_forward(
+                inputs[:, None], hidden, dspark_cache, **draft_kwargs
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[DSpark] draft failed; falling back: %r", exc)
             _stats["errors"] += 1
