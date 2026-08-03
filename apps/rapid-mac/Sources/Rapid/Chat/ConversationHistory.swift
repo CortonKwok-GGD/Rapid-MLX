@@ -78,7 +78,14 @@ enum ConversationStore {
     static func save(_ conversations: [ChatConversation]) {
         writeQueue.async {
             guard let data = try? JSONEncoder().encode(conversations) else { return }
-            try? data.write(to: fileURL(), options: .atomic)
+            let url = fileURL()
+            // Owner-only (0600): chat transcripts are private. The atomic
+            // write would otherwise inherit the umask default (often 0644 =
+            // world-readable), exposing history to other local users.
+            try? data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: url.path
+            )
         }
     }
 
