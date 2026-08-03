@@ -2948,9 +2948,25 @@ def _validate_tool_call_params(
             logger.warning(
                 f"Tool call '{func_name}': arguments is not valid JSON: {args_str!r}"
             )
+            if enforce_required:
+                raise _InvalidToolArgumentsError(
+                    status_code=400,
+                    detail=(
+                        f"Tool call '{func_name}' arguments must be a valid JSON "
+                        "object; retry the request."
+                    ),
+                )
             continue
 
         if not isinstance(args, dict):
+            if enforce_required:
+                raise _InvalidToolArgumentsError(
+                    status_code=400,
+                    detail=(
+                        f"Tool call '{func_name}' arguments must be a JSON object; "
+                        "retry the request."
+                    ),
+                )
             continue
 
         missing = sorted(required_names - args.keys()) if enforce_required else []

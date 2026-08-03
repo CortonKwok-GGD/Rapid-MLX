@@ -329,6 +329,17 @@ class TestDeferredPassThrough:
         with pytest.raises(HTTPException, match="missing required argument"):
             _validate_tool_call_params([_call("f", "{}")], tools, enforce_required=True)
 
+    @pytest.mark.parametrize("arguments", ["", "[]", '"text"'])
+    def test_required_mode_rejects_non_object_arguments(self, arguments):
+        from vllm_mlx.service.helpers import _validate_tool_call_params
+
+        tools = [_tool("f", {"x": {"type": "string"}})]
+        tools[0]["function"]["parameters"]["required"] = ["x"]
+        with pytest.raises(HTTPException, match="JSON object"):
+            _validate_tool_call_params(
+                [_call("f", arguments)], tools, enforce_required=True
+            )
+
     def test_schema_valid_repetitive_string_is_not_rejected(self):
         """Repeated patches/test fixtures remain valid executable input."""
         from vllm_mlx.service.helpers import _validate_tool_call_params

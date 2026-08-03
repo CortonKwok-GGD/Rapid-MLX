@@ -114,6 +114,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+class _AgentActionLoopError(HTTPException):
+    rapid_mlx_error_code = "agent_action_loop"
+
+
 def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) -> None:
     """Reject a model call identical to the most recent agent call."""
     if not tool_calls or not isinstance(input_items, list):
@@ -167,14 +171,9 @@ def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) 
                 "with identical arguments; refusing an agent action loop. "
                 "Retry with a different action."
             )
-            raise HTTPException(
+            raise _AgentActionLoopError(
                 status_code=400,
-                detail={
-                    "error": {
-                        "code": "agent_action_loop",
-                        "message": message,
-                    }
-                },
+                detail=message,
             )
 
 
