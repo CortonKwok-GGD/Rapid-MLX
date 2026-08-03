@@ -69,6 +69,15 @@ _REASONING_SENTINELS = {
     "<｜DSML｜",
     "</｜DSML｜",
 }
+_EXISTING_CONTROL_ESCAPE = re.compile(
+    r"<(?P<esc>\u200b+)(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))"
+)
+
+
+def _double_existing_control_escapes(text: str) -> str:
+    return _EXISTING_CONTROL_ESCAPE.sub(
+        lambda match: "<" + (match.group("esc") * 2), text
+    )
 
 
 def _collect_role_markers(
@@ -200,6 +209,27 @@ def _sanitize_message_content(
     return content
 
 
+def _double_existing_control_escapes_in_content(content):
+    """Quote pre-existing framing bytes before adding protocol framing."""
+    if isinstance(content, str):
+        return _double_existing_control_escapes(content)
+    if isinstance(content, list):
+        new_parts = []
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ):
+                new_part = dict(part)
+                new_part["text"] = _double_existing_control_escapes(part["text"])
+                new_parts.append(new_part)
+            else:
+                new_parts.append(part)
+        return new_parts
+    return content
+
+
 def _sanitize_messages_for_template(
     messages: list[dict],
     template_applicator,
@@ -244,6 +274,8 @@ def _sanitize_messages_for_template(
             sanitized.append(msg)
             continue
         content = msg.get("content")
+        if include_reasoning_sentinels:
+            content = _double_existing_control_escapes_in_content(content)
         new_content = _sanitize_message_content(content, pattern)
         if new_content is content:
             sanitized.append(msg)
@@ -791,7 +823,13 @@ def _sanitize_tools_for_template(
     pattern = _build_marker_pattern(markers)
     if pattern is None:
         return tools
-    return _walk_tools_iter(tools, lambda s: _neutralize_in_string(s, pattern))
+
+    def _sanitize_tool_string(value: str) -> str:
+        if include_reasoning_sentinels:
+            value = _double_existing_control_escapes(value)
+        return _neutralize_in_string(value, pattern)
+
+    return _walk_tools_iter(tools, _sanitize_tool_string)
 
 
 def _build_tool_injection_text(tools: list[dict]) -> str:

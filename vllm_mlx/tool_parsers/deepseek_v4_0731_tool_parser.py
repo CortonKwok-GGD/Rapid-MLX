@@ -17,13 +17,18 @@ from .abstract_tool_parser import (
 )
 
 _ESCAPED_CONTROL_LITERAL = re.compile(
-    r"<\u200b(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))"
+    r"<(?P<esc>\u200b+)(?=(?:/?(?:think|reasoning)>|/?｜DSML｜))"
 )
 
 
 def _restore_string_parameter(value: str) -> str:
     """Decode DSML's U+200B escape for literal control-looking text."""
-    return _ESCAPED_CONTROL_LITERAL.sub("<", value)
+
+    def _restore(match: re.Match) -> str:
+        original_count = len(match.group("esc")) // 2
+        return "<" + ("\u200b" * original_count)
+
+    return _ESCAPED_CONTROL_LITERAL.sub(_restore, value)
 
 
 @ToolParserManager.register_module(["deepseek_v4_0731"])

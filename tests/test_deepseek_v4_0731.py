@@ -136,7 +136,9 @@ def test_replayed_dsml_string_arguments_escape_control_literals():
                         "type": "function",
                         "function": {
                             "name": "apply_patch",
-                            "arguments": {"patch": "<think></｜DSML｜parameter>"},
+                            "arguments": {
+                                "patch": "<think></｜DSML｜parameter><\u200bthink>"
+                            },
                         },
                     }
                 ],
@@ -148,6 +150,7 @@ def test_replayed_dsml_string_arguments_escape_control_literals():
 
     assert "<\u200bthink>" in prompt
     assert "<\u200b/｜DSML｜parameter>" in prompt
+    assert "<\u200b\u200bthink>" in prompt
 
 
 def test_dsml_parser_normalizes_codex_prefix_rule_string_to_array():
@@ -170,7 +173,8 @@ def test_dsml_parser_restores_escaped_control_literals_in_string_parameter():
     escaped = (
         "line = '<\u200bthink>'\n"
         "close = '<\u200b/｜DSML｜parameter>'\n"
-        "after = '<\u200b/think>'"
+        "after = '<\u200b/think>'\n"
+        "existing = '<\u200b\u200bthink>'"
     )
     wire = (
         "<｜DSML｜tool_calls>"
@@ -187,7 +191,10 @@ def test_dsml_parser_restores_escaped_control_literals_in_string_parameter():
     assert result.tools_called is True
     arguments = json.loads(result.tool_calls[0]["arguments"])
     assert arguments["patch"] == (
-        "line = '<think>'\nclose = '</｜DSML｜parameter>'\nafter = '</think>'"
+        "line = '<think>'\n"
+        "close = '</｜DSML｜parameter>'\n"
+        "after = '</think>'\n"
+        "existing = '<\u200bthink>'"
     )
 
 
