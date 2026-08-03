@@ -2905,10 +2905,14 @@ def _validate_tool_call_params(
             continue
         scoped = _extract_param_schemas([tool])
         parameters = func.get("parameters")
-        required = parameters.get("required", []) if isinstance(parameters, dict) else []
-        required_names = {
-            item for item in required if isinstance(item, str) and item
-        } if isinstance(required, list) else set()
+        required = (
+            parameters.get("required", []) if isinstance(parameters, dict) else []
+        )
+        required_names = (
+            {item for item in required if isinstance(item, str) and item}
+            if isinstance(required, list)
+            else set()
+        )
         tool_by_name[name] = (
             {k.split(".", 1)[1]: v for k, v in scoped.items()},
             required_names,

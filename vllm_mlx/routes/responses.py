@@ -96,6 +96,7 @@ from ..service.helpers import (
     _resolve_top_p,
     _uses_deepseek_v4_reasoning,
     _validate_model_name,
+    _validate_tool_call_params,
     _wait_with_disconnect,
     build_extended_sampling_kwargs,
     enforce_context_length,
@@ -111,6 +112,48 @@ from ..service.helpers import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _reject_immediate_repeated_tool_call(tool_calls: list, input_items: object) -> None:
+    """Reject a model call identical to the most recent agent call."""
+    if not tool_calls or not isinstance(input_items, list):
+        return
+
+    previous: tuple[str, str] | None = None
+    for item in reversed(input_items):
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if not isinstance(data, dict) or data.get("type") != "function_call":
+            continue
+        name = data.get("name") or (data.get("function") or {}).get("name")
+        arguments = data.get("arguments")
+        if arguments is None and isinstance(data.get("function"), dict):
+            arguments = data["function"].get("arguments")
+        previous = (str(name or ""), str(arguments or "{}"))
+        break
+    if previous is None:
+        return
+
+    current = tool_calls[0]
+    function = (
+        current.function
+        if hasattr(current, "function")
+        else current.get("function", current)
+    )
+    name = function.name if hasattr(function, "name") else function.get("name", "")
+    arguments = (
+        function.arguments
+        if hasattr(function, "arguments")
+        else function.get("arguments", "{}")
+    )
+    if (str(name), str(arguments)) == previous:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model repeated the immediately preceding tool call '{name}' "
+                "with identical arguments; refusing an agent action loop. "
+                "Retry with a different action."
+            ),
+        )
 
 
 def _resolve_context_safe_implicit_responses_max_tokens(
@@ -1490,6 +1533,11 @@ async def _non_stream(
     tool_calls = _enforce_responses_tool_choice(
         tool_calls, responses_request, openai_request
     )
+    if tool_calls and openai_request.tools:
+        _reject_immediate_repeated_tool_call(tool_calls, responses_request.input)
+        _validate_tool_call_params(
+            tool_calls, openai_request.tools, enforce_required=True
+        )
 
     cleaned_text, reasoning_text = _finalize_content_and_reasoning(
         raw_text=output.raw_text or output.text,
@@ -2858,6 +2906,13 @@ async def _stream_responses(
             tool_calls = _enforce_responses_tool_choice(
                 parsed_tool_calls, responses_request, openai_request
             )
+            if tool_calls and openai_request.tools:
+                _reject_immediate_repeated_tool_call(
+                    tool_calls, responses_request.input
+                )
+                _validate_tool_call_params(
+                    tool_calls, openai_request.tools, enforce_required=True
+                )
         except HTTPException as forced_choice_err:
             # Drop any deferred buffered text — the request failed
             # under forced choice, the deferred prose has no
@@ -2871,7 +2926,11 @@ async def _stream_responses(
                     "message", "tool_choice could not be fulfilled"
                 )
             else:
-                err_code = "tool_choice_unfulfilled"
+                err_code = (
+                    "invalid_tool_arguments"
+                    if forced_choice_err.status_code == 400
+                    else "tool_choice_unfulfilled"
+                )
                 err_msg = str(err_detail)
             yield _emit(
                 "response.failed",

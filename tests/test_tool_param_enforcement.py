@@ -330,9 +330,7 @@ class TestDeferredPassThrough:
         # Inject ``required`` into the parameters block.
         tools[0]["function"]["parameters"]["required"] = ["x"]
         with pytest.raises(HTTPException, match="missing required argument"):
-            _validate_tool_call_params(
-                [_call("f", "{}")], tools, enforce_required=True
-            )
+            _validate_tool_call_params([_call("f", "{}")], tools, enforce_required=True)
 
     def test_one_of_violation_does_not_raise(self):
         """``oneOf`` (and ``anyOf`` / ``allOf``) violations remain

@@ -957,6 +957,47 @@ def _parse_sse(body_text: str) -> list[tuple[str, dict]]:
     return events
 
 
+def test_rejects_immediately_repeated_tool_action():
+    from fastapi import HTTPException
+
+    from vllm_mlx.api.models import FunctionCall, ToolCall
+    from vllm_mlx.routes.responses import _reject_immediate_repeated_tool_call
+
+    history = [
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call_old",
+            "arguments": '{"cmd":"rg get_stats"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_old",
+            "output": "matches",
+        },
+    ]
+    repeated = [
+        ToolCall(
+            id="call_new",
+            type="function",
+            function=FunctionCall(
+                name="exec_command", arguments='{"cmd":"rg get_stats"}'
+            ),
+        )
+    ]
+    with pytest.raises(HTTPException, match="identical arguments"):
+        _reject_immediate_repeated_tool_call(repeated, history)
+
+    different = [
+        ToolCall(
+            id="call_new",
+            type="function",
+            function=FunctionCall(name="exec_command", arguments='{"cmd":"pwd"}'),
+        )
+    ]
+    _reject_immediate_repeated_tool_call(different, history)
+
+
 class TestResponsesStream:
     def test_stream_emits_codex_required_events(self, responses_client):
         """Codex CLI hard-requires ``response.created`` first and
