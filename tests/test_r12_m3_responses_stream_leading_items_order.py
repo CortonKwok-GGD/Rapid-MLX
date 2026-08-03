@@ -309,9 +309,13 @@ class TestLeadingItemOrdering:
         events = _stream_and_parse(client, _stream_payload())
 
         active_item: tuple[str, str] | None = None
-        for name, data in events:
+        reasoning_done_idx: int | None = None
+        message_added_idx: int | None = None
+        for event_idx, (name, data) in enumerate(events):
             if name == "response.output_item.added":
                 item = data["item"]
+                if item["type"] == "message":
+                    message_added_idx = event_idx
                 assert active_item is None, (
                     f"opened {item['type']} before closing active "
                     f"{active_item}; event={data}"
@@ -324,12 +328,17 @@ class TestLeadingItemOrdering:
                 )
             elif name == "response.output_item.done":
                 item = data["item"]
+                if item["type"] == "reasoning":
+                    reasoning_done_idx = event_idx
                 assert active_item == (item["id"], item["type"]), (
                     f"closed {item['type']} while active={active_item}"
                 )
                 active_item = None
 
         assert active_item is None
+        assert reasoning_done_idx is not None, events
+        assert message_added_idx is not None, events
+        assert reasoning_done_idx < message_added_idx
 
     def test_empty_reasoning_still_emits_reasoning_before_message(self, make_client):
         """M-3 root case: model produces NO reasoning bytes. The fix must
