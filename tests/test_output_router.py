@@ -93,6 +93,8 @@ QWEN3_VOCAB = {
     "ing": 2,
     "Answer": 3,
     "Plain": 4,
+    '<｜DSML｜parameter name="patch" string="true">': 5,
+    "</｜DSML｜parameter>": 6,
 }
 
 QWEN3_TOKENIZER = FakeTokenizer(QWEN3_VOCAB)
@@ -107,6 +109,8 @@ DEEPSEEK_R1_VOCAB = {
     " one": 2,
     "Answer": 3,
     "Plain": 4,
+    '<｜DSML｜parameter name="patch" string="true">': 5,
+    "</｜DSML｜parameter>": 6,
 }
 
 DEEPSEEK_R1_TOKENIZER = FakeTokenizer(DEEPSEEK_R1_VOCAB)
@@ -487,16 +491,28 @@ class TestQwen3ThinkRouting:
         assert result["content"] == "Answer"
         assert result["tool_calls"] is None
 
-    def test_literal_think_tags_in_visible_payload_are_preserved(self):
-        """Reasoning sentinels in code/tool arguments are data after </think>."""
+    def test_late_think_tag_reopens_reasoning(self):
+        """A genuine late think transition must not become public content."""
         router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
         assert router is not None
 
         result = router.feed_sequence([248068, 1, 248069, 3, 248068, 4, 248069, 3])
 
-        assert result["reasoning"] == "Reason"
-        assert result["content"] == "Answer<think>Plain</think>Answer"
+        assert result["reasoning"] == "ReasonPlain"
+        assert result["content"] == "AnswerAnswer"
         assert result["tool_calls"] is None
+
+    def test_literal_think_tags_in_dsml_parameter_are_preserved(self):
+        router = OutputRouter.from_tokenizer(QWEN3_TOKENIZER)
+        assert router is not None
+
+        result = router.feed_sequence([248069, 5, 248068, 4, 248069, 6])
+
+        assert result["reasoning"] is None
+        assert result["content"] == (
+            '<｜DSML｜parameter name="patch" string="true">'
+            "<think>Plain</think></｜DSML｜parameter>"
+        )
 
 
 class TestDeepSeekR1ThinkRouting:
@@ -563,15 +579,18 @@ class TestDeepSeekR1ThinkRouting:
         assert result["content"] == "Answer"
         assert result["tool_calls"] is None
 
-    def test_literal_think_tags_in_visible_payload_are_preserved(self):
+    def test_literal_think_tags_in_dsml_parameter_are_preserved(self):
         """A patch/tool argument may legitimately contain reasoning-tag text."""
         router = OutputRouter.from_tokenizer(DEEPSEEK_R1_TOKENIZER)
         assert router is not None
 
-        result = router.feed_sequence([151648, 1, 151649, 3, 151648, 4, 151649, 3])
+        result = router.feed_sequence([151649, 5, 151648, 4, 151649, 6])
 
-        assert result["reasoning"] == "Step"
-        assert result["content"] == "Answer<think>Plain</think>Answer"
+        assert result["reasoning"] is None
+        assert result["content"] == (
+            '<｜DSML｜parameter name="patch" string="true">'
+            "<think>Plain</think></｜DSML｜parameter>"
+        )
         assert result["tool_calls"] is None
 
 

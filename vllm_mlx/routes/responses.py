@@ -2339,6 +2339,7 @@ async def _stream_responses(
         # misclassified as a downstream-output completion. This flag
         # plus ``tool_calls`` is the precise signal.
         reasoning_block_closed = False
+        public_output_closed_before_late_reasoning = False
 
         # Lazy message-item state. We do NOT emit the message
         # output_item.added until we have actual user-facing text to stream
@@ -2842,6 +2843,12 @@ async def _stream_responses(
                     # ``<think>``".
                     reasoning_block_closed = True
                 elif output_channel == "reasoning":
+                    if accumulated_text.strip():
+                        # Record the explicit content -> reasoning channel
+                        # boundary while it happens. A terminal stop can then
+                        # distinguish a closed public segment followed by a
+                        # stray hidden tail from ambiguous mixed output.
+                        public_output_closed_before_late_reasoning = True
                     # R11-B (R11-M-F1): accumulate reasoning text for the
                     # post-loop ``reasoning`` output-item emitter so
                     # ``max_output_tokens`` cut-offs during the think
@@ -3701,7 +3708,11 @@ async def _stream_responses(
                 if isinstance(part, dict)
             )
         if reasoning_item_finalized and emitted_reasoning != accumulated_reasoning_text:
-            if last_finish_reason == "stop" and consumable_output_seen:
+            if (
+                last_finish_reason == "stop"
+                and consumable_output_seen
+                and public_output_closed_before_late_reasoning
+            ):
                 logger.warning(
                     "Responses (stream): discarded %d chars of reasoning emitted "
                     "after terminal public content was finalized",

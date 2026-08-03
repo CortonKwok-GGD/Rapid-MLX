@@ -158,6 +158,8 @@ class OutputRouter:
         # because feed() returned a queued event from a prior rollback.
         # Drained at the top of subsequent feed() calls and by finalize().
         self._redo_queue: list[int] = []
+        self._visible_tail = ""
+        self._inside_dsml_parameter = False
 
     def reset(self):
         """Reset state for a new request."""
@@ -168,6 +170,15 @@ class OutputRouter:
         self._pending_control_tokens = []
         self._pending_init_word = None
         self._redo_queue = []
+        self._visible_tail = ""
+        self._inside_dsml_parameter = False
+
+    def _track_visible_payload(self, text: str) -> None:
+        """Track whether visible DeepSeek DSML is inside a parameter value."""
+        self._visible_tail = (self._visible_tail + text)[-256:]
+        opener = self._visible_tail.rfind("<｜DSML｜parameter ")
+        closer = self._visible_tail.rfind("</｜DSML｜parameter>")
+        self._inside_dsml_parameter = opener > closer
 
     def _drain_pending_init_word(self, current_token_id: int) -> RouterEvent | None:
         """If a bare-INIT channel word is buffered, decide based on the
@@ -376,15 +387,17 @@ class OutputRouter:
         # templates open reasoning in the prompt and generate only the closing
         # tag; THINKING remains structural for the normal tagged-reasoning path.
         if token_id == m.think_start:
-            if self.state == RouterState.CONTENT:
+            if self.state == RouterState.CONTENT and self._inside_dsml_parameter:
                 text = self.tokenizer.decode([token_id])
+                self._track_visible_payload(text)
                 return RouterEvent(Channel.CONTENT, token_id, text)
             self.state = RouterState.THINKING
             return None
 
         if token_id == m.think_end:
-            if self.state == RouterState.CONTENT:
+            if self.state == RouterState.CONTENT and self._inside_dsml_parameter:
                 text = self.tokenizer.decode([token_id])
+                self._track_visible_payload(text)
                 return RouterEvent(Channel.CONTENT, token_id, text)
             self.state = RouterState.CONTENT
             return None
@@ -444,6 +457,7 @@ class OutputRouter:
         if self.state == RouterState.THINKING:
             return RouterEvent(Channel.REASONING, token_id, text)
         else:
+            self._track_visible_payload(text)
             return RouterEvent(Channel.CONTENT, token_id, text)
 
     def _drain_pending_init_word_at_finalize(self) -> RouterEvent | None:
