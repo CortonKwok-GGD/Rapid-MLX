@@ -31,6 +31,13 @@ final class ChatViewModel {
     /// upserts under this id once the user sends.
     private(set) var activeConversationID = UUID()
 
+    /// Bumped on every conversation switch (new / select / delete). Each
+    /// send captures the epoch; any streaming write or completion whose
+    /// captured epoch no longer matches is discarded — so a stream that
+    /// outlives a switch can't bleed tokens into, or persist over, the
+    /// conversation the user moved to (codex BLOCKING).
+    private var conversationEpoch = 0
+
     /// ``var`` not ``let`` because ``ChatStreamClient`` is a struct
     /// and ``send()`` re-targets ``client.baseURL`` to track
     /// ``ServerManager.activePort`` (v0.5.6 port-fallback) before each
@@ -124,11 +131,15 @@ final class ChatViewModel {
         guard id != activeConversationID else { return }
         inflight?.cancel()
         inflight = nil
+        conversationEpoch &+= 1
+        // Archive + unstick BEFORE swapping buffers, so the old transcript
+        // is what gets persisted and a mid-stream switch doesn't leave the
+        // incoming conversation showing Stop.
+        isStreaming = false
         persistActive()
         guard let conv = conversations.first(where: { $0.id == id }) else { return }
         messages = conv.messages
         activeConversationID = id
-        isStreaming = false
         lastError = nil
         lastFailureKind = nil
     }
@@ -141,9 +152,10 @@ final class ChatViewModel {
         if id == activeConversationID {
             inflight?.cancel()
             inflight = nil
+            conversationEpoch &+= 1
+            isStreaming = false
             messages.removeAll()
             activeConversationID = UUID()
-            isStreaming = false
             lastError = nil
             lastFailureKind = nil
         }
@@ -164,6 +176,15 @@ final class ChatViewModel {
         messages[index] = message
     }
 
+    /// Streaming write guarded on the sending conversation's epoch: a
+    /// no-op once the user has switched conversations under the stream, so
+    /// a stale/cancelled stream can't overwrite a message in — or, via the
+    /// completion path, persist — the conversation now on screen.
+    private func writeStreamMessage(at index: Int, epoch: Int, _ message: ChatMessage) {
+        guard epoch == conversationEpoch else { return }
+        updateMessage(at: index, with: message)
+    }
+
     /// Snapshot of the message at ``index``, or ``nil`` when out of range.
     private func currentMessage(index: Int) -> ChatMessage? {
         guard messages.indices.contains(index) else { return nil }
@@ -175,6 +196,11 @@ final class ChatViewModel {
     func newConversation() {
         inflight?.cancel()
         inflight = nil
+        conversationEpoch &+= 1
+        // Fix: without this a New Chat during a stream leaves the empty
+        // chat stuck showing Stop (isStreaming never reset). Setting it
+        // false here also archives the just-closed conversation via didSet.
+        isStreaming = false
         persistActive()
         messages.removeAll()
         activeConversationID = UUID()
@@ -218,6 +244,7 @@ final class ChatViewModel {
         lastFailureKind = nil
         isStreaming = true
 
+        let epoch = conversationEpoch
         inflight = Task { [weak self] in
             guard let self else { return }
 
@@ -237,19 +264,20 @@ final class ChatViewModel {
                 // returns `ready == true`, yet must still not stream and
                 // must still reset `isStreaming`.
                 guard !Task.isCancelled else {
-                    finishStartupCancellation(placeholderIndex: placeholderIndex)
+                    finishStartupCancellation(placeholderIndex: placeholderIndex, epoch: epoch)
                     return
                 }
                 guard ready else {
                     finishWithStartupFailure(
                         placeholderIndex: placeholderIndex,
-                        alias: alias
+                        alias: alias,
+                        epoch: epoch
                     )
                     return
                 }
             }
             guard !Task.isCancelled else {
-                finishStartupCancellation(placeholderIndex: placeholderIndex)
+                finishStartupCancellation(placeholderIndex: placeholderIndex, epoch: epoch)
                 return
             }
 
@@ -264,7 +292,8 @@ final class ChatViewModel {
 
             await self.runSingleStream(
                 alias: alias,
-                placeholderIndex: placeholderIndex
+                placeholderIndex: placeholderIndex,
+                epoch: epoch
             )
         }
     }
@@ -285,8 +314,10 @@ final class ChatViewModel {
     /// ``finishStartupCancellation``.
     func finishWithStartupFailure(
         placeholderIndex: Int,
-        alias: String
+        alias: String,
+        epoch: Int? = nil
     ) {
+        if let epoch, epoch != conversationEpoch { return }
         let message = "Couldn't start \(alias). Try again, or pick a different model in the box below."
         if var placeholder = currentMessage(index: placeholderIndex) {
             placeholder.status = .failed
@@ -324,8 +355,10 @@ final class ChatViewModel {
     /// the state-transition contract directly, exactly as it pins
     /// ``finaliseCancellation``.
     func finishStartupCancellation(
-        placeholderIndex: Int
+        placeholderIndex: Int,
+        epoch: Int? = nil
     ) {
+        if let epoch, epoch != conversationEpoch { return }
         if var placeholder = currentMessage(index: placeholderIndex) {
             Self.finaliseCancellation(message: &placeholder)
             updateMessage(at: placeholderIndex, with: placeholder)
@@ -760,11 +793,17 @@ final class ChatViewModel {
     /// trimmed (ChatGPT / Claude desktop behaviour).
     private func runSingleStream(
         alias: String,
-        placeholderIndex: Int
+        placeholderIndex: Int,
+        epoch: Int
     ) async {
         defer {
-            isStreaming = false
-            inflight = nil
+            // A stream that outlived a conversation switch must not reset
+            // the NEW conversation's streaming state or clear a newer
+            // in-flight task handle.
+            if epoch == conversationEpoch {
+                isStreaming = false
+                inflight = nil
+            }
         }
         // History for this request: everything BEFORE the streaming
         // placeholder. The placeholder itself is excluded because the
@@ -818,7 +857,8 @@ final class ChatViewModel {
         }
         _ = await runOneStream(
             placeholderIndex: placeholderIndex,
-            request: request
+            request: request,
+            epoch: epoch
         )
     }
 
@@ -838,7 +878,8 @@ final class ChatViewModel {
 
     private func runOneStream(
         placeholderIndex: Int,
-        request: ChatStreamClient.Request
+        request: ChatStreamClient.Request,
+        epoch: Int
     ) async -> StreamOutcome {
         var current = currentMessage(index: placeholderIndex)
             ?? ChatMessage(role: .assistant, status: .streaming)
@@ -1063,10 +1104,7 @@ final class ChatViewModel {
                         }
                     }
                 }
-                self.updateMessage(
-                    at: placeholderIndex,
-                    with: current
-                )
+                self.writeStreamMessage(at: placeholderIndex, epoch: epoch, current)
             }
         } catch where Self.isCancellation(error) {
             // v0.4.29 pin: cancel MUST land as .complete (not .failed)
@@ -1076,7 +1114,7 @@ final class ChatViewModel {
             // partial reply visually. Logic lifted into a static
             // helper so the contract is testable without async fan-out.
             ChatViewModel.finaliseCancellation(message: &current)
-            updateMessage(at: placeholderIndex, with: current)
+            writeStreamMessage(at: placeholderIndex, epoch: epoch, current)
             // #478: tell a screen-reader user the reply was stopped.
             if voiceOverActive, let cue = announcer.onTerminal(.cancelled, errorMessage: nil) {
                 VoiceOverAnnouncer.announce(cue)
@@ -1096,7 +1134,7 @@ final class ChatViewModel {
             current.failureKind = failureKind
             lastFailureKind = failureKind
             lastError = actionable
-            updateMessage(at: placeholderIndex, with: current)
+            writeStreamMessage(at: placeholderIndex, epoch: epoch, current)
             // #478: speak the failure to a screen-reader user (the error
             // string), so a silent red bubble isn't the only signal.
             if voiceOverActive, let cue = announcer.onTerminal(.failed, errorMessage: actionable) {
@@ -1120,7 +1158,7 @@ final class ChatViewModel {
                 promptTokens: capturedPromptTokens,
                 completionTokens: capturedCompletionTokens
             )
-            updateMessage(at: placeholderIndex, with: current)
+            writeStreamMessage(at: placeholderIndex, epoch: epoch, current)
         }
         if capturedFinish == "tool_calls" && !capturedCalls.isEmpty {
             return .toolCallsPending(capturedCalls)

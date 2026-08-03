@@ -32,13 +32,34 @@ enum ConversationStore {
     }
 
     static func load() -> [ChatConversation] {
-        guard let data = try? Data(contentsOf: fileURL()) else { return [] }
-        return (try? JSONDecoder().decode([ChatConversation].self, from: data)) ?? []
+        let url = fileURL()
+        // A MISSING file is a normal first run → empty history. A file that
+        // EXISTS but fails to decode (schema change, corruption) must NOT be
+        // silently discarded — the next save would atomically overwrite the
+        // user's whole history with a single new conversation. Side it to
+        // `.corrupt-<t>` so it's recoverable, then start empty.
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        if let decoded = try? JSONDecoder().decode([ChatConversation].self, from: data) {
+            return decoded
+        }
+        let backup = url.deletingLastPathComponent()
+            .appendingPathComponent(
+                "conversations.corrupt-\(Int(Date().timeIntervalSince1970)).json"
+            )
+        try? FileManager.default.moveItem(at: url, to: backup)
+        return []
     }
 
+    /// Persist off the main actor — the caller (``ChatViewModel``) is
+    /// ``@MainActor`` and every save re-encodes the whole history, so
+    /// encoding + disk I/O must not run on the main thread or history
+    /// growth would stall the UI. The snapshot is passed by value (Codable
+    /// value types), so the background write sees a stable copy.
     static func save(_ conversations: [ChatConversation]) {
-        guard let data = try? JSONEncoder().encode(conversations) else { return }
-        try? data.write(to: fileURL(), options: .atomic)
+        DispatchQueue.global(qos: .utility).async {
+            guard let data = try? JSONEncoder().encode(conversations) else { return }
+            try? data.write(to: fileURL(), options: .atomic)
+        }
     }
 
     /// Derive a one-line title from the transcript — the first user
