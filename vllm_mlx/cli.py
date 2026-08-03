@@ -4594,15 +4594,31 @@ def bench_command(args):
         thread_name_prefix="mlx-step",
         initializer=_init_mlx_step_thread,
     )
+    interrupted = False
     try:
         asyncio.run(run_benchmark())
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
     finally:
         # Caller-supplied executors are NOT owned or shut down by
-        # AsyncEngineCore.stop(), so reap the worker here on every exit path
-        # (success, load error → sys.exit, Ctrl-C). The worker is idle by now
-        # — the engine closed its BatchGenerator on it during stop() — so the
-        # join returns immediately.
-        model_load_executor.shutdown(wait=True)
+        # AsyncEngineCore.stop(), so reap the worker here on every exit path.
+        # On a normal or load-error (sys.exit) exit the worker is idle — the
+        # engine closed its BatchGenerator on it during stop(), or the load
+        # future already finished — so this join returns immediately.
+        # ``cancel_futures`` drops any still-queued (never-started) work.
+        #
+        # Ctrl-C landing INSIDE the native ``load`` (an uninterruptible mlx
+        # weight read) is a known, inherent limitation, NOT a regression from
+        # this change: pre-PR this path loaded on the MAIN thread, equally
+        # uninterruptible, so exit already blocked until the read finished.
+        # ``wait=False`` here just avoids re-blocking in this ``finally``;
+        # concurrent.futures' atexit hook still joins the non-daemon worker at
+        # interpreter shutdown, so the wall-clock is unchanged either way and
+        # no GPU work ever escapes the process. Truly aborting a native load
+        # mid-read would need ``os._exit`` and risk leaving Metal state dirty
+        # — not worth it for a benchmark command.
+        model_load_executor.shutdown(wait=not interrupted, cancel_futures=True)
 
 
 def _format_bytes(n: int) -> str:
