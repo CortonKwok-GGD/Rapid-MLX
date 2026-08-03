@@ -591,6 +591,12 @@ class TestModelsRoutes:
                 for level in catalog["test-model"]["supported_reasoning_levels"]
             ] == ["none", "low", "medium", "high"]
             assert "coding agent" in catalog["test-model"]["base_instructions"]
+            assert "Do not merely announce" in catalog["test-model"][
+                "base_instructions"
+            ]
+            assert "Make repository changes with apply_patch" in catalog[
+                "test-model"
+            ]["base_instructions"]
         finally:
             self._restore(orig)
 
