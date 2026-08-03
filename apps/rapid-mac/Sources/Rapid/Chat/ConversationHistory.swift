@@ -45,8 +45,13 @@ enum ConversationStore {
         guard let data = try? Data(contentsOf: url),
               let decoded = try? JSONDecoder().decode([ChatConversation].self, from: data)
         else {
+            // Unique name (UUID) so the move can't fail on a pre-existing
+            // backup → the live file is reliably cleared out of the way
+            // before we return empty. A move that still fails here is a
+            // same-directory permission/IO fault, in which case the next
+            // ``save`` (same dir) also fails — so there's no clobber path.
             let backup = url.deletingLastPathComponent().appendingPathComponent(
-                "conversations.corrupt-\(Int(Date().timeIntervalSince1970)).json"
+                "conversations.corrupt-\(UUID().uuidString).json"
             )
             try? fm.moveItem(at: url, to: backup)
             return []
