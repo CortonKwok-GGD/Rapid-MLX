@@ -1397,18 +1397,20 @@ def test_shutdown_partial_commit_prioritizes_latest_message_boundary(tmp_path):
     """A reusable boundary must beat a longer non-trimmable completion tail."""
     cache_dir = tmp_path / "snap"
     cache = fresh_cache()
-    older_boundary = list(range(60))
-    latest_boundary = list(range(70))
+    older_boundary = list(range(70))
+    # Simulate context truncation/new-session turnover: the latest boundary can
+    # legitimately be shorter than an older one.
+    latest_boundary = list(range(60))
     completion_tail = list(range(100))
     cache.store(
         older_boundary,
-        make_kvcache(num_tokens=60),
+        make_kvcache(num_tokens=70),
         evict_prefixes=False,
         message_boundary=True,
     )
     cache.store(
         latest_boundary,
-        make_kvcache(num_tokens=70, fill=2.0),
+        make_kvcache(num_tokens=60, fill=2.0),
         evict_prefixes=False,
         message_boundary=True,
     )
@@ -1441,6 +1443,28 @@ def test_shutdown_partial_commit_prioritizes_latest_message_boundary(tmp_path):
 
     index = json.loads((cache_dir / "index.json").read_text())
     assert index["entries"][0]["message_boundary"] is True
+    assert index["entries"][0]["message_boundary_sequence"] == 2
+
+
+def test_shutdown_mixed_cache_preserves_deepest_prefix_priority(tmp_path):
+    cache_dir = tmp_path / "snap"
+    cache = fresh_cache()
+    boundary = list(range(10))
+    deepest_trimmable = list(range(100))
+    cache.store(boundary, make_kvcache(10), message_boundary=True)
+    cache.store(deepest_trimmable, make_kvcache(100), evict_prefixes=False)
+    cache._entries[tuple(boundary)].non_trimmable = True
+
+    calls = {"n": 0}
+
+    def predicate(predicted_sec=0.0):
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    assert cache.save_to_disk(str(cache_dir), should_abort=predicate) is True
+    loaded_cache = fresh_cache()
+    assert loaded_cache.load_from_disk(str(cache_dir)) == 1
+    assert next(iter(loaded_cache._entries)) == tuple(deepest_trimmable)
 
 
 def test_message_boundary_marker_roundtrips_and_legacy_defaults_false(tmp_path):
@@ -1455,6 +1479,7 @@ def test_message_boundary_marker_roundtrips_and_legacy_defaults_false(tmp_path):
     loaded_cache = fresh_cache()
     assert loaded_cache.load_from_disk(str(tmp_path)) == 1
     assert next(iter(loaded_cache._entries.values())).message_boundary is True
+    assert next(iter(loaded_cache._entries.values())).message_boundary_sequence == 1
 
     index_path = tmp_path / "index.json"
     index = json.loads(index_path.read_text())
@@ -1463,6 +1488,7 @@ def test_message_boundary_marker_roundtrips_and_legacy_defaults_false(tmp_path):
     legacy_cache = fresh_cache()
     assert legacy_cache.load_from_disk(str(tmp_path)) == 1
     assert next(iter(legacy_cache._entries.values())).message_boundary is False
+    assert next(iter(legacy_cache._entries.values())).message_boundary_sequence == 0
 
 
 def test_deadline_save_skips_oversized_prefix_and_tries_smaller(tmp_path):

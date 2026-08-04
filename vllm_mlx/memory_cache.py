@@ -1174,6 +1174,10 @@ class _CacheEntry:
     # persistence cycles so a deadline-limited shutdown saves the latest
     # usable boundary instead of a longer prompt+completion tail.
     message_boundary: bool = False
+    # Monotonic creation/update order for message boundaries. Unlike LRU rank
+    # or token depth, this remains meaningful after a fetch, context truncation,
+    # and process restart.
+    message_boundary_sequence: int = 0
 
     @classmethod
     def create(
@@ -1182,6 +1186,7 @@ class _CacheEntry:
         cache: list[Any],
         *,
         message_boundary: bool = False,
+        message_boundary_sequence: int = 0,
     ) -> _CacheEntry:
         """Create a cache entry with memory estimation.
 
@@ -1198,6 +1203,7 @@ class _CacheEntry:
             memory_bytes=memory,
             non_trimmable=_cache_has_non_trimmable(cache),
             message_boundary=message_boundary,
+            message_boundary_sequence=message_boundary_sequence,
         )
 
 
@@ -1698,6 +1704,7 @@ class MemoryAwarePrefixCache:
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
         self._entries: OrderedDict[tuple[int, ...], _CacheEntry] = OrderedDict()
+        self._message_boundary_sequence = 0
 
         # Sorted index of token keys for efficient prefix/supersequence lookup.
         # Tuple lexicographic ordering means a prefix key P is always < any
@@ -2100,7 +2107,10 @@ class MemoryAwarePrefixCache:
         with self._lock:
             if tokens_key in self._entries:
                 if message_boundary:
-                    self._entries[tokens_key].message_boundary = True
+                    self._message_boundary_sequence += 1
+                    existing = self._entries[tokens_key]
+                    existing.message_boundary = True
+                    existing.message_boundary_sequence = self._message_boundary_sequence
                 self._entries.move_to_end(tokens_key)
                 return True
 
@@ -2144,7 +2154,10 @@ class MemoryAwarePrefixCache:
             # lock. Just bump LRU and bail.
             if tokens_key in self._entries:
                 if message_boundary:
-                    self._entries[tokens_key].message_boundary = True
+                    self._message_boundary_sequence += 1
+                    existing = self._entries[tokens_key]
+                    existing.message_boundary = True
+                    existing.message_boundary_sequence = self._message_boundary_sequence
                 self._entries.move_to_end(tokens_key)
                 return True
 
@@ -2199,6 +2212,9 @@ class MemoryAwarePrefixCache:
             # Store entry. Insert into _entries before _sorted_keys so
             # that even if a future change drops the lock, fetch never
             # observes a key in sorted_keys that's missing from entries.
+            if message_boundary:
+                self._message_boundary_sequence += 1
+                entry.message_boundary_sequence = self._message_boundary_sequence
             self._entries[tokens_key] = entry
             self._current_memory += entry.memory_bytes
             bisect.insort(self._sorted_keys, tokens_key)
@@ -2675,9 +2691,13 @@ class MemoryAwarePrefixCache:
             # deepest explicit boundary first, then fall back to the deepest
             # frontier for legacy/unmarked entries. Depth is stable when a
             # fetch refreshes LRU order, unlike recency rank.
+            all_non_trimmable = all(entry.non_trimmable for _, entry in entries_to_save)
             entries_to_save.sort(
                 key=lambda item: (
-                    item[1].message_boundary and item[1].non_trimmable,
+                    all_non_trimmable and item[1].message_boundary,
+                    item[1].message_boundary_sequence
+                    if all_non_trimmable and item[1].message_boundary
+                    else 0,
                     len(item[0]),
                 ),
                 reverse=True,
@@ -2775,6 +2795,7 @@ class MemoryAwarePrefixCache:
                         "memory_bytes": entry.memory_bytes,
                         "cache_types": cache_types,
                         "message_boundary": entry.message_boundary,
+                        "message_boundary_sequence": (entry.message_boundary_sequence),
                     }
                 )
                 saved_lru_rank[i] = lru_rank[tokens_key]
@@ -3650,6 +3671,11 @@ class MemoryAwarePrefixCache:
                     # Backward compatible with snapshots written before this
                     # marker existed.
                     message_boundary=bool(entry_meta.get("message_boundary", False)),
+                    message_boundary_sequence=(
+                        int(entry_meta.get("message_boundary_sequence", 0))
+                        if entry_meta.get("message_boundary", False)
+                        else 0
+                    ),
                 )
                 staged[tokens_key] = entry
                 staged_memory += memory
@@ -3906,6 +3932,14 @@ class MemoryAwarePrefixCache:
             # actually looking for. Kept inside the same critical section
             # as the install so a scraper reads a consistent stats block.
             self._stats.load_skipped += corrupt_skipped
+            if self._entries:
+                self._message_boundary_sequence = max(
+                    self._message_boundary_sequence,
+                    max(
+                        entry.message_boundary_sequence
+                        for entry in self._entries.values()
+                    ),
+                )
 
         # #1100 codex round 4 (#3): authoritative loaded-byte total, summed
         # from the entries actually installed in THIS load (under the lock
