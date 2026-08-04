@@ -138,6 +138,20 @@ class RequestOutputCollector:
         merged_new_token_ids = existing.new_token_ids + new.new_token_ids
         merged_new_text = existing.new_text + new.new_text
 
+        # ``error`` and ``error_kind`` are a MATCHED PAIR — a discriminator is
+        # only meaningful for its own error string. Select them ATOMICALLY:
+        # if the newer chunk carries an error, take BOTH its ``error`` and its
+        # ``error_kind`` (even when the kind is None); otherwise inherit BOTH
+        # from the existing buffer. Selecting them independently could pair a
+        # newer genuine runtime abort (error set, error_kind None) with an
+        # older "repetition" kind, making the engine clear the runtime error
+        # and return 200 instead of 503. (Both branches preserve the prior
+        # ``new.error or existing.error`` behaviour for the ``error`` field.)
+        if new.error:
+            merged_error, merged_error_kind = new.error, new.error_kind
+        else:
+            merged_error, merged_error_kind = existing.error, existing.error_kind
+
         return RequestOutput(
             request_id=new.request_id,
             new_token_ids=merged_new_token_ids,
@@ -151,16 +165,14 @@ class RequestOutputCollector:
             cached_tokens=new.cached_tokens,
             logprobs=new.logprobs,  # Use latest token's logprobs
             # Terminal scheduler failures (exact repetition, explicit abort,
-            # Metal recovery) must survive aggregation. Dropping this field
-            # turns an aborted generation into a successful blank response.
-            error=new.error or existing.error,
-            # ``error_kind`` is the companion discriminator to ``error`` — it
-            # must survive aggregation for the SAME reason. If it were dropped,
-            # an aggregated repetition abort would arrive with error_kind=None
-            # and the engine would raise 503 (discarding the partial) instead of
-            # returning it as 200. Prefer the newer chunk's value, falling back
-            # to the existing buffer so a later plain flush can't demote it.
-            error_kind=new.error_kind or existing.error_kind,
+            # Metal recovery) must survive aggregation. Dropping ``error`` turns
+            # an aborted generation into a successful blank response; dropping
+            # ``error_kind`` (the companion discriminator) turns an aggregated
+            # repetition abort into a 503 that discards the partial. Both are
+            # selected atomically above so a runtime error never inherits a
+            # stale "repetition" kind.
+            error=merged_error,
+            error_kind=merged_error_kind,
             # H-03: prefer the newer chunk's matched_stop (the scheduler
             # pins it exactly once on the chunk where the stop fires);
             # fall back to the existing buf so we never demote a

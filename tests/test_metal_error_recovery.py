@@ -295,6 +295,45 @@ async def test_generate_still_raises_503_on_runtime_abort():
     assert "Metal" in str(raised)
 
 
+def test_merge_selects_error_and_kind_atomically():
+    """Aggregation must pick ``error`` and ``error_kind`` as a matched pair.
+    A newer genuine runtime abort (error set, error_kind None) merged over an
+    older "repetition" chunk must NOT inherit the stale "repetition" kind —
+    otherwise the engine would clear a real runtime error and return 200
+    instead of 503."""
+    collector = RequestOutputCollector(aggregate=True)
+    rid = "merge-pair-1"
+    # Older chunk: a repetition abort.
+    collector.put(
+        RequestOutput(
+            request_id=rid,
+            finished=True,
+            finish_reason="abort",
+            error="Model generation aborted: exact repetition loop detected",
+            error_kind="repetition",
+            output_text="haha",
+        )
+    )
+    # Newer chunk (producer got further ahead): a genuine runtime abort with no
+    # kind. Not drained in between → forces a merge.
+    collector.put(
+        RequestOutput(
+            request_id=rid,
+            finished=True,
+            finish_reason="abort",
+            error="Inference aborted: RuntimeError: Metal command buffer error",
+            error_kind=None,
+        )
+    )
+    merged = collector.get_nowait()
+    assert merged is not None
+    assert "Metal" in merged.error, "newer runtime error wins"
+    assert merged.error_kind is None, (
+        "error_kind must follow its own error — not inherit the stale "
+        "'repetition' kind, which would wrongly downgrade a 503 to 200"
+    )
+
+
 @pytest.mark.asyncio
 async def test_engine_loop_backs_off_on_persistent_failures():
     """When step() fails repeatedly the loop must back off — otherwise the
