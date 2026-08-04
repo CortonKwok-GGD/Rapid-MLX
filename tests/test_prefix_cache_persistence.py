@@ -1422,6 +1422,9 @@ def test_shutdown_partial_commit_prioritizes_latest_message_boundary(tmp_path):
     # their serialized cache bodies remain valid lightweight fixtures.
     for entry in cache._entries.values():
         entry.non_trimmable = True
+    # Fetching an older boundary refreshes its LRU position. Persistence must
+    # still select the deeper conversational frontier, not mutable recency.
+    cache.fetch(older_boundary)
 
     calls = {"n": 0}
 

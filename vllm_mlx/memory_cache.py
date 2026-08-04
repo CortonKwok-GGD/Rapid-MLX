@@ -2128,9 +2128,7 @@ class MemoryAwarePrefixCache:
             )
 
         # Create entry and estimate memory (pure compute, no shared state).
-        entry = _CacheEntry.create(
-            tokens, cache, message_boundary=message_boundary
-        )
+        entry = _CacheEntry.create(tokens, cache, message_boundary=message_boundary)
 
         # Check if single entry exceeds limit
         if entry.memory_bytes > self._max_memory:
@@ -2674,15 +2672,12 @@ class MemoryAwarePrefixCache:
         if check_abort is not None:
             # For non-trimmable hybrid caches, a longer completion tail cannot
             # be cropped to the next request's message boundary. Prefer the
-            # newest explicit boundary first, then fall back to the deepest
-            # frontier for legacy/unmarked entries. LRU rank is ascending
-            # oldest->newest, hence the descending rank in this key.
+            # deepest explicit boundary first, then fall back to the deepest
+            # frontier for legacy/unmarked entries. Depth is stable when a
+            # fetch refreshes LRU order, unlike recency rank.
             entries_to_save.sort(
                 key=lambda item: (
                     item[1].message_boundary and item[1].non_trimmable,
-                    lru_rank[item[0]]
-                    if item[1].message_boundary and item[1].non_trimmable
-                    else len(item[0]),
                     len(item[0]),
                 ),
                 reverse=True,
@@ -3654,9 +3649,7 @@ class MemoryAwarePrefixCache:
                     protected=protected_import,
                     # Backward compatible with snapshots written before this
                     # marker existed.
-                    message_boundary=bool(
-                        entry_meta.get("message_boundary", False)
-                    ),
+                    message_boundary=bool(entry_meta.get("message_boundary", False)),
                 )
                 staged[tokens_key] = entry
                 staged_memory += memory
