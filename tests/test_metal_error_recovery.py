@@ -212,6 +212,19 @@ async def test_generate_returns_partial_on_repetition_abort():
     ev = asyncio.Event()
     ev.set()
     engine._finished_events[rid] = ev
+    # Seed TWO chunks without draining so the collector AGGREGATES them (the
+    # producer-ahead path generate() actually hits in production). This is what
+    # catches error_kind being dropped by _merge_outputs — a single terminal
+    # chunk would bypass the merge entirely.
+    engine._output_collectors[rid].put(
+        RequestOutput(
+            request_id=rid,
+            new_text="haha",
+            new_token_ids=[1, 2],
+            output_text="haha",
+            completion_tokens=2,
+        )
+    )
     engine._output_collectors[rid].put(
         RequestOutput(
             request_id=rid,
@@ -222,6 +235,8 @@ async def test_generate_returns_partial_on_repetition_abort():
                 "(period_tokens=3, repeats=86)"
             ),
             error_kind="repetition",
+            new_text="ha",
+            new_token_ids=[3],
             output_text="hahaha",
             completion_tokens=280,
         )
@@ -239,6 +254,9 @@ async def test_generate_returns_partial_on_repetition_abort():
     assert result.finish_reason == "length", "abort remapped to spec-valid length"
     assert result.error is None, "error cleared so the route returns 200 not 503"
     assert result.output_text == "hahaha", "partial output preserved"
+    # Guard the exact regression codex flagged: error_kind must survive
+    # aggregation, else the merged terminal arrives as None and generate() 503s.
+    assert result.error_kind == "repetition", "error_kind survived _merge_outputs"
 
 
 @pytest.mark.asyncio

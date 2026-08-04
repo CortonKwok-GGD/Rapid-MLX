@@ -154,6 +154,13 @@ class RequestOutputCollector:
             # Metal recovery) must survive aggregation. Dropping this field
             # turns an aborted generation into a successful blank response.
             error=new.error or existing.error,
+            # ``error_kind`` is the companion discriminator to ``error`` — it
+            # must survive aggregation for the SAME reason. If it were dropped,
+            # an aggregated repetition abort would arrive with error_kind=None
+            # and the engine would raise 503 (discarding the partial) instead of
+            # returning it as 200. Prefer the newer chunk's value, falling back
+            # to the existing buffer so a later plain flush can't demote it.
+            error_kind=new.error_kind or existing.error_kind,
             # H-03: prefer the newer chunk's matched_stop (the scheduler
             # pins it exactly once on the chunk where the stop fires);
             # fall back to the existing buf so we never demote a
