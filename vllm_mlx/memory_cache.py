@@ -1169,9 +1169,20 @@ class _CacheEntry:
     # Live-STORE entries are always ``protected=False`` (the opportunistic path
     # the bound governs). The bound governs OPPORTUNISTIC (unprotected) entries.
     protected: bool = False
+    # Exact message-boundary snapshots are the reusable restart frontier for
+    # hybrid caches that cannot be trimmed.  Keep this semantic marker across
+    # persistence cycles so a deadline-limited shutdown saves the latest
+    # usable boundary instead of a longer prompt+completion tail.
+    message_boundary: bool = False
 
     @classmethod
-    def create(cls, tokens: list[int], cache: list[Any]) -> _CacheEntry:
+    def create(
+        cls,
+        tokens: list[int],
+        cache: list[Any],
+        *,
+        message_boundary: bool = False,
+    ) -> _CacheEntry:
         """Create a cache entry with memory estimation.
 
         Live-store entries are EVICTABLE (``protected=False``) — the
@@ -1186,6 +1197,7 @@ class _CacheEntry:
             cache=cache,
             memory_bytes=memory,
             non_trimmable=_cache_has_non_trimmable(cache),
+            message_boundary=message_boundary,
         )
 
 
@@ -2013,7 +2025,12 @@ class MemoryAwarePrefixCache:
         return None, tokens
 
     def store(
-        self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        evict_prefixes: bool = True,
+        *,
+        message_boundary: bool = False,
     ) -> bool:
         """
         Store KV cache for future reuse.
@@ -2030,6 +2047,10 @@ class MemoryAwarePrefixCache:
                 when storing prompt+output entries to preserve prompt-only
                 entries created by prompt_cache_save (those are the entries
                 that future requests will actually match).
+            message_boundary: Mark an exact conversational boundary. These
+                entries are preferred by deadline-limited disk persistence
+                because non-trimmable hybrid caches can only resume them at
+                their exact token length.
 
         Returns:
             True if stored successfully, False if rejected.
@@ -2078,6 +2099,8 @@ class MemoryAwarePrefixCache:
         # Holds the lock briefly so the bump is consistent with concurrent fetch.
         with self._lock:
             if tokens_key in self._entries:
+                if message_boundary:
+                    self._entries[tokens_key].message_boundary = True
                 self._entries.move_to_end(tokens_key)
                 return True
 
@@ -2105,7 +2128,9 @@ class MemoryAwarePrefixCache:
             )
 
         # Create entry and estimate memory (pure compute, no shared state).
-        entry = _CacheEntry.create(tokens, cache)
+        entry = _CacheEntry.create(
+            tokens, cache, message_boundary=message_boundary
+        )
 
         # Check if single entry exceeds limit
         if entry.memory_bytes > self._max_memory:
@@ -2120,6 +2145,8 @@ class MemoryAwarePrefixCache:
             # the same key while we were trimming/compressing outside the
             # lock. Just bump LRU and bail.
             if tokens_key in self._entries:
+                if message_boundary:
+                    self._entries[tokens_key].message_boundary = True
                 self._entries.move_to_end(tokens_key)
                 return True
 
@@ -2645,11 +2672,21 @@ class MemoryAwarePrefixCache:
         lru_rank = {tokens_key: rank for rank, tokens_key in enumerate(self._entries)}
         saved_lru_rank: dict[int, int] = {}
         if check_abort is not None:
-            # A deadline-limited snapshot should preserve the deepest reusable
-            # frontier first. LRU order may begin with a tiny bootstrap entry,
-            # which can otherwise consume the only guaranteed shutdown slot
-            # and skew the observed-throughput estimate with fixed fsync cost.
-            entries_to_save.sort(key=lambda item: len(item[0]), reverse=True)
+            # For non-trimmable hybrid caches, a longer completion tail cannot
+            # be cropped to the next request's message boundary. Prefer the
+            # newest explicit boundary first, then fall back to the deepest
+            # frontier for legacy/unmarked entries. LRU rank is ascending
+            # oldest->newest, hence the descending rank in this key.
+            entries_to_save.sort(
+                key=lambda item: (
+                    item[1].message_boundary and item[1].non_trimmable,
+                    lru_rank[item[0]]
+                    if item[1].message_boundary and item[1].non_trimmable
+                    else len(item[0]),
+                    len(item[0]),
+                ),
+                reverse=True,
+            )
         total_bytes_written = 0
         total_write_seconds = 0.0
         for i, (tokens_key, entry) in enumerate(entries_to_save):
@@ -2742,6 +2779,7 @@ class MemoryAwarePrefixCache:
                         "num_tokens": len(tokens_key),
                         "memory_bytes": entry.memory_bytes,
                         "cache_types": cache_types,
+                        "message_boundary": entry.message_boundary,
                     }
                 )
                 saved_lru_rank[i] = lru_rank[tokens_key]
@@ -3614,6 +3652,11 @@ class MemoryAwarePrefixCache:
                     #    persists opportunistic entries; see load_from_disk
                     #    docstring for the full restart cycle).
                     protected=protected_import,
+                    # Backward compatible with snapshots written before this
+                    # marker existed.
+                    message_boundary=bool(
+                        entry_meta.get("message_boundary", False)
+                    ),
                 )
                 staged[tokens_key] = entry
                 staged_memory += memory
