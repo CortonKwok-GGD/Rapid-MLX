@@ -159,6 +159,125 @@ async def test_stream_outputs_raises_on_error_field():
 
 
 @pytest.mark.asyncio
+async def test_stream_outputs_returns_partial_on_repetition_abort():
+    """Streaming path, repetition-guard hard-stop: unlike a Metal abort, this is
+    a graceful terminal stop whose partial output is valid. stream_outputs must
+    NOT raise — it must yield the (already-generated) chunk with the internal
+    "abort" finish_reason remapped to the spec-valid "length" and ``error``
+    cleared, so the client gets a clean terminal frame instead of a 503/error
+    SSE frame that discards the partial and invites an identical retry."""
+    engine = _make_engine()
+
+    rid = "stream-rep-1"
+    engine._output_collectors[rid] = RequestOutputCollector(aggregate=True)
+    engine._output_collectors[rid].put(
+        RequestOutput(
+            request_id=rid,
+            finished=True,
+            finish_reason="abort",
+            error=(
+                "Model generation aborted: exact repetition loop detected "
+                "(period_tokens=3, repeats=86)"
+            ),
+            error_kind="repetition",
+            output_text="hahaha",
+            completion_tokens=280,
+        )
+    )
+
+    raised = None
+    yields = []
+    try:
+        async for chunk in engine.stream_outputs(rid):
+            yields.append(chunk)
+    except InferenceAbortedError as exc:  # must NOT happen
+        raised = exc
+
+    assert raised is None, "repetition abort must not raise (it is graceful)"
+    assert len(yields) == 1, "the terminal partial chunk must be yielded"
+    assert yields[0].finish_reason == "length", "abort remapped to spec-valid length"
+    assert yields[0].error is None, "error cleared so no 503/error frame"
+    assert yields[0].output_text == "hahaha", "partial output preserved"
+
+
+@pytest.mark.asyncio
+async def test_generate_returns_partial_on_repetition_abort():
+    """Non-streaming path, repetition-guard hard-stop: generate() must RETURN the
+    partial output (200) with finish_reason remapped to "length" and error
+    cleared, instead of raising InferenceAbortedError (→ 503) and discarding it."""
+    engine = _make_engine()
+
+    rid = "gen-rep-1"
+    engine._output_collectors[rid] = RequestOutputCollector(aggregate=True)
+    ev = asyncio.Event()
+    ev.set()
+    engine._finished_events[rid] = ev
+    engine._output_collectors[rid].put(
+        RequestOutput(
+            request_id=rid,
+            finished=True,
+            finish_reason="abort",
+            error=(
+                "Model generation aborted: exact repetition loop detected "
+                "(period_tokens=3, repeats=86)"
+            ),
+            error_kind="repetition",
+            output_text="hahaha",
+            completion_tokens=280,
+        )
+    )
+
+    # Bypass the real enqueue — return the pre-seeded rid so generate() drains
+    # our repetition output and exercises the raise-or-return decision.
+    async def _fake_add_request(*_a, **_kw):
+        return rid
+
+    engine.add_request = _fake_add_request
+
+    result = await engine.generate(prompt="x", request_id=rid)
+    assert result is not None, "generate must return the partial, not raise"
+    assert result.finish_reason == "length", "abort remapped to spec-valid length"
+    assert result.error is None, "error cleared so the route returns 200 not 503"
+    assert result.output_text == "hahaha", "partial output preserved"
+
+
+@pytest.mark.asyncio
+async def test_generate_still_raises_503_on_runtime_abort():
+    """Guard: a genuine runtime abort (error_kind None, e.g. Metal) must STILL
+    raise InferenceAbortedError so the HTTP layer keeps mapping it to 503. Only
+    the repetition kind is exempted."""
+    engine = _make_engine()
+
+    rid = "gen-metal-1"
+    engine._output_collectors[rid] = RequestOutputCollector(aggregate=True)
+    ev = asyncio.Event()
+    ev.set()
+    engine._finished_events[rid] = ev
+    engine._output_collectors[rid].put(
+        RequestOutput(
+            request_id=rid,
+            finished=True,
+            finish_reason="abort",
+            error="Inference aborted: RuntimeError: Metal command buffer error",
+            error_kind=None,
+        )
+    )
+
+    async def _fake_add_request(*_a, **_kw):
+        return rid
+
+    engine.add_request = _fake_add_request
+
+    raised = None
+    try:
+        await engine.generate(prompt="x", request_id=rid)
+    except InferenceAbortedError as exc:
+        raised = exc
+    assert raised is not None, "runtime abort must still raise (→ 503)"
+    assert "Metal" in str(raised)
+
+
+@pytest.mark.asyncio
 async def test_engine_loop_backs_off_on_persistent_failures():
     """When step() fails repeatedly the loop must back off — otherwise the
     retry cadence floods logs at ~10 Hz and burns CPU spinning on a stuck
