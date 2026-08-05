@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
+import re
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -47,7 +47,8 @@ CASES = (
         prompt=(
             "Inspect scripts/release_check_m3_random.py and "
             "tests/test_release_check_random.py. Make exactly one "
-            "exec_command tool call that reads both files; do not edit files."
+            "exec_command tool call using exactly: cat "
+            "scripts/release_check_m3_random.py tests/test_release_check_random.py"
         ),
         expected="one_exec_call_reads_both",
         tools=(EXEC_TOOL,),
@@ -127,32 +128,10 @@ def score(
             command = json.loads(calls[0].get("arguments") or "{}").get("cmd", "")
         except json.JSONDecodeError:
             return False, "invalid tool arguments JSON"
-        if any(
-            token in command
-            for token in (";", "&&", "||", "|", "`", "$(", "$", ">", "<", "\n", "\r")
-        ):
-            return False, "tool command contains shell control operators"
-        try:
-            tokens = shlex.split(command, comments=True)
-        except ValueError:
-            return False, "tool command is not valid shell syntax"
-        approved_readers = {"cat", "sed", "head", "tail"}
-        if not tokens or Path(tokens[0]).name not in approved_readers:
-            return False, "tool command does not use an approved read-only command"
-        if Path(tokens[0]).name == "sed":
-            options = [token for token in tokens[1:] if token.startswith("-")]
-            if any(option == "-i" or option.startswith("-i") for option in options):
-                return False, "sed in-place editing is not read-only"
-            scripts = [token for token in tokens[1:] if not token.startswith("-")]
-            if not scripts or not scripts[0].rstrip("p").replace(",", "").isdigit():
-                return False, "sed command is not a simple print range"
-        passed = all(
-            path in tokens
-            for path in (
-                "scripts/release_check_m3_random.py",
-                "tests/test_release_check_random.py",
-            )
+        expected = (
+            "cat scripts/release_check_m3_random.py tests/test_release_check_random.py"
         )
+        passed = command.strip() == expected
         return (
             passed,
             None if passed else "tool command did not read both requested files",
@@ -217,10 +196,16 @@ def parse_endpoint(value: str) -> tuple[str, str, str | None]:
         name, target = value.split("=", 1)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("endpoint must be NAME=URL[,ENV_VAR]") from exc
-    url, separator, env_var = target.partition(",")
+    url, separator, env_var = target.rpartition(",")
+    if not separator:
+        url, env_var = target, None
     if not name or not url:
         raise argparse.ArgumentTypeError("endpoint name and URL are required")
-    return name, url, env_var if separator else None
+    if env_var is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_var):
+        raise argparse.ArgumentTypeError(
+            "credential suffix must be an environment-variable name"
+        )
+    return name, url, env_var
 
 
 def reject_duplicate_endpoint_names(
@@ -277,7 +262,7 @@ def main() -> int:
         if env_var:
             token = os.environ.get(env_var)
             if not token:
-                parser.error(f"environment variable {env_var!r} is not set")
+                parser.error("credential environment variable is not set")
             headers["Authorization"] = f"Bearer {token}"
         with httpx.Client(headers=headers, timeout=args.timeout) as client:
             for case in CASES:

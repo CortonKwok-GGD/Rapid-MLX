@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import json
 import sys
@@ -38,7 +39,7 @@ def test_score_bounded_inspection_requires_one_call_with_both_paths():
         "name": "exec_command",
         "arguments": json.dumps(
             {
-                "cmd": "sed -n '1,200p' scripts/release_check_m3_random.py "
+                "cmd": "cat scripts/release_check_m3_random.py "
                 "tests/test_release_check_random.py"
             }
         ),
@@ -138,3 +139,13 @@ def test_parse_endpoint_uses_environment_variable_name():
         "https://example.test/v1",
         "CLOUD_KEY",
     )
+
+
+def test_parse_endpoint_rejects_literal_credential_suffix():
+    try:
+        MODULE.parse_endpoint("cloud=https://example.test/v1,not-a-valid-env-name")
+    except argparse.ArgumentTypeError as exc:
+        assert "environment-variable name" in str(exc)
+        assert "not-a-valid" not in str(exc)
+    else:
+        raise AssertionError("expected literal credential suffix to fail")

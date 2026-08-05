@@ -61,6 +61,10 @@ def test_detect_repetition_finds_exact_repeated_suffix():
     assert period == 8
 
 
+def test_detect_repetition_finds_short_period_degradation():
+    assert MODULE.detect_repetition("prefix " + "error " * 20) == (True, 1)
+
+
 def test_detect_repetition_ignores_normal_short_answer():
     assert MODULE.detect_repetition("vllm_mlx/model_profile.py") == (False, None)
 
@@ -120,3 +124,26 @@ def test_run_replay_records_transport_failure():
     assert result.status == "error"
     assert result.failure == "RuntimeError: endpoint unavailable"
     assert result.answer == ""
+
+
+def test_replay_endpoint_validation_is_credential_safe_and_unique():
+    assert MODULE.parse_endpoint("cloud=https://example.test/v1,CLOUD_KEY") == (
+        "cloud",
+        "https://example.test/v1",
+        "CLOUD_KEY",
+    )
+    try:
+        MODULE.parse_endpoint("cloud=https://example.test/v1,not-a-valid-env-name")
+    except argparse.ArgumentTypeError as exc:
+        assert "environment-variable name" in str(exc)
+        assert "not-a-valid" not in str(exc)
+    else:
+        raise AssertionError("expected literal credential suffix to fail")
+    try:
+        MODULE.reject_duplicate_endpoint_names(
+            [("cloud", "http://one", None), ("cloud", "http://two", None)]
+        )
+    except ValueError as exc:
+        assert "duplicate endpoint" in str(exc)
+    else:
+        raise AssertionError("expected duplicate endpoint names to fail")

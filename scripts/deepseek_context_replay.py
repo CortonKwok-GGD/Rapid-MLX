@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -39,10 +40,25 @@ def parse_endpoint(value: str) -> tuple[str, str, str | None]:
         name, target = value.split("=", 1)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("endpoint must be NAME=URL[,ENV_VAR]") from exc
-    url, separator, env_var = target.partition(",")
+    url, separator, env_var = target.rpartition(",")
+    if not separator:
+        url, env_var = target, None
     if not name or not url:
         raise argparse.ArgumentTypeError("endpoint name and URL are required")
-    return name, url, env_var if separator else None
+    if env_var is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_var):
+        raise argparse.ArgumentTypeError(
+            "credential suffix must be an environment-variable name"
+        )
+    return name, url, env_var
+
+
+def reject_duplicate_endpoint_names(
+    endpoints: list[tuple[str, str, str | None]],
+) -> None:
+    names = [name for name, _, _ in endpoints]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate endpoint name(s): {', '.join(duplicates)}")
 
 
 def positive_int(value: str) -> int:
@@ -103,7 +119,7 @@ def _is_within_root(path: Path, resolved_root: Path) -> bool:
 def detect_repetition(text: str, *, repeats: int = 3) -> tuple[bool, int | None]:
     """Detect an exact repeated suffix using whitespace-delimited tokens."""
     tokens = text.split()
-    for period in range(8, min(512, len(tokens) // repeats) + 1):
+    for period in range(1, min(512, len(tokens) // repeats) + 1):
         suffix = tokens[-period:]
         if all(
             tokens[-period * index : -period * (index - 1) or None] == suffix
@@ -233,6 +249,10 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
+    try:
+        reject_duplicate_endpoint_names(args.endpoint)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     results: list[ReplayResult] = []
     target_sizes = args.target_chars or [320_000, 400_000, 480_000]
@@ -245,7 +265,7 @@ def main() -> int:
         if env_var:
             token = os.environ.get(env_var)
             if not token:
-                parser.error(f"environment variable {env_var!r} is not set")
+                parser.error("credential environment variable is not set")
             headers["Authorization"] = f"Bearer {token}"
         with httpx.Client(headers=headers, timeout=args.timeout) as client:
             for target_chars, corpus in corpora.items():
