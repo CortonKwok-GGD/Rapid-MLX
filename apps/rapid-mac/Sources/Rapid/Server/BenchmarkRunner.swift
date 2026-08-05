@@ -480,7 +480,15 @@ final class BenchmarkRunner {
                 // already landed, adopt() kills it right away.
                 handle.adopt(task)
                 if let line = stdinLine {
-                    inPipe.fileHandleForWriting.write(Data(line.utf8))
+                    // `FileHandle.write(_:)` raises an ObjC exception on EPIPE,
+                    // which Swift cannot catch — it terminates the app. That is
+                    // reachable here: `adopt` above kills the child immediately
+                    // if a cancel already landed (Publish, then close the card),
+                    // so stdin can be gone before this write. The throwing
+                    // `write(contentsOf:)` surfaces the same condition as a
+                    // Swift error we can ignore — a child that is no longer
+                    // there does not need its "y".
+                    try? inPipe.fileHandleForWriting.write(contentsOf: Data(line.utf8))
                     try? inPipe.fileHandleForWriting.close()
                 }
 
