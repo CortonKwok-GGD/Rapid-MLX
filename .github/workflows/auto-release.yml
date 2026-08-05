@@ -265,9 +265,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Idempotency: re-check at create time too.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — done"
+          # Idempotency: re-check at create time too. An existing Release is
+          # only "already done" if it points at the commit these notes
+          # describe — a retry that resolved a different RELEASE_SHA must not
+          # report success over a release that documents another tree.
+          if EXISTING_REL=$(gh release view "$TAG" --json targetCommitish,tagName -q .targetCommitish 2>/dev/null); then
+            # targetCommitish can be a branch name for pre-existing releases;
+            # resolve through the tag, which is what actually ships.
+            if REL_SHA=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" 2>/dev/null); then
+              :
+            else
+              REL_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q .object.sha 2>/dev/null || echo "")
+            fi
+            if [ -n "$REL_SHA" ] && [ "$REL_SHA" != "$RELEASE_SHA" ]; then
+              echo "❌ Release $TAG already exists at $REL_SHA, but these notes describe $RELEASE_SHA." >&2
+              echo "   Refusing to report success over a release that documents a different tree." >&2
+              exit 1
+            fi
+            echo "Release $TAG already exists at the release commit ($EXISTING_REL) — done"
             exit 0
           fi
 
@@ -279,7 +294,20 @@ jobs:
           # whose notes describe $RELEASE_SHA attached to a tag pointing
           # somewhere else. That is the one way this job can ship a release that
           # lies about its own contents, so fail loudly instead of guessing.
-          git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+          # ``git fetch <tag>`` fails both when the tag is absent (fine) and
+          # when the network/auth broke (NOT fine), and swallowing that with
+          # ``|| true`` would read a failed check as "no tag exists" — then
+          # ``gh release create`` reuses the remote tag, ignores --target, and
+          # the post-condition only catches it AFTER downstream workflows fired.
+          # ``ls-remote`` separates the two: exit 0 + empty means genuinely
+          # absent, non-zero means we could not check and must not guess.
+          if ! REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$TAG"); then
+            echo "❌ could not query origin for refs/tags/$TAG — refusing to guess." >&2
+            exit 1
+          fi
+          if [ -n "$REMOTE_TAG" ]; then
+            git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          fi
           if EXISTING=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}"); then
             if [ "$EXISTING" != "$RELEASE_SHA" ]; then
               echo "❌ Tag $TAG already exists at $EXISTING, but these notes describe $RELEASE_SHA." >&2
