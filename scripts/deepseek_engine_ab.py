@@ -63,19 +63,19 @@ CASES = (
             "without g12_eligible must remain eligible for backward "
             "compatibility; only an explicit false opts out. The patch "
             "implements exactly that. Is there a material correctness blocker? "
-            "Reply exactly NO_BLOCKER if none. Do not reconsider your answer."
+            "Reply with one word: YES or NO."
         ),
-        expected="exact_no_blocker",
+        expected="exact_no",
     ),
     Case(
         name="schema_recovery",
         prompt=(
             "AliasProfile is a deprecated alias of ModelProfile. A regression "
             "says: g12_eligible is rejected because it is absent from the "
-            "allowed profile-key schema. Reply exactly "
-            "ADD_G12_ELIGIBLE_TO_SCHEMA and nothing else."
+            "allowed profile-key schema. Should the next change add or remove "
+            "g12_eligible from that schema? Reply with one word: ADD or REMOVE."
         ),
-        expected="exact_add_schema_key",
+        expected="exact_add",
     ),
 )
 
@@ -111,16 +111,16 @@ def extract_response(data: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
 def score(
     case: Case, answer: str, calls: list[dict[str, Any]]
 ) -> tuple[bool, str | None]:
-    if case.expected == "exact_no_blocker":
+    if case.expected == "exact_no":
         return (
-            answer == "NO_BLOCKER",
-            None if answer == "NO_BLOCKER" else "not exact NO_BLOCKER",
+            answer == "NO",
+            None if answer == "NO" else "not exact NO",
         )
-    if case.expected == "exact_add_schema_key":
-        passed = answer == "ADD_G12_ELIGIBLE_TO_SCHEMA"
+    if case.expected == "exact_add":
+        passed = answer == "ADD"
         return (
             passed,
-            None if passed else "not exact ADD_G12_ELIGIBLE_TO_SCHEMA",
+            None if passed else "not exact ADD",
         )
     if case.expected == "one_exec_call_reads_both":
         if len(calls) != 1 or calls[0].get("name") != "exec_command":
@@ -216,6 +216,15 @@ def parse_endpoint(value: str) -> tuple[str, str, str | None]:
         raise argparse.ArgumentTypeError("endpoint URL must be HTTP(S)")
     if env_var is not None and parsed_url.scheme != "https":
         raise argparse.ArgumentTypeError("credentialed endpoints must use HTTPS")
+    if (
+        parsed_url.username
+        or parsed_url.password
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise argparse.ArgumentTypeError(
+            "endpoint URL must not contain userinfo, query parameters, or fragments"
+        )
     return name, url, env_var
 
 
@@ -232,15 +241,20 @@ def summarize(trials: list[Trial]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for endpoint in sorted({trial.endpoint for trial in trials}):
         selected = [trial for trial in trials if trial.endpoint == endpoint]
+        completed = [trial for trial in selected if trial.status == "completed"]
         summary[endpoint] = {
             "passed": sum(trial.passed for trial in selected),
             "trials": len(selected),
             "pass_rate": sum(trial.passed for trial in selected) / len(selected),
-            "median_latency_seconds": statistics.median(
-                trial.latency_seconds for trial in selected
+            "median_latency_seconds": (
+                statistics.median(trial.latency_seconds for trial in completed)
+                if completed
+                else None
             ),
-            "median_output_tokens": statistics.median(
-                trial.output_tokens for trial in selected
+            "median_output_tokens": (
+                statistics.median(trial.output_tokens for trial in completed)
+                if completed
+                else None
             ),
         }
     return summary

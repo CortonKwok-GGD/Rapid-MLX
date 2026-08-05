@@ -81,13 +81,13 @@ def test_score_bounded_inspection_rejects_non_reading_path_mentions():
 
 def test_score_review_is_exact():
     case = MODULE.CASES[1]
-    assert MODULE.score(case, "NO_BLOCKER", []) == (True, None)
-    assert MODULE.score(case, "There is NO_BLOCKER", [])[0] is False
+    assert MODULE.score(case, "NO", []) == (True, None)
+    assert MODULE.score(case, "There is NO", [])[0] is False
 
 
 def test_score_recovery_requires_exact_contract():
     case = MODULE.CASES[2]
-    assert MODULE.score(case, "ADD_G12_ELIGIBLE_TO_SCHEMA", [])[0]
+    assert MODULE.score(case, "ADD", [])[0]
     for answer in (
         "Do not add g12_eligible to the schema.",
         "Delete g12_eligible from the schema.",
@@ -108,7 +108,7 @@ def test_run_trial_reports_incomplete_status():
                 "output": [
                     {
                         "type": "message",
-                        "content": [{"type": "output_text", "text": "NO_BLOCKER"}],
+                        "content": [{"type": "output_text", "text": "NO"}],
                     }
                 ],
             },
@@ -166,3 +166,26 @@ def test_parse_endpoint_rejects_literal_credential_suffix():
         assert "HTTPS" in str(exc)
     else:
         raise AssertionError("expected plaintext credential endpoint to fail")
+    for unsafe in (
+        "https://user:secret@example.test/v1",
+        "https://example.test/v1?api_key=secret",
+        "https://example.test/v1#secret",
+    ):
+        try:
+            MODULE.parse_endpoint(f"cloud={unsafe}")
+        except argparse.ArgumentTypeError as exc:
+            assert "must not contain" in str(exc)
+        else:
+            raise AssertionError("expected credential-bearing URL to fail")
+
+
+def test_summary_excludes_error_latency_from_median():
+    completed = MODULE.Trial(
+        "local", "case", 1, True, "completed", 10.0, 1, 1, 0, 0, "NO"
+    )
+    failed = MODULE.Trial(
+        "local", "case", 2, False, "error", 0.01, 0, 0, 0, 0, "", "timeout"
+    )
+    summary = MODULE.summarize([completed, failed])["local"]
+    assert summary["median_latency_seconds"] == 10.0
+    assert summary["median_output_tokens"] == 1

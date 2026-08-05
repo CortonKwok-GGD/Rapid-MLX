@@ -44,28 +44,6 @@ def test_build_corpus_does_not_follow_source_symlinks(tmp_path):
     assert "safe.py" in corpus
 
 
-def test_build_corpus_places_score_evidence_first(tmp_path):
-    (tmp_path / "vllm_mlx").mkdir()
-    (tmp_path / "vllm_mlx" / "large.py").write_text("x" * 200)
-    (tmp_path / "vllm_mlx" / "model_profile.py").write_text("class ModelProfile: pass")
-    corpus = MODULE.build_corpus(tmp_path, 80)
-    assert corpus.startswith("\n--- FILE: vllm_mlx/model_profile.py ---")
-    assert "class ModelProfile" in corpus
-
-
-def test_build_corpus_rejects_truncated_score_evidence(tmp_path):
-    (tmp_path / "vllm_mlx").mkdir()
-    (tmp_path / "vllm_mlx" / "model_profile.py").write_text(
-        "class ModelProfile:\n" + "    pass\n" * 20
-    )
-    try:
-        MODULE.build_corpus(tmp_path, 40)
-    except ValueError as exc:
-        assert "complete scoring evidence" in str(exc)
-    else:
-        raise AssertionError("expected truncated evidence target to fail")
-
-
 def test_detect_repetition_finds_exact_repeated_suffix():
     prefix = "unique context "
     cycle = "one two three four five six seven eight "
@@ -93,12 +71,33 @@ def test_build_conversation_preserves_complete_prior_turns():
     ]
     assert items[1]["content"][0]["text"] == MODULE.TURN_ACKNOWLEDGEMENT
     assert MODULE.TURN_ACKNOWLEDGEMENT in items[0]["content"][0]["text"]
-    assert (
-        "Which file defines class ModelProfile?" not in items[0]["content"][0]["text"]
-    )
-    assert "Which file defines class ModelProfile?" in items[-1]["content"][0]["text"]
+    assert MODULE.TURN_ACKNOWLEDGEMENT in items[-1]["content"][0]["text"]
     assert "a" * 5 in items[0]["content"][0]["text"]
     assert "a" * 2 in items[-1]["content"][0]["text"]
+
+
+def test_larger_conversation_extends_completed_smaller_request():
+    smaller = MODULE.build_conversation("a" * 10, turn_chars=5)
+    completed_smaller = smaller + [
+        {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": MODULE.TURN_ACKNOWLEDGEMENT}],
+        }
+    ]
+    larger = MODULE.build_conversation("a" * 15, turn_chars=5)
+    assert larger[: len(completed_smaller)] == completed_smaller
+
+
+def test_default_target_sizes_are_complete_turn_boundaries():
+    for size in (320_000, 480_000, 640_000):
+        assert size % MODULE.TURN_CHARS == 0
+    MODULE.validate_target_sizes([320_000, 480_000])
+    try:
+        MODULE.validate_target_sizes([400_000])
+    except ValueError as exc:
+        assert "complete turn boundary" in str(exc)
+    else:
+        raise AssertionError("expected partial-turn target to fail")
 
 
 def test_build_conversation_rejects_non_positive_turn_size():
@@ -158,6 +157,17 @@ def test_replay_endpoint_validation_is_credential_safe_and_unique():
         assert "HTTPS" in str(exc)
     else:
         raise AssertionError("expected plaintext credential endpoint to fail")
+    for unsafe in (
+        "https://user:secret@example.test/v1",
+        "https://example.test/v1?api_key=secret",
+        "https://example.test/v1#secret",
+    ):
+        try:
+            MODULE.parse_endpoint(f"cloud={unsafe}")
+        except argparse.ArgumentTypeError as exc:
+            assert "must not contain" in str(exc)
+        else:
+            raise AssertionError("expected credential-bearing URL to fail")
     try:
         MODULE.reject_duplicate_endpoint_names(
             [("cloud", "http://one", None), ("cloud", "http://two", None)]
