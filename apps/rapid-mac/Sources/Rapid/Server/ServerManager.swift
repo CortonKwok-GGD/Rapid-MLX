@@ -71,12 +71,20 @@ final class ServerManager {
     /// message even though the model does come up.
     private var memoryConfirmTask: Task<Void, Never>?
 
-    /// True while the confirmed launch is still running. Polled by
+    /// Confirmed launches still running, by sequence number. Polled by
     /// ``awaitConfirmedLaunch`` instead of awaiting the task's ``value``:
     /// awaiting a non-throwing Task is NOT cancellation-aware, so a caller
     /// that gets cancelled mid-wait (chat Stop, switching conversations)
     /// would stay suspended until a possibly-stalled download finished.
-    private var memoryConfirmInFlight = false
+    ///
+    /// Keyed per launch rather than a single flag: two confirmations can
+    /// overlap (confirm A while its pull settles, then park and CANCEL B),
+    /// and a shared flag would let B's cancel tell A's waiter that A had
+    /// finished — dropping A's chat turn while A was still coming up.
+    private var memoryConfirmRunning: Set<Int> = []
+
+    /// Monotonic id for the most recent confirmed launch.
+    private var memoryConfirmSeq = 0
 
     /// Alias the child is currently serving once `/healthz` answered 200,
     /// else `nil`. Authoritative source of truth for which model id any
@@ -631,7 +639,9 @@ final class ServerManager {
             if confirmed {
                 // Wait out the actual re-entered launch — no fixed bound,
                 // because it may legitimately sit on a background download.
-                await awaitConfirmedLaunch()
+                // Bind to THIS confirmation so an unrelated later cancel
+                // cannot end the wait early.
+                await awaitConfirmedLaunch(memoryConfirmSeq)
             }
         }
         // ``start`` returns silently when another caller already owns
@@ -683,8 +693,8 @@ final class ServerManager {
     /// pre-spawn download can take minutes) but cancellation-aware: the
     /// ``Task.sleep`` throws when the CALLER is cancelled, so we stop waiting
     /// and leave the launch itself running — the user did ask for it.
-    private func awaitConfirmedLaunch() async {
-        while memoryConfirmInFlight {
+    private func awaitConfirmedLaunch(_ seq: Int) async {
+        while memoryConfirmRunning.contains(seq) {
             do {
                 try await Task.sleep(nanoseconds: 200_000_000)
             } catch {
@@ -771,7 +781,9 @@ final class ServerManager {
         // Publish the task BEFORE clearing nothing else — both this and the
         // waiter run on the MainActor, so a waiter that observes
         // ``pendingMemoryWarning == nil`` is guaranteed to see this task.
-        memoryConfirmInFlight = true
+        memoryConfirmSeq += 1
+        let seq = memoryConfirmSeq
+        memoryConfirmRunning.insert(seq)
         memoryConfirmTask = Task { [weak self] in
             await self?.start(
                 alias: warning.alias,
@@ -779,7 +791,7 @@ final class ServerManager {
                 isAutoRespawn: warning.isAutoRespawn,
                 bypassMemoryGuard: true
             )
-            self?.memoryConfirmInFlight = false
+            self?.memoryConfirmRunning.remove(seq)
         }
     }
 
@@ -787,9 +799,12 @@ final class ServerManager {
     /// held request; ``state`` is untouched (it never left idle/stopped
     /// because ``start`` returned before spawning).
     func cancelPendingMemoryLoad() {
+        // Deliberately leaves ``memoryConfirmRunning`` alone: this cancels a
+        // load that was never started, so any launch still in flight belongs
+        // to an EARLIER confirmation and its waiter must not be told it
+        // finished.
         memoryLoadConfirmed = false
         memoryConfirmTask = nil
-        memoryConfirmInFlight = false
         pendingMemoryWarning = nil
     }
 
