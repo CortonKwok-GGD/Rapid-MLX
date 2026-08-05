@@ -401,7 +401,11 @@ if [ "${RAPID_MLX_RELEASE_GATE:-0}" = "1" ]; then
 
   # Decode-throughput perf gate on the warm serve. Advisory (measure + print)
   # unless a reviewed floor is set via RAPID_MLX_PERF_MIN_TPS — never a fabricated
-  # baseline. perf_gate.py exits non-zero only when a floor is set AND breached.
+  # baseline. Exit codes: 0 = passed or advisory (INCLUDING a failed measurement
+  # in advisory mode — nothing is being enforced, so a flaky request must not
+  # take the release down); 1 = below the reviewed floor; 2 = a floor IS set but
+  # the run could not be measured, which fails closed because "unable to verify"
+  # is not "verified".
   if ! "$GATE_PY" "$REPO_ROOT/evals/perf_gate.py" --base-url "$B/v1"; then
     echo "RESULT: FAIL — $ALIAS perf regressed below the reviewed floor; blocks the release."
     exit 1

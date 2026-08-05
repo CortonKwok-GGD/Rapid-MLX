@@ -45,6 +45,8 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import sys
 import time
@@ -61,8 +63,27 @@ _DEFAULT_PROMPT = (
 )
 
 
+# Smallest decode sample this gate will judge. Below this the tokens/sec
+# figure is dominated by scheduling noise rather than steady-state decode.
+_MIN_DECODE_TOKENS = 64
+
+
 class InvalidServerResponseError(RuntimeError):
     """The server replied, but without usable token accounting."""
+
+
+def _env_float(name: str) -> float | None:
+    """Parse a float env var. Unset/blank -> None (advisory). Garbage raises,
+    because an operator who set the variable meant to enforce something."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise SystemExit(
+            f"ERROR: {name}={raw!r} is not a number; refusing to guess a floor."
+        )
 
 
 def _server_reachable(base_url: str) -> bool:
@@ -73,35 +94,83 @@ def _server_reachable(base_url: str) -> bool:
         return False
 
 
-def _complete(
+class MeasurementError(RuntimeError):
+    """The run completed but produced no usable perf sample."""
+
+
+def _measure_decode(
     base_url: str, prompt: str, *, max_tokens: int, timeout: float
-) -> tuple[int, float]:
-    """One non-streaming completion at temperature 0. Returns
-    ``(completion_tokens, elapsed_seconds)``. Raises on a malformed reply."""
+) -> tuple[int, float, float]:
+    """Stream one completion and separate prefill from decode.
+
+    Returns ``(decoded_tokens, ttft_seconds, decode_seconds)``.
+
+    Dividing total request latency by token count — which this gate used to
+    do — charges prefill and time-to-first-token against decode, so a long
+    prompt makes a healthy model look slow (512 tokens with 10s TTFT + 20s
+    decode reports 17 tok/s for a model actually decoding at 25.6). vLLM and
+    SGLang both report TTFT and output-token throughput as separate numbers
+    for exactly this reason; measure decode the same way, from the first
+    streamed token to the last.
+    """
     body = {
         "model": "default",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
-        "stream": False,
+        "stream": True,
         # Match the gauntlet's --no-thinking boot: measure answer-token decode,
         # not thinking-mode expansion.
         "enable_thinking": False,
     }
     start = time.monotonic()
-    resp = httpx.post(
-        f"{base_url.rstrip('/')}/chat/completions", json=body, timeout=timeout
-    )
-    elapsed = time.monotonic() - start
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-        completion_tokens = int(data["usage"]["completion_tokens"])
-    except (ValueError, KeyError, TypeError) as exc:
-        raise InvalidServerResponseError(
-            "response lacked usage.completion_tokens — cannot measure throughput"
-        ) from exc
-    return completion_tokens, elapsed
+    first_tok_at: float | None = None
+    last_tok_at = start
+    tokens = 0
+    finish_reason: str | None = None
+
+    with httpx.stream(
+        "POST", f"{base_url.rstrip('/')}/chat/completions", json=body, timeout=timeout
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+                choice = chunk["choices"][0]
+            except (ValueError, KeyError, IndexError):
+                continue
+            if choice.get("delta", {}).get("content"):
+                now = time.monotonic()
+                if first_tok_at is None:
+                    first_tok_at = now
+                last_tok_at = now
+                tokens += 1
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+
+    if first_tok_at is None or tokens == 0:
+        raise MeasurementError("server streamed no content tokens")
+
+    # A gate that accepts any sample size is not a gate: `max_tokens` is only
+    # a CEILING, so a model that stops after 8 tokens would report a number
+    # computed over 0.2s of noise and sail past any floor. Require enough
+    # decode to be meaningful.
+    if tokens < _MIN_DECODE_TOKENS:
+        raise MeasurementError(
+            f"only {tokens} tokens decoded (finish_reason={finish_reason!r}); "
+            f"need >= {_MIN_DECODE_TOKENS} for a meaningful throughput sample"
+        )
+
+    ttft = first_tok_at - start
+    decode_seconds = last_tok_at - first_tok_at
+    if decode_seconds <= 0:
+        raise MeasurementError("all tokens arrived in one batch — cannot time decode")
+    return tokens, ttft, decode_seconds
 
 
 def main() -> int:
@@ -115,11 +184,7 @@ def main() -> int:
     ap.add_argument(
         "--min-tps",
         type=float,
-        default=(
-            float(os.environ["RAPID_MLX_PERF_MIN_TPS"])
-            if os.environ.get("RAPID_MLX_PERF_MIN_TPS")
-            else None
-        ),
+        default=_env_float("RAPID_MLX_PERF_MIN_TPS"),
         help="reviewed decode tokens/sec floor; below it the gate fails. "
         "Default: $RAPID_MLX_PERF_MIN_TPS, else advisory-only.",
     )
@@ -134,6 +199,21 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    # A floor of NaN silently disables enforcement: every `tps < nan` is False,
+    # so a 1 tok/s model would PASS. Same for inf (always fails) and <= 0
+    # (meaningless). A malformed floor means the operator INTENDED to enforce
+    # and the value is broken — refuse rather than quietly run advisory.
+    if args.min_tps is not None and not (
+        math.isfinite(args.min_tps) and args.min_tps > 0
+    ):
+        print(
+            f"ERROR: --min-tps/RAPID_MLX_PERF_MIN_TPS is {args.min_tps!r}; "
+            "expected a finite number > 0. Refusing to run with a floor that "
+            "cannot enforce anything.",
+            file=sys.stderr,
+        )
+        return 2
+
     base_url = args.base_url
     print("=" * 60)
     print("  perf-regression gate (decode throughput)")
@@ -144,38 +224,57 @@ def main() -> int:
     print(f"  floor: {floor_str}   max_tokens: {args.max_tokens}")
     print("=" * 60)
 
-    if not _server_reachable(base_url):
+    # The caller's contract is "non-zero blocks the release", so whether a
+    # measurement FAILURE blocks depends on the mode. With a reviewed floor we
+    # fail closed: unable to verify == not verified. In advisory mode there is
+    # nothing to enforce, so an unreachable server or a flaky request must not
+    # take the release down over a number nobody is checking yet.
+    advisory = args.min_tps is None
+
+    def _unmeasurable(msg: str) -> int:
+        print(f"ERROR: perf measurement failed: {msg}", file=sys.stderr)
+        if advisory:
+            print(
+                "  ADVISORY: no floor set — not blocking the release on a "
+                "measurement this gate is not yet enforcing."
+            )
+            return 0
         print(
-            f"ERROR: no rapid-mlx server reachable at {base_url}. "
-            "Start one with: rapid-mlx serve <model> --port 8000",
+            "  A floor is set, so an unverifiable measurement blocks: "
+            "cannot confirm the model did not regress.",
             file=sys.stderr,
         )
         return 2
+
+    if not _server_reachable(base_url):
+        return _unmeasurable(
+            f"no rapid-mlx server reachable at {base_url} "
+            "(start one with: rapid-mlx serve <model> --port 8000)"
+        )
 
     try:
-        # Warm the long-context decode path so the measured run is not skewed by
-        # a first-touch kernel compile (the agent smoke already exercised the
+        # Warm the decode path so the measured run is not skewed by a
+        # first-touch kernel compile (the agent smoke already exercised the
         # serve, so this is usually a no-op).
-        _complete(base_url, "Say ready.", max_tokens=8, timeout=args.timeout)
-        tokens, elapsed = _complete(
+        _measure_decode(base_url, "Say ready.", max_tokens=8, timeout=args.timeout)
+    except Exception:  # noqa: BLE001 — warm-up result is deliberately ignored
+        pass
+
+    try:
+        tokens, ttft, decode_seconds = _measure_decode(
             base_url, _DEFAULT_PROMPT, max_tokens=args.max_tokens, timeout=args.timeout
         )
-    except (httpx.HTTPError, InvalidServerResponseError) as exc:
-        print(f"ERROR: perf measurement failed: {exc}", file=sys.stderr)
-        return 2
+    except (httpx.HTTPError, InvalidServerResponseError, MeasurementError) as exc:
+        return _unmeasurable(str(exc))
 
-    if tokens <= 0 or elapsed <= 0:
-        print(
-            f"ERROR: unusable measurement (tokens={tokens}, elapsed={elapsed:.3f}s).",
-            file=sys.stderr,
-        )
-        return 2
-
-    tps = tokens / elapsed
-    print(f"  measured: {tokens} tokens in {elapsed:.2f}s -> {tps:.2f} tok/s")
+    tps = tokens / decode_seconds
+    print(
+        f"  measured: {tokens} tokens, TTFT {ttft:.2f}s, "
+        f"decode {decode_seconds:.2f}s -> {tps:.2f} tok/s (decode only)"
+    )
     print("=" * 60)
 
-    if args.min_tps is None:
+    if advisory:
         print(
             "  ADVISORY: no floor set (RAPID_MLX_PERF_MIN_TPS unset) — record this "
             "number, review it, then set the floor to enforce."
