@@ -227,12 +227,14 @@ def run_replay(
         answer = extract_text(data)
         repeated, period = detect_repetition(answer)
         usage = data.get("usage") or {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
         status = str(data.get("status"))
         failure = None if status == "completed" else f"endpoint status was {status!r}"
     except Exception as exc:
         answer = ""
         repeated, period = False, None
-        usage = {}
+        input_tokens = output_tokens = 0
         status = "error"
         failure = f"{type(exc).__name__}: {exc}"
     latency = time.perf_counter() - started
@@ -240,8 +242,8 @@ def run_replay(
         endpoint=endpoint,
         target_chars=target_chars,
         source_chars=len(corpus),
-        input_tokens=int(usage.get("input_tokens") or 0),
-        output_tokens=int(usage.get("output_tokens") or 0),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         latency_seconds=round(latency, 3),
         status=status,
         answer=answer,
@@ -308,7 +310,8 @@ def main() -> int:
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
-            json.dumps([asdict(result) for result in results], indent=2) + "\n"
+            json.dumps([asdict(result) for result in results], indent=2) + "\n",
+            encoding="utf-8",
         )
     return (
         0

@@ -167,15 +167,19 @@ def run_trial(
         answer, calls = extract_response(data)
         passed, failure = score(case, answer, calls)
         status = str(data.get("status"))
-        if status != "completed" and failure is None:
-            failure = f"endpoint status was {status!r}, not 'completed'"
+        if status != "completed":
+            status_failure = f"endpoint status was {status!r}, not 'completed'"
+            failure = f"{status_failure}; {failure}" if failure else status_failure
         usage = data.get("usage") or {}
         details = usage.get("output_tokens_details") or {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        reasoning_tokens = int(details.get("reasoning_tokens") or 0)
     except Exception as exc:
         answer, calls = "", []
         passed = False
         status = "error"
-        usage, details = {}, {}
+        input_tokens = output_tokens = reasoning_tokens = 0
         failure = f"{type(exc).__name__}: {exc}"
     elapsed = time.perf_counter() - started
     return Trial(
@@ -185,9 +189,9 @@ def run_trial(
         passed=passed and status == "completed",
         status=status,
         latency_seconds=round(elapsed, 3),
-        input_tokens=int(usage.get("input_tokens") or 0),
-        output_tokens=int(usage.get("output_tokens") or 0),
-        reasoning_tokens=int(details.get("reasoning_tokens") or 0),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
         tool_calls=len(calls),
         answer=answer,
         failure=failure,
@@ -301,7 +305,8 @@ def main() -> int:
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
         )
     print(json.dumps({"summary": report["summary"]}, ensure_ascii=False))
     return 0 if all(trial.passed for trial in trials) else 1

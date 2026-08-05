@@ -138,6 +138,33 @@ def test_run_replay_records_transport_failure():
     assert result.answer == ""
 
 
+def test_run_replay_records_malformed_usage():
+    response = type(
+        "Response",
+        (),
+        {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": "not-a-number"},
+            },
+        },
+    )()
+    client = type("Client", (), {"post": lambda self, *args, **kwargs: response})()
+    result = MODULE.run_replay(
+        client,
+        endpoint="local",
+        url="http://test/v1",
+        model="model",
+        corpus="source",
+        target_chars=6,
+    )
+    assert result.status == "error"
+    assert result.input_tokens == 0
+    assert result.failure.startswith("ValueError:")
+
+
 def test_replay_endpoint_validation_is_credential_safe_and_unique():
     assert MODULE.parse_endpoint("cloud=https://example.test/v1,CLOUD_KEY") == (
         "cloud",

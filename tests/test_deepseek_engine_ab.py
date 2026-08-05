@@ -133,6 +133,28 @@ def test_run_trial_records_transport_failure():
     assert trial.failure == "RuntimeError: endpoint unavailable"
 
 
+def test_run_trial_records_malformed_usage():
+    response = type(
+        "Response",
+        (),
+        {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": "not-a-number"},
+            },
+        },
+    )()
+    client = type("Client", (), {"post": lambda self, *args, **kwargs: response})()
+    trial = MODULE.run_trial(
+        client, "local", "http://test/v1", "model", MODULE.CASES[0], 1
+    )
+    assert trial.status == "error"
+    assert trial.input_tokens == 0
+    assert trial.failure.startswith("ValueError:")
+
+
 def test_duplicate_endpoint_names_are_rejected():
     try:
         MODULE.reject_duplicate_endpoint_names(
