@@ -57,6 +57,8 @@ def test_score_bounded_inspection_rejects_non_reading_path_mentions():
         "tests/test_release_check_random.py",
         "cat scripts/release_check_m3_random.py "
         "tests/test_release_check_random.py > /tmp/copied",
+        "sed -i '' -e 's/x/y/' scripts/release_check_m3_random.py "
+        "tests/test_release_check_random.py",
     ):
         call = {
             "name": "exec_command",
@@ -104,6 +106,30 @@ def test_run_trial_reports_incomplete_status():
     trial = MODULE.run_trial(client, "local", "http://test/v1", "model", case, 1)
     assert not trial.passed
     assert trial.failure == "endpoint status was 'incomplete', not 'completed'"
+
+
+def test_run_trial_records_transport_failure():
+    class BrokenClient:
+        def post(self, *args, **kwargs):
+            raise RuntimeError("endpoint unavailable")
+
+    trial = MODULE.run_trial(
+        BrokenClient(), "local", "http://test/v1", "model", MODULE.CASES[0], 1
+    )
+    assert not trial.passed
+    assert trial.status == "error"
+    assert trial.failure == "RuntimeError: endpoint unavailable"
+
+
+def test_duplicate_endpoint_names_are_rejected():
+    try:
+        MODULE.reject_duplicate_endpoint_names(
+            [("local", "http://one", None), ("local", "http://two", None)]
+        )
+    except ValueError as exc:
+        assert "duplicate endpoint" in str(exc)
+    else:
+        raise AssertionError("expected duplicate endpoints to fail")
 
 
 def test_parse_endpoint_uses_environment_variable_name():

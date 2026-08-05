@@ -136,9 +136,16 @@ def score(
             tokens = shlex.split(command, comments=True)
         except ValueError:
             return False, "tool command is not valid shell syntax"
-        approved_readers = {"cat", "sed", "head", "tail", "rg", "grep"}
+        approved_readers = {"cat", "sed", "head", "tail"}
         if not tokens or Path(tokens[0]).name not in approved_readers:
             return False, "tool command does not use an approved read-only command"
+        if Path(tokens[0]).name == "sed":
+            options = [token for token in tokens[1:] if token.startswith("-")]
+            if any(option == "-i" or option.startswith("-i") for option in options):
+                return False, "sed in-place editing is not read-only"
+            scripts = [token for token in tokens[1:] if not token.startswith("-")]
+            if not scripts or not scripts[0].rstrip("p").replace(",", "").isdigit():
+                return False, "sed command is not a simple print range"
         passed = all(
             path in tokens
             for path in (
@@ -170,17 +177,24 @@ def run_trial(
     if case.tools:
         payload["tools"] = list(case.tools)
     started = time.perf_counter()
-    response = client.post(f"{url.rstrip('/')}/responses", json=payload)
+    try:
+        response = client.post(f"{url.rstrip('/')}/responses", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        answer, calls = extract_response(data)
+        passed, failure = score(case, answer, calls)
+        status = str(data.get("status"))
+        if status != "completed" and failure is None:
+            failure = f"endpoint status was {status!r}, not 'completed'"
+        usage = data.get("usage") or {}
+        details = usage.get("output_tokens_details") or {}
+    except Exception as exc:
+        answer, calls = "", []
+        passed = False
+        status = "error"
+        usage, details = {}, {}
+        failure = f"{type(exc).__name__}: {exc}"
     elapsed = time.perf_counter() - started
-    response.raise_for_status()
-    data = response.json()
-    answer, calls = extract_response(data)
-    passed, failure = score(case, answer, calls)
-    status = str(data.get("status"))
-    if status != "completed" and failure is None:
-        failure = f"endpoint status was {status!r}, not 'completed'"
-    usage = data.get("usage") or {}
-    details = usage.get("output_tokens_details") or {}
     return Trial(
         endpoint=endpoint_name,
         case=case.name,
@@ -207,6 +221,15 @@ def parse_endpoint(value: str) -> tuple[str, str, str | None]:
     if not name or not url:
         raise argparse.ArgumentTypeError("endpoint name and URL are required")
     return name, url, env_var if separator else None
+
+
+def reject_duplicate_endpoint_names(
+    endpoints: list[tuple[str, str, str | None]],
+) -> None:
+    names = [name for name, _, _ in endpoints]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate endpoint name(s): {', '.join(duplicates)}")
 
 
 def summarize(trials: list[Trial]) -> dict[str, Any]:
@@ -243,6 +266,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("--repetitions must be positive")
+    try:
+        reject_duplicate_endpoint_names(args.endpoint)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     trials: list[Trial] = []
     for name, url, env_var in args.endpoint:

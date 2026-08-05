@@ -31,6 +31,7 @@ class ReplayResult:
     answer: str
     repeated: bool
     repetition_period: int | None
+    failure: str | None = None
 
 
 def parse_endpoint(value: str) -> tuple[str, str, str | None]:
@@ -53,12 +54,15 @@ def positive_int(value: str) -> int:
 
 def build_corpus(root: Path, target_chars: int) -> str:
     """Build deterministic, non-repeated source context up to ``target_chars``."""
+    resolved_root = root.resolve()
     paths = sorted(
         {
             path
             for pattern in DEFAULT_GLOBS
             for path in root.glob(pattern)
             if path.is_file()
+            and not path.is_symlink()
+            and _is_within_root(path, resolved_root)
         },
         # Put the score-bearing file in the first turn so every configured
         # target has enough evidence.  Sort the rest by size to avoid repeated
@@ -86,6 +90,14 @@ def build_corpus(root: Path, target_chars: int) -> str:
             f"source corpus has only {len(corpus)} characters; requested {target_chars}"
         )
     return corpus
+
+
+def _is_within_root(path: Path, resolved_root: Path) -> bool:
+    try:
+        path.resolve().relative_to(resolved_root)
+    except ValueError:
+        return False
+    return True
 
 
 def detect_repetition(text: str, *, repeats: int = 3) -> tuple[bool, int | None]:
@@ -171,21 +183,30 @@ def run_replay(
     target_chars: int,
 ) -> ReplayResult:
     started = time.perf_counter()
-    response = client.post(
-        f"{url.rstrip('/')}/responses",
-        json={
-            "model": model,
-            "input": build_conversation(corpus),
-            "max_output_tokens": 128,
-            "reasoning": {"effort": "none"},
-        },
-    )
+    try:
+        response = client.post(
+            f"{url.rstrip('/')}/responses",
+            json={
+                "model": model,
+                "input": build_conversation(corpus),
+                "max_output_tokens": 128,
+                "reasoning": {"effort": "none"},
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        answer = extract_text(data)
+        repeated, period = detect_repetition(answer)
+        usage = data.get("usage") or {}
+        status = str(data.get("status"))
+        failure = None if status == "completed" else f"endpoint status was {status!r}"
+    except Exception as exc:
+        answer = ""
+        repeated, period = False, None
+        usage = {}
+        status = "error"
+        failure = f"{type(exc).__name__}: {exc}"
     latency = time.perf_counter() - started
-    response.raise_for_status()
-    data = response.json()
-    answer = extract_text(data)
-    repeated, period = detect_repetition(answer)
-    usage = data.get("usage") or {}
     return ReplayResult(
         endpoint=endpoint,
         target_chars=target_chars,
@@ -193,10 +214,11 @@ def run_replay(
         input_tokens=int(usage.get("input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),
         latency_seconds=round(latency, 3),
-        status=str(data.get("status")),
+        status=status,
         answer=answer,
         repeated=repeated,
         repetition_period=period,
+        failure=failure,
     )
 
 
@@ -214,16 +236,19 @@ def main() -> int:
 
     results: list[ReplayResult] = []
     target_sizes = args.target_chars or [320_000, 400_000, 480_000]
-    for target_chars in sorted(set(target_sizes)):
-        corpus = build_corpus(args.root, target_chars)
-        for name, url, env_var in args.endpoint:
-            headers = {}
-            if env_var:
-                token = os.environ.get(env_var)
-                if not token:
-                    parser.error(f"environment variable {env_var!r} is not set")
-                headers["Authorization"] = f"Bearer {token}"
-            with httpx.Client(headers=headers, timeout=args.timeout) as client:
+    corpora = {
+        target_chars: build_corpus(args.root, target_chars)
+        for target_chars in sorted(set(target_sizes))
+    }
+    for name, url, env_var in args.endpoint:
+        headers = {}
+        if env_var:
+            token = os.environ.get(env_var)
+            if not token:
+                parser.error(f"environment variable {env_var!r} is not set")
+            headers["Authorization"] = f"Bearer {token}"
+        with httpx.Client(headers=headers, timeout=args.timeout) as client:
+            for target_chars, corpus in corpora.items():
                 result = run_replay(
                     client,
                     endpoint=name,
@@ -232,8 +257,8 @@ def main() -> int:
                     corpus=corpus,
                     target_chars=target_chars,
                 )
-            results.append(result)
-            print(json.dumps(asdict(result), ensure_ascii=False), flush=True)
+                results.append(result)
+                print(json.dumps(asdict(result), ensure_ascii=False), flush=True)
 
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,17 @@ def test_build_corpus_rejects_undersized_source(tmp_path):
         raise AssertionError("expected undersized corpus to fail")
 
 
+def test_build_corpus_does_not_follow_source_symlinks(tmp_path):
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("TOP_SECRET")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "linked.py").symlink_to(outside)
+    (tmp_path / "scripts" / "safe.py").write_text("s" * 100)
+    corpus = MODULE.build_corpus(tmp_path, 60)
+    assert "TOP_SECRET" not in corpus
+    assert "safe.py" in corpus
+
+
 def test_build_corpus_places_score_evidence_first(tmp_path):
     (tmp_path / "vllm_mlx").mkdir()
     (tmp_path / "vllm_mlx" / "large.py").write_text("x" * 200)
@@ -91,3 +102,21 @@ def test_positive_int_rejects_non_positive_targets():
             assert "positive" in str(exc)
         else:
             raise AssertionError("expected invalid target size to fail")
+
+
+def test_run_replay_records_transport_failure():
+    class BrokenClient:
+        def post(self, *args, **kwargs):
+            raise RuntimeError("endpoint unavailable")
+
+    result = MODULE.run_replay(
+        BrokenClient(),
+        endpoint="local",
+        url="http://test/v1",
+        model="model",
+        corpus="source",
+        target_chars=6,
+    )
+    assert result.status == "error"
+    assert result.failure == "RuntimeError: endpoint unavailable"
+    assert result.answer == ""
