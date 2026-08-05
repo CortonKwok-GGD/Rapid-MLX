@@ -57,6 +57,12 @@ final class ServerManager {
     /// being held for confirmation.
     var pendingMemoryWarning: ModelSizing.MemoryWarning?
 
+    /// How the user answered the most recent memory prompt. Read by
+    /// ``awaitMemoryDecision`` so ``ensureServing`` can tell "user backed
+    /// out" (an honest startup failure) from "user chose Load anyway"
+    /// (wait for the re-entered launch instead of reporting failure).
+    private var memoryLoadConfirmed: Bool = false
+
     /// Alias the child is currently serving once `/healthz` answered 200,
     /// else `nil`. Authoritative source of truth for which model id any
     /// outgoing chat request should put in `model:` — picker bar state
@@ -598,6 +604,23 @@ final class ServerManager {
             await stop()
         }
         await start(alias: trimmed, hfPath: hfPath)
+        // ``start`` also returns without spawning when the pre-load
+        // memory guard parks the load on a confirmation prompt. Reading
+        // ``isServing`` now would report "couldn't start the model"
+        // while the user is still looking at the dialog — and the action
+        // that triggered the load (typically a first chat message) would
+        // be marked failed and then silently dropped the moment the user
+        // picks "Load anyway". Wait for the answer instead.
+        if pendingMemoryWarning != nil {
+            let confirmed = await awaitMemoryDecision()
+            if confirmed {
+                // ``confirmPendingMemoryLoad`` re-enters ``start`` from
+                // the alert button's own Task, so the state machine may
+                // not have left idle yet; wait for it to pick up before
+                // the ``.starting`` settle below reads it.
+                await awaitStartupBegun(alias: trimmed)
+            }
+        }
         // ``start`` returns silently when another caller already owns
         // the launch (``isOperating`` set, or ``child`` non-nil), which
         // leaves us sitting in ``.starting``. Reporting failure there
@@ -626,6 +649,41 @@ final class ServerManager {
     /// genuinely in flight, and 200 ms is far below human perception
     /// against a 15-60 s load. Returns early on cancellation so a
     /// caller that gives up doesn't pin this task.
+    /// Blocks while a load is parked on the memory-confirmation prompt.
+    /// Returns whether the user chose to load anyway. Polls rather than
+    /// awaiting a continuation so a dismissed-without-answer alert (or a
+    /// build with no view bound to ``pendingMemoryWarning``) resolves via
+    /// ``cancelPendingMemoryLoad`` instead of stranding the caller.
+    private func awaitMemoryDecision() async -> Bool {
+        while pendingMemoryWarning != nil {
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return false
+            }
+        }
+        return memoryLoadConfirmed
+    }
+
+    /// Waits for ``start`` to pick the alias up after a confirmed
+    /// memory-risky load. Bounded: a confirm that never reaches ``start``
+    /// must not hang ``ensureServing`` forever.
+    private func awaitStartupBegun(alias: String, timeout: TimeInterval = 5.0) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            switch state {
+            case .starting(let current) where current == alias: return
+            case .ready(let current) where current == alias: return
+            default: break
+            }
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
     private func awaitStartupSettled(alias: String) async {
         while true {
             guard case .starting(let current) = state, current == alias else { return }
@@ -699,6 +757,7 @@ final class ServerManager {
     /// race to nil and silently drop the load. Re-enters ``start`` with
     /// the guard bypassed.
     func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) async {
+        memoryLoadConfirmed = true
         pendingMemoryWarning = nil
         await start(
             alias: warning.alias,
@@ -712,6 +771,7 @@ final class ServerManager {
     /// held request; ``state`` is untouched (it never left idle/stopped
     /// because ``start`` returned before spawning).
     func cancelPendingMemoryLoad() {
+        memoryLoadConfirmed = false
         pendingMemoryWarning = nil
     }
 
@@ -780,7 +840,15 @@ final class ServerManager {
                 usedBytes: snapshot.usedBytes,
                 totalBytes: snapshot.totalBytes
             )
-            if safety != .safe {
+            // Only ``.unsafe`` (>= 85%, the panic line) blocks. ``.tight``
+            // is defined as "will load but risks swap / stalls" — holding
+            // it behind a modal would fire on ordinary loads (13 GiB used
+            // on a 32 GiB Mac + an 11.8 GiB model projects to 77.5%) and
+            // train the user to click through the one prompt that matters.
+            // Every mature local-model app draws the same line: refuse
+            // only what is genuinely dangerous, and surface "tight"
+            // passively — the picker's static sizing bands already do.
+            if safety == .unsafe {
                 pendingMemoryWarning = ModelSizing.MemoryWarning(
                     alias: trimmedAlias,
                     hfPath: hfPath,
@@ -789,6 +857,7 @@ final class ServerManager {
                     footprintGB: footprint.totalGB,
                     freeGB: Double(snapshot.freeBytes) / Double(1 << 30)
                 )
+                memoryLoadConfirmed = false
                 return
             }
         }

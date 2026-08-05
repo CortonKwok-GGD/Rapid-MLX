@@ -98,6 +98,22 @@ final class BenchmarkRunner {
             submitPhase = .failed("Pick a model first.")
             return
         }
+        // Same pre-load memory guard as ``run`` (#324). Submitting re-runs
+        // the FULL standardized workload — a cold model reload on top of
+        // whatever the app's sidecar already has resident — so it is the
+        // heavier of the two 2x-load paths, not a lighter one. Leaving it
+        // unguarded would let Publish walk straight into the near-crash
+        // that ``run`` now refuses.
+        if let snapshot = MemoryProbe.snapshot(),
+           ModelSizing.memorySafety(
+               footprint: ModelSizing.estimate(alias: alias),
+               usedBytes: snapshot.usedBytes,
+               totalBytes: snapshot.totalBytes
+           ) == .unsafe {
+            submitPhase = .failed(
+                "Not enough free memory to run the submission benchmark for \(alias) right now — it reloads the model on top of what's already running. Close some apps or restart the model, then try again.")
+            return
+        }
         submitPhase = .submitting
         // The CLI prints the exact payload and asks "submit? [y/N]" on
         // stdin. The app already showed its own consent, so answer "y".

@@ -176,6 +176,20 @@ struct ModelSizingTests {
         #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 14 * gib, totalBytes: 32 * gib) == .tight)
     }
 
+    @Test("memorySafety: only >=85% blocks — the 75-85% band still loads")
+    func liveGuardBlocksOnlyAtDangerLine() {
+        let g = ModelSizing.estimate(alias: "gemma-4-12b") // ~11.8 GB
+        let gib: UInt64 = 1 << 30
+        // ServerManager holds a load for confirmation on `.unsafe` ONLY.
+        // 13 GiB used on a 32 GiB Mac projects to ~77.5%: a routine load
+        // on a mid-size Mac. It must classify `.tight`, not `.unsafe` —
+        // prompting here would fire on ordinary loads and train the user
+        // to click through the one prompt that actually matters.
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 13 * gib, totalBytes: 32 * gib) == .tight)
+        // Just over the 85% panic line on the same Mac → blocked.
+        #expect(ModelSizing.memorySafety(footprint: g, usedBytes: 16 * gib, totalBytes: 32 * gib) == .unsafe)
+    }
+
     @Test("memorySafety: fails open on unknown params or unreadable probe")
     func liveGuardFailsOpen() {
         let gib: UInt64 = 1 << 30
