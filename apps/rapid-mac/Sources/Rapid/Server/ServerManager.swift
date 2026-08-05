@@ -63,6 +63,14 @@ final class ServerManager {
     /// (wait for the re-entered launch instead of reporting failure).
     private var memoryLoadConfirmed: Bool = false
 
+    /// The re-entered launch spawned by "Load anyway". ``ensureServing``
+    /// awaits this instead of polling for a state change: ``start`` can
+    /// legitimately sit in ``awaitDownloadSettlement`` (a background pull
+    /// still fetching the model) with ``state`` still idle for far longer
+    /// than any fixed bound, and timing out there would drop the user's
+    /// message even though the model does come up.
+    private var memoryConfirmTask: Task<Void, Never>?
+
     /// Alias the child is currently serving once `/healthz` answered 200,
     /// else `nil`. Authoritative source of truth for which model id any
     /// outgoing chat request should put in `model:` — picker bar state
@@ -614,11 +622,10 @@ final class ServerManager {
         if pendingMemoryWarning != nil {
             let confirmed = await awaitMemoryDecision()
             if confirmed {
-                // ``confirmPendingMemoryLoad`` re-enters ``start`` from
-                // the alert button's own Task, so the state machine may
-                // not have left idle yet; wait for it to pick up before
-                // the ``.starting`` settle below reads it.
-                await awaitStartupBegun(alias: trimmed)
+                // Await the actual re-entered launch. It may block on a
+                // background download well past any fixed timeout, so this
+                // waits on the task itself rather than polling for state.
+                await memoryConfirmTask?.value
             }
         }
         // ``start`` returns silently when another caller already owns
@@ -665,24 +672,6 @@ final class ServerManager {
         return memoryLoadConfirmed
     }
 
-    /// Waits for ``start`` to pick the alias up after a confirmed
-    /// memory-risky load. Bounded: a confirm that never reaches ``start``
-    /// must not hang ``ensureServing`` forever.
-    private func awaitStartupBegun(alias: String, timeout: TimeInterval = 5.0) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            switch state {
-            case .starting(let current) where current == alias: return
-            case .ready(let current) where current == alias: return
-            default: break
-            }
-            do {
-                try await Task.sleep(nanoseconds: 100_000_000)
-            } catch {
-                return
-            }
-        }
-    }
 
     private func awaitStartupSettled(alias: String) async {
         while true {
@@ -756,15 +745,20 @@ final class ServerManager {
     /// the same run-loop turn the button fires — reading it here would
     /// race to nil and silently drop the load. Re-enters ``start`` with
     /// the guard bypassed.
-    func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) async {
+    func confirmPendingMemoryLoad(_ warning: ModelSizing.MemoryWarning) {
         memoryLoadConfirmed = true
         pendingMemoryWarning = nil
-        await start(
-            alias: warning.alias,
-            hfPath: warning.hfPath,
-            isAutoRespawn: warning.isAutoRespawn,
-            bypassMemoryGuard: true
-        )
+        // Publish the task BEFORE clearing nothing else — both this and the
+        // waiter run on the MainActor, so a waiter that observes
+        // ``pendingMemoryWarning == nil`` is guaranteed to see this task.
+        memoryConfirmTask = Task { [weak self] in
+            await self?.start(
+                alias: warning.alias,
+                hfPath: warning.hfPath,
+                isAutoRespawn: warning.isAutoRespawn,
+                bypassMemoryGuard: true
+            )
+        }
     }
 
     /// The user backed out of a memory-risky load. Just drops the
@@ -772,6 +766,7 @@ final class ServerManager {
     /// because ``start`` returned before spawning).
     func cancelPendingMemoryLoad() {
         memoryLoadConfirmed = false
+        memoryConfirmTask = nil
         pendingMemoryWarning = nil
     }
 
@@ -858,6 +853,15 @@ final class ServerManager {
                     freeGB: Double(snapshot.freeBytes) / Double(1 << 30)
                 )
                 memoryLoadConfirmed = false
+                // The user is now the decision-maker for this alias, so a
+                // queued auto-respawn must not answer for them. Parking a
+                // load leaves ``state`` untouched — still ``.crashed`` when
+                // the user hit Restart after a crash — so
+                // ``runScheduledAutoRespawn``'s state recheck would PASS and
+                // fire ``start(isAutoRespawn: true)``, which bypasses this
+                // guard and loads the very model the user may be about to
+                // decline. Cancel it; a confirm re-enters ``start`` explicitly.
+                cancelAutoRespawn()
                 return
             }
         }

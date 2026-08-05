@@ -187,7 +187,7 @@ struct ContentView: View {
                 server.cancelPendingMemoryLoad()
             }
             Button(warning.confirmTitle, role: .destructive) {
-                Task { await server.confirmPendingMemoryLoad(warning) }
+                server.confirmPendingMemoryLoad(warning)
             }
         } message: { warning in
             Text(warning.message)
