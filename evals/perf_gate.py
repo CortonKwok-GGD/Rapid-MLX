@@ -131,6 +131,10 @@ def _measure_decode(
         "enable_thinking": False,
     }
     start = time.monotonic()
+    # httpx's timeout is per-READ (inactivity), not a total deadline: a stream
+    # that trickles one frame every timeout-minus-epsilon seconds never trips
+    # it and can outlive the whole CI job budget. Bound the wall clock too.
+    deadline = start + timeout
     first_tok_at: float | None = None
     last_tok_at = start
     deltas = 0
@@ -142,6 +146,11 @@ def _measure_decode(
     ) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
+            if time.monotonic() > deadline:
+                raise MeasurementError(
+                    f"stream exceeded the {timeout:.0f}s budget "
+                    f"(decoded {deltas} frames so far)"
+                )
             if not line.startswith("data:"):
                 continue
             payload = line[5:].strip()
@@ -237,7 +246,11 @@ def main() -> int:
         help="generation length for the measured request (default: 512)",
     )
     ap.add_argument(
-        "--timeout", type=float, default=180.0, help="per-request timeout (s)"
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="total budget for the measured request (s). Bounds wall-clock "
+        "time, not just read inactivity (default: 300)",
     )
     args = ap.parse_args()
 
