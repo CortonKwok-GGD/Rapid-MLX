@@ -55,17 +55,15 @@ CASES = (
         tools=(EXEC_TOOL,),
     ),
     Case(
-        name="evidence_bounded_review",
+        name="backward_compatibility_review",
         prompt=(
-            "You are reviewing a narrowly scoped change. Facts: G12 is only "
-            "an agent-quality sampling gate. Parser and wire-format tests "
-            "remain separate and unchanged for every model. Existing profiles "
-            "without g12_eligible must remain eligible for backward "
-            "compatibility; only an explicit false opts out. The patch "
-            "implements exactly that. Is there a material correctness blocker? "
-            "Reply with one word: YES or NO."
+            "Review this compatibility requirement: profiles without "
+            "g12_eligible remain eligible, while an explicit false opts out. "
+            "Candidate A is `profile.get('g12_eligible', True) is not False`. "
+            "Candidate B is `bool(profile.get('g12_eligible', False))`. Which "
+            "candidate satisfies the requirement? Reply with one letter: A or B."
         ),
-        expected="exact_no",
+        expected="exact_a",
     ),
     Case(
         name="schema_recovery",
@@ -111,10 +109,10 @@ def extract_response(data: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
 def score(
     case: Case, answer: str, calls: list[dict[str, Any]]
 ) -> tuple[bool, str | None]:
-    if case.expected == "exact_no":
+    if case.expected == "exact_a":
         return (
-            answer == "NO",
-            None if answer == "NO" else "not exact NO",
+            answer == "A",
+            None if answer == "A" else "not exact A",
         )
     if case.expected == "exact_add":
         passed = answer == "ADD"

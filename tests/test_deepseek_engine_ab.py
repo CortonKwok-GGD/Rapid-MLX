@@ -81,8 +81,8 @@ def test_score_bounded_inspection_rejects_non_reading_path_mentions():
 
 def test_score_review_is_exact():
     case = MODULE.CASES[1]
-    assert MODULE.score(case, "NO", []) == (True, None)
-    assert MODULE.score(case, "There is NO", [])[0] is False
+    assert MODULE.score(case, "A", []) == (True, None)
+    assert MODULE.score(case, "Candidate A", [])[0] is False
 
 
 def test_score_recovery_requires_exact_contract():
@@ -108,7 +108,7 @@ def test_run_trial_reports_incomplete_status():
                 "output": [
                     {
                         "type": "message",
-                        "content": [{"type": "output_text", "text": "NO"}],
+                        "content": [{"type": "output_text", "text": "A"}],
                     }
                 ],
             },
