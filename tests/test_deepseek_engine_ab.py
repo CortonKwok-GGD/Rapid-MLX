@@ -49,16 +49,61 @@ def test_score_bounded_inspection_requires_one_call_with_both_paths():
     assert "one exec_command" in failure
 
 
+def test_score_bounded_inspection_rejects_non_reading_path_mentions():
+    case = MODULE.CASES[0]
+    for command in (
+        "echo scripts/release_check_m3_random.py tests/test_release_check_random.py",
+        "cat placeholder.py # scripts/release_check_m3_random.py "
+        "tests/test_release_check_random.py",
+        "cat scripts/release_check_m3_random.py "
+        "tests/test_release_check_random.py > /tmp/copied",
+    ):
+        call = {
+            "name": "exec_command",
+            "arguments": json.dumps({"cmd": command}),
+        }
+        assert not MODULE.score(case, "", [call])[0]
+
+
 def test_score_review_is_exact():
     case = MODULE.CASES[1]
     assert MODULE.score(case, "NO_BLOCKER", []) == (True, None)
     assert MODULE.score(case, "There is NO_BLOCKER", [])[0] is False
 
 
-def test_score_recovery_rejects_removal_advice():
+def test_score_recovery_requires_exact_contract():
     case = MODULE.CASES[2]
-    assert MODULE.score(case, "Add g12_eligible to the allowed profile schema.", [])[0]
-    assert not MODULE.score(case, "Remove g12_eligible from the schema.", [])[0]
+    assert MODULE.score(case, "ADD_G12_ELIGIBLE_TO_SCHEMA", [])[0]
+    for answer in (
+        "Do not add g12_eligible to the schema.",
+        "Delete g12_eligible from the schema.",
+        "Exclude g12_eligible from the schema.",
+    ):
+        assert not MODULE.score(case, answer, [])[0]
+
+
+def test_run_trial_reports_incomplete_status():
+    case = MODULE.CASES[1]
+    response = type(
+        "Response",
+        (),
+        {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {
+                "status": "incomplete",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "NO_BLOCKER"}],
+                    }
+                ],
+            },
+        },
+    )()
+    client = type("Client", (), {"post": lambda self, *args, **kwargs: response})()
+    trial = MODULE.run_trial(client, "local", "http://test/v1", "model", case, 1)
+    assert not trial.passed
+    assert trial.failure == "endpoint status was 'incomplete', not 'completed'"
 
 
 def test_parse_endpoint_uses_environment_variable_name():

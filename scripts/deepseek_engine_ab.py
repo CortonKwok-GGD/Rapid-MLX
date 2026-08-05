@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -69,10 +70,10 @@ CASES = (
         prompt=(
             "AliasProfile is a deprecated alias of ModelProfile. A regression "
             "says: g12_eligible is rejected because it is absent from the "
-            "allowed profile-key schema. State the next code change in at most "
-            "25 words. Do not propose removing g12_eligible."
+            "allowed profile-key schema. Reply exactly "
+            "ADD_G12_ELIGIBLE_TO_SCHEMA and nothing else."
         ),
-        expected="add_schema_key",
+        expected="exact_add_schema_key",
     ),
 )
 
@@ -113,20 +114,11 @@ def score(
             answer == "NO_BLOCKER",
             None if answer == "NO_BLOCKER" else "not exact NO_BLOCKER",
         )
-    if case.expected == "add_schema_key":
-        lowered = answer.lower()
-        passed = (
-            "g12_eligible" in lowered
-            and "schema" in lowered
-            and any(word in lowered for word in ("add", "allow", "include"))
-            and not any(
-                phrase in lowered
-                for phrase in ("remove `g12_eligible`", "remove g12_eligible")
-            )
-        )
+    if case.expected == "exact_add_schema_key":
+        passed = answer == "ADD_G12_ELIGIBLE_TO_SCHEMA"
         return (
             passed,
-            None if passed else "did not add g12_eligible to the allowed schema",
+            None if passed else "not exact ADD_G12_ELIGIBLE_TO_SCHEMA",
         )
     if case.expected == "one_exec_call_reads_both":
         if len(calls) != 1 or calls[0].get("name") != "exec_command":
@@ -135,8 +127,20 @@ def score(
             command = json.loads(calls[0].get("arguments") or "{}").get("cmd", "")
         except json.JSONDecodeError:
             return False, "invalid tool arguments JSON"
+        if any(
+            token in command
+            for token in (";", "&&", "||", "|", "`", "$(", "$", ">", "<", "\n", "\r")
+        ):
+            return False, "tool command contains shell control operators"
+        try:
+            tokens = shlex.split(command, comments=True)
+        except ValueError:
+            return False, "tool command is not valid shell syntax"
+        approved_readers = {"cat", "sed", "head", "tail", "rg", "grep"}
+        if not tokens or Path(tokens[0]).name not in approved_readers:
+            return False, "tool command does not use an approved read-only command"
         passed = all(
-            path in command
+            path in tokens
             for path in (
                 "scripts/release_check_m3_random.py",
                 "tests/test_release_check_random.py",
@@ -172,14 +176,17 @@ def run_trial(
     data = response.json()
     answer, calls = extract_response(data)
     passed, failure = score(case, answer, calls)
+    status = str(data.get("status"))
+    if status != "completed" and failure is None:
+        failure = f"endpoint status was {status!r}, not 'completed'"
     usage = data.get("usage") or {}
     details = usage.get("output_tokens_details") or {}
     return Trial(
         endpoint=endpoint_name,
         case=case.name,
         repetition=repetition,
-        passed=passed and data.get("status") == "completed",
-        status=str(data.get("status")),
+        passed=passed and status == "completed",
+        status=status,
         latency_seconds=round(elapsed, 3),
         input_tokens=int(usage.get("input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),

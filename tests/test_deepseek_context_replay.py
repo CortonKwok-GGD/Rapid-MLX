@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import sys
 from pathlib import Path
@@ -63,6 +64,11 @@ def test_build_conversation_preserves_complete_prior_turns():
         "user",
     ]
     assert items[1]["content"][0]["text"] == MODULE.TURN_ACKNOWLEDGEMENT
+    assert MODULE.TURN_ACKNOWLEDGEMENT in items[0]["content"][0]["text"]
+    assert (
+        "Which file defines class ModelProfile?" not in items[0]["content"][0]["text"]
+    )
+    assert "Which file defines class ModelProfile?" in items[-1]["content"][0]["text"]
     assert "a" * 5 in items[0]["content"][0]["text"]
     assert "a" * 2 in items[-1]["content"][0]["text"]
 
@@ -74,3 +80,14 @@ def test_build_conversation_rejects_non_positive_turn_size():
         assert "positive" in str(exc)
     else:
         raise AssertionError("expected invalid turn size to fail")
+
+
+def test_positive_int_rejects_non_positive_targets():
+    assert MODULE.positive_int("1") == 1
+    for value in ("0", "-1"):
+        try:
+            MODULE.positive_int(value)
+        except argparse.ArgumentTypeError as exc:
+            assert "positive" in str(exc)
+        else:
+            raise AssertionError("expected invalid target size to fail")
