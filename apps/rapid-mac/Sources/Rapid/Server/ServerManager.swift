@@ -754,7 +754,7 @@ final class ServerManager {
 
         // Pre-load memory guard (#324). Loading a model whose footprint,
         // stacked on top of what is ALREADY resident, would push unified
-        // memory past ~90% of total can freeze or kernel-panic the whole
+        // memory past ~85% of total can freeze or kernel-panic the whole
         // Mac — a far worse outcome than declining to load. This is the
         // single choke point every start path funnels through (picker,
         // first message, auto-restart, quickstart), so the check + the
