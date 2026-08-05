@@ -20,6 +20,13 @@
 # config it touches.
 set -uo pipefail
 
+# Resolved HERE, before anything runs: ``seed_repo``/``verify`` cd into the
+# per-agent scratch dirs and that cwd persists (they are functions, not
+# subshells). Resolving a relative ``$BASH_SOURCE`` later — after the cwd has
+# moved — yields an empty REPO_ROOT, and the release gate would then invoke
+# ``/evals/coherence_gate.py`` and fail a run where every check passed.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 export PATH="/opt/homebrew/bin:/opt/homebrew/opt/coreutils/libexec/gnubin:$HOME/.local/bin:$PATH"
 VENV="${RAPID_MLX_VENV:-$HOME/rapid-mlx-audit-venv}"
 RMLX="$VENV/bin/rapid-mlx"
@@ -388,7 +395,6 @@ done
 # in speed — the exact class (#1247/#1234) that shipped as garbage in 0.11.4.
 if [ "${RAPID_MLX_RELEASE_GATE:-0}" = "1" ]; then
   GATE_PY="$VENV/bin/python"
-  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   echo
   echo "== release-gate: deep coherence (#1247) + perf on warm $ALIAS serve =="
 

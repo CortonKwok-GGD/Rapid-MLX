@@ -112,6 +112,11 @@ def _measure_decode(
     SGLang both report TTFT and output-token throughput as separate numbers
     for exactly this reason; measure decode the same way, from the first
     streamed token to the last.
+
+    Token COUNT comes from ``usage.completion_tokens`` via
+    ``stream_options.include_usage``, not from counting SSE frames: one delta
+    is not one token (the detokenizer can batch several, and a frame can
+    carry no text at all), so frame-counting silently understates throughput.
     """
     body = {
         "model": "default",
@@ -119,6 +124,8 @@ def _measure_decode(
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": True,
+        # Authoritative token accounting — see the docstring.
+        "stream_options": {"include_usage": True},
         # Match the gauntlet's --no-thinking boot: measure answer-token decode,
         # not thinking-mode expansion.
         "enable_thinking": False,
@@ -126,7 +133,8 @@ def _measure_decode(
     start = time.monotonic()
     first_tok_at: float | None = None
     last_tok_at = start
-    tokens = 0
+    deltas = 0
+    usage_tokens: int | None = None
     finish_reason: str | None = None
 
     with httpx.stream(
@@ -141,20 +149,54 @@ def _measure_decode(
                 continue
             try:
                 chunk = json.loads(payload)
-                choice = chunk["choices"][0]
-            except (ValueError, KeyError, IndexError):
+            except ValueError as exc:
+                # A frame we cannot parse means the stream is not what we think
+                # it is. Swallowing it would let a truncated run be judged as a
+                # complete one.
+                raise MeasurementError(
+                    f"malformed SSE frame: {payload[:120]!r}"
+                ) from exc
+            # Mid-stream error frames are how the server reports a generation
+            # that died partway. Counting the tokens that arrived before it
+            # would score an incomplete run as a healthy one.
+            if isinstance(chunk, dict) and chunk.get("error"):
+                raise MeasurementError(
+                    f"server reported an error mid-stream: {chunk['error']}"
+                )
+            if usage := (chunk.get("usage") if isinstance(chunk, dict) else None):
+                if (ct := usage.get("completion_tokens")) is not None:
+                    usage_tokens = int(ct)
+            choices = chunk.get("choices") or []
+            if not choices:
                 continue
+            choice = choices[0]
             if choice.get("delta", {}).get("content"):
                 now = time.monotonic()
                 if first_tok_at is None:
                     first_tok_at = now
                 last_tok_at = now
-                tokens += 1
+                deltas += 1
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
 
-    if first_tok_at is None or tokens == 0:
+    if first_tok_at is None or deltas == 0:
         raise MeasurementError("server streamed no content tokens")
+
+    # A stream that never reported why it stopped did not demonstrably finish;
+    # judging its throughput would score a truncated generation as a healthy one.
+    if finish_reason is None:
+        raise MeasurementError(
+            "stream ended without a terminal finish_reason — generation did not "
+            "demonstrably complete"
+        )
+
+    tokens = usage_tokens if usage_tokens is not None else deltas
+    if usage_tokens is None:
+        print(
+            "  NOTE: server sent no usage.completion_tokens; falling back to "
+            "counting SSE deltas, which can understate throughput.",
+            file=sys.stderr,
+        )
 
     # A gate that accepts any sample size is not a gate: `max_tokens` is only
     # a CEILING, so a model that stops after 8 tokens would report a number
