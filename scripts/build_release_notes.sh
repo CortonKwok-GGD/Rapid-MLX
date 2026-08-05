@@ -72,11 +72,15 @@ RELEASE_SHA=$(git rev-parse --verify "${RELEASE_SHA}^{commit}")
 # with "_(no changes recorded)_" or a partial list.
 #
 # ``git describe`` walks ancestry, which is the property we actually want.
+# ``--first-parent`` keeps that walk on the mainline: without it a tag that
+# rode in on a merged side branch (fork at v1.0.0, tag v0.9.9, merge just
+# before v1.1.0) is "nearer" than the real previous release, and every
+# commit between them silently vanishes from the published notes.
 # ``--exclude $TAG`` keeps a re-run from selecting the version's own tag (which
 # would make the range empty).
 # --------------------------------------------------------------------------
 PREV_TAG=$(
-  git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude "$TAG" \
+  git describe --first-parent --tags --abbrev=0 --match 'v[0-9]*' --exclude "$TAG" \
     "$RELEASE_SHA" 2>/dev/null || true
 )
 

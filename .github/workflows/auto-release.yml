@@ -307,8 +307,19 @@ jobs:
           fi
           if [ -n "$REMOTE_TAG" ]; then
             git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG"
+            # ls-remote already proved the tag EXISTS, so a peel that fails
+            # here is not "no tag" — it is a tag we cannot reason about (an
+            # annotated tag can legally point at a tree or blob). Falling
+            # through would hand it to ``gh release create``, which reuses the
+            # tag and ignores --target, and the post-condition would only
+            # notice after the release published and triggered downstream.
+            if ! EXISTING=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}"); then
+              echo "❌ Tag $TAG exists on origin but does not peel to a commit." >&2
+              echo "   Refusing to publish against a tag whose target cannot be verified." >&2
+              exit 1
+            fi
           fi
-          if EXISTING=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}"); then
+          if [ -n "${EXISTING:-}" ]; then
             if [ "$EXISTING" != "$RELEASE_SHA" ]; then
               echo "❌ Tag $TAG already exists at $EXISTING, but these notes describe $RELEASE_SHA." >&2
               echo "   GitHub ignores --target when the tag already exists, so publishing now" >&2

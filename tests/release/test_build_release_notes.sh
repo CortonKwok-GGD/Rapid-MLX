@@ -196,6 +196,32 @@ BODY=$(VERSION=0.1.0 RELEASE_SHA="$(git rev-parse HEAD)" SKIP_CONTRIBUTORS=1 bas
 contains "$(cat "$TMP/e4")" "first release" "no tags at all: falls back to git log -50"
 check "no tags at all: lists both commits" "$(grep -c '^- ' <<<"$BODY")" "2"
 
+# --- 2h. a tag that rode in on a merged SIDE BRANCH must not become the
+# baseline. Without --first-parent, `git describe` walks into merged parents
+# and finds v0.9.9 "nearer" than the real previous mainline release v2.0.0 —
+# which would silently drop every commit between them from the notes.
+SB3="$TMP/sandbox3"; mkdir -p "$SB3"; cd "$SB3"
+git init -q .; git config user.email t@t; git config user.name t; git config commit.gpgsign false
+printf 1 > a; git add -A; git commit -qm "feat: base"
+printf 2 > b; git add -A; git commit -qm "chore: bump version to 2.0.0"
+git tag v2.0.0 HEAD
+MAINLINE=$(git rev-parse HEAD)
+# real mainline work that MUST appear in the notes
+printf 3 > c; git add -A; git commit -qm "feat: mainline work (#42)"
+# a side branch forked from before the release, carrying an older tag
+git checkout -q -b side "$MAINLINE"
+printf 4 > d; git add -A; git commit -qm "feat: side work"
+git tag v0.9.9 HEAD
+git checkout -q -
+git merge -q --no-ff side -m "Merge side"
+printf 5 > e; git add -A; git commit -qm "chore: bump version to 2.1.0"
+V210=$(git rev-parse HEAD)
+BODY=$(VERSION=2.1.0 RELEASE_SHA="$V210" SKIP_CONTRIBUTORS=1 bash "$SCRIPT" 2>"$TMP/e5")
+contains "$(cat "$TMP/e5")" "baseline: v2.0.0" \
+  "side-branch tag does not hijack the baseline (--first-parent)"
+contains "$BODY" "mainline work" \
+  "commits after the real previous release still appear in the notes"
+
 echo
 printf 'passed %d, failed %d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
