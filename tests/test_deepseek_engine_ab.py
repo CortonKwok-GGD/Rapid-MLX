@@ -66,6 +66,17 @@ def test_score_bounded_inspection_rejects_non_reading_path_mentions():
             "arguments": json.dumps({"cmd": command}),
         }
         assert not MODULE.score(case, "", [call])[0]
+    malformed = {
+        "name": "exec_command",
+        "arguments": json.dumps(
+            {
+                "cmd": "cat scripts/release_check_m3_random.py "
+                "tests/test_release_check_random.py",
+                "extra": "not allowed",
+            }
+        ),
+    }
+    assert not MODULE.score(case, "", [malformed])[0]
 
 
 def test_score_review_is_exact():
@@ -149,3 +160,9 @@ def test_parse_endpoint_rejects_literal_credential_suffix():
         assert "not-a-valid" not in str(exc)
     else:
         raise AssertionError("expected literal credential suffix to fail")
+    try:
+        MODULE.parse_endpoint("cloud=http://example.test/v1,CLOUD_KEY")
+    except argparse.ArgumentTypeError as exc:
+        assert "HTTPS" in str(exc)
+    else:
+        raise AssertionError("expected plaintext credential endpoint to fail")

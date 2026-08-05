@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Replay identical long engineering contexts against Responses endpoints."""
+"""Replay naturally growing engineering contexts against Responses endpoints.
+
+Target sizes are ascending exact prefixes by design: this measures the
+multi-turn prefix-cache behavior an agent sees as its conversation grows.  It
+is not a cold-prefill benchmark.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -33,6 +39,7 @@ class ReplayResult:
     repeated: bool
     repetition_period: int | None
     failure: str | None = None
+    measurement: str = "natural_prefix_growth"
 
 
 def parse_endpoint(value: str) -> tuple[str, str, str | None]:
@@ -49,6 +56,11 @@ def parse_endpoint(value: str) -> tuple[str, str, str | None]:
         raise argparse.ArgumentTypeError(
             "credential suffix must be an environment-variable name"
         )
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise argparse.ArgumentTypeError("endpoint URL must be HTTP(S)")
+    if env_var is not None and parsed_url.scheme != "https":
+        raise argparse.ArgumentTypeError("credentialed endpoints must use HTTPS")
     return name, url, env_var
 
 
@@ -71,6 +83,20 @@ def positive_int(value: str) -> int:
 def build_corpus(root: Path, target_chars: int) -> str:
     """Build deterministic, non-repeated source context up to ``target_chars``."""
     resolved_root = root.resolve()
+    evidence_path = root / EXPECTED_ANSWER
+    if (
+        evidence_path.is_file()
+        and not evidence_path.is_symlink()
+        and _is_within_root(evidence_path, resolved_root)
+    ):
+        evidence = f"\n--- FILE: {EXPECTED_ANSWER} ---\n" + evidence_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        if target_chars < len(evidence):
+            raise ValueError(
+                f"target must be at least {len(evidence)} characters to include "
+                "the complete scoring evidence"
+            )
     paths = sorted(
         {
             path
@@ -245,7 +271,15 @@ def main() -> int:
     )
     parser.add_argument("--model", default="deepseek-v4-flash")
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--target-chars", type=positive_int, action="append")
+    parser.add_argument(
+        "--target-chars",
+        type=positive_int,
+        action="append",
+        help=(
+            "ascending natural-context size; later targets intentionally reuse "
+            "earlier prefixes"
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()

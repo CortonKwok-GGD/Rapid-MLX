@@ -17,6 +17,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -125,9 +126,14 @@ def score(
         if len(calls) != 1 or calls[0].get("name") != "exec_command":
             return False, f"expected one exec_command, got {len(calls)} tool calls"
         try:
-            command = json.loads(calls[0].get("arguments") or "{}").get("cmd", "")
+            arguments = json.loads(calls[0].get("arguments") or "{}")
         except json.JSONDecodeError:
             return False, "invalid tool arguments JSON"
+        if not isinstance(arguments, dict) or set(arguments) != {"cmd"}:
+            return False, "tool arguments must contain only the cmd field"
+        command = arguments["cmd"]
+        if not isinstance(command, str):
+            return False, "tool cmd must be a string"
         expected = (
             "cat scripts/release_check_m3_random.py tests/test_release_check_random.py"
         )
@@ -205,6 +211,11 @@ def parse_endpoint(value: str) -> tuple[str, str, str | None]:
         raise argparse.ArgumentTypeError(
             "credential suffix must be an environment-variable name"
         )
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise argparse.ArgumentTypeError("endpoint URL must be HTTP(S)")
+    if env_var is not None and parsed_url.scheme != "https":
+        raise argparse.ArgumentTypeError("credentialed endpoints must use HTTPS")
     return name, url, env_var
 
 

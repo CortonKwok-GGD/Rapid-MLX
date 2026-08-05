@@ -53,6 +53,19 @@ def test_build_corpus_places_score_evidence_first(tmp_path):
     assert "class ModelProfile" in corpus
 
 
+def test_build_corpus_rejects_truncated_score_evidence(tmp_path):
+    (tmp_path / "vllm_mlx").mkdir()
+    (tmp_path / "vllm_mlx" / "model_profile.py").write_text(
+        "class ModelProfile:\n" + "    pass\n" * 20
+    )
+    try:
+        MODULE.build_corpus(tmp_path, 40)
+    except ValueError as exc:
+        assert "complete scoring evidence" in str(exc)
+    else:
+        raise AssertionError("expected truncated evidence target to fail")
+
+
 def test_detect_repetition_finds_exact_repeated_suffix():
     prefix = "unique context "
     cycle = "one two three four five six seven eight "
@@ -139,6 +152,12 @@ def test_replay_endpoint_validation_is_credential_safe_and_unique():
         assert "not-a-valid" not in str(exc)
     else:
         raise AssertionError("expected literal credential suffix to fail")
+    try:
+        MODULE.parse_endpoint("cloud=http://example.test/v1,CLOUD_KEY")
+    except argparse.ArgumentTypeError as exc:
+        assert "HTTPS" in str(exc)
+    else:
+        raise AssertionError("expected plaintext credential endpoint to fail")
     try:
         MODULE.reject_duplicate_endpoint_names(
             [("cloud", "http://one", None), ("cloud", "http://two", None)]
