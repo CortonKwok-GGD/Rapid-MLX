@@ -71,6 +71,13 @@ final class ServerManager {
     /// message even though the model does come up.
     private var memoryConfirmTask: Task<Void, Never>?
 
+    /// True while the confirmed launch is still running. Polled by
+    /// ``awaitConfirmedLaunch`` instead of awaiting the task's ``value``:
+    /// awaiting a non-throwing Task is NOT cancellation-aware, so a caller
+    /// that gets cancelled mid-wait (chat Stop, switching conversations)
+    /// would stay suspended until a possibly-stalled download finished.
+    private var memoryConfirmInFlight = false
+
     /// Alias the child is currently serving once `/healthz` answered 200,
     /// else `nil`. Authoritative source of truth for which model id any
     /// outgoing chat request should put in `model:` — picker bar state
@@ -622,10 +629,9 @@ final class ServerManager {
         if pendingMemoryWarning != nil {
             let confirmed = await awaitMemoryDecision()
             if confirmed {
-                // Await the actual re-entered launch. It may block on a
-                // background download well past any fixed timeout, so this
-                // waits on the task itself rather than polling for state.
-                await memoryConfirmTask?.value
+                // Wait out the actual re-entered launch — no fixed bound,
+                // because it may legitimately sit on a background download.
+                await awaitConfirmedLaunch()
             }
         }
         // ``start`` returns silently when another caller already owns
@@ -672,6 +678,20 @@ final class ServerManager {
         return memoryLoadConfirmed
     }
 
+
+    /// Waits for a confirmed memory-risky launch to finish. Unbounded (a
+    /// pre-spawn download can take minutes) but cancellation-aware: the
+    /// ``Task.sleep`` throws when the CALLER is cancelled, so we stop waiting
+    /// and leave the launch itself running — the user did ask for it.
+    private func awaitConfirmedLaunch() async {
+        while memoryConfirmInFlight {
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return
+            }
+        }
+    }
 
     private func awaitStartupSettled(alias: String) async {
         while true {
@@ -751,6 +771,7 @@ final class ServerManager {
         // Publish the task BEFORE clearing nothing else — both this and the
         // waiter run on the MainActor, so a waiter that observes
         // ``pendingMemoryWarning == nil`` is guaranteed to see this task.
+        memoryConfirmInFlight = true
         memoryConfirmTask = Task { [weak self] in
             await self?.start(
                 alias: warning.alias,
@@ -758,6 +779,7 @@ final class ServerManager {
                 isAutoRespawn: warning.isAutoRespawn,
                 bypassMemoryGuard: true
             )
+            self?.memoryConfirmInFlight = false
         }
     }
 
@@ -767,6 +789,7 @@ final class ServerManager {
     func cancelPendingMemoryLoad() {
         memoryLoadConfirmed = false
         memoryConfirmTask = nil
+        memoryConfirmInFlight = false
         pendingMemoryWarning = nil
     }
 
