@@ -18,7 +18,6 @@ AXApplication title="Rapid-MLX"
         AXSplitter value=number enabled=false
         AXGroup subrole=AXHostingView
           AXStaticText value=text enabled=true
-          AXStaticText value=text enabled=true
           AXButton id="Images.Cancel" desc="Close" help="Cancel" enabled=true
           AXStaticText value=text enabled=true
           AXStaticText value=text enabled=true
