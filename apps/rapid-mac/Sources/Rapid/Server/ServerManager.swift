@@ -354,9 +354,12 @@ final class ServerManager {
     /// Auth is required to target the lane (the bearer secret is minted per
     /// spawn), so both the ready state AND a live bearer are demanded here;
     /// this keeps ``AudioViewModel`` from needlessly tearing down the chat
-    /// model just to run a transcription.
+    /// model just to run a transcription. With auth off (``APIAuthConfig``
+    /// mode ``off``) ``activeBearer`` is nil by design and the lane is still
+    /// usable — the engine serves unauthenticated — so only the ready state
+    /// gates co-loading.
     var voiceCoLoadsOnPrimary: Bool {
-        servingAlias != nil && activeBearer != nil
+        servingAlias != nil && (activeBearer != nil || APIAuthConfig.mode == .off)
     }
 
     /// Whether the selected voice model can receive requests without another
@@ -2488,16 +2491,26 @@ final class ServerManager {
         // Issue #17 desktop-half: generate a per-launch bearer
         // secret, hand it to the child via RAPID_MLX_API_KEY, and
         // pin it on self so ChatStreamClient can add the matching
-        // Authorization header. SecRandomCopyBytes failing is
-        // pathological (kernel-level RNG starvation); we surface as
-        // .crashed rather than silently spawning unauthenticated.
-        guard let bearer = BearerSecret.generate() else {
-            isOperating = false
-            state = .crashed(
-                alias: trimmedAlias,
-                message: "Couldn't start the model securely. Restart Rapid-MLX; if this keeps happening, please file a bug."
-            )
-            return
+        // Authorization header. The mode is configurable (random /
+        // fixed / off) via APIAuthConfig. SecRandomCopyBytes failing
+        // in random/fixed mode is pathological (kernel-level RNG
+        // starvation); we surface as .crashed rather than silently
+        // spawning unauthenticated. Off mode intentionally returns
+        // nil — the engine then runs without auth.
+        let bearer: String?
+        switch APIAuthConfig.mode {
+        case .off:
+            bearer = nil
+        case .random, .fixed:
+            guard let generated = APIAuthConfig.bearerForSpawn() else {
+                isOperating = false
+                state = .crashed(
+                    alias: trimmedAlias,
+                    message: "Couldn't start the model securely. Restart Rapid-MLX; if this keeps happening, please file a bug."
+                )
+                return
+            }
+            bearer = generated
         }
         // Codex r1 P3 (#17): hold the bearer in a local until the
         // spawn succeeds, then publish to ``activeBearer``. The
@@ -4175,7 +4188,7 @@ final class ServerManager {
     /// the existence check lives at the call site, which falls the
     /// value back to ``nil`` when the drive is unplugged.
     nonisolated internal static func serveEnvironmentAdditions(
-        bearer: String,
+        bearer: String?,
         ambient: [String: String],
         physicalRAMBytes: UInt64 = 0,
         availableRAMBytes: UInt64 = 0,
@@ -4216,8 +4229,10 @@ final class ServerManager {
             home: env["HOME"]
         )
 
-        // Layer 2: desktop-injected, always.
-        if !bearer.isEmpty {
+        // Layer 2: desktop-injected, always. nil bearer (auth off)
+        // means the engine runs without RAPID_MLX_API_KEY and its
+        // native middleware serves every endpoint unauthenticated.
+        if let bearer, !bearer.isEmpty {
             env["RAPID_MLX_API_KEY"] = bearer
         }
         // Prefix-cache restore is a best-effort server warm-start optimization,

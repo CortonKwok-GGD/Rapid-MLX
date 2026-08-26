@@ -88,6 +88,11 @@ struct SettingsView: View {
         case performance
         case appearance
         case privacy
+        /// Issue #17 configurable local API authentication: random /
+        /// fixed / off. Lives next to privacy because it is a security
+        /// surface — the bearer is the only gate between any local
+        /// process and the engine's GPU.
+        case apiAuth
         /// Rapid-MLX Desktop app updates. The .app self-update is the
         /// only correct way to bump the bundled engine.
         case app
@@ -109,6 +114,7 @@ struct SettingsView: View {
             case .performance: return "Performance"
             case .appearance: return "Appearance"
             case .privacy: return "Privacy"
+            case .apiAuth: return "API Auth"
             case .app: return "App"
             #if DEBUG
             case .developer: return "Developer"
@@ -124,6 +130,7 @@ struct SettingsView: View {
             case .performance: return "speedometer"
             case .appearance: return "paintpalette.fill"
             case .privacy: return "lock.shield.fill"
+            case .apiAuth: return "key.fill"
             case .app: return "app.badge.fill"
             #if DEBUG
             case .developer: return "hammer.fill"
@@ -490,6 +497,8 @@ struct SettingsView: View {
             appearancePanel
         case .privacy:
             privacyPanel
+        case .apiAuth:
+            SettingsAPIAuthPanel()
         case .app:
             appPanel
         #if DEBUG

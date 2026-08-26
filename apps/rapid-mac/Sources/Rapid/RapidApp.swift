@@ -198,9 +198,11 @@ struct RapidApp: App {
             // Only report an endpoint once the child answered /healthz —
             // polling a starting server just logs connection refusals, and a
             // stopped one has no bearer to authenticate with.
-            guard let manager, manager.servingAlias != nil,
-                  let bearer = manager.activeBearer else { return nil }
-            return (host: manager.host, port: manager.activePort, bearer: bearer)
+            guard let manager, manager.servingAlias != nil else { return nil }
+            // Auth off (APIAuthConfig mode .off) leaves activeBearer nil;
+            // MCPCatalog skips the Authorization header and the engine
+            // serves unauthenticated, so the endpoint stays usable.
+            return (host: manager.host, port: manager.activePort, bearer: manager.activeBearer)
         }
         let mcpRegistry = MCPToolRegistry(catalog: mcpCatalog, approval: mcpApprovalStore)
         let toolRegistry = CompositeToolRegistry(builtin: builtinRegistry, mcp: mcpRegistry)
