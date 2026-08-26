@@ -660,6 +660,11 @@ final class ServerManager {
     /// without auth", which surfaces as ``.crashed`` to the user.
     private(set) var activeBearer: String?
 
+    /// The auth mode that was in effect when the current child spawned.
+    /// Lets the settings panel distinguish "change already applied" from
+    /// "pending restart". Cleared whenever the child stops.
+    private(set) var activeAuthMode: APIAuthMode?
+
     /// Supplies the `--mcp-config` path for the next spawn, or `nil` to launch
     /// with the MCP subsystem entirely absent.
     ///
@@ -1870,12 +1875,23 @@ final class ServerManager {
         return result
     }
 
+    /// Stops the running engine and relaunches it for the same alias.
+    ///
+    /// Used by settings panels that need a process-level restart to apply a
+    /// configuration change (API auth mode, speculative-decoding flags).
+    /// ``residencyEligible`` is forced false: these changes live in the
+    /// child process env / launch flags, so the in-process
+    /// ``/v1/models/load`` path must NOT be used.
+    func restart(alias: String, hfPath: String? = nil) async -> Bool {
+        await stop()
+        return await ensureServing(alias: alias, hfPath: hfPath, residencyEligible: false)
+    }
+
     /// Speculative decoding is installed while the process-owning engine
     /// starts, unlike the resident API's per-engine KV/prefix knobs. Rebuild
     /// one setting changes; conversations and downloaded weights remain.
     func restartForSpeculativePerformance(alias: String, hfPath: String? = nil) async -> Bool {
-        await stop()
-        return await ensureServing(alias: alias, hfPath: hfPath, residencyEligible: false)
+        await restart(alias: alias, hfPath: hfPath)
     }
 
     /// True when the child is serving exactly this alias.
@@ -2497,8 +2513,14 @@ final class ServerManager {
         // starvation); we surface as .crashed rather than silently
         // spawning unauthenticated. Off mode intentionally returns
         // nil — the engine then runs without auth.
+        // P1-2: capture the EFFECTIVE mode (fixed-without-key degrades
+        // to random) at the same moment the bearer is created and
+        // publish THAT below, so ``activeAuthMode`` always matches the
+        // env the child actually received — even if the user changes
+        // the mode while the spawn is in flight.
+        let spawnAuthMode = APIAuthConfig.effectiveMode
         let bearer: String?
-        switch APIAuthConfig.mode {
+        switch spawnAuthMode {
         case .off:
             bearer = nil
         case .random, .fixed:
@@ -2727,6 +2749,7 @@ final class ServerManager {
         // Codex r1 P3 (#17): only publish the bearer after the spawn
         // has succeeded — see comment at the bearer guard above.
         setActiveServerSession(bearer: bearer)
+        self.activeAuthMode = spawnAuthMode
         self.stdoutPipe = stdoutPipe
         self.stderrPipe = stderrPipe
         // #20: persist ownership before startMonitor() so a crash
@@ -2994,6 +3017,7 @@ final class ServerManager {
         // secret targeting whatever happens to bind the port next.
         // (#1035: the nil transition evicts cached MCP tools via didSet.)
         setActiveServerSession(bearer: nil)
+        activeAuthMode = nil
         // Issue #278: honour the "readyAt cleared on every child
         // exit" invariant in shutdownSync too (parallel to the
         // terminateChild defensive teardown). App-termination only,
@@ -3081,6 +3105,7 @@ final class ServerManager {
             // #17: see shutdownSync — bearer is dead the moment the
             // child is.
             setActiveServerSession(bearer: nil)
+        activeAuthMode = nil
             startedAt = nil
             // Issue #278: defensive teardown also has to honour the
             // "readyAt cleared on every child exit" invariant in
@@ -3152,6 +3177,7 @@ final class ServerManager {
         // #17: the child owns the secret; the secret is meaningless
         // (and a leak vector) once the child is gone.
         setActiveServerSession(bearer: nil)
+        activeAuthMode = nil
         startedAt = nil
         // Issue #278: snapshot + window-gate the auto-respawn budget
         // reset, then clear ``readyAt``. The wasExpected-stop branch

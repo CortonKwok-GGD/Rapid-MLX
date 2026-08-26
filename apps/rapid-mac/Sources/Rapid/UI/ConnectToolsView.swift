@@ -12,6 +12,9 @@ import SwiftUI
 /// every copied snippet is correct for the current run (the port floats
 /// 8000–8009 and the bearer rotates each start).
 struct ConnectToolsView: View {
+    @Environment(SettingsRouter.self) private var settingsRouter
+    @Environment(\.openWindow) private var openWindow
+
     let host: String
     let port: Int
     let bearer: String
@@ -64,6 +67,11 @@ struct ConnectToolsView: View {
     @State private var integrationTargets: [IntegrationTarget] = []
     @State private var showsConnectionDetails = false
     @State private var showsMoreIntegrations = false
+    @AppStorage(APIAuthConfig.storageKey) private var authModeRaw = APIAuthMode.random.rawValue
+
+    private var authMode: APIAuthMode {
+        APIAuthMode(rawValue: authModeRaw) ?? .random
+    }
 
     private var openAIBaseURL: String { "http://\(host):\(port)/v1" }
     private var anthropicBaseURL: String { "http://\(host):\(port)" }
@@ -154,6 +162,15 @@ struct ConnectToolsView: View {
             return "Your API key is created when the local server starts."
         }
         return "Start a model to fill in the model name."
+    }
+
+    /// What the API-key row says while nothing is minted yet. Off mode
+    /// intentionally has NO key — "Created when the server starts" would
+    /// promise a value that never arrives. Random/fixed keep the legacy
+    /// wording because those modes DO mint one on start.
+    private var apiKeyPlaceholder: String {
+        if authMode == .off { return "Auth off — no key" }
+        return "Created when the server starts"
     }
 
     var body: some View {
@@ -370,7 +387,12 @@ struct ConnectToolsView: View {
                     label: "API key",
                     value: bearer,
                     masked: true,
-                    placeholder: "Created when the server starts"
+                    placeholder: apiKeyPlaceholder,
+                    onConfigure: {
+                        settingsRouter.route(to: .apiAuth) {
+                            openWindow(id: "settings")
+                        }
+                    }
                 )
                 rowDivider
                 CopyableRow(
@@ -845,6 +867,10 @@ private struct CopyableRow: View {
     /// Its presence also disables Copy — an empty clipboard write is a
     /// silent failure the user only discovers in their editor.
     var placeholder: String? = nil
+    /// Optional trailing action (e.g. "Configure…" next to the API key
+    /// row). When non-nil, a small gear button renders after the Copy
+    /// button and calls this closure.
+    var onConfigure: (() -> Void)? = nil
     @State private var reveal = false
     @State private var copied = false
 
@@ -911,6 +937,17 @@ private struct CopyableRow: View {
             }
             .disabled(!hasValue)
             .accessibilityIdentifier("ConnectTools.Copy.\(label)")
+            if let onConfigure {
+                QuietIconButton(
+                    symbol: "gearshape",
+                    label: "Configure \(label)",
+                    help: "Open Settings to configure the API key mode.",
+                    size: RapidTheme.ControlHeight.mini
+                ) {
+                    onConfigure()
+                }
+                .accessibilityIdentifier("ConnectTools.Configure.\(label)")
+            }
         }
         .padding(.horizontal, RapidTheme.Space.md)
         .frame(height: RapidTheme.ControlHeight.medium)
