@@ -354,12 +354,12 @@ final class ServerManager {
     /// Auth is required to target the lane (the bearer secret is minted per
     /// spawn), so both the ready state AND a live bearer are demanded here;
     /// this keeps ``AudioViewModel`` from needlessly tearing down the chat
-    /// model just to run a transcription. With auth off (``APIAuthConfig``
-    /// mode ``off``) ``activeBearer`` is nil by design and the lane is still
-    /// usable — the engine serves unauthenticated — so only the ready state
-    /// gates co-loading.
+    /// model just to run a transcription.
     var voiceCoLoadsOnPrimary: Bool {
-        servingAlias != nil && (activeBearer != nil || APIAuthConfig.mode == .off)
+        // Auth is required to target the lane; every spawn resolves a
+        // bearer (off mode was removed by review), so a live bearer is
+        // the gate.
+        servingAlias != nil && activeBearer != nil
     }
 
     /// Whether the selected voice model can receive requests without another
@@ -2504,35 +2504,26 @@ final class ServerManager {
         }
         activePort = resolvedPort
 
-        // Issue #17 desktop-half: generate a per-launch bearer
-        // secret, hand it to the child via RAPID_MLX_API_KEY, and
-        // pin it on self so ChatStreamClient can add the matching
-        // Authorization header. The mode is configurable (random /
-        // fixed / off) via APIAuthConfig. SecRandomCopyBytes failing
-        // in random/fixed mode is pathological (kernel-level RNG
-        // starvation); we surface as .crashed rather than silently
-        // spawning unauthenticated. Off mode intentionally returns
-        // nil — the engine then runs without auth.
-        // P1-2: capture the EFFECTIVE mode (fixed-without-key degrades
-        // to random) at the same moment the bearer is created and
-        // publish THAT below, so ``activeAuthMode`` always matches the
-        // env the child actually received — even if the user changes
-        // the mode while the spawn is in flight.
-        let spawnAuthMode = APIAuthConfig.effectiveMode
-        let bearer: String?
-        switch spawnAuthMode {
-        case .off:
-            bearer = nil
-        case .random, .fixed:
-            guard let generated = APIAuthConfig.bearerForSpawn() else {
-                isOperating = false
-                state = .crashed(
-                    alias: trimmedAlias,
-                    message: "Couldn't start the model securely. Restart Rapid-MLX; if this keeps happening, please file a bug."
-                )
-                return
-            }
-            bearer = generated
+        // Issue #17 desktop-half: generate a bearer secret, hand it to
+        // the child via RAPID_MLX_API_KEY, and pin it on self so
+        // ChatStreamClient can add the matching Authorization header.
+        // The key lifetime (launch / 24h / permanent) is configurable
+        // via APIAuthConfig; the secret is persisted in the Keychain
+        // for the persistent modes. SecRandomCopyBytes failing is
+        // pathological (kernel-level RNG starvation); we surface as
+        // .crashed rather than silently spawning unauthenticated.
+        // P1-2: capture the mode at the same moment the bearer is
+        // created and publish THAT below, so ``activeAuthMode`` always
+        // matches the env the child actually received — even if the
+        // user changes the mode while the spawn is in flight.
+        let spawnAuthMode = APIAuthConfig.mode
+        guard let bearer = APIAuthConfig.bearerForSpawn() else {
+            isOperating = false
+            state = .crashed(
+                alias: trimmedAlias,
+                message: "Couldn't start the model securely. Restart Rapid-MLX; if this keeps happening, please file a bug."
+            )
+            return
         }
         // Codex r1 P3 (#17): hold the bearer in a local until the
         // spawn succeeds, then publish to ``activeBearer``. The
@@ -4255,9 +4246,10 @@ final class ServerManager {
             home: env["HOME"]
         )
 
-        // Layer 2: desktop-injected, always. nil bearer (auth off)
-        // means the engine runs without RAPID_MLX_API_KEY and its
-        // native middleware serves every endpoint unauthenticated.
+        // Layer 2: desktop-injected, always. The bearer is never nil for
+        // a live spawn (launch / 24h / permanent all resolve to a secret;
+        // RNG failure aborts the start instead), so the engine always runs
+        // with auth. nil only guards the no-engine-yet window.
         if let bearer, !bearer.isEmpty {
             env["RAPID_MLX_API_KEY"] = bearer
         }

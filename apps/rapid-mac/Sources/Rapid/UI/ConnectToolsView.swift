@@ -67,11 +67,6 @@ struct ConnectToolsView: View {
     @State private var integrationTargets: [IntegrationTarget] = []
     @State private var showsConnectionDetails = false
     @State private var showsMoreIntegrations = false
-    @AppStorage(APIAuthConfig.storageKey) private var authModeRaw = APIAuthMode.random.rawValue
-
-    private var authMode: APIAuthMode {
-        APIAuthMode(rawValue: authModeRaw) ?? .random
-    }
 
     private var openAIBaseURL: String { "http://\(host):\(port)/v1" }
     private var anthropicBaseURL: String { "http://\(host):\(port)" }
@@ -164,13 +159,29 @@ struct ConnectToolsView: View {
         return "Start a model to fill in the model name."
     }
 
-    /// What the API-key row says while nothing is minted yet. Off mode
-    /// intentionally has NO key — "Created when the server starts" would
-    /// promise a value that never arrives. Random/fixed keep the legacy
-    /// wording because those modes DO mint one on start.
+    /// What the API-key row says while nothing is minted yet. Every mode
+    /// mints a key on start (there is no unauthenticated mode), so the
+    /// placeholder just reflects the not-started state.
     private var apiKeyPlaceholder: String {
-        if authMode == .off { return "Auth off — no key" }
         return "Created when the server starts"
+    }
+
+    /// Expiry hint under the API-key row while a persisted key is in play
+    /// (24h / permanent modes). Lets tooling that hard-coded the key know
+    /// when it stops working.
+    @ViewBuilder
+    private func apiKeyExpiryRow(_ expiry: Date) -> some View {
+        HStack(spacing: RapidTheme.Space.xs) {
+            Image(systemName: "clock")
+                .font(RapidFont.caption)
+                .foregroundStyle(.tertiary)
+            Text("Key expires \(expiry.formatted(date: .abbreviated, time: .shortened))")
+                .font(RapidFont.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.top, 4)
+        .padding(.leading, 2)
+        .accessibilityIdentifier("ConnectTools.APIKeyExpiry")
     }
 
     var body: some View {
@@ -394,6 +405,9 @@ struct ConnectToolsView: View {
                         }
                     }
                 )
+                if let expiry = APIAuthConfig.keyExpiry, !bearer.isEmpty {
+                    apiKeyExpiryRow(expiry)
+                }
                 rowDivider
                 CopyableRow(
                     label: "Model",

@@ -2,239 +2,220 @@ import SwiftUI
 
 /// API authentication configuration for the embedded engine.
 ///
-/// The engine binds loopback-only, so the bearer is NOT a network firewall —
-/// it gates *local* callers (see Issue #17). Three modes:
+/// A single "key lifetime" picker replaces the old random/fixed/off matrix:
 ///
-///   * Random key (default) — fresh 64-hex secret per launch; safest, but
-///     external local callers (curl, scripts) must re-fetch it each start.
-///   * Fixed key — user-supplied, stored in app preferences; stable
-///     across launches so tooling can hard-code it.
-///   * Off — no auth; the engine serves every local request unauthenticated.
-///     Most convenient, least safe: ANY local process (a sandbox-escaped
-///     browser tab, an unrelated script) can drive inference.
+/// * ``launch`` — a fresh 64-hex secret per engine spawn.
+/// * ``hours24`` — one secret reused for 24 hours, persisted in the system
+///   Keychain; tooling can hard-code it across restarts for a day.
+/// * ``permanent`` — one secret reused indefinitely until rotated manually.
+///
+/// Switching to a persistent mode persists the engine's current key
+/// immediately (or mints one if the engine isn't running), so the key on
+/// screen today IS the key that survives. Mode changes never force a
+/// restart; Rotate key is the one action that does — it is gated behind
+/// a confirmation so the user can back out of an in-flight service.
 struct SettingsAPIAuthPanel: View {
-    @AppStorage(APIAuthConfig.storageKey) private var modeRaw = APIAuthMode.random.rawValue
-
     @Environment(ServerManager.self) private var server
-    @State private var fixedKeyInput = ""
-    @State private var savedNotice = false
-    @State private var restarting = false
-    @State private var restartFeedback: String?
-    @State private var revealInput = false
-    @FocusState private var keyFieldFocused: Bool
-    @State private var noticeDismissTask: Task<Void, Never>?
+    @AppStorage(APIAuthConfig.storageKey) private var modeRaw = APIAuthMode.launch.rawValue
+    @State private var keyRevision = 0
+    @State private var confirmingRotate = false
+    @State private var rotating = false
+    @State private var rotateError: String?
+    @State private var keychainDenied = false
 
     private var mode: APIAuthMode {
-        APIAuthMode(rawValue: modeRaw) ?? .random
+        APIAuthMode(rawValue: modeRaw) ?? .launch
     }
 
-    private var hasFixedKey: Bool {
-        !(APIAuthConfig.defaults.string(forKey: APIAuthConfig.fixedKeyStorageKey) ?? "").isEmpty
+    /// Picker binding that normalizes stale values left by earlier builds
+    /// (the storage key predates the launch/hours24/permanent enum, so a
+    /// user's old ``fixed``/``off`` choice would otherwise render as an
+    /// empty selection). Reading a legacy value shows ``launch``; picking
+    /// any option writes back a canonical value.
+    private var normalizedModeBinding: Binding<String> {
+        Binding(
+            get: { APIAuthMode(rawValue: modeRaw)?.rawValue ?? APIAuthMode.launch.rawValue },
+            set: { modeRaw = $0 }
+        )
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: RapidTheme.Space.xl) {
             SectionHeader(
                 "API Authentication",
-                subtitle: "Controls the bearer key the embedded engine requires on its local port.",
+                subtitle: "Controls the bearer key the embedded engine requires on its local port. Changes apply on the next model start.",
                 emphasis: .page
             )
 
-            SettingsSection(
-                "Auth mode",
-                subtitle: "Applies on the next model start."
-            ) {
-                Picker("Mode", selection: $modeRaw) {
-                    ForEach(APIAuthMode.allCases) { m in
-                        Text(m.title).tag(m.rawValue)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .accessibilityIdentifier("Settings.APIAuth.Mode")
-                .onChange(of: modeRaw) { _, _ in
-                    restartFeedback = nil
-                    savedNotice = false
-                }
-
-                switch mode {
-                case .random:
-                    InlineNotice(
-                        message: "A new random key is minted each launch and shown in the status pill. Safest — a leaked key expires with the session.",
-                        tone: .info
-                    )
-                case .fixed:
-                    fixedKeySection
-                case .off:
-                    InlineNotice(
-                        message: "No auth: any local process can call the engine on 127.0.0.1 and drive inference. Use only on a trusted, single-user Mac.",
-                        tone: .warning
-                    )
-                }
-
-                if isServing {
-                    Divider()
-                    HStack(spacing: RapidTheme.Space.md) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            if authNeedsRestart {
-                                Text("A model is currently running")
-                                    .font(RapidFont.secondary)
-                                    .foregroundStyle(.secondary)
-                                Text("Auth changes apply on the next engine start.")
-                                    .font(RapidFont.caption)
-                                    .foregroundStyle(.tertiary)
-                            } else {
-                                Text("Auth is already in effect")
-                                    .font(RapidFont.secondary)
-                                    .foregroundStyle(.secondary)
-                                Text("No restart needed for the current settings.")
-                                    .font(RapidFont.caption)
-                                    .foregroundStyle(.tertiary)
-                            }
+            SettingsSection("Key lifetime") {
+                VStack(alignment: .leading, spacing: RapidTheme.Space.md) {
+                    Picker("Lifetime", selection: normalizedModeBinding) {
+                        ForEach(APIAuthMode.allCases) { m in
+                            Text(m.title).tag(m.rawValue)
                         }
-                        Spacer()
-                        Button(restarting ? "Restarting…" : (authNeedsRestart ? "Restart model to apply" : "Restart anyway")) {
-                            restartToApply()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(restarting)
                     }
-                    if let feedback = restartFeedback {
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("Settings.APIAuth.Mode")
+                    .onChange(of: modeRaw) { _, newRaw in
+                        guard let newMode = APIAuthMode(rawValue: newRaw) else {
+                            modeRaw = APIAuthMode.launch.rawValue
+                            return
+                        }
+                        guard newMode != .launch else {
+                            // Switching back to session-only: purge the
+                            // persisted key so it cannot resurface later.
+                            keychainDenied = !APIAuthConfig.clearPersistedKey()
+                            return
+                        }
+                        keychainDenied = !persistCurrentKey()
+                        keyRevision += 1
+                    }
+
+                    switch mode {
+                    case .launch:
                         InlineNotice(
-                            message: feedback,
-                            tone: feedback.hasPrefix("Applied") ? .success : (feedback.hasPrefix("No changes") ? .info : .error)
+                            message: "A new random key is minted on each start. Safest — a leaked key expires with the session.",
+                            tone: .info
+                        )
+                        if keychainDenied {
+                            InlineNotice(
+                                message: "Keychain access was denied, so the previous persistent key was not removed. It could be reused if you select a persistent mode again — allow Keychain access to purge it.",
+                                tone: .warning
+                            )
+                        }
+                    case .hours24:
+                        persistentKeySection(
+                            notice: "One key, reused for 24 hours, stored in the system Keychain.",
+                            expiryHint: APIAuthConfig.keyExpiry
+                        )
+                    case .permanent:
+                        persistentKeySection(
+                            notice: "One key, reused until you rotate it, stored in the system Keychain.",
+                            expiryHint: nil
                         )
                     }
                 }
             }
         }
+        .padding(RapidTheme.Space.xl)
     }
 
-    private var fixedKeySection: some View {
+    /// Key display + rotate for the persistent modes. `expiryHint` is the
+    /// date the current key stops being fresh (nil = never).
+    private func persistentKeySection(notice: String, expiryHint: Date?) -> some View {
         VStack(alignment: .leading, spacing: RapidTheme.Space.md) {
-            HStack(spacing: RapidTheme.Space.md) {
-                HStack(spacing: RapidTheme.Space.xs) {
-                    if revealInput {
-                        TextField("Fixed API key", text: $fixedKeyInput)
-                            .textFieldStyle(.roundedBorder)
-                            .focused($keyFieldFocused)
-                            .accessibilityIdentifier("Settings.APIAuth.FixedKey")
-                    } else {
-                        SecureField("Fixed API key", text: $fixedKeyInput)
-                            .textFieldStyle(.roundedBorder)
-                            .focused($keyFieldFocused)
-                            .accessibilityIdentifier("Settings.APIAuth.FixedKey")
-                    }
-                    QuietIconButton(
-                        symbol: revealInput ? "eye.slash" : "eye",
-                        label: revealInput ? "Hide key" : "Show key",
-                        size: RapidTheme.ControlHeight.mini
-                    ) {
-                        revealInput.toggle()
-                        // P2-5: the TextField/SecureField swap rebuilds the
-                        // field, which drops first responder. Re-assert
-                        // focus on the next runloop tick so a half-typed
-                        // key survives the reveal toggle.
-                        DispatchQueue.main.async {
-                            keyFieldFocused = true
-                        }
-                    }
-                    .accessibilityIdentifier("Settings.APIAuth.RevealInput")
-                }
-                .onAppear {
-                    if fixedKeyInput.isEmpty,
-                       let existing = APIAuthConfig.defaults.string(forKey: APIAuthConfig.fixedKeyStorageKey) {
-                        fixedKeyInput = existing
-                    }
-                }
-                Button("Save") {
-                    saveFixedKey()
-                }
-                .buttonStyle(.borderedProminent)
-            }
-            if savedNotice {
+            InlineNotice(message: notice, tone: .info)
+            InlineNotice(
+                message: "macOS asks for Keychain permission on first use — choose “Always Allow” so the key persists.",
+                tone: .info
+            )
+            if keychainDenied {
                 InlineNotice(
-                    message: isServing
-                        ? "Saved — takes effect after you restart the model."
-                        : "Saved — will be used on the next model start.",
-                    tone: .success
-                )
-                .transition(.opacity)
-            }
-            if !hasFixedKey {
-                // P1-1: without a stored key the engine silently falls back
-                // to a fresh random key every launch. Surface it instead of
-                // letting the panel claim "Applied" for a fixed mode that
-                // never actually fixed anything.
-                InlineNotice(
-                    message: "No fixed key stored yet — the engine falls back to a fresh random key until you save one.",
+                    message: "Keychain access was denied, so the key was not saved. Every launch will use a fresh random key — switch away from a persistent mode or allow Keychain access to fix.",
                     tone: .warning
                 )
             }
-            InlineNotice(
-                message: "The key is stored in app preferences. Keep it stable: this is the value external tools should send as the Bearer token.",
-                tone: .info
-            )
-        }
-    }
 
-    private var isServing: Bool {
-        if case .ready = server.state { return true }
-        return false
-    }
-
-    /// True when the running engine's auth differs from what the current
-    /// settings would spawn (mode or fixed key), so a restart would
-    /// actually change something. Delegates to the pure helper so the
-    /// effective-mode fallback (fixed-without-key ⇒ random) is handled in
-    /// exactly one place.
-    private var authNeedsRestart: Bool {
-        APIAuthConfig.needsRestart(
-            activeMode: server.activeAuthMode,
-            activeBearer: server.activeBearer,
-            isServing: isServing
-        )
-    }
-
-    private func saveFixedKey() {
-        let trimmed = fixedKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        APIAuthConfig.defaults.set(trimmed, forKey: APIAuthConfig.fixedKeyStorageKey)
-        savedNotice = true
-        restartFeedback = nil
-        // P2-4: auto-dismiss the confirmation so it doesn't linger forever.
-        // Cancel any previous dismissal so a rapid re-save doesn't get
-        // cleared early by the first save's timer.
-        noticeDismissTask?.cancel()
-        noticeDismissTask = Task {
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
-            if !Task.isCancelled {
-                savedNotice = false
+            if let key = displayedKey {
+                HStack(spacing: RapidTheme.Space.md) {
+                    Text(masked(key))
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("Settings.APIAuth.KeyDisplay")
+                    Spacer()
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(key, forType: .string)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            } else {
+                Text("No key stored yet — one is generated on the next model start.")
+                    .font(RapidFont.secondary)
+                    .foregroundStyle(.secondary)
             }
+
+            if let expiry = expiryHint {
+                InlineNotice(
+                    message: "Expires \(expiry.formatted(date: .abbreviated, time: .shortened)). A fresh key is minted on the next start.",
+                    tone: .warning
+                )
+            }
+
+            Button(rotating ? "Rotating…" : "Rotate key") {
+                confirmingRotate = true
+            }
+            .buttonStyle(.bordered)
+            .disabled(rotating)
+        }
+        .confirmationDialog(
+            "Rotate API key?",
+            isPresented: $confirmingRotate,
+            titleVisibility: .visible
+        ) {
+            Button("Rotate & Restart", role: .destructive) {
+                rotateKeyAndRestart()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A new key is generated and the engine restarts immediately. In-flight requests are interrupted.")
+        }
+        .alert("Rotation failed", isPresented: Binding(
+            get: { rotateError != nil },
+            set: { if !$0 { rotateError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(rotateError ?? "")
         }
     }
 
-    private func restartToApply() {
-        guard case .ready(let alias) = server.state else { return }
-        guard authNeedsRestart else {
-            restartFeedback = "No changes — auth is already in effect."
+    /// Rotate the persisted key, then restart the engine so the new key is
+    /// live immediately (the engine pins the key it is spawned with). If no
+    /// model is serving, the new key simply takes effect on the next start.
+    private func rotateKeyAndRestart() {
+        guard APIAuthConfig.rotatePersistedKey() else {
+            rotateError = "Couldn't store the new key — Keychain access may be denied. No restart was performed; the previous key is still in effect."
             return
         }
-        // P1-1 hardening: never claim "Applied" for a fixed mode with no
-        // stored key — the restart would just mint another random key.
-        if mode == .fixed && !hasFixedKey {
-            restartFeedback = "Save a fixed key first — without one the engine falls back to a random key."
-            return
-        }
-        restarting = true
-        restartFeedback = nil
+        keychainDenied = false
+        keyRevision += 1
+        guard let alias = server.servingAlias else { return }
+        rotating = true
         Task {
             let ok = await server.restart(alias: alias)
-            restarting = false
-            if ok {
-                restartFeedback = "Applied — the engine restarted with the new auth mode."
-            } else {
-                restartFeedback = "Restart failed — check the server logs and try again."
+            rotating = false
+            if !ok {
+                rotateError = "Engine restart failed — the new key is stored and applies on the next model start."
             }
         }
+    }
+
+    /// Persist the engine's current key when the user switches to a
+    /// persistent mode, so the key they see today IS the key that survives
+    /// (24 hours / until rotated). If the engine isn't running, reuse an
+    /// existing fresh persisted key — switching modes must not churn the
+    /// secret (hard-coded tooling keeps working); mint only when nothing
+    /// fresh is stored. Returns false when the Keychain write was refused.
+    private func persistCurrentKey() -> Bool {
+        if let current = server.activeBearer {
+            return APIAuthConfig.persistBearer(current)
+        }
+        if let stored = APIAuthConfig.storedBearer(),
+           APIAuthConfig.isFresh(stored.generatedAt) {
+            return true
+        }
+        return APIAuthConfig.rotatePersistedKey()
+    }
+
+    /// Re-read the Keychain so Rotate is reflected immediately (`keyRevision`
+    /// forces SwiftUI to recompute the body).
+    private var displayedKey: String? {
+        _ = keyRevision
+        return APIAuthConfig.persistedKey
+    }
+
+    private func masked(_ key: String) -> String {
+        String(repeating: "•", count: min(key.count, 16))
     }
 }

@@ -199,9 +199,8 @@ struct RapidApp: App {
             // polling a starting server just logs connection refusals, and a
             // stopped one has no bearer to authenticate with.
             guard let manager, manager.servingAlias != nil else { return nil }
-            // Auth off (APIAuthConfig mode .off) leaves activeBearer nil;
-            // MCPCatalog skips the Authorization header and the engine
-            // serves unauthenticated, so the endpoint stays usable.
+            // Every spawn resolves a bearer (no unauthenticated mode), so
+            // the endpoint always authenticates via the live secret.
             return (host: manager.host, port: manager.activePort, bearer: manager.activeBearer)
         }
         let mcpRegistry = MCPToolRegistry(catalog: mcpCatalog, approval: mcpApprovalStore)
