@@ -84,13 +84,23 @@ Ordinary pull requests run the path-aware PR gate and leave the required
 request becomes an integration candidate only when a maintainer applies exactly
 one authorization label after review and PR validation have converged:
 
-- `merge-ready` when the diff does not select the Desktop lane;
-- `merge-ready-mac` when the diff selects the Desktop lane.
+- `merge-ready` only when the classifier selects neither the engine nor the
+  Desktop lane (`engine=false`, `desktop=false`);
+- `merge-ready-mac` when the classifier selects the engine lane, the Desktop
+  lane, or both.
 
 The managed queue never mixes the two labels in one batch. It collects up to
 four candidates of the same class and validates their combined tree once. The
-non-Desktop queue waits at most five minutes to favor latency; the Desktop queue
+no-Mac queue waits at most five minutes to favor latency; the Mac-required queue
 waits at most 15 minutes to amortize scarce macOS capacity.
+
+The Linux `changes` classifier publishes exactly one successful lane marker per
+head: `merge-lane-no-mac` for the false/false state, or `merge-lane-mac` for the
+other three engine/Desktop combinations. Each queue requires its matching
+marker, so a mistaken human label cannot route a Mac-dependent change into the
+no-Mac batch. The combined batch still runs only the union selected by its real
+diff: an engine-only batch does not acquire GUI work, and a Desktop-only batch
+does not acquire engine work.
 
 Labeling writes a `merge-ready-head` success status onto that exact pull-request
 head. Both queues require the status before admission, while their synthetic
@@ -136,7 +146,7 @@ The queue contract lives in `.mergify.yml`:
   newly pushed head from racing asynchronous label revocation;
 - serial mode with one batch in flight, so speculative checks cannot multiply
   scarce macOS capacity;
-- separate non-Desktop and Desktop queues, each with mutually exclusive
+- separate no-Mac and Mac-required queues, each with mutually exclusive
   authorization labels;
 - up to four pull requests per batch, with five-minute and 15-minute maximum
   fill waits respectively;

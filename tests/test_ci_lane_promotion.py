@@ -240,6 +240,27 @@ def test_merge_authorization_labels_do_not_retrigger_product_ci():
         assert "unlabeled" not in triggers["types"]
 
 
+def test_merge_lane_checks_partition_all_classifier_states():
+    no_mac = _job(ENGINE_WORKFLOW, "merge-lane-no-mac")
+    mac = _job(ENGINE_WORKFLOW, "merge-lane-mac")
+
+    assert no_mac["needs"] == "changes"
+    assert mac["needs"] == "changes"
+    assert no_mac["runs-on"] == "ubuntu-latest"
+    assert mac["runs-on"] == "ubuntu-latest"
+
+    no_mac_condition = str(no_mac["if"])
+    assert "needs.changes.result == 'success'" in no_mac_condition
+    assert "needs.changes.outputs.engine != 'true'" in no_mac_condition
+    assert "needs.changes.outputs.desktop != 'true'" in no_mac_condition
+
+    mac_condition = str(mac["if"])
+    assert "needs.changes.result == 'success'" in mac_condition
+    assert "needs.changes.outputs.engine == 'true'" in mac_condition
+    assert "needs.changes.outputs.desktop == 'true'" in mac_condition
+    assert "||" in mac_condition
+
+
 def test_unpromoted_engine_aggregate_requires_fast_linux_and_apple_lanes():
     run = _step_run(ENGINE_WORKFLOW, "tests", "Check test results")
     no_lane = run.index('if [ "$expected" != "true" ]')

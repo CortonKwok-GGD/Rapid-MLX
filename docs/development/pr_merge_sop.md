@@ -238,9 +238,11 @@ Before merge, the PR description must accurately reflect actual current state:
 
 - For an ordinary pull request, apply exactly one integration authorization
   label and let the matching managed queue combine and revalidate it. Use
-  `merge-ready` when the classifier does not select the Desktop lane, or
-  `merge-ready-mac` when it does. Do not manually rebase after queue entry and
-  do not click GitHub's merge button:
+  `merge-ready` only when both `merge-lane-no-mac` is green and
+  `merge-lane-mac` is skipped. Use `merge-ready-mac` when
+  `merge-lane-mac` is green; this includes engine-only, Desktop-only, and
+  cross-cutting changes. Do not manually rebase after queue entry and do not
+  click GitHub's merge button:
 
   ```bash
   # No Desktop/GUI lane:
@@ -250,7 +252,7 @@ Before merge, the PR description must accurately reflect actual current state:
   gh pr edit <PR#> --repo raullenchai/Rapid-MLX --add-label merge-ready-mac
   ```
 
-- The non-Desktop queue waits up to five minutes; the Desktop queue waits up to
+- The no-Mac queue waits up to five minutes; the Mac-required queue waits up to
   15 minutes. Each collects as many as four same-class pull requests, runs the
   affected full lanes once on the combined tree, and then squash-merges each
   original. A failed batch is split to identify the blocking member; do not add

@@ -13,6 +13,10 @@ REQUIRED_CHECKS = {
     "check-success = @github-actions/version-bump-guard",
 }
 HEAD_AUTHORIZATION = "check-success = merge-ready-head"
+LANE_CHECKS = {
+    "no-mac-batch": "check-success = @github-actions/merge-lane-no-mac",
+    "mac-batch": "check-success = @github-actions/merge-lane-mac",
+}
 
 
 def _config() -> dict[str, object]:
@@ -42,11 +46,16 @@ def test_queue_batches_four_ready_prs_after_a_bounded_wait():
 def test_queue_revalidates_every_required_check_on_the_combined_batch():
     rules = _rules_by_name("queue_rules")
 
-    for rule in rules.values():
+    for name, rule in rules.items():
         assert set(rule["queue_conditions"]) >= REQUIRED_CHECKS
         assert HEAD_AUTHORIZATION in rule["queue_conditions"]
+        assert LANE_CHECKS[name] in rule["queue_conditions"]
+        assert not ({*LANE_CHECKS.values()} - {LANE_CHECKS[name]}) & set(
+            rule["queue_conditions"]
+        )
         assert set(rule["merge_conditions"]) == REQUIRED_CHECKS
         assert HEAD_AUTHORIZATION not in rule["merge_conditions"]
+        assert not set(LANE_CHECKS.values()) & set(rule["merge_conditions"])
         assert rule["branch_protection_injection_mode"] == "queue"
         assert rule["queue_branch_prefix"] == "mergify/merge-queue/"
 
