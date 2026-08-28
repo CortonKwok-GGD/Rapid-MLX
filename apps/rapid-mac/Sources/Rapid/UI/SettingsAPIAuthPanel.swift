@@ -128,6 +128,7 @@ struct SettingsAPIAuthPanel: View {
                         NSPasteboard.general.setString(key, forType: .string)
                     }
                     .buttonStyle(.bordered)
+                    .accessibilityIdentifier("Settings.APIAuth.CopyKey")
                 }
             } else {
                 Text("No key stored yet — one is generated on the next model start.")
@@ -147,6 +148,7 @@ struct SettingsAPIAuthPanel: View {
             }
             .buttonStyle(.bordered)
             .disabled(rotating)
+            .accessibilityIdentifier("Settings.APIAuth.RotateKey")
         }
         .confirmationDialog(
             "Rotate API key?",
@@ -156,7 +158,9 @@ struct SettingsAPIAuthPanel: View {
             Button("Rotate & Restart", role: .destructive) {
                 rotateKeyAndRestart()
             }
+            .accessibilityIdentifier("Settings.APIAuth.ConfirmRotate")
             Button("Cancel", role: .cancel) {}
+            .accessibilityIdentifier("Settings.APIAuth.CancelRotate")
         } message: {
             Text("A new key is generated and the engine restarts immediately. In-flight requests are interrupted.")
         }
@@ -165,6 +169,7 @@ struct SettingsAPIAuthPanel: View {
             set: { if !$0 { rotateError = nil } }
         )) {
             Button("OK", role: .cancel) {}
+            .accessibilityIdentifier("Settings.APIAuth.RotationFailedOK")
         } message: {
             Text(rotateError ?? "")
         }
