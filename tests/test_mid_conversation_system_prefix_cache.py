@@ -35,6 +35,8 @@ import pytest
 from vllm_mlx.api.models import Message
 from vllm_mlx.api.responses_adapter import _merge_system_messages as _merge_raw
 
+pytestmark = pytest.mark.real_hf_cache
+
 
 def _merge_system_messages(messages):
     """Relocation is opt-in and only the Anthropic lane opts in."""

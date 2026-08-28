@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for model registry and multi-engine scenarios."""
 
+import functools
 import gc
+import os
+import socket
 
 import pytest
 
@@ -14,16 +17,36 @@ from vllm_mlx import (
     get_registry,
 )
 
+pytestmark = pytest.mark.real_hf_cache
+
 # Use a small model for fast tests
 TEST_MODEL = "mlx-community/Qwen3-0.6B-8bit"
 
 
-@pytest.fixture(scope="module")
-def model_and_tokenizer():
-    """Load model once for all tests in module."""
+@functools.cache
+def _cached_model_and_tokenizer():
     from mlx_lm import load
 
     return load(TEST_MODEL)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_cached_model_and_tokenizer():
+    """Return model memory when this integration module finishes."""
+    yield
+    _cached_model_and_tokenizer.cache_clear()
+    gc.collect()
+    import mlx.core as mx
+
+    mx.clear_cache()
+
+
+@pytest.fixture
+def model_and_tokenizer():
+    """Load once, but only after the function-scoped hermetic guard is armed."""
+    assert os.environ.get("HF_HUB_OFFLINE") == "1"
+    assert getattr(socket.socket.connect, "_hermetic_network_guard", False)
+    return _cached_model_and_tokenizer()
 
 
 class TestModelRegistry:
