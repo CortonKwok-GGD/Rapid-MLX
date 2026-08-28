@@ -209,6 +209,25 @@ def run_pipeline(
             )
             break
 
+    # ``--body-only`` exists to reproduce the description-quality verdict
+    # locally. If that single gate got SKIPPED (via
+    # ``PR_VALIDATE_SKIP_DESC=1``) the run validated nothing — a silent
+    # MERGE-SAFE here would mislead the author into thinking their body is
+    # fine. Surface it as a loud WARNING (non-blocking, the user asked for
+    # the override) rather than a clean pass.
+    if body_only:
+        desc_result = next(
+            (r for r in ctx.results if r.name == "cl_description_quality"), None
+        )
+        if desc_result is not None and desc_result.status == "skip":
+            print(
+                "  WARNING: --body-only ran but the description gate was "
+                "SKIPPED via PR_VALIDATE_SKIP_DESC=1 — this run validated "
+                "NOTHING about the body. Unset that env var and re-run to "
+                "get a real description verdict.",
+                file=sys.stderr,
+            )
+
     # Render the scorecard to stdout (so callers can pipe into PR comments).
     print(render_scorecard(ctx))
 

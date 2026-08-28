@@ -90,6 +90,78 @@ _RATIONALE_SIGNALS = (
     re.compile(r"\bbecause\b", re.IGNORECASE),
 )
 
+# Strip HTML comments (``<!-- ... -->``) BEFORE any scoring so template
+# boilerplate / rationale hidden inside ``<!-- -->`` can't satisfy the
+# "body has rationale" rule. Issue #2510: an UNEDITED
+# ``.github/PULL_REQUEST_TEMPLATE.md`` (with ``[x]`` boxes ticked) was a
+# FALSE green because the template's ``## Why`` / ``## Scope`` headings
+# matched the rationale signals even though all the real prose sat inside
+# HTML comments.
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+# Markdown headings ``#``..``######``, for slicing the body into sections.
+_HEADING = re.compile(r"^(#{1,6})\s+(\S.*)$", re.MULTILINE)
+
+# The two contract headings whose sections must carry real prose. A PR
+# that uses the template but leaves ``## Why`` / ``## Scope`` empty (their
+# only content being an HTML comment) must FAIL — the whole point of issue
+# #2510. Only these two matter; optional/empty sections elsewhere (e.g. a
+# newer ``## Author`` field) are deliberately NOT gated so a legitimate PR
+# with real Why/Scope prose but an empty Author field still passes.
+_CONTRACT_HEADINGS = ("why", "scope")
+
+# Markdown furniture stripped from the front of a line before deciding
+# whether it counts as "substantive prose" — blank lines, bullet/quote
+# prefixes, and task-list checkboxes (``- [ ]`` / ``- [x]``).
+_FURNITURE = re.compile(r"^[\s>*+\-\[\]xX]*")
+
+
+def _strip_comments(body: str) -> str:
+    """Return ``body`` with every ``<!-- ... -->`` HTML comment removed.
+
+    Comment content is inert markdown that GitHub renders hidden; it must
+    not count toward "does this PR explain WHY?" — an author can leave the
+    entire template in place (all prose inside comments) and the body
+    would look well-formed while carrying zero real rationale.
+    """
+    return _HTML_COMMENT.sub("", body)
+
+
+def _sections(body: str) -> dict[str, str]:
+    """Split a body into per-heading sections keyed by lowercased heading
+    text. A section runs from its heading to the next heading at the SAME
+    or HIGHER level (a ``###`` subheading stays within its parent). Each
+    value is the section's prose (the heading line itself excluded)."""
+    matches = list(_HEADING.finditer(body))
+    sections: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        level = len(m.group(1))
+        start = m.end()
+        end = len(body)
+        for j in range(i + 1, len(matches)):
+            if len(matches[j].group(1)) <= level:
+                end = matches[j].start()
+                break
+        name = m.group(2).strip().lower()
+        sections[name] = body[start:end]
+    return sections
+
+
+def _is_substantive_prose(text: str) -> bool:
+    """True if ``text`` contains at least one real word after stripping
+    markdown furniture (bullets, quotes, checkboxes, blank lines) from each
+    line. Rejects a section whose "content" is only markdown decoration or
+    that is empty once HTML comments (the template's hiding place) are
+    removed."""
+    for line in text.splitlines():
+        stripped = _FURNITURE.sub("", line)
+        # ``[^\W\d_]`` matches any unicode letter (word char, not digit/_). A
+        # real rationale line always has at least one letter after furniture.
+        if re.search(r"[^\W\d_]", stripped):
+            return True
+    return False
+
+
 _OVERRIDE_ENV = "PR_VALIDATE_SKIP_DESC"
 
 
@@ -110,6 +182,10 @@ class CLDescriptionQualityStep(Step):
 
         title = (ctx.pr_title or "").strip()
         body = (ctx.pr_body or "").strip()
+        # Everything below scores the COMMENT-STRIPPED body so template
+        # boilerplate hidden in ``<!-- -->`` can never satisfy "body exists"
+        # or "body has rationale" (issue #2510).
+        stripped = _strip_comments(body).strip()
 
         # 1) Title check — strip a conventional-commit prefix if present
         # so "fix: bug" still trips the bad-pattern net, but
@@ -159,12 +235,14 @@ class CLDescriptionQualityStep(Step):
                     ),
                 )
 
-        # 2) Body must exist
-        if not body:
+        # 2) Body must exist. Scored on the comment-stripped body: a body
+        # whose only content is ``<!-- … -->`` is effectively empty (issue
+        # #2510) — the template's skeleton must not read as a real body.
+        if not stripped:
             return StepResult(
                 name=self.name,
                 status="fail",
-                summary="PR body is empty",
+                summary="PR body is empty (or only HTML comments)",
                 details=(
                     "Every PR needs a body explaining the WHY: what problem "
                     "is being solved and why this approach. "
@@ -188,13 +266,49 @@ class CLDescriptionQualityStep(Step):
                 ),
             )
 
-        # 3) Body must contain a rationale signal
+        # 3) Body must explain WHY.
+        #
+        # 3a) If the author used the ``## Why`` / ``## Scope`` contract
+        # headings, those sections must carry real prose — NOT just the
+        # heading. An UNEDITED template has all its prose inside HTML
+        # comments, so after comment-strip ``## Why`` is immediately
+        # followed by ``## Scope`` with nothing in between → empty → FAIL.
+        # Only these two headings are gated; optional/empty sections
+        # elsewhere (e.g. a newer ``## Author`` field) never false-fail a
+        # PR that has real Why/Scope prose.
+        sections = _sections(stripped)
+        for heading in _CONTRACT_HEADINGS:
+            if heading in sections and not _is_substantive_prose(sections[heading]):
+                return StepResult(
+                    name=self.name,
+                    status="fail",
+                    summary=f"`## {heading.title()}` section is empty (unfilled template)",
+                    details=(
+                        f"The PR has a `## {heading.title()}` heading but that "
+                        "section carries no prose — its only content is an "
+                        "HTML comment or markdown furniture. The template's "
+                        "comment blocks are guide rails, not a filled-in "
+                        "answer.\n\n"
+                        f"Rewrite the `## {heading.title()}` section with the "
+                        "actual rationale (issue #2510): what problem is "
+                        "being solved and why this approach.\n\n"
+                        f"Current section (after removing `<!-- -->` "
+                        f"comments):\n```\n{sections[heading].strip() or '(empty)'}\n```"
+                    ),
+                )
+
+        # 3b) Body must carry a rationale signal. Evaluated on the
+        # comment-stripped body so comment-only prose (e.g. a lone
+        # ``<!-- because … -->``) never satisfies the check. This keeps the
+        # lenient paths intact for PRs that DON'T use the template headings
+        # — an inline ``Why:`` line, a ``Closes #N`` link, or a because-
+        # clause, and the ``## Why`` heading itself for template users.
         for pattern in _RATIONALE_SIGNALS:
-            if pattern.search(body):
+            if pattern.search(stripped):
                 return StepResult(
                     name=self.name,
                     status="pass",
-                    summary=f"title OK + body has rationale ({len(body)} chars)",
+                    summary=f"title OK + body has rationale ({len(stripped)} chars)",
                 )
 
         return StepResult(
@@ -202,7 +316,7 @@ class CLDescriptionQualityStep(Step):
             status="fail",
             summary="PR body has no rationale signal (no 'why', no 'closes #', no 'because')",
             details=(
-                f"Body is {len(body)} chars but contains no recognizable "
+                f"Body is {len(stripped)} chars but contains no recognizable "
                 "rationale signal. Add one of:\n"
                 "- A heading like `## Why`, `## Rationale`, `## Motivation`, "
                 "or `## Background`.\n"

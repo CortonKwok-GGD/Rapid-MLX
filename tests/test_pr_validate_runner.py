@@ -379,6 +379,29 @@ class TestBodyOnly:
         assert rc == 0  # template body → desc gate passes
         assert "## [cl_description_quality]" in captured.err
 
+    def test_body_only_with_skip_desc_warns_not_silent_pass(
+        self, repo_root_cwd, capsys, monkeypatch
+    ):
+        """``--body-only`` + ``PR_VALIDATE_SKIP_DESC=1`` must WARN rather
+        than silently report MERGE-SAFE. In body-only mode the description
+        gate is the ONLY check; if the override skips it, the run validated
+        nothing and a clean verdict would mislead the author (issue #2510)."""
+        monkeypatch.setenv("PR_VALIDATE_SKIP_DESC", "1")
+        self._stub_fetch(
+            monkeypatch,
+            title="feat: some perfectly good title",
+            body="## Why\nfixes #123 (a real rationale)\n## Scope\n- real",
+        )
+        rc = run_pipeline(pr_number=999, body_only=True)
+        captured = capsys.readouterr()
+        # Skip is neutral → non-blocking exit code still 0 (user asked for
+        # the override), but the run must NOT be a silent pass: a loud
+        # warning tells the author nothing about the body was validated.
+        assert rc == 0
+        assert "WARNING" in captured.err
+        assert "PR_VALIDATE_SKIP_DESC" in captured.err
+        assert "validated" in captured.err
+
 
 class TestBaseOverrideValidation:
     def test_bad_base_sha_fails_fast_with_clear_message(self, repo_root_cwd, capsys):
