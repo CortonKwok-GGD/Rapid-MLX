@@ -138,8 +138,18 @@ struct SettingsAPIAuthPanel: View {
                 )
             }
 
-            Button(rotating ? "Rotating…" : "Rotate key") {
+            Button {
                 confirmingRotate = true
+            } label: {
+                if rotating {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 14)
+                    Text("Rotating…")
+                } else {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                    Text("Rotate key")
+                }
             }
             .buttonStyle(.bordered)
             .disabled(rotating)
