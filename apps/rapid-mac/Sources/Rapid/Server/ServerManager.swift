@@ -3096,7 +3096,7 @@ final class ServerManager {
             // #17: see shutdownSync — bearer is dead the moment the
             // child is.
             setActiveServerSession(bearer: nil)
-        activeAuthMode = nil
+            activeAuthMode = nil
             startedAt = nil
             // Issue #278: defensive teardown also has to honour the
             // "readyAt cleared on every child exit" invariant in
