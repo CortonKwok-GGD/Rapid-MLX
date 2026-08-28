@@ -88,10 +88,10 @@ struct SettingsView: View {
         case performance
         case appearance
         case privacy
-        /// Issue #17 configurable local API authentication: random /
-        /// fixed / off. Lives next to privacy because it is a security
-        /// surface — the bearer is the only gate between any local
-        /// process and the engine's GPU.
+        /// Issue #17 configurable local API authentication: key
+        /// lifetime (launch / 24h / permanent), Keychain-backed. Lives
+        /// next to privacy because it is a security surface — the bearer
+        /// is the only gate between any local process and the engine.
         case apiAuth
         /// Rapid-MLX Desktop app updates. The .app self-update is the
         /// only correct way to bump the bundled engine.
