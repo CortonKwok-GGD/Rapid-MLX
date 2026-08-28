@@ -55,7 +55,9 @@ jobs:
               --github-output "$GITHUB_OUTPUT"
             full_gate=false
             if [ "$FULL_CI" = true ] || \
-              { [[ "$HEAD_REF" == train/* ]] && [ "$HEAD_REPO" = "$REPO" ]; }; then
+              { [ "$HEAD_REPO" = "$REPO" ] && \
+                { [[ "$HEAD_REF" == train/* ]] || \
+                  [[ "$HEAD_REF" =~ ^mergify/merge-queue/[0-9a-f]{10}$ ]]; }; }; then
               full_gate=true
             fi
             echo "full_gate=$full_gate" >> "$GITHUB_OUTPUT"
@@ -379,6 +381,7 @@ jobs:
             tests/test_desktop_manifest.py \
             tests/test_classify_ci_changes.py \
             tests/test_ci_lane_promotion.py \
+            tests/test_mergify_batch_queue.py \
             tests/test_ci_apple_coverage_union.py \
             tests/test_check_mlx_upstream_calls.py \
             tests/test_no_out_of_band_routing.py \
