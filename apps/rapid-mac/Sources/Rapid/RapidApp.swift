@@ -197,11 +197,17 @@ struct RapidApp: App {
         let mcpCatalog = MCPCatalog { [weak manager] in
             // Only report an endpoint once the child answered /healthz —
             // polling a starting server just logs connection refusals, and a
-            // stopped one has no bearer to authenticate with.
-            guard let manager, manager.servingAlias != nil else { return nil }
-            // Every spawn resolves a bearer (no unauthenticated mode), so
-            // the endpoint always authenticates via the live secret.
-            return (host: manager.host, port: manager.activePort, bearer: manager.activeBearer)
+            // stopped one has no bearer to authenticate with. Both the
+            // ready state AND a live bearer are demanded: terminateChild
+            // clears the bearer a moment before handleChildExit flips the
+            // state, and an endpoint with a nil bearer would make the
+            // client send unauthenticated requests into an authenticated
+            // engine (401s). Every spawn resolves a bearer (no
+            // unauthenticated mode), so this guard never blocks a healthy
+            // serving endpoint.
+            guard let manager, manager.servingAlias != nil,
+                  let bearer = manager.activeBearer else { return nil }
+            return (host: manager.host, port: manager.activePort, bearer: bearer)
         }
         let mcpRegistry = MCPToolRegistry(catalog: mcpCatalog, approval: mcpApprovalStore)
         let toolRegistry = CompositeToolRegistry(builtin: builtinRegistry, mcp: mcpRegistry)
