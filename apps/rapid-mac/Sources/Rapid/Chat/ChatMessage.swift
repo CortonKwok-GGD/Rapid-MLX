@@ -4,6 +4,66 @@ import UniformTypeIdentifiers
 
 struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable {
     static let maxBytes = 20 * 1024 * 1024
+    /// Per-message image budget, mirroring the document attachment budget
+    /// (``ChatFileAttachment/maxAttachmentsPerMessage`` and friends). The
+    /// per-file 20 MB cap is not enough on its own: a multi-select or drop can
+    /// present dozens of individually valid images, and decoding every one and
+    /// base64-encoding the whole set into a single request would freeze or
+    /// exhaust the Desktop process. `maxImagesPerMessage` bounds the count and
+    /// ``maxCombinedEncodedImageBytes`` bounds the aggregate **encoded** bytes.
+    static let maxImagesPerMessage = 4
+    /// Combined budget for the images in one message, measured in exact
+    /// encoded `data:<mime>;base64,…` byte counts, not raw `Data.count`.
+    /// Each image travels over the wire as a base64 data URL, so raw bytes
+    /// under-count the request by ~4/3 and can deterministically blow past the
+    /// engine's 8 MiB request-body cap with a 413. This budget stays below
+    /// that cap while leaving dedicated room for text, history, tools, and
+    /// JSON framing. **Value under review: Pixel (product).**
+    static let maxCombinedEncodedImageBytes = 6 * 1024 * 1024
+
+    /// A human-readable form of ``maxCombinedEncodedImageBytes`` for notices.
+    static var formattedCombinedImageBudget: String {
+        let bytes = maxCombinedEncodedImageBytes
+        let mb = Double(bytes) / Double(1024 * 1024)
+        if mb == mb.rounded() { return "\(Int(mb)) MB" }
+        return String(format: "%.1f MB", mb)
+    }
+
+    /// User-facing explanation for attachments rejected by the per-message
+    /// image budget. Keeping this copy beside the limits lets both the pre-read
+    /// picker gate and the authoritative post-normalization gate report the
+    /// same count and binding reason.
+    static func budgetNotice(
+        rejectedCount: Int = 0,
+        limit: ImageBudgetLimit = .count
+    ) -> String {
+        let budget = formattedCombinedImageBudget
+        let base = "Attach up to \(maxImagesPerMessage) images or \(budget) of images per message."
+        guard rejectedCount > 0 else { return base }
+        let reason: String = switch limit {
+        case .count: "too many images"
+        case .bytes: "their combined size exceeds the \(budget) budget"
+        }
+        let plural = rejectedCount == 1 ? "image was" : "images were"
+        return "\(base) \(rejectedCount) \(plural) not added — \(reason)."
+    }
+
+    /// Why ``importCandidates(_:existingCount:existingBytes:)`` dropped a
+    /// candidate. Kept distinct so a notice can tell the user whether the
+    /// count or the combined-byte budget was the binding limit.
+    enum ImageBudgetLimit {
+        case count
+        case bytes
+    }
+
+    /// Exact number of bytes a `data:<mime>;base64,<payload>` URL occupies for
+    /// `rawBytes` of payload, without materialising the base64 string.
+    /// `"data:"` + `<mime>` + `";base64,"` + base64(data); base64 of `n` bytes
+    /// is `4 * ceil(n / 3)` and the integer `(n + 2) / 3 * 4` avoids floats.
+    static func encodedDataURLByteCount(mimeType: String, rawBytes: Int) -> Int {
+        let base64 = ((rawBytes + 2) / 3) * 4
+        return 5 + mimeType.utf8.count + 8 + base64
+    }
     /// Keep image preprocessing below the embedded engine's per-request
     /// vision-token budget. A 2048 × 1536 image is roughly 4K vision tokens
     /// on the recommended model, leaving useful margin below its 8K cap.
@@ -29,6 +89,62 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
             max(1, Int((Double(width) * scale).rounded())),
             max(1, Int((Double(height) * scale).rounded()))
         )
+    }
+
+    /// Bound work before reading any selected image. The per-file 20 MB cap
+    /// is enforced at read time; this pre-read gate stops the count and the
+    /// aggregate bytes from growing unbounded across a multi-select/drop, which
+    /// would otherwise decode and retain every image and base64 them all into a
+    /// single request. Accepted order matches the selection; each candidate's
+    /// on-disk file size is the pre-read estimate for the aggregate byte gate,
+    /// charged at the encoded data-URL rate. The exact post-decode gate
+    /// (``ChatImageAttachment/fittedForMessage(_:)``) is authoritative and is
+    /// also applied at the wire, so a small pre-read skew cannot admit an
+    /// over-budget request.
+    static func importCandidates(
+        _ urls: [URL],
+        existingCount: Int,
+        existingBytes: Int
+    ) -> (accepted: [URL], rejectedCount: Int, limit: ImageBudgetLimit) {
+        var accepted: [URL] = []
+        var remainingCount = max(0, maxImagesPerMessage - max(0, existingCount))
+        var remainingBytes = max(0, maxCombinedEncodedImageBytes - max(0, existingBytes))
+        var limit: ImageBudgetLimit = .count
+        for url in urls {
+            guard remainingCount > 0 else { break }
+            let size = (
+                try? url.resourceValues(forKeys: [.fileSizeKey])
+            )?.fileSize ?? 0
+            // MIME is unknown before read; its prefix differs by one byte, which
+            // is immaterial at this pre-read stage.
+            let estimatedEncoded = encodedDataURLByteCount(mimeType: "image/jpeg", rawBytes: size)
+            guard estimatedEncoded <= remainingBytes else {
+                limit = .bytes
+                continue
+            }
+            accepted.append(url)
+            remainingCount -= 1
+            remainingBytes -= estimatedEncoded
+        }
+        return (accepted, max(0, urls.count - accepted.count), limit)
+    }
+
+    /// Returns the ordered subset that fits the per-message image budget (count
+    /// and combined bytes). Images cannot be truncated the way document text is
+    /// (``ChatFileAttachment/fittedForMessage(_:)``), so an image that does not
+    /// fit is dropped rather than reduced.
+    static func fittedForMessage(
+        _ attachments: [ChatImageAttachment]
+    ) -> [ChatImageAttachment] {
+        var result: [ChatImageAttachment] = []
+        var remainingBytes = maxCombinedEncodedImageBytes
+        for attachment in attachments {
+            guard result.count < maxImagesPerMessage,
+                  attachment.encodedDataURLByteCount <= remainingBytes else { continue }
+            result.append(attachment)
+            remainingBytes -= attachment.encodedDataURLByteCount
+        }
+        return result
     }
 
     let id: UUID
@@ -181,6 +297,12 @@ struct ChatImageAttachment: Codable, Equatable, Hashable, Identifiable, Sendable
     }
 
     var dataURL: String { "data:\(mimeType);base64,\(data.base64EncodedString())" }
+
+    /// Exact number of bytes this attachment's `dataURL` occupies on the wire,
+    /// without materialising `dataURL` just to measure it.
+    var encodedDataURLByteCount: Int {
+        Self.encodedDataURLByteCount(mimeType: mimeType, rawBytes: data.count)
+    }
 
     enum ValidationError: LocalizedError {
         case tooLarge, tooManyPixels, unsupportedType, animatedGIF

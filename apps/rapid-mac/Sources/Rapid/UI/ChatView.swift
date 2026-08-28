@@ -1021,19 +1021,48 @@ struct ChatView: View {
     /// phone capture, so keep it off the main actor. The conversation-keyed
     /// generation contract mirrors document imports: a late result cannot land
     /// in whichever conversation happens to be visible by then.
+    ///
+    /// The picker/drop counts against a per-message image budget (count and
+    /// combined bytes), gated here before any decode work, exactly like
+    /// ``addFileURLs(_:)`` gates documents.
     @discardableResult
     private func addImageURLs(_ urls: [URL]) -> Bool {
+        let existing = attachmentDraft.images
+        let selection = ChatImageAttachment.importCandidates(
+            urls,
+            existingCount: existing.count,
+            existingBytes: existing.reduce(0) { $0 + $1.encodedDataURLByteCount }
+        )
+        guard !selection.accepted.isEmpty else {
+            attachmentDraft.notice = ChatImageAttachment.budgetNotice(
+                rejectedCount: selection.rejectedCount,
+                limit: selection.limit
+            )
+            return false
+        }
         guard let importRequest = attachmentDrafts.beginImageImport(
             conversationID: viewModel.activeConversationID
         ) else { return false }
         Task { @MainActor in
             let outcome = await Task.detached(priority: .userInitiated) {
-                Self.loadImageAttachments(urls)
+                Self.loadImageAttachments(selection.accepted)
             }.value
+            // Merge distinct reasons instead of replacing one with the other: a
+            // batch can drop candidates at the pre-read budget gate AND contain
+            // an invalid / oversize-20 MB file discovered at decode time. The
+            // notice keeps both, and names how many and why.
+            var notice = outcome.rejection
+            if selection.rejectedCount > 0 {
+                let budget = ChatImageAttachment.budgetNotice(
+                    rejectedCount: selection.rejectedCount,
+                    limit: selection.limit
+                )
+                notice = notice.map { "\(budget) \($0)" } ?? budget
+            }
             attachmentDrafts.finishImageImport(
                 request: importRequest,
                 outcome.accepted,
-                notice: outcome.rejection
+                notice: notice
             )
         }
         return true
@@ -1149,10 +1178,16 @@ struct ChatView: View {
                 return true
             }
             do {
-                attachmentDraft.appendImage(try ChatImageAttachment(
+                let pasted = try ChatImageAttachment(
                     filename: "Pasted image.png", mimeType: "image/png", data: png
-                ))
-                attachmentDraft.notice = nil
+                )
+                // The draft's own budget gate rejects a paste that would exceed
+                // the per-message image count or combined-byte budget.
+                if attachmentDraft.appendImage(pasted) {
+                    attachmentDraft.notice = nil
+                } else {
+                    attachmentDraft.notice = ChatImageAttachment.budgetNotice()
+                }
             } catch { attachmentDraft.notice = error.localizedDescription }
         }
         return true

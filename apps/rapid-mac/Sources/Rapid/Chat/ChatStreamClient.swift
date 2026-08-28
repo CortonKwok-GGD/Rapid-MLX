@@ -944,14 +944,22 @@ enum Wire {
         init(from message: ChatMessage, includeImages: Bool = true) {
             self.role = message.role.rawValue
             let modelContent = message.modelContent
-            if message.imageAttachments.isEmpty || !includeImages {
+            // Defense in depth: re-apply the per-message image budget at the
+            // wire, so a restored or pre-limit message can never resend more
+            // encoded image bytes than the request body can carry (413). Normal
+            // in-app sends were already fitted at the draft, making this a
+            // no-op for them.
+            let images = includeImages
+                ? ChatImageAttachment.fittedForMessage(message.imageAttachments)
+                : []
+            if images.isEmpty {
                 self.content = .text(modelContent)
             } else {
                 var parts: [ContentPart] = []
                 if !modelContent.isEmpty {
                     parts.append(.init(type: "text", text: modelContent, image_url: nil))
                 }
-                parts.append(contentsOf: message.imageAttachments.map {
+                parts.append(contentsOf: images.map {
                     .init(type: "image_url", text: nil, image_url: .init(url: $0.dataURL))
                 })
                 self.content = .parts(parts)

@@ -25,15 +25,53 @@ struct ChatAttachmentDraft: Equatable {
     var hasAttachments: Bool { !images.isEmpty || !files.isEmpty }
     var isImportingFiles: Bool { fileImportID != nil || imageImportID != nil }
 
-    mutating func appendImage(_ image: ChatImageAttachment, sourceURL: URL? = nil) {
+    /// Appends a single image only when it fits the per-message image budget
+    /// (count and combined bytes). Returns `false` (and appends nothing) when
+    /// the budget is already exhausted, so a caller can surface a notice. This
+    /// is the draft-level companion to ``ChatImageAttachment/importCandidates``:
+    /// the pre-read gate bounds the picker/drop, and this bounds the direct
+    /// paste path and any late import completion.
+    @discardableResult
+    mutating func appendImage(
+        _ image: ChatImageAttachment,
+        sourceURL: URL? = nil
+    ) -> Bool {
+        guard Self.canAppend(image, to: images) else { return false }
         images.append(image)
         if let sourceURL { sourcePaths[image.id] = Self.attachmentKey(for: sourceURL) }
+        return true
     }
 
+    /// Appends each imported image that still fits the per-message image budget,
+    /// preserving order and source identity, and returns how many were rejected
+    /// for exceeding it. Mirrors how file imports apply their fitted budget;
+    /// the existing, already-fitted images always precede the imported ones, so
+    /// the shared gate keeps only the imported subset that still fits.
+    @discardableResult
     mutating func appendImages(
         _ imported: [(attachment: ChatImageAttachment, sourceURL: URL)]
-    ) {
-        for item in imported { appendImage(item.attachment, sourceURL: item.sourceURL) }
+    ) -> Int {
+        let fitted = ChatImageAttachment.fittedForMessage(
+            images + imported.map(\.attachment)
+        )
+        let kept = imported.filter { attachment, _ in
+            fitted.contains { $0.id == attachment.id }
+        }
+        for item in kept {
+            images.append(item.attachment)
+            sourcePaths[item.attachment.id] = Self.attachmentKey(for: item.sourceURL)
+        }
+        return imported.count - kept.count
+    }
+
+    private static func canAppend(
+        _ image: ChatImageAttachment,
+        to images: [ChatImageAttachment]
+    ) -> Bool {
+        guard images.count < ChatImageAttachment.maxImagesPerMessage else { return false }
+        let existingBytes = images.reduce(0) { $0 + $1.encodedDataURLByteCount }
+        return existingBytes + image.encodedDataURLByteCount
+            <= ChatImageAttachment.maxCombinedEncodedImageBytes
     }
 
     mutating func beginImageImport() -> UUID? {
@@ -54,12 +92,27 @@ struct ChatAttachmentDraft: Equatable {
         notice: String?
     ) -> Bool {
         guard imageImportID == id else { return false }
-        appendImages(imported)
-        if let notice {
-            if let current = self.notice, current != notice {
-                self.notice = "\(current) \(notice)"
+        let combinedCount = images.count + imported.count
+        let budgetRejectedCount = appendImages(imported)
+        var mergedNotice = notice
+        if budgetRejectedCount > 0 {
+            // The on-disk pre-read estimate can differ from the normalized
+            // PNG/JPEG payload. This is the authoritative post-normalization
+            // gate, so its late rejection must be visible rather than silently
+            // dropping an image that the picker initially admitted.
+            let limit: ChatImageAttachment.ImageBudgetLimit =
+                combinedCount > ChatImageAttachment.maxImagesPerMessage ? .count : .bytes
+            let budgetNotice = ChatImageAttachment.budgetNotice(
+                rejectedCount: budgetRejectedCount,
+                limit: limit
+            )
+            mergedNotice = mergedNotice.map { "\(budgetNotice) \($0)" } ?? budgetNotice
+        }
+        if let mergedNotice {
+            if let current = self.notice, current != mergedNotice {
+                self.notice = "\(current) \(mergedNotice)"
             } else {
-                self.notice = notice
+                self.notice = mergedNotice
             }
         }
         imageImportID = nil
