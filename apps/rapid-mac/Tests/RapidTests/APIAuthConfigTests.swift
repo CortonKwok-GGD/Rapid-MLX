@@ -25,11 +25,6 @@ private final class InMemoryKeychain: KeychainStoring, @unchecked Sendable {
 
     func read(account: String) -> String? { items[account] }
 
-    func readWithoutUserInteraction(account: String) -> KeychainReadResult {
-        if let value = items[account] { return .found(value) }
-        return .missing
-    }
-
     @discardableResult
     func write(account: String, secret: String) -> Bool {
         if failWrites { return false }
@@ -61,6 +56,10 @@ private final class InMemoryKeychain: KeychainStoring, @unchecked Sendable {
 /// secret lives in the Keychain. Tests inject both a throwaway UserDefaults
 /// suite and an in-memory Keychain, and restore the real stores in
 /// teardown so the developer's preferences/Keychain are never touched.
+/// @MainActor: the suite swaps the global APIAuthConfig.defaults /
+/// keychain for each test, so tests must not run concurrently (Swift
+/// Testing would otherwise race the static store swaps).
+@MainActor
 @Suite("APIAuthConfig — key lifetime (launch / 24h / permanent)")
 final class APIAuthConfigTests {
     /// TestDefaultsScope pattern: name suites per-test, clean up on deinit so
@@ -304,5 +303,67 @@ final class APIAuthConfigTests {
         keychain.failDeletes = true
         #expect(!APIAuthConfig.clearPersistedKey(),
                 "ACL-refused delete must surface as false so the UI warns the old key may resurface")
+    }
+
+    // MARK: - spawn/client path contracts (owner review)
+
+    @Test("spawn env carries the current effective bearer (fresh 24h key)")
+    func testSpawnEnvCarriesEffectiveBearer() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .hours24
+        let bearer = try #require(APIAuthConfig.bearerForSpawn())
+        // Real spawn-path contract: ServerManager.serveEnvironmentAdditions
+        // is exactly what the spawn uses to build the sidecar env (Layer 2).
+        let env = ServerManager.serveEnvironmentAdditions(
+            bearer: bearer,
+            ambient: ["PATH": "/usr/bin:/bin"]
+        )
+        #expect(env["RAPID_MLX_API_KEY"] == bearer,
+                "spawn env must carry the bearer the spawn actually resolved")
+        #expect(env["RAPID_MLX_API_KEY"] != nil,
+                "a live spawn must never be unauthenticated")
+    }
+
+    @Test("spawn env reflects the rotated key after 24h expiry (runtime enforcement)")
+    func testSpawnEnvRotatesAfterExpiry() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .hours24
+        let now = Date()
+        let first = try #require(APIAuthConfig.bearerForSpawn(now: now))
+        // A later spawn past the 24h lifetime must resolve a NEW key and
+        // carry it into the spawn env — the engine never starts with an
+        // expired secret.
+        let expired = now.addingTimeInterval(25 * 60 * 60)
+        let rotated = try #require(APIAuthConfig.bearerForSpawn(now: expired))
+        #expect(rotated != first, "expired 24h key must rotate at spawn")
+        let env = ServerManager.serveEnvironmentAdditions(
+            bearer: rotated,
+            ambient: ["PATH": "/usr/bin:/bin"]
+        )
+        #expect(env["RAPID_MLX_API_KEY"] == rotated)
+        #expect(env["RAPID_MLX_API_KEY"] != first,
+                "spawn env must never carry the expired key")
+    }
+
+    @Test("client path uses the same bearer the spawn resolved")
+    func testClientPathMatchesSpawnBearer() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .hours24
+        let bearer = try #require(APIAuthConfig.bearerForSpawn())
+        let env = ServerManager.serveEnvironmentAdditions(
+            bearer: bearer,
+            ambient: ["PATH": "/usr/bin:/bin"]
+        )
+        let spawnValue = env["RAPID_MLX_API_KEY"]
+        #expect(spawnValue == bearer)
+        // ChatStreamClient is driven with the manager's activeBearer; the
+        // contract is that this is the SAME value the spawn injected. The
+        // full header-on-wire assertion lives in ChatStreamBearerAuthTests;
+        // this pins the value identity between spawn and client.
+        let header = "Bearer \(spawnValue ?? "")"
+        #expect(header == "Bearer \(bearer)")
     }
 }
