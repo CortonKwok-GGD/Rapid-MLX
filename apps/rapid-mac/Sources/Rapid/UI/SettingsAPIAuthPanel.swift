@@ -117,19 +117,14 @@ struct SettingsAPIAuthPanel: View {
             }
 
             if let key = displayedKey {
-                HStack(spacing: RapidTheme.Space.md) {
-                    Text(masked(key))
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                        .accessibilityIdentifier("Settings.APIAuth.KeyDisplay")
-                    Spacer()
-                    Button("Copy") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(key, forType: .string)
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("Settings.APIAuth.CopyKey")
-                }
+                // Same eye-toggle + Copy row as the Connect (launch) page —
+                // shared component so the two surfaces can never drift.
+                CopyableRow(
+                    label: "API key",
+                    value: key,
+                    masked: true,
+                    identifierPrefix: "Settings.APIAuth"
+                )
             } else {
                 Text("No key stored yet — one is generated on the next model start.")
                     .font(RapidFont.secondary)
@@ -220,7 +215,4 @@ struct SettingsAPIAuthPanel: View {
         return APIAuthConfig.persistedKey
     }
 
-    private func masked(_ key: String) -> String {
-        String(repeating: "•", count: min(key.count, 16))
-    }
 }
