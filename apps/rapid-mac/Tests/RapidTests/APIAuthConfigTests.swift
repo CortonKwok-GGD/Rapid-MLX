@@ -62,11 +62,11 @@ private final class InMemoryKeychain: KeychainStoring, @unchecked Sendable {
 /// secret lives in the Keychain. Tests inject both a throwaway UserDefaults
 /// suite and an in-memory Keychain, and restore the real stores in
 /// teardown so the developer's preferences/Keychain are never touched.
-/// @MainActor: the suite swaps the global APIAuthConfig.defaults /
-/// keychain for each test, so tests must not run concurrently (Swift
-/// Testing would otherwise race the static store swaps).
+/// `@MainActor` keeps each mutation actor-safe; `.serialized` additionally
+/// prevents a test that awaits the persistence actor from yielding to another
+/// case that swaps the same global stores.
 @MainActor
-@Suite("APIAuthConfig — key lifetime (launch / 24h / permanent)")
+@Suite("APIAuthConfig — key lifetime (launch / 24h / permanent)", .serialized)
 final class APIAuthConfigTests {
     /// TestDefaultsScope pattern: name suites per-test, clean up on deinit so
     /// ``~/Library/Preferences`` never accumulates straggler plists.
