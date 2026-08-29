@@ -439,7 +439,6 @@ final class APIAuthConfigTests {
 
         let resolved = try #require(APIAuthConfig.resolvedBearerForSpawn())
         let displayed = SettingsAPIAuthPanel.displayedKey(
-            persistenceDegraded: resolved.persistenceDegraded,
             activeBearer: resolved.secret,
             persistedKey: APIAuthConfig.persistedKey
         )
@@ -449,6 +448,21 @@ final class APIAuthConfigTests {
         #expect(resolved.secret != old)
         #expect(APIAuthConfig.persistedKey == old, "refused upsert leaves the stale item in Keychain")
         #expect(displayed == resolved.secret, "Settings must copy the bearer accepted by the live child")
+    }
+
+    @Test("running child bearer stays displayed until rotation restart succeeds")
+    func testActiveBearerWinsDuringRotationRestartRace() {
+        let active = String(repeating: "a", count: 64)
+        let newlyPersisted = String(repeating: "b", count: 64)
+
+        #expect(SettingsAPIAuthPanel.displayedKey(
+            activeBearer: active,
+            persistedKey: newlyPersisted
+        ) == active)
+        #expect(SettingsAPIAuthPanel.displayedKey(
+            activeBearer: nil,
+            persistedKey: newlyPersisted
+        ) == newlyPersisted)
     }
 
     @Test("server publishes persisted auth from an asynchronous snapshot")

@@ -238,22 +238,19 @@ struct SettingsAPIAuthPanel: View {
         }
     }
 
-    /// In degraded mode the child is running with a strong session-only key
-    /// while an older, expired item may still exist in Keychain. Showing that
-    /// stale item would make every copied request fail with 401, so the live
-    /// child bearer wins until the child exits.
+    /// A running child always owns the credential users can use right now.
+    /// The persisted snapshot can differ briefly after Rotate but before a
+    /// replacement child starts, or indefinitely when restart fails. Showing
+    /// it during either window would make copied requests fail with 401.
     static func displayedKey(
-        persistenceDegraded: Bool,
         activeBearer: String?,
         persistedKey: String?
     ) -> String? {
-        if persistenceDegraded { return activeBearer }
-        return persistedKey
+        activeBearer ?? persistedKey
     }
 
     private var displayedKey: String? {
         Self.displayedKey(
-            persistenceDegraded: server.authPersistenceDegraded,
             activeBearer: server.activeBearer,
             persistedKey: server.authPersistence.persistedKey
         )
