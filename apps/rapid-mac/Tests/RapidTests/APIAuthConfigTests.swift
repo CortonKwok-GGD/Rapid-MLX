@@ -144,6 +144,28 @@ final class APIAuthConfigTests {
         #expect(manager.activeBearer == "existing-bearer")
     }
 
+    @Test("restart preserves the current model path only for the same alias")
+    func testRestartHFPathResolution() {
+        #expect(ServerManager.resolveRestartHFPath(
+            requestedAlias: "custom-model",
+            explicitHFPath: nil,
+            launchedAlias: "CUSTOM-MODEL",
+            launchedHFPath: "/models/custom-model"
+        ) == "/models/custom-model")
+        #expect(ServerManager.resolveRestartHFPath(
+            requestedAlias: "different-model",
+            explicitHFPath: nil,
+            launchedAlias: "custom-model",
+            launchedHFPath: "/models/custom-model"
+        ) == nil)
+        #expect(ServerManager.resolveRestartHFPath(
+            requestedAlias: "custom-model",
+            explicitHFPath: "owner/explicit-repo",
+            launchedAlias: "custom-model",
+            launchedHFPath: "/models/custom-model"
+        ) == "owner/explicit-repo")
+    }
+
     // MARK: - storage split (review: no secret in defaults)
 
     @Test("secret never lands in UserDefaults")

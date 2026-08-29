@@ -700,6 +700,10 @@ final class ServerManager {
     /// whether a speculative-decoding change needs a real restart.
     private(set) var launchedPerformanceAlias: String?
     private(set) var launchedPerformanceFlags: [String] = []
+    /// Repository/local path used to launch the process-owning model. Kept
+    /// alongside its alias so a process-level restart can faithfully rebuild
+    /// custom entries that are not recoverable from the catalog by alias.
+    private(set) var launchedHFPath: String?
     /// Process-wide lane captured at spawn. Nil means there is no live child;
     /// UI capability must observe this value rather than the process handle.
     private(set) var launchedImageInputLane: Bool?
@@ -1067,11 +1071,13 @@ final class ServerManager {
         residency: ModelResidencySnapshot = .empty,
         activeBearer: String? = nil,
         isOperating: Bool = false,
+        launchedHFPath: String? = nil,
         sessionDefaults: UserDefaults? = nil
     ) {
         self.state = testingState
         self.activeBearer = activeBearer
         self.isOperating = isOperating
+        self.launchedHFPath = launchedHFPath
         self.binaryPath = binaryPath
         self.residency = residency
         self.sessionDefaults = sessionDefaults
@@ -1889,9 +1895,35 @@ final class ServerManager {
         // failed restart instead of letting stop() no-op and then reporting
         // success against the old process with stale launch configuration.
         guard !isOperating else { return false }
+        let restartHFPath = Self.resolveRestartHFPath(
+            requestedAlias: alias,
+            explicitHFPath: hfPath,
+            launchedAlias: launchedChildAlias,
+            launchedHFPath: launchedHFPath
+        )
         await stop()
         guard child == nil else { return false }
-        return await ensureServing(alias: alias, hfPath: hfPath, residencyEligible: false)
+        return await ensureServing(
+            alias: alias,
+            hfPath: restartHFPath,
+            residencyEligible: false
+        )
+    }
+
+    /// An explicit caller path always wins. Otherwise inherit the current
+    /// process path only when the restart targets that same alias; carrying a
+    /// path across aliases could load the wrong model under a new name.
+    nonisolated internal static func resolveRestartHFPath(
+        requestedAlias: String,
+        explicitHFPath: String?,
+        launchedAlias: String?,
+        launchedHFPath: String?
+    ) -> String? {
+        if let explicitHFPath, !explicitHFPath.isEmpty { return explicitHFPath }
+        guard launchedAlias?.caseInsensitiveCompare(requestedAlias) == .orderedSame else {
+            return nil
+        }
+        return launchedHFPath
     }
 
     /// Speculative decoding is installed while the process-owning engine
@@ -2740,6 +2772,7 @@ final class ServerManager {
         self.child = process
         self.launchedPerformanceAlias = trimmedAlias
         self.launchedPerformanceFlags = performanceFlags
+        self.launchedHFPath = hfPath
         // Codex r1 P3 (#17): only publish the bearer after the spawn
         // has succeeded — see comment at the bearer guard above.
         setActiveServerSession(bearer: bearer)
