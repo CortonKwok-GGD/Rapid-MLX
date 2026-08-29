@@ -76,13 +76,13 @@ struct SettingsVisualFoundationTests {
     @MainActor
     @Test("Every category still exists, with a title and an icon")
     func everyCategorySurvives() {
-        // ``performance`` joined in #1717 (per-model engine knobs), as
-        // ``connectors`` did in #1716. The guard's job is to make a category
-        // change deliberate and reviewed, not to freeze the list forever —
-        // update this literal alongside the enum when a feature adds one.
+        // ``apiAuth`` joins as the security control for the embedded engine.
+        // The guard's job is to make a category change deliberate and
+        // reviewed, not to freeze the list forever — update this literal
+        // alongside the enum when a feature adds one.
         var expected: Set<String> = [
             "modelManagement", "instructions", "tools", "connectors", "performance",
-            "appearance", "privacy", "app",
+            "appearance", "privacy", "apiAuth", "app",
         ]
         // `swift test` builds debug, so the debug-only category is present
         // here and absent from the shipped binary. Conditioning the literal
@@ -109,7 +109,7 @@ struct SettingsVisualFoundationTests {
     func categoryOrderIsStable() {
         var expectedOrder = [
             "modelManagement", "instructions", "tools", "connectors", "performance",
-            "appearance", "privacy", "app",
+            "appearance", "privacy", "apiAuth", "app",
         ]
         #if DEBUG
         expectedOrder.append("developer")
@@ -133,7 +133,9 @@ struct SettingsVisualFoundationTests {
         #expect(SettingsView.category(.app, movedBy: 1) == nil)
         #endif
         #expect(SettingsView.category(.modelManagement, movedBy: 1) == .instructions)
-        #expect(SettingsView.category(.app, movedBy: -1) == .privacy)
+        #expect(SettingsView.category(.privacy, movedBy: 1) == .apiAuth)
+        #expect(SettingsView.category(.apiAuth, movedBy: 1) == .app)
+        #expect(SettingsView.category(.app, movedBy: -1) == .apiAuth)
     }
 
     /// Each panel reaches its state through the SwiftUI environment. A
