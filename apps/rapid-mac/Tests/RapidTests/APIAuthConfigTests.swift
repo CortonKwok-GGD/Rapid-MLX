@@ -113,12 +113,35 @@ final class APIAuthConfigTests {
         #expect(APIAuthConfig.mode == .permanent)
     }
 
-    @Test("auth settings are locked while a child is starting")
-    func testAuthMutationGateCoversStartupRace() {
-        #expect(!SettingsAPIAuthPanel.canMutateAuth(for: .starting(alias: "model")))
-        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .ready(alias: "model")))
-        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .idle))
-        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .stopped))
+    @Test("auth settings are locked during startup and lifecycle operations")
+    func testAuthMutationGateCoversLifecycleRaces() {
+        #expect(!SettingsAPIAuthPanel.canMutateAuth(
+            for: .starting(alias: "model"), isOperating: false
+        ))
+        #expect(!SettingsAPIAuthPanel.canMutateAuth(
+            for: .ready(alias: "model"), isOperating: true
+        ))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(
+            for: .ready(alias: "model"), isOperating: false
+        ))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .idle, isOperating: false))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .stopped, isOperating: false))
+    }
+
+    @Test("restart refuses to race an existing lifecycle operation")
+    func testRestartRejectsConcurrentLifecycleOperation() async {
+        let manager = ServerManager(
+            testingState: .ready(alias: "model"),
+            binaryPath: URL(fileURLWithPath: "/usr/bin/true"),
+            activeBearer: "existing-bearer",
+            isOperating: true
+        )
+
+        let restarted = await manager.restart(alias: "model")
+
+        #expect(!restarted)
+        #expect(manager.state == .ready(alias: "model"))
+        #expect(manager.activeBearer == "existing-bearer")
     }
 
     // MARK: - storage split (review: no secret in defaults)

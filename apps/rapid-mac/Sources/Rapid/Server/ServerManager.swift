@@ -1066,10 +1066,12 @@ final class ServerManager {
         binaryPath: URL? = nil,
         residency: ModelResidencySnapshot = .empty,
         activeBearer: String? = nil,
+        isOperating: Bool = false,
         sessionDefaults: UserDefaults? = nil
     ) {
         self.state = testingState
         self.activeBearer = activeBearer
+        self.isOperating = isOperating
         self.binaryPath = binaryPath
         self.residency = residency
         self.sessionDefaults = sessionDefaults
@@ -1883,7 +1885,12 @@ final class ServerManager {
     /// child process env / launch flags, so the in-process
     /// ``/v1/models/load`` path must NOT be used.
     func restart(alias: String, hfPath: String? = nil) async -> Bool {
+        // A concurrent start/stop owns the child transition. Treat that as a
+        // failed restart instead of letting stop() no-op and then reporting
+        // success against the old process with stale launch configuration.
+        guard !isOperating else { return false }
         await stop()
+        guard child == nil else { return false }
         return await ensureServing(alias: alias, hfPath: hfPath, residencyEligible: false)
     }
 
