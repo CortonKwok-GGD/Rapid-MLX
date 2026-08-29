@@ -113,6 +113,14 @@ final class APIAuthConfigTests {
         #expect(APIAuthConfig.mode == .permanent)
     }
 
+    @Test("auth settings are locked while a child is starting")
+    func testAuthMutationGateCoversStartupRace() {
+        #expect(!SettingsAPIAuthPanel.canMutateAuth(for: .starting(alias: "model")))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .ready(alias: "model")))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .idle))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .stopped))
+    }
+
     // MARK: - storage split (review: no secret in defaults)
 
     @Test("secret never lands in UserDefaults")

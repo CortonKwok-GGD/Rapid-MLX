@@ -27,6 +27,18 @@ struct SettingsAPIAuthPanel: View {
         APIAuthMode(rawValue: modeRaw) ?? .launch
     }
 
+    /// A child captures its bearer before health readiness. Changing the
+    /// mode or persisted key during that window can make Settings display a
+    /// credential different from the one the starting child received.
+    static func canMutateAuth(for state: ServerState) -> Bool {
+        if case .starting = state { return false }
+        return true
+    }
+
+    private var authMutationLocked: Bool {
+        !Self.canMutateAuth(for: server.state)
+    }
+
     /// Picker binding that normalizes stale values left by earlier builds
     /// (the storage key predates the launch/hours24/permanent enum, so a
     /// user's old ``fixed``/``off`` choice would otherwise render as an
@@ -55,6 +67,7 @@ struct SettingsAPIAuthPanel: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .disabled(authMutationLocked)
                     .accessibilityIdentifier("Settings.APIAuth.Mode")
                     .onChange(of: modeRaw) { _, newRaw in
                         guard let newMode = APIAuthMode(rawValue: newRaw) else {
@@ -69,6 +82,13 @@ struct SettingsAPIAuthPanel: View {
                         }
                         keychainDenied = !persistCurrentKey()
                         keyRevision += 1
+                    }
+
+                    if authMutationLocked {
+                        InlineNotice(
+                            message: "Wait for the model to finish starting before changing the key lifetime or rotating its key.",
+                            tone: .info
+                        )
                     }
 
                     switch mode {
@@ -148,7 +168,7 @@ struct SettingsAPIAuthPanel: View {
                 }
             }
             .buttonStyle(.bordered)
-            .disabled(rotating)
+            .disabled(rotating || authMutationLocked)
             .accessibilityIdentifier("Settings.APIAuth.RotateKey")
         }
         .confirmationDialog(
@@ -180,13 +200,14 @@ struct SettingsAPIAuthPanel: View {
     /// live immediately (the engine pins the key it is spawned with). If no
     /// model is serving, the new key simply takes effect on the next start.
     private func rotateKeyAndRestart() {
+        guard !authMutationLocked else { return }
         guard APIAuthConfig.rotatePersistedKey() else {
             rotateError = "Couldn't store the new key — Keychain access may be denied. No restart was performed; the previous key is still in effect."
             return
         }
         keychainDenied = false
         keyRevision += 1
-        guard let alias = server.servingAlias else { return }
+        guard let alias = server.launchedChildAlias else { return }
         rotating = true
         Task {
             let ok = await server.restart(alias: alias)
