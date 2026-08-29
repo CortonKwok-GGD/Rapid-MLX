@@ -16,6 +16,8 @@ import Testing
 /// an isolated in-memory test double.
 private final class InMemoryKeychain: KeychainStoring, @unchecked Sendable {
     private var items: [String: String] = [:]
+    private(set) var readCount = 0
+    private(set) var lastReadWasOnMainThread: Bool?
 
     /// Test seam: simulate a refused Keychain write (user denied the prompt).
     var failWrites = false
@@ -23,7 +25,11 @@ private final class InMemoryKeychain: KeychainStoring, @unchecked Sendable {
     /// Test seam: simulate an ACL-refused Keychain delete.
     var failDeletes = false
 
-    func read(account: String) -> String? { items[account] }
+    func read(account: String) -> String? {
+        readCount += 1
+        lastReadWasOnMainThread = Thread.isMainThread
+        return items[account]
+    }
 
     @discardableResult
     func write(account: String, secret: String) -> Bool {
@@ -288,7 +294,10 @@ final class APIAuthConfigTests {
         defer { tearDownStores() }
         APIAuthConfig.mode = .permanent
         _ = try #require(APIAuthConfig.bearerForSpawn())
-        #expect(APIAuthConfig.keyRotationDate == nil, "permanent mode has no scheduled rotation")
+        #expect(
+            APIAuthConfig.persistenceSnapshot(for: .permanent).rotationDate == nil,
+            "permanent mode has no scheduled rotation"
+        )
     }
 
     @Test("daily mode reports the earliest next-start rotation moment")
@@ -298,8 +307,30 @@ final class APIAuthConfigTests {
         APIAuthConfig.mode = .hours24
         let now = Date()
         _ = try #require(APIAuthConfig.bearerForSpawn(now: now))
-        let rotation = try #require(APIAuthConfig.keyRotationDate)
+        let rotation = try #require(
+            APIAuthConfig.persistenceSnapshot(for: .hours24).rotationDate
+        )
         #expect(abs(rotation.timeIntervalSince(now) - 24 * 60 * 60) < 1)
+    }
+
+    @Test("persistence snapshot reads Keychain once")
+    func testPersistenceSnapshotUsesSingleKeychainRead() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .hours24
+        let now = Date()
+        let bearer = String(repeating: "a", count: 64)
+        keychain.seed(
+            account: APIAuthConfig.keychainAccount,
+            payload: "\(bearer)\n\(Int(now.timeIntervalSince1970))"
+        )
+        let readsBefore = keychain.readCount
+
+        let snapshot = APIAuthConfig.persistenceSnapshot(for: .hours24)
+
+        #expect(keychain.readCount == readsBefore + 1)
+        #expect(snapshot.persistedKey == bearer)
+        #expect(snapshot.rotationDate != nil)
     }
 
     // MARK: - rotate
@@ -391,6 +422,56 @@ final class APIAuthConfigTests {
             ambient: ["PATH": "/usr/bin:/bin"]
         )
         #expect(env["RAPID_MLX_API_KEY"] == resolved.secret)
+    }
+
+    @Test("expired stale key is never displayed after replacement write fails")
+    func testExpiredStaleKeyDoesNotReplaceLiveDegradedBearer() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .hours24
+        let old = String(repeating: "a", count: 64)
+        let expiredAt = Date().addingTimeInterval(-25 * 60 * 60)
+        keychain.seed(
+            account: APIAuthConfig.keychainAccount,
+            payload: "\(old)\n\(Int(expiredAt.timeIntervalSince1970))"
+        )
+        keychain.failWrites = true
+
+        let resolved = try #require(APIAuthConfig.resolvedBearerForSpawn())
+        let displayed = SettingsAPIAuthPanel.displayedKey(
+            persistenceDegraded: resolved.persistenceDegraded,
+            activeBearer: resolved.secret,
+            persistedKey: APIAuthConfig.persistedKey
+        )
+
+        #expect(resolved.persistenceDegraded)
+        #expect(resolved.persistence == .empty)
+        #expect(resolved.secret != old)
+        #expect(APIAuthConfig.persistedKey == old, "refused upsert leaves the stale item in Keychain")
+        #expect(displayed == resolved.secret, "Settings must copy the bearer accepted by the live child")
+    }
+
+    @Test("server publishes persisted auth from an asynchronous snapshot")
+    func testServerRefreshesCachedAuthPersistence() async throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .hours24
+        let bearer = String(repeating: "b", count: 64)
+        let now = Date()
+        keychain.seed(
+            account: APIAuthConfig.keychainAccount,
+            payload: "\(bearer)\n\(Int(now.timeIntervalSince1970))"
+        )
+        let manager = ServerManager(
+            testingState: .stopped,
+            binaryPath: URL(fileURLWithPath: "/usr/bin/true")
+        )
+
+        await manager.refreshAuthPersistence()
+
+        #expect(manager.authPersistence.persistedKey == bearer)
+        #expect(manager.authPersistence.rotationDate != nil)
+        #expect(keychain.lastReadWasOnMainThread == false)
     }
 
     @Test("missing Keychain entry falls back to fresh")

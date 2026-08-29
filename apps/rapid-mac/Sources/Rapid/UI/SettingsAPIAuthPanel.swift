@@ -17,7 +17,7 @@ import SwiftUI
 struct SettingsAPIAuthPanel: View {
     @Environment(ServerManager.self) private var server
     @AppStorage(APIAuthConfig.storageKey) private var modeRaw = APIAuthMode.launch.rawValue
-    @State private var keyRevision = 0
+    @State private var applyingMode = false
     @State private var confirmingRotate = false
     @State private var rotating = false
     @State private var rotateError: String?
@@ -41,7 +41,7 @@ struct SettingsAPIAuthPanel: View {
     }
 
     private var authMutationLocked: Bool {
-        !Self.canMutateAuth(
+        applyingMode || rotating || !Self.canMutateAuth(
             for: server.state,
             isOperating: server.isOperating,
             isRestarting: server.isRestarting
@@ -83,14 +83,19 @@ struct SettingsAPIAuthPanel: View {
                             modeRaw = APIAuthMode.launch.rawValue
                             return
                         }
-                        guard newMode != .launch else {
-                            // Switching back to session-only: purge the
-                            // persisted key so it cannot resurface later.
-                            keychainDenied = !APIAuthConfig.clearPersistedKey()
-                            return
+                        applyingMode = true
+                        Task {
+                            defer { applyingMode = false }
+                            if newMode == .launch {
+                                // Switching back to session-only: purge the
+                                // persisted key so it cannot resurface later.
+                                keychainDenied = !(await server.clearAuthPersistence())
+                            } else {
+                                keychainDenied = !(await server.persistAuthBearerForSelectedMode(
+                                    server.activeBearer
+                                ))
+                            }
                         }
-                        keychainDenied = !persistCurrentKey()
-                        keyRevision += 1
                     }
 
                     if authMutationLocked {
@@ -115,7 +120,7 @@ struct SettingsAPIAuthPanel: View {
                     case .hours24:
                         persistentKeySection(
                             notice: "One key is reused across launches, then replaced on the first model start after 24 hours.",
-                            rotationHint: APIAuthConfig.keyRotationDate
+                            rotationHint: server.authPersistence.rotationDate
                         )
                     case .permanent:
                         persistentKeySection(
@@ -127,6 +132,9 @@ struct SettingsAPIAuthPanel: View {
             }
         }
         .padding(RapidTheme.Space.xl)
+        .task {
+            await server.refreshAuthPersistence()
+        }
     }
 
     /// Key display + rotate for the persistent modes. `rotationHint` is the
@@ -210,15 +218,18 @@ struct SettingsAPIAuthPanel: View {
     /// model is serving, the new key simply takes effect on the next start.
     private func rotateKeyAndRestart() {
         guard !authMutationLocked else { return }
-        guard APIAuthConfig.rotatePersistedKey() else {
-            rotateError = "Couldn't store the new key — Keychain access may be denied. No restart was performed; the previous key is still in effect."
-            return
-        }
-        keychainDenied = false
-        keyRevision += 1
-        guard let alias = server.launchedChildAlias else { return }
         rotating = true
         Task {
+            guard await server.rotateAuthPersistence() else {
+                rotating = false
+                rotateError = "Couldn't store the new key — Keychain access may be denied. No restart was performed; the previous key is still in effect."
+                return
+            }
+            keychainDenied = false
+            guard let alias = server.launchedChildAlias else {
+                rotating = false
+                return
+            }
             let ok = await server.restart(alias: alias)
             rotating = false
             if !ok {
@@ -227,28 +238,25 @@ struct SettingsAPIAuthPanel: View {
         }
     }
 
-    /// Persist the engine's current key when the user switches to a
-    /// persistent mode, so the key they see today IS the key that survives
-    /// (24 hours / until rotated). If the engine isn't running, reuse an
-    /// existing fresh persisted key — switching modes must not churn the
-    /// secret (hard-coded tooling keeps working); mint only when nothing
-    /// fresh is stored. Returns false when the Keychain write was refused.
-    private func persistCurrentKey() -> Bool {
-        if let current = server.activeBearer {
-            return APIAuthConfig.persistBearer(current)
-        }
-        if let stored = APIAuthConfig.storedBearer(),
-           APIAuthConfig.isFresh(stored.generatedAt) {
-            return true
-        }
-        return APIAuthConfig.rotatePersistedKey()
+    /// In degraded mode the child is running with a strong session-only key
+    /// while an older, expired item may still exist in Keychain. Showing that
+    /// stale item would make every copied request fail with 401, so the live
+    /// child bearer wins until the child exits.
+    static func displayedKey(
+        persistenceDegraded: Bool,
+        activeBearer: String?,
+        persistedKey: String?
+    ) -> String? {
+        if persistenceDegraded { return activeBearer }
+        return persistedKey
     }
 
-    /// Re-read the Keychain so Rotate is reflected immediately (`keyRevision`
-    /// forces SwiftUI to recompute the body).
     private var displayedKey: String? {
-        _ = keyRevision
-        return APIAuthConfig.persistedKey
+        Self.displayedKey(
+            persistenceDegraded: server.authPersistenceDegraded,
+            activeBearer: server.activeBearer,
+            persistedKey: server.authPersistence.persistedKey
+        )
     }
 
 }

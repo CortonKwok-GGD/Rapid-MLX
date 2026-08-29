@@ -203,6 +203,9 @@ struct ConnectToolsView: View {
         .task {
             integrationTargets = await IntegrationCatalog.load()
         }
+        .task {
+            await server.refreshAuthPersistence()
+        }
     }
 
     /// The scrollable content. Factored out so the snapshot harness can
@@ -405,7 +408,7 @@ struct ConnectToolsView: View {
                         }
                     }
                 )
-                if let rotation = APIAuthConfig.keyRotationDate, !bearer.isEmpty {
+                if let rotation = server.authPersistence.rotationDate, !bearer.isEmpty {
                     apiKeyRotationRow(rotation)
                 }
                 rowDivider

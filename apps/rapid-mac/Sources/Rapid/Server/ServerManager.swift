@@ -678,6 +678,16 @@ final class ServerManager {
     /// state exists so Settings can explain that cross-launch reuse degraded.
     private(set) var authPersistenceDegraded = false
 
+    /// Cached Keychain-backed authentication state for SwiftUI. Keychain
+    /// reads happen on a dedicated persistence actor and publish here once,
+    /// keeping Security.framework work out of view-body recomputation.
+    private(set) var authPersistence: APIAuthConfig.PersistenceSnapshot = .empty
+
+    /// Monotonic publication token for async auth persistence work. A newer
+    /// refresh/mutation supersedes an older result even when main-actor
+    /// continuation scheduling differs from the persistence actor's order.
+    @ObservationIgnored private var authPersistenceRevision = 0
+
     /// Supplies the `--mcp-config` path for the next spawn, or `nil` to launch
     /// with the MCP subsystem entirely absent.
     ///
@@ -734,6 +744,70 @@ final class ServerManager {
     private func setActiveServerSession(bearer: String?) {
         activeBearer = bearer
         activeModelProfile = nil
+    }
+
+    /// Refresh the persisted-key snapshot without blocking the main actor.
+    /// If the user changes lifetime while the read is in flight, discard the
+    /// stale result; the mode-change task will publish its own exact snapshot.
+    func refreshAuthPersistence() async {
+        authPersistenceRevision += 1
+        let revision = authPersistenceRevision
+        let selectedMode = APIAuthConfig.mode
+        let snapshot = await APIAuthPersistenceStore.shared.snapshot(for: selectedMode)
+        guard authPersistenceRevision == revision,
+              APIAuthConfig.mode == selectedMode else { return }
+        authPersistence = snapshot
+    }
+
+    /// Persist the running engine's bearer (or ensure a stopped app has one)
+    /// for the currently selected persistent mode. The returned value is the
+    /// Keychain write result; the observable cache is updated from the same
+    /// operation, never by a second synchronous read.
+    func persistAuthBearerForSelectedMode(_ currentBearer: String?) async -> Bool {
+        authPersistenceRevision += 1
+        let revision = authPersistenceRevision
+        let selectedMode = APIAuthConfig.mode
+        let update = await APIAuthPersistenceStore.shared.ensureBearer(
+            currentBearer: currentBearer,
+            mode: selectedMode
+        )
+        guard APIAuthConfig.mode == selectedMode else { return false }
+        authPersistenceDegraded = currentBearer != nil && !update.succeeded
+        guard authPersistenceRevision == revision else { return update.succeeded }
+        authPersistence = update.snapshot
+        return update.succeeded
+    }
+
+    /// Purge the dormant persistent bearer when the user selects per-launch
+    /// auth. A refused delete remains a visible warning, but the selected
+    /// launch-mode cache is empty either way.
+    func clearAuthPersistence() async -> Bool {
+        authPersistenceRevision += 1
+        let revision = authPersistenceRevision
+        let succeeded = await APIAuthPersistenceStore.shared.clear()
+        guard APIAuthConfig.mode == .launch else { return false }
+        authPersistenceDegraded = false
+        guard authPersistenceRevision == revision else { return succeeded }
+        authPersistence = .empty
+        return succeeded
+    }
+
+    /// Mint and persist a replacement for the selected persistent mode.
+    /// Restart remains a separate lifecycle action owned by the caller.
+    func rotateAuthPersistence() async -> Bool {
+        authPersistenceRevision += 1
+        let revision = authPersistenceRevision
+        let selectedMode = APIAuthConfig.mode
+        let update = await APIAuthPersistenceStore.shared.rotate(mode: selectedMode)
+        guard APIAuthConfig.mode == selectedMode else { return false }
+        if update.succeeded {
+            authPersistenceDegraded = false
+        }
+        guard authPersistenceRevision == revision else { return update.succeeded }
+        if update.succeeded {
+            authPersistence = update.snapshot
+        }
+        return update.succeeded
     }
 
     func applyActiveModelProfile(_ profile: ServerModelProfile, forAlias alias: String) {
@@ -2613,13 +2687,31 @@ final class ServerManager {
         // for the persistent modes. SecRandomCopyBytes failing is
         // pathological (kernel-level RNG starvation); we surface as
         // .crashed rather than silently spawning unauthenticated.
-        guard let resolvedBearer = APIAuthConfig.resolvedBearerForSpawn() else {
+        authPersistenceRevision += 1
+        let authRevision = authPersistenceRevision
+        let selectedAuthMode = APIAuthConfig.mode
+        let resolvedBearer = await APIAuthPersistenceStore.shared.bearerForSpawn(
+            mode: selectedAuthMode
+        )
+        if didSignalShutdown || !Self.reservationAllows(
+            active: restartReservation,
+            presented: lifecycleReservation
+        ) {
+            isOperating = false
+            startedAt = nil
+            state = .stopped
+            return
+        }
+        guard let resolvedBearer else {
             isOperating = false
             state = .crashed(
                 alias: trimmedAlias,
                 message: "Couldn't start the model securely. Restart Rapid-MLX; if this keeps happening, please file a bug."
             )
             return
+        }
+        if authPersistenceRevision == authRevision {
+            authPersistence = resolvedBearer.persistence
         }
         let bearer = resolvedBearer.secret
         // Codex r1 P3 (#17): hold the bearer in a local until the
