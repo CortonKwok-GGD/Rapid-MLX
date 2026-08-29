@@ -5,8 +5,8 @@ import SwiftUI
 /// A single "key lifetime" picker replaces the old random/fixed/off matrix:
 ///
 /// * ``launch`` — a fresh 64-hex secret per engine spawn.
-/// * ``hours24`` — one secret reused for 24 hours, persisted in the system
-///   Keychain; tooling can hard-code it across restarts for a day.
+/// * ``hours24`` — one secret reused across launches and replaced on the
+///   first model start after 24 hours.
 /// * ``permanent`` — one secret reused indefinitely until rotated manually.
 ///
 /// Switching to a persistent mode persists the engine's current key
@@ -85,13 +85,13 @@ struct SettingsAPIAuthPanel: View {
                         }
                     case .hours24:
                         persistentKeySection(
-                            notice: "One key, reused for 24 hours, stored in the system Keychain.",
-                            expiryHint: APIAuthConfig.keyExpiry
+                            notice: "One key is reused across launches, then replaced on the first model start after 24 hours.",
+                            rotationHint: APIAuthConfig.keyRotationDate
                         )
                     case .permanent:
                         persistentKeySection(
                             notice: "One key, reused until you rotate it, stored in the system Keychain.",
-                            expiryHint: nil
+                            rotationHint: nil
                         )
                     }
                 }
@@ -100,18 +100,14 @@ struct SettingsAPIAuthPanel: View {
         .padding(RapidTheme.Space.xl)
     }
 
-    /// Key display + rotate for the persistent modes. `expiryHint` is the
-    /// date the current key stops being fresh (nil = never).
-    private func persistentKeySection(notice: String, expiryHint: Date?) -> some View {
+    /// Key display + rotate for the persistent modes. `rotationHint` is the
+    /// earliest date a subsequent model start replaces the key (nil = never).
+    private func persistentKeySection(notice: String, rotationHint: Date?) -> some View {
         VStack(alignment: .leading, spacing: RapidTheme.Space.md) {
             InlineNotice(message: notice, tone: .info)
-            InlineNotice(
-                message: "macOS asks for Keychain permission on first use — choose “Always Allow” so the key persists.",
-                tone: .info
-            )
-            if keychainDenied {
+            if keychainDenied || server.authPersistenceDegraded {
                 InlineNotice(
-                    message: "Keychain access was denied, so the key was not saved. Every launch will use a fresh random key — switch away from a persistent mode or allow Keychain access to fix.",
+                    message: "The key could not be saved in Keychain. This engine is still protected with a one-time key, but the key will change on its next start. Unlock your Mac and try again, or use Per launch.",
                     tone: .warning
                 )
             }
@@ -131,9 +127,9 @@ struct SettingsAPIAuthPanel: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let expiry = expiryHint {
+            if let rotation = rotationHint {
                 InlineNotice(
-                    message: "Expires \(expiry.formatted(date: .abbreviated, time: .shortened)). A fresh key is minted on the next start.",
+                    message: "Rotates on the first model start after \(rotation.formatted(date: .abbreviated, time: .shortened)). The running engine keeps its current key until then.",
                     tone: .warning
                 )
             }

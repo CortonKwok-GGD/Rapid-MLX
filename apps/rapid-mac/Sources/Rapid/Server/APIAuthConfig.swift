@@ -13,9 +13,9 @@ import Foundation
 ///   * ``launch`` (default) — a fresh 64-hex secret per spawn
 ///     (``BearerSecret.generate()``). Most secure: a leaked key is
 ///     bounded to the current session.
-///   * ``hours24`` — one secret reused for up to 24 hours, persisted in
-///     the system Keychain so local tooling can hard-code it across
-///     restarts for a day.
+///   * ``hours24`` — one secret reused across launches, then replaced on
+///     the first model start after 24 hours. It is persisted in the system
+///     Keychain so local tooling can reuse it across restarts for a day.
 ///   * ``permanent`` — one secret reused indefinitely until the user
 ///     explicitly rotates it. Persisted in the system Keychain.
 ///
@@ -33,7 +33,7 @@ enum APIAuthMode: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .launch: return "Per launch"
-        case .hours24: return "24 hours"
+        case .hours24: return "Daily"
         case .permanent: return "Permanent"
         }
     }
@@ -50,6 +50,13 @@ enum APIAuthMode: String, CaseIterable, Identifiable {
 }
 
 enum APIAuthConfig {
+    struct SpawnBearer: Equatable {
+        let secret: String
+        /// The engine remains authenticated when persistence fails; this
+        /// flag lets Settings tell the truth that the key is session-only.
+        let persistenceDegraded: Bool
+    }
+
     static let storageKey = "apiAuthMode"
 
     /// Keychain account for the persisted engine bearer. The payload is a
@@ -95,13 +102,26 @@ enum APIAuthConfig {
             return nil
         }
         let parts = stored.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              !parts[0].isEmpty,
-              let epoch = TimeInterval(parts[1])
+        guard parts.count == 2 else { return nil }
+        let secret = String(parts[0])
+        guard isValidSecret(secret),
+              let epoch = TimeInterval(parts[1]),
+              epoch.isFinite,
+              epoch >= 0
         else {
             return nil
         }
-        return (String(parts[0]), Date(timeIntervalSince1970: epoch))
+        return (secret, Date(timeIntervalSince1970: epoch))
+    }
+
+    /// Persisted bearers are generated as 32 random bytes encoded as
+    /// lowercase hex. Reject anything else as corrupt rather than weakening
+    /// authentication by trusting a malformed Keychain payload.
+    private static func isValidSecret(_ secret: String) -> Bool {
+        let bytes = secret.utf8
+        return bytes.count == 64 && bytes.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
     }
 
     /// Persist a bearer with its generation time to the Keychain.
@@ -119,7 +139,8 @@ enum APIAuthConfig {
     /// Whether a persisted secret is still within its configured lifetime.
     static func isFresh(_ generatedAt: Date, now: Date = Date()) -> Bool {
         guard let lifetime = mode.lifetime else { return true }
-        return now.timeIntervalSince(generatedAt) < lifetime
+        let age = now.timeIntervalSince(generatedAt)
+        return age >= 0 && age < lifetime
     }
 
     /// Remove the persisted secret from the Keychain. Called when the user
@@ -144,18 +165,26 @@ enum APIAuthConfig {
     ///   never to unauthenticated).
     ///
     /// - Parameter now: injectable clock for tests (expiry arithmetic).
-    static func bearerForSpawn(now: Date = Date()) -> String? {
+    static func resolvedBearerForSpawn(now: Date = Date()) -> SpawnBearer? {
         switch mode {
         case .launch:
-            return BearerSecret.generate()
+            guard let secret = BearerSecret.generate() else { return nil }
+            return SpawnBearer(secret: secret, persistenceDegraded: false)
         case .hours24, .permanent:
             if let stored = storedBearer(), isFresh(stored.generatedAt, now: now) {
-                return stored.secret
+                return SpawnBearer(secret: stored.secret, persistenceDegraded: false)
             }
             guard let fresh = BearerSecret.generate() else { return nil }
-            persistBearer(fresh, generatedAt: now)
-            return fresh
+            let persisted = persistBearer(fresh, generatedAt: now)
+            return SpawnBearer(secret: fresh, persistenceDegraded: !persisted)
         }
+    }
+
+    /// Compatibility convenience for callers that only need the secret.
+    /// The process owner uses ``resolvedBearerForSpawn`` so it can surface a
+    /// safe-but-session-only fallback when Keychain persistence is unavailable.
+    static func bearerForSpawn(now: Date = Date()) -> String? {
+        resolvedBearerForSpawn(now: now)?.secret
     }
 
     /// Force a new persisted secret now ("Rotate" / revoke). The old key
@@ -169,10 +198,10 @@ enum APIAuthConfig {
         return persistBearer(fresh, generatedAt: now)
     }
 
-    /// When the currently-persisted key expires, for the settings/launch
-    /// UI. ``nil`` means it never expires (launch has no persisted key;
-    /// permanent is indefinite). Returns nil when nothing is stored.
-    static var keyExpiry: Date? {
+    /// Earliest date after which a new model start rotates the persisted key.
+    /// This is not a live-engine expiry: a running child keeps the bearer it
+    /// was spawned with until it stops. ``nil`` means no scheduled rotation.
+    static var keyRotationDate: Date? {
         guard let stored = storedBearer() else { return nil }
         guard let lifetime = mode.lifetime else { return nil }
         return stored.generatedAt.addingTimeInterval(lifetime)

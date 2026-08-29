@@ -166,16 +166,16 @@ struct ConnectToolsView: View {
         return "Created when the server starts"
     }
 
-    /// Expiry hint under the API-key row while a persisted key is in play
-    /// (24h / permanent modes). Lets tooling that hard-coded the key know
-    /// when it stops working.
+    /// Rotation hint under the API-key row while the daily mode is active.
+    /// Rotation occurs only when a model next starts, so the copy must not
+    /// imply that a running engine rejects the key at this wall-clock time.
     @ViewBuilder
-    private func apiKeyExpiryRow(_ expiry: Date) -> some View {
+    private func apiKeyRotationRow(_ rotation: Date) -> some View {
         HStack(spacing: RapidTheme.Space.xs) {
             Image(systemName: "clock")
                 .font(RapidFont.caption)
                 .foregroundStyle(.tertiary)
-            Text("Key expires \(expiry.formatted(date: .abbreviated, time: .shortened))")
+            Text("Key rotates on the first model start after \(rotation.formatted(date: .abbreviated, time: .shortened))")
                 .font(RapidFont.caption)
                 .foregroundStyle(.tertiary)
         }
@@ -405,8 +405,8 @@ struct ConnectToolsView: View {
                         }
                     }
                 )
-                if let expiry = APIAuthConfig.keyExpiry, !bearer.isEmpty {
-                    apiKeyExpiryRow(expiry)
+                if let rotation = APIAuthConfig.keyRotationDate, !bearer.isEmpty {
+                    apiKeyRotationRow(rotation)
                 }
                 rowDivider
                 CopyableRow(
@@ -871,5 +871,3 @@ private struct ConnectToolRow: View {
     }
 
 }
-
-

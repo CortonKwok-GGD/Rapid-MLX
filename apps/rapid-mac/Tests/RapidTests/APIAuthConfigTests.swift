@@ -170,7 +170,7 @@ final class APIAuthConfigTests {
         #expect(first == second, "fresh persisted secret must be reused")
     }
 
-    @Test("24h rotates after the lifetime expires")
+    @Test("daily mode rotates on the first spawn after 24h")
     func testHours24RotatesAfterLifetime() throws {
         setUpStores()
         defer { tearDownStores() }
@@ -197,24 +197,24 @@ final class APIAuthConfigTests {
         #expect(first == second, "permanent secret must never expire")
     }
 
-    @Test("permanent has no expiry")
+    @Test("permanent has no scheduled rotation")
     func testPermanentKeyExpiryNil() throws {
         setUpStores()
         defer { tearDownStores() }
         APIAuthConfig.mode = .permanent
         _ = try #require(APIAuthConfig.bearerForSpawn())
-        #expect(APIAuthConfig.keyExpiry == nil, "permanent mode has no expiry")
+        #expect(APIAuthConfig.keyRotationDate == nil, "permanent mode has no scheduled rotation")
     }
 
-    @Test("24h reports the exact expiry moment")
-    func testHours24KeyExpirySet() throws {
+    @Test("daily mode reports the earliest next-start rotation moment")
+    func testHours24KeyRotationDateSet() throws {
         setUpStores()
         defer { tearDownStores() }
         APIAuthConfig.mode = .hours24
         let now = Date()
         _ = try #require(APIAuthConfig.bearerForSpawn(now: now))
-        let expiry = try #require(APIAuthConfig.keyExpiry)
-        #expect(abs(expiry.timeIntervalSince(now) - 24 * 60 * 60) < 1)
+        let rotation = try #require(APIAuthConfig.keyRotationDate)
+        #expect(abs(rotation.timeIntervalSince(now) - 24 * 60 * 60) < 1)
     }
 
     // MARK: - rotate
@@ -256,6 +256,56 @@ final class APIAuthConfigTests {
         #expect(bearer.count == 64)
         #expect(APIAuthConfig.persistedKey == bearer,
                 "fail-safe must also repair the corrupt entry")
+    }
+
+    @Test("weak but parseable Keychain secret is rejected and repaired")
+    func testWeakKeychainSecretFallsBackToFresh() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .permanent
+        keychain.seed(
+            account: APIAuthConfig.keychainAccount,
+            payload: "weak\n\(Int(Date().timeIntervalSince1970))"
+        )
+        let bearer = try #require(APIAuthConfig.bearerForSpawn())
+        #expect(bearer.count == 64)
+        #expect(bearer != "weak")
+        #expect(APIAuthConfig.persistedKey == bearer)
+    }
+
+    @Test("non-hex Keychain secret is rejected and repaired")
+    func testNonHexKeychainSecretFallsBackToFresh() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .permanent
+        let nonHex = String(repeating: "z", count: 64)
+        keychain.seed(
+            account: APIAuthConfig.keychainAccount,
+            payload: "\(nonHex)\n\(Int(Date().timeIntervalSince1970))"
+        )
+        let bearer = try #require(APIAuthConfig.bearerForSpawn())
+        #expect(bearer.count == 64)
+        #expect(bearer != nonHex)
+        #expect(APIAuthConfig.persistedKey == bearer)
+    }
+
+    @Test("persistent spawn stays authenticated when Keychain write fails")
+    func testPersistentSpawnReportsSafePersistenceDegradation() throws {
+        setUpStores()
+        defer { tearDownStores() }
+        APIAuthConfig.mode = .hours24
+        keychain.failWrites = true
+
+        let resolved = try #require(APIAuthConfig.resolvedBearerForSpawn())
+
+        #expect(resolved.secret.count == 64)
+        #expect(resolved.persistenceDegraded)
+        #expect(APIAuthConfig.persistedKey == nil)
+        let env = ServerManager.serveEnvironmentAdditions(
+            bearer: resolved.secret,
+            ambient: ["PATH": "/usr/bin:/bin"]
+        )
+        #expect(env["RAPID_MLX_API_KEY"] == resolved.secret)
     }
 
     @Test("missing Keychain entry falls back to fresh")
@@ -325,7 +375,7 @@ final class APIAuthConfigTests {
                 "a live spawn must never be unauthenticated")
     }
 
-    @Test("spawn env reflects the rotated key after 24h expiry (runtime enforcement)")
+    @Test("a model start after 24h rotates the spawn bearer")
     func testSpawnEnvRotatesAfterExpiry() throws {
         setUpStores()
         defer { tearDownStores() }

@@ -660,10 +660,10 @@ final class ServerManager {
     /// without auth", which surfaces as ``.crashed`` to the user.
     private(set) var activeBearer: String?
 
-    /// The auth mode that was in effect when the current child spawned.
-    /// Lets the settings panel distinguish "change already applied" from
-    /// "pending restart". Cleared whenever the child stops.
-    private(set) var activeAuthMode: APIAuthMode?
+    /// A persistent mode could not write its newly minted key to Keychain.
+    /// The child is still authenticated with a strong one-time bearer; this
+    /// state exists so Settings can explain that cross-launch reuse degraded.
+    private(set) var authPersistenceDegraded = false
 
     /// Supplies the `--mcp-config` path for the next spawn, or `nil` to launch
     /// with the MCP subsystem entirely absent.
@@ -2512,12 +2512,7 @@ final class ServerManager {
         // for the persistent modes. SecRandomCopyBytes failing is
         // pathological (kernel-level RNG starvation); we surface as
         // .crashed rather than silently spawning unauthenticated.
-        // P1-2: capture the mode at the same moment the bearer is
-        // created and publish THAT below, so ``activeAuthMode`` always
-        // matches the env the child actually received — even if the
-        // user changes the mode while the spawn is in flight.
-        let spawnAuthMode = APIAuthConfig.mode
-        guard let bearer = APIAuthConfig.bearerForSpawn() else {
+        guard let resolvedBearer = APIAuthConfig.resolvedBearerForSpawn() else {
             isOperating = false
             state = .crashed(
                 alias: trimmedAlias,
@@ -2525,6 +2520,7 @@ final class ServerManager {
             )
             return
         }
+        let bearer = resolvedBearer.secret
         // Codex r1 P3 (#17): hold the bearer in a local until the
         // spawn succeeds, then publish to ``activeBearer``. The
         // previous shape published BEFORE the spawn, so a thrown
@@ -2740,7 +2736,7 @@ final class ServerManager {
         // Codex r1 P3 (#17): only publish the bearer after the spawn
         // has succeeded — see comment at the bearer guard above.
         setActiveServerSession(bearer: bearer)
-        self.activeAuthMode = spawnAuthMode
+        authPersistenceDegraded = resolvedBearer.persistenceDegraded
         self.stdoutPipe = stdoutPipe
         self.stderrPipe = stderrPipe
         // #20: persist ownership before startMonitor() so a crash
@@ -3008,7 +3004,7 @@ final class ServerManager {
         // secret targeting whatever happens to bind the port next.
         // (#1035: the nil transition evicts cached MCP tools via didSet.)
         setActiveServerSession(bearer: nil)
-        activeAuthMode = nil
+        authPersistenceDegraded = false
         // Issue #278: honour the "readyAt cleared on every child
         // exit" invariant in shutdownSync too (parallel to the
         // terminateChild defensive teardown). App-termination only,
@@ -3096,7 +3092,7 @@ final class ServerManager {
             // #17: see shutdownSync — bearer is dead the moment the
             // child is.
             setActiveServerSession(bearer: nil)
-            activeAuthMode = nil
+            authPersistenceDegraded = false
             startedAt = nil
             // Issue #278: defensive teardown also has to honour the
             // "readyAt cleared on every child exit" invariant in
@@ -3168,7 +3164,7 @@ final class ServerManager {
         // #17: the child owns the secret; the secret is meaningless
         // (and a leak vector) once the child is gone.
         setActiveServerSession(bearer: nil)
-        activeAuthMode = nil
+        authPersistenceDegraded = false
         startedAt = nil
         // Issue #278: snapshot + window-gate the auto-respawn budget
         // reset, then clear ``readyAt``. The wasExpected-stop branch
