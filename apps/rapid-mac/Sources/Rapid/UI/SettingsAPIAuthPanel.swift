@@ -30,14 +30,22 @@ struct SettingsAPIAuthPanel: View {
     /// A child captures its bearer before health readiness. Changing the
     /// mode or persisted key during that window can make Settings display a
     /// credential different from the one the starting child received.
-    static func canMutateAuth(for state: ServerState, isOperating: Bool) -> Bool {
-        guard !isOperating else { return false }
+    static func canMutateAuth(
+        for state: ServerState,
+        isOperating: Bool,
+        isRestarting: Bool
+    ) -> Bool {
+        guard !isOperating, !isRestarting else { return false }
         if case .starting = state { return false }
         return true
     }
 
     private var authMutationLocked: Bool {
-        !Self.canMutateAuth(for: server.state, isOperating: server.isOperating)
+        !Self.canMutateAuth(
+            for: server.state,
+            isOperating: server.isOperating,
+            isRestarting: server.isRestarting
+        )
     }
 
     /// Picker binding that normalizes stale values left by earlier builds

@@ -598,6 +598,19 @@ final class ServerManager {
     /// buttons during this window so a second click cannot race the
     /// first into spawning a duplicate child.
     private(set) var isOperating: Bool = false
+    private(set) var isRestarting: Bool = false
+
+    /// Reserves the stop→start gap of a process-level restart. Ordinary
+    /// ensure/start requests cannot enter while this token is live; an
+    /// explicit Stop cancels it. This keeps a restart atomic without holding
+    /// ``isOperating`` through the potentially long health/download wait.
+    private var restartReservation: UUID?
+
+    /// Test-only interleaving seams. Production leaves both nil.
+    @ObservationIgnored
+    internal var restartAfterStopHook: (() async -> Void)?
+    @ObservationIgnored
+    internal var restartLaunchOverride: ((String, String?) -> Bool)?
 
     /// Live download / load progress derived from the child's stderr
     /// tqdm output. ``.idle`` until the first tqdm line lands; flips to
@@ -1435,6 +1448,7 @@ final class ServerManager {
         residencyEligible: Bool = true,
         catalogEntryHint: CatalogEntryHint? = nil
     ) async -> Bool {
+        guard restartReservation == nil else { return false }
         let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         var catalogGeneration = downloads?.cacheGeneration ?? 0
@@ -1887,27 +1901,46 @@ final class ServerManager {
     ///
     /// Used by settings panels that need a process-level restart to apply a
     /// configuration change (API auth mode, speculative-decoding flags).
-    /// ``residencyEligible`` is forced false: these changes live in the
-    /// child process env / launch flags, so the in-process
-    /// ``/v1/models/load`` path must NOT be used.
+    /// These changes live in the child process env / launch flags, so restart
+    /// owns one reserved stop→start transition and bypasses resident loading.
+    /// The same model was live immediately before Stop, so its replacement
+    /// does not repeat the over-capacity prompt against pre-stop memory.
     func restart(alias: String, hfPath: String? = nil) async -> Bool {
         // A concurrent start/stop owns the child transition. Treat that as a
         // failed restart instead of letting stop() no-op and then reporting
         // success against the old process with stale launch configuration.
-        guard !isOperating else { return false }
+        guard !isOperating, restartReservation == nil else { return false }
+        let reservation = UUID()
+        restartReservation = reservation
+        isRestarting = true
+        defer {
+            if restartReservation == reservation {
+                restartReservation = nil
+            }
+            isRestarting = false
+        }
         let restartHFPath = Self.resolveRestartHFPath(
             requestedAlias: alias,
             explicitHFPath: hfPath,
             launchedAlias: launchedChildAlias,
             launchedHFPath: launchedHFPath
         )
-        await stop()
-        guard child == nil else { return false }
-        return await ensureServing(
+        await stop(preservingLastServedAlias: false)
+        guard restartReservation == reservation, child == nil else { return false }
+        if let restartAfterStopHook {
+            await restartAfterStopHook()
+            guard restartReservation == reservation, child == nil else { return false }
+        }
+        if let restartLaunchOverride {
+            return restartLaunchOverride(alias, restartHFPath)
+        }
+        await start(
             alias: alias,
             hfPath: restartHFPath,
-            residencyEligible: false
+            bypassMemoryGuard: true,
+            lifecycleReservation: reservation
         )
+        return restartReservation == reservation && isServing(alias)
     }
 
     /// An explicit caller path always wins. Otherwise inherit the current
@@ -1924,6 +1957,13 @@ final class ServerManager {
             return nil
         }
         return launchedHFPath
+    }
+
+    nonisolated internal static func reservationAllows(
+        active: UUID?,
+        presented: UUID?
+    ) -> Bool {
+        active == presented
     }
 
     /// Speculative decoding is installed while the process-owning engine
@@ -2227,8 +2267,13 @@ final class ServerManager {
         memoryRequestID: UUID? = nil,
         isLaunchAutoStart: Bool = false,
         memoryAdmission: MemoryAdmissionContext? = nil,
-        catalogEntryHint: CatalogEntryHint? = nil
+        catalogEntryHint: CatalogEntryHint? = nil,
+        lifecycleReservation: UUID? = nil
     ) async {
+        guard Self.reservationAllows(
+            active: restartReservation,
+            presented: lifecycleReservation
+        ) else { return }
         // Issue #278: a manual restart is the user taking over the
         // lifecycle — reset the budget at entry so a previously
         // exhausted counter doesn't make a quick post-restart crash
@@ -2401,6 +2446,10 @@ final class ServerManager {
             // moved on during the wait.
             guard !isOperating else { return }
             guard child == nil else { return }
+            guard Self.reservationAllows(
+                active: restartReservation,
+                presented: lifecycleReservation
+            ) else { return }
         }
 
         // Resolve authoritative capability before entering the spawn critical
@@ -2433,6 +2482,10 @@ final class ServerManager {
         )
         if Task.isCancelled || didSignalShutdown { return }
         guard !isOperating, child == nil else { return }
+        guard Self.reservationAllows(
+            active: restartReservation,
+            presented: lifecycleReservation
+        ) else { return }
         let catalogSupportsImageInput = ModelBrandStyle.supportsImageInput(
             forAlias: trimmedAlias,
             isBuiltinProfile: catalogEntry?.isBuiltinProfile,
@@ -2531,6 +2584,15 @@ final class ServerManager {
         // ever reaps it — an orphan holding the port for the next launch.
         if didSignalShutdown {
             isOperating = false
+            return
+        }
+        guard Self.reservationAllows(
+            active: restartReservation,
+            presented: lifecycleReservation
+        ) else {
+            isOperating = false
+            startedAt = nil
+            state = .stopped
             return
         }
         guard let resolvedPort = allocated else {
@@ -2943,6 +3005,10 @@ final class ServerManager {
     /// SIGKILL if still alive. State transitions to `.stopped` on
     /// success.
     func stop() async {
+        // User Stop supersedes any reserved restart, including its post-stop
+        // catalog wait. The reserved start rechecks this token after every
+        // suspension point and will not recreate the child.
+        restartReservation = nil
         await stop(preservingLastServedAlias: false)
     }
 

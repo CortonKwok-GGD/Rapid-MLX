@@ -116,16 +116,23 @@ final class APIAuthConfigTests {
     @Test("auth settings are locked during startup and lifecycle operations")
     func testAuthMutationGateCoversLifecycleRaces() {
         #expect(!SettingsAPIAuthPanel.canMutateAuth(
-            for: .starting(alias: "model"), isOperating: false
+            for: .starting(alias: "model"), isOperating: false, isRestarting: false
         ))
         #expect(!SettingsAPIAuthPanel.canMutateAuth(
-            for: .ready(alias: "model"), isOperating: true
+            for: .ready(alias: "model"), isOperating: true, isRestarting: false
+        ))
+        #expect(!SettingsAPIAuthPanel.canMutateAuth(
+            for: .stopped, isOperating: false, isRestarting: true
         ))
         #expect(SettingsAPIAuthPanel.canMutateAuth(
-            for: .ready(alias: "model"), isOperating: false
+            for: .ready(alias: "model"), isOperating: false, isRestarting: false
         ))
-        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .idle, isOperating: false))
-        #expect(SettingsAPIAuthPanel.canMutateAuth(for: .stopped, isOperating: false))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(
+            for: .idle, isOperating: false, isRestarting: false
+        ))
+        #expect(SettingsAPIAuthPanel.canMutateAuth(
+            for: .stopped, isOperating: false, isRestarting: false
+        ))
     }
 
     @Test("restart refuses to race an existing lifecycle operation")
@@ -164,6 +171,31 @@ final class APIAuthConfigTests {
             launchedAlias: "custom-model",
             launchedHFPath: "/models/custom-model"
         ) == "owner/explicit-repo")
+    }
+
+    @Test("restart reservation blocks an interleaved model start")
+    func testRestartReservationOwnsStopStartGap() async {
+        let manager = ServerManager(
+            testingState: .ready(alias: "custom-model"),
+            binaryPath: URL(fileURLWithPath: "/usr/bin/true"),
+            launchedHFPath: "/models/custom-model"
+        )
+        var competingStartSucceeded: Bool?
+        var reservedLaunch: (alias: String, hfPath: String?)?
+        manager.restartAfterStopHook = {
+            competingStartSucceeded = await manager.ensureServing(alias: "other-model")
+        }
+        manager.restartLaunchOverride = { alias, hfPath in
+            reservedLaunch = (alias, hfPath)
+            return true
+        }
+
+        let restarted = await manager.restart(alias: "custom-model")
+
+        #expect(restarted)
+        #expect(competingStartSucceeded == false)
+        #expect(reservedLaunch?.alias == "custom-model")
+        #expect(reservedLaunch?.hfPath == "/models/custom-model")
     }
 
     // MARK: - storage split (review: no secret in defaults)
